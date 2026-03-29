@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VDS</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="title-bar">
+    <div class="title-bar-drag">
+      <span class="title-bar-title">VDS</span>
+    </div>
+    <div class="title-bar-controls">
+      <button class="title-btn" id="btn-minimize" title="最小化">
+        <svg width="12" height="12" viewBox="0 0 12 12"><rect y="5" width="12" height="2" fill="currentColor"/></svg>
+      </button>
+      <button class="title-btn" id="btn-maximize" title="最大化">
+        <svg width="12" height="12" viewBox="0 0 12 12"><rect x="1" y="1" width="10" height="10" stroke="currentColor" stroke-width="2" fill="none"/></svg>
+      </button>
+      <button class="title-btn title-btn-close" id="btn-close" title="关闭">
+        <svg width="12" height="12" viewBox="0 0 12 12"><path d="M1 1L11 11M11 1L1 11" stroke="currentColor" stroke-width="2"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div id="close-modal" class="modal hidden">
+    <div class="close-modal-content">
+      <h3>请选择操作</h3>
+      <div class="close-modal-buttons">
+        <button id="btn-minimize-to-tray" class="btn btn-primary">最小化到托盘</button>
+        <button id="btn-exit-app" class="btn btn-danger">关闭程序</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="update-modal" class="modal hidden">
+    <div class="modal-content update-modal-content">
+      <h3 id="update-title">正在检测更新</h3>
+      <p id="update-step" class="update-step">准备连接更新源...</p>
+      <p id="update-detail" class="update-detail">当前版本 v0.0.0</p>
+      <div id="update-progress-container" class="progress-container">
+        <div class="progress-bar">
+          <div id="update-progress" class="progress-fill"></div>
+        </div>
+        <div class="progress-text">
+          <span id="update-percent">0%</span>
+          <span id="update-speed">0 MB/秒</span>
+        </div>
+        <div class="progress-detail">
+          <span id="update-transferred">0 / 0 MB</span>
+          <span id="update-time">剩余时间: 计算中...</span>
+        </div>
+      </div>
+      <div id="update-actions" class="modal-buttons update-actions hidden">
+        <button id="btn-close-update" class="btn btn-secondary">关闭</button>
+        <button id="btn-install-update" class="btn btn-primary hidden">立即安装</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="container">
+    <div id="mode-select" class="panel">
+      <h1>屏幕共享</h1>
+      <p class="subtitle">基于 WebRTC 的多人观看方案</p>
+      <div class="mode-buttons">
+        <button id="btn-host" class="btn btn-primary">我要分享屏幕</button>
+        <button id="btn-viewer" class="btn btn-secondary">我要观看</button>
+      </div>
+    </div>
+
+    <div id="host-panel" class="panel hidden">
+      <h2>分享屏幕</h2>
+      <div class="status-bar">
+        <span id="host-status" class="status">准备就绪</span>
+      </div>
+
+      <div id="room-info" class="hidden">
+        <p>房间号 <strong id="room-id-display"></strong></p>
+        <p>观众数 <span id="viewer-count">0</span></p>
+        <button id="btn-copy-room" class="btn btn-small">复制房间号</button>
+      </div>
+
+      <button id="btn-start-share" class="btn btn-primary">开始共享</button>
+      <button id="btn-stop-share" class="btn btn-danger hidden">停止共享</button>
+      <button id="btn-back" class="btn btn-small">返回</button>
+
+      <div id="video-container">
+        <video id="local-video" autoplay muted playsinline></video>
+      </div>
+    </div>
+
+    <div id="viewer-panel" class="panel hidden">
+      <h2>观看屏幕</h2>
+      <div id="join-form">
+        <input type="text" id="room-id-input" placeholder="输入房间号" maxlength="6">
+        <button id="btn-join" class="btn btn-primary">加入</button>
+      </div>
+
+      <div id="viewer-status" class="hidden">
+        <p>房间号 <strong id="viewer-room-id"></strong></p>
+        <p>连接状态 <span id="connection-status">等待连接...</span></p>
+        <p>你在链中的位置 <span id="chain-position">-</span></p>
+      </div>
+
+      <button id="btn-leave" class="btn btn-danger hidden">离开</button>
+      <button id="btn-back-viewer" class="btn btn-small">返回</button>
+
+      <div id="remote-video-container">
+        <video id="remote-video" autoplay playsinline controls></video>
+        <p id="waiting-message">等待分享者开始...</p>
+      </div>
+    </div>
+
+    <div id="error-toast" class="toast hidden"></div>
+
+    <div id="source-modal" class="modal hidden">
+      <div class="modal-content">
+        <h3>选择要分享的内容 <button id="btn-refresh-sources" class="btn-icon" title="刷新窗口列表">↻</button></h3>
+        <div class="source-list" id="source-list"></div>
+        <div class="modal-buttons">
+          <button id="btn-confirm-source" class="btn btn-primary">确认</button>
+          <button id="btn-cancel-source" class="btn btn-secondary">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="quality-modal" class="modal hidden">
+      <div class="modal-content">
+        <h3>画质设置</h3>
+        <div class="quality-settings">
+          <div class="quality-row">
+            <label>分辨率</label>
+            <select id="quality-resolution">
+              <option value="1920x1080" selected>1080p (1920x1080)</option>
+              <option value="1280x720">720p (1280x720)</option>
+              <option value="854x480">480p (854x480)</option>
+            </select>
+          </div>
+          <div class="quality-row">
+            <label>码率 (kbps)</label>
+            <input type="number" id="quality-bitrate" value="10000" min="500" max="50000" step="500">
+          </div>
+          <div class="quality-row">
+            <label>帧率</label>
+            <select id="quality-framerate">
+              <option value="60" selected>60 帧</option>
+              <option value="45">45 帧</option>
+              <option value="30">30 帧</option>
+            </select>
+          </div>
+          <div class="quality-row">
+            <label>编码格式</label>
+            <select id="quality-codec">
+              <option value="none" selected>不指定</option>
+              <option value="h264">优先 H.264</option>
+              <option value="av1">优先 AV1</option>
+            </select>
+          </div>
+        </div>
+        <div class="modal-buttons">
+          <button id="btn-confirm-quality" class="btn btn-primary">确认并继续</button>
+          <button id="btn-cancel-quality" class="btn btn-secondary">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="audio-modal" class="modal hidden">
+      <div class="modal-content">
+        <h3>选择要捕获音频的进程</h3>
+        <p style="color:#8892b0;margin-bottom:15px;">选择要捕获音频的应用程序</p>
+        <div class="source-list" id="audio-process-list"></div>
+        <div class="modal-buttons">
+          <button id="btn-confirm-audio" class="btn btn-primary">确认</button>
+          <button id="btn-cancel-audio" class="btn btn-secondary">跳过，不捕获音频</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

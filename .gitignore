@@ -1,5 +1,9 @@
 node_modules/
 .claude/
+build/
+dist/
+runtime/
+server/updates/
 *.pem
 *.key
 .DS_Store

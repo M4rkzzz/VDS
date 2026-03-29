@@ -1,0 +1,9 @@
+.git
+.claude
+node_modules
+build
+dist
+runtime
+server/updates
+*.log
+.DS_Store
