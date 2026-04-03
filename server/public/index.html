@@ -3,15 +3,23 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: data:; connect-src 'self' http: https: ws: wss:; font-src 'self' data:;"
+  >
   <title>VDS</title>
   <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body data-app-view="home" data-landing-focus="idle" data-landing-commit="idle" data-workspace-mask="idle" data-close-modal="closed">
   <div class="title-bar">
     <div class="title-bar-drag">
       <span class="title-bar-title">VDS</span>
     </div>
     <div class="title-bar-controls">
+      <div class="debug-menu-anchor">
+        <button class="title-btn title-btn-debug" id="btn-debug-toggle" title="打开调试菜单" aria-haspopup="true" aria-expanded="false">调试</button>
+        <div class="debug-menu hidden" id="debug-menu"></div>
+      </div>
       <button class="title-btn" id="btn-minimize" title="最小化">
         <svg width="12" height="12" viewBox="0 0 12 12"><rect y="5" width="12" height="2" fill="currentColor"/></svg>
       </button>
@@ -26,18 +34,23 @@
 
   <div id="close-modal" class="modal hidden">
     <div class="close-modal-content">
+      <button id="btn-close-modal-dismiss" class="close-modal-dismiss" type="button" aria-label="取消关闭">
+        <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
+          <path d="M2 2L12 12M12 2L2 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </button>
       <h3>请选择操作</h3>
       <div class="close-modal-buttons">
         <button id="btn-minimize-to-tray" class="btn btn-primary">最小化到托盘</button>
-        <button id="btn-exit-app" class="btn btn-danger">关闭程序</button>
+        <button id="btn-exit-app" class="btn btn-danger">退出应用</button>
       </div>
     </div>
   </div>
 
   <div id="update-modal" class="modal hidden">
     <div class="modal-content update-modal-content">
-      <h3 id="update-title">正在检测更新</h3>
-      <p id="update-step" class="update-step">准备连接更新源...</p>
+      <h3 id="update-title">正在检查更新</h3>
+      <p id="update-step" class="update-step">正在准备更新请求...</p>
       <p id="update-detail" class="update-detail">当前版本 v0.0.0</p>
       <div id="update-progress-container" class="progress-container">
         <div class="progress-bar">
@@ -49,7 +62,7 @@
         </div>
         <div class="progress-detail">
           <span id="update-transferred">0 / 0 MB</span>
-          <span id="update-time">剩余时间: 计算中...</span>
+          <span id="update-time">剩余时间：计算中...</span>
         </div>
       </div>
       <div id="update-actions" class="modal-buttons update-actions hidden">
@@ -60,55 +73,108 @@
   </div>
 
   <div class="container">
-    <div id="mode-select" class="panel">
-      <h1>屏幕共享</h1>
-      <p class="subtitle">基于 WebRTC 的多人观看方案</p>
-      <div class="mode-buttons">
-        <button id="btn-host" class="btn btn-primary">我要分享屏幕</button>
-        <button id="btn-viewer" class="btn btn-secondary">我要观看</button>
+    <div id="mode-select" class="panel landing-panel">
+      <div class="landing-split-shell">
+        <button id="btn-host" class="landing-half landing-half-host" type="button">
+          <span class="landing-half-inner">
+            <span class="landing-half-title">主持</span>
+            <span class="landing-half-meta">host</span>
+          </span>
+        </button>
+        <div class="landing-divider" aria-hidden="true"></div>
+        <button id="btn-viewer" class="landing-half landing-half-viewer" type="button">
+          <span class="landing-half-inner">
+            <span class="landing-half-title">加入</span>
+            <span class="landing-half-meta">join</span>
+          </span>
+        </button>
       </div>
     </div>
 
-    <div id="host-panel" class="panel hidden">
-      <h2>分享屏幕</h2>
-      <div class="status-bar">
-        <span id="host-status" class="status">准备就绪</span>
-      </div>
+    <div id="workspace-transition-mask" class="workspace-transition-mask" aria-hidden="true"></div>
 
-      <div id="room-info" class="hidden">
-        <p>房间号 <strong id="room-id-display"></strong></p>
-        <p>观众数 <span id="viewer-count">0</span></p>
-        <button id="btn-copy-room" class="btn btn-small">复制房间号</button>
-      </div>
+    <div id="host-panel" class="panel workspace-panel workspace-panel-host hidden">
+      <div class="workspace-split workspace-split-host">
+        <aside class="workspace-side workspace-side-host">
+          <div class="workspace-side-header">
+            <p class="workspace-side-label">host</p>
+            <h2 class="workspace-side-title">主持</h2>
+          </div>
 
-      <button id="btn-start-share" class="btn btn-primary">开始共享</button>
-      <button id="btn-stop-share" class="btn btn-danger hidden">停止共享</button>
-      <button id="btn-back" class="btn btn-small">返回</button>
+          <div class="status-bar workspace-block">
+            <span id="host-status" class="status">准备就绪</span>
+          </div>
 
-      <div id="video-container">
-        <video id="local-video" autoplay muted playsinline></video>
+          <div id="room-info" class="workspace-card workspace-block hidden">
+            <p>房间号：<strong id="room-id-display"></strong></p>
+            <p>观众数：<span id="viewer-count">0</span></p>
+            <button id="btn-copy-room" class="btn btn-small">复制房间号</button>
+          </div>
+
+          <div class="workspace-card workspace-block workspace-action-card">
+            <div class="workspace-action-row workspace-action-row-stacked">
+              <button id="btn-start-share" class="btn btn-primary">开始共享</button>
+              <button id="btn-stop-share" class="btn btn-danger hidden">停止共享</button>
+              <button id="btn-back" class="btn btn-small">返回</button>
+            </div>
+          </div>
+
+          <div class="native-panel-toolbar native-panel-toolbar-host workspace-block">
+            <button id="btn-host-fullscreen" class="btn btn-small btn-secondary" type="button">全屏预览</button>
+          </div>
+        </aside>
+
+        <section class="workspace-stage-panel workspace-stage-panel-host">
+          <div id="video-container" class="workspace-stage">
+            <video id="local-video" autoplay muted playsinline></video>
+          </div>
+        </section>
       </div>
     </div>
 
-    <div id="viewer-panel" class="panel hidden">
-      <h2>观看屏幕</h2>
-      <div id="join-form">
-        <input type="text" id="room-id-input" placeholder="输入房间号" maxlength="6">
-        <button id="btn-join" class="btn btn-primary">加入</button>
-      </div>
+    <div id="viewer-panel" class="panel workspace-panel workspace-panel-viewer hidden">
+      <div class="workspace-split workspace-split-viewer">
+        <section class="workspace-stage-panel workspace-stage-panel-viewer">
+          <div id="remote-video-container" class="workspace-stage">
+            <video id="remote-video" autoplay playsinline controls></video>
+            <audio id="remote-audio" autoplay style="display:none"></audio>
+            <p id="waiting-message">等待分享者开始共享...</p>
+          </div>
+        </section>
 
-      <div id="viewer-status" class="hidden">
-        <p>房间号 <strong id="viewer-room-id"></strong></p>
-        <p>连接状态 <span id="connection-status">等待连接...</span></p>
-        <p>你在链中的位置 <span id="chain-position">-</span></p>
-      </div>
+        <aside class="workspace-side workspace-side-viewer">
+          <div class="workspace-side-header workspace-side-header-viewer">
+            <p class="workspace-side-label">join</p>
+            <h2 class="workspace-side-title">加入</h2>
+          </div>
 
-      <button id="btn-leave" class="btn btn-danger hidden">离开</button>
-      <button id="btn-back-viewer" class="btn btn-small">返回</button>
+          <div id="join-form" class="workspace-card workspace-join-card workspace-block">
+            <input type="text" id="room-id-input" placeholder="输入房间号" maxlength="6">
+            <button id="btn-join" class="btn btn-primary">加入</button>
+          </div>
 
-      <div id="remote-video-container">
-        <video id="remote-video" autoplay playsinline controls></video>
-        <p id="waiting-message">等待分享者开始...</p>
+          <div id="viewer-status" class="workspace-card workspace-block hidden">
+            <p>房间号：<strong id="viewer-room-id"></strong></p>
+            <p>连接状态：<span id="connection-status">等待连接...</span></p>
+            <p>你在链中的位置：<span id="chain-position">-</span></p>
+          </div>
+
+          <div class="workspace-card workspace-block workspace-action-card">
+            <div class="workspace-action-row workspace-action-row-stacked">
+              <button id="btn-leave" class="btn btn-danger hidden">离开</button>
+              <button id="btn-back-viewer" class="btn btn-small">返回</button>
+            </div>
+          </div>
+
+          <div class="native-panel-toolbar native-panel-toolbar-viewer workspace-block">
+            <button id="btn-viewer-fullscreen" class="btn btn-small btn-secondary" type="button">全屏播放</button>
+            <label class="native-volume-control" for="viewer-volume">
+              <span>音量</span>
+              <input id="viewer-volume" type="range" min="0" max="100" step="1" value="100">
+              <span id="viewer-volume-value">100%</span>
+            </label>
+          </div>
+        </aside>
       </div>
     </div>
 
@@ -116,8 +182,23 @@
 
     <div id="source-modal" class="modal hidden">
       <div class="modal-content">
-        <h3>选择要分享的内容 <button id="btn-refresh-sources" class="btn-icon" title="刷新窗口列表">↻</button></h3>
+        <h3>选择要分享的内容 <button id="btn-refresh-sources" class="btn-icon" title="刷新">↻</button></h3>
         <div class="source-list" id="source-list"></div>
+        <div class="source-audio-panel">
+          <label class="checkbox-label source-preview-toggle">
+            <input type="checkbox" id="source-preview-enabled" checked>
+            <span>开启本地预览</span>
+          </label>
+          <label class="checkbox-label source-audio-toggle">
+            <input type="checkbox" id="source-audio-enabled">
+            <span>共享进程音频</span>
+          </label>
+          <div id="source-audio-summary" class="source-audio-summary">当前目标没有匹配到可用的音频进程。</div>
+          <div class="source-audio-actions">
+            <button id="btn-change-source-audio" class="btn btn-secondary btn-small">更改音频进程</button>
+          </div>
+          <div id="source-audio-process-list" class="source-audio-process-list hidden"></div>
+        </div>
         <div class="modal-buttons">
           <button id="btn-confirm-source" class="btn btn-primary">确认</button>
           <button id="btn-cancel-source" class="btn btn-secondary">取消</button>
@@ -126,37 +207,97 @@
     </div>
 
     <div id="quality-modal" class="modal hidden">
-      <div class="modal-content">
-        <h3>画质设置</h3>
-        <div class="quality-settings">
-          <div class="quality-row">
-            <label>分辨率</label>
-            <select id="quality-resolution">
-              <option value="1920x1080" selected>1080p (1920x1080)</option>
-              <option value="1280x720">720p (1280x720)</option>
-              <option value="854x480">480p (854x480)</option>
-            </select>
+      <div class="modal-content quality-modal-content">
+        <div class="quality-modal-header">
+          <div>
+            <h3>编码与画质</h3>
+            <p class="quality-modal-subtitle">按当前设备能力选择编码、分辨率、帧率与实时性策略。</p>
           </div>
-          <div class="quality-row">
-            <label>码率 (kbps)</label>
-            <input type="number" id="quality-bitrate" value="10000" min="500" max="50000" step="500">
-          </div>
-          <div class="quality-row">
-            <label>帧率</label>
-            <select id="quality-framerate">
-              <option value="60" selected>60 帧</option>
-              <option value="45">45 帧</option>
-              <option value="30">30 帧</option>
-            </select>
-          </div>
-          <div class="quality-row">
-            <label>编码格式</label>
-            <select id="quality-codec">
-              <option value="none" selected>不指定</option>
-              <option value="h264">优先 H.264</option>
-              <option value="av1">优先 AV1</option>
-            </select>
-          </div>
+        </div>
+        <div class="quality-settings quality-settings-modern">
+          <section class="quality-section">
+            <p class="quality-section-heading">基础设置</p>
+            <div class="quality-setting-row">
+              <div class="quality-setting-copy">
+                <label>编码</label>
+                <p id="quality-codec-note" class="quality-setting-note">当前直播链路默认以 H.264 兼容优先。</p>
+              </div>
+              <div class="quality-setting-control">
+                <div id="quality-codec-options" class="quality-segment-group quality-segment-group-compact" aria-label="编码选项"></div>
+              </div>
+            </div>
+
+            <div class="quality-setting-row quality-setting-row-toggle">
+              <div class="quality-setting-copy">
+                <label>硬件加速编码</label>
+                <p id="quality-hardware-support" class="quality-setting-note">正在检测当前设备支持的 FFmpeg 硬件编码器…</p>
+              </div>
+              <div class="quality-setting-control quality-setting-control-toggle">
+                <label class="quality-switch" for="quality-hardware-acceleration">
+                  <input id="quality-hardware-acceleration" type="checkbox" checked>
+                  <span class="quality-switch-track" aria-hidden="true"></span>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section class="quality-section">
+            <p class="quality-section-heading">高级设置</p>
+            <div class="quality-setting-row">
+              <div class="quality-setting-copy">
+                <label>分辨率</label>
+                <p class="quality-setting-note">默认 1080p，可按设备和网络条件选择固定输出分辨率。</p>
+              </div>
+              <div class="quality-setting-control">
+                <div id="quality-resolution-options" class="quality-segment-group quality-segment-group-wrap quality-segment-group-compact" aria-label="分辨率选项"></div>
+              </div>
+            </div>
+
+            <div class="quality-setting-row">
+              <div class="quality-setting-copy">
+                <label>帧率</label>
+                <p class="quality-setting-note">更高帧率会显著提高编码压力与带宽占用。</p>
+              </div>
+              <div class="quality-setting-control">
+                <div id="quality-fps-options" class="quality-segment-group quality-segment-group-compact" aria-label="帧率选项"></div>
+              </div>
+            </div>
+
+            <div class="quality-setting-row">
+              <div class="quality-setting-copy">
+                <label>码率</label>
+                <p class="quality-setting-note">默认 10000 kbps，加减步长 1000。</p>
+              </div>
+              <div class="quality-setting-control">
+                <div class="quality-stepper">
+                  <button id="quality-bitrate-decrease" class="quality-stepper-btn" type="button" aria-label="降低码率">-</button>
+                  <input type="number" id="quality-bitrate" value="10000" min="1000" max="80000" step="1000">
+                  <span class="quality-stepper-unit">kbps</span>
+                  <button id="quality-bitrate-increase" class="quality-stepper-btn" type="button" aria-label="提高码率">+</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="quality-setting-row">
+              <div class="quality-setting-copy">
+                <label>编码器预设</label>
+                <p id="quality-preset-note" class="quality-setting-note">默认均衡，将按实际编码器映射到对应预设。</p>
+              </div>
+              <div class="quality-setting-control">
+                <div id="quality-preset-options" class="quality-segment-group quality-segment-group-compact" aria-label="编码器预设"></div>
+              </div>
+            </div>
+
+            <div class="quality-setting-row">
+              <div class="quality-setting-copy">
+                <label>调优</label>
+                <p class="quality-setting-note">可不选，也可选择其中一项。</p>
+              </div>
+              <div class="quality-setting-control">
+                <div id="quality-tune-options" class="quality-segment-group quality-segment-group-compact" aria-label="调优选项"></div>
+              </div>
+            </div>
+          </section>
         </div>
         <div class="modal-buttons">
           <button id="btn-confirm-quality" class="btn btn-primary">确认并继续</button>
@@ -164,20 +305,9 @@
         </div>
       </div>
     </div>
-
-    <div id="audio-modal" class="modal hidden">
-      <div class="modal-content">
-        <h3>选择要捕获音频的进程</h3>
-        <p style="color:#8892b0;margin-bottom:15px;">选择要捕获音频的应用程序</p>
-        <div class="source-list" id="audio-process-list"></div>
-        <div class="modal-buttons">
-          <button id="btn-confirm-audio" class="btn btn-primary">确认</button>
-          <button id="btn-cancel-audio" class="btn btn-secondary">跳过，不捕获音频</button>
-        </div>
-      </div>
-    </div>
   </div>
 
   <script src="app.js"></script>
+  <script src="app-native-overrides.js"></script>
 </body>
 </html>

@@ -1,0 +1,14 @@
+{
+  "name": "vds-media-agent",
+  "version-string": "0.1.0",
+  "dependencies": [
+    {
+      "name": "libdatachannel",
+      "default-features": false,
+      "features": [
+        "srtp",
+        "ws"
+      ]
+    }
+  ]
+}

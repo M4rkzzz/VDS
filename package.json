@@ -1,13 +1,18 @@
 {
   "name": "screenshare-relay",
-  "version": "1.5.0",
+  "version": "1.5.3",
   "description": "Multi-viewer screen sharing with cascade relay (蜈蚣法) - Electron Edition",
   "main": "desktop/main.js",
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
+    "dev:dual": "powershell -ExecutionPolicy Bypass -File scripts/start-dual-test-env.ps1",
+    "dev:dual:native": "powershell -ExecutionPolicy Bypass -File scripts/start-dual-test-env.ps1 -EnableNativePeerTransport",
+    "dev:triple": "powershell -ExecutionPolicy Bypass -File scripts/start-triple-test-env.ps1",
+    "dev:triple:native": "powershell -ExecutionPolicy Bypass -File scripts/start-triple-test-env.ps1 -EnableNativePeerTransport",
     "server": "node server/index.js",
     "build": "electron-builder",
+    "build:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/build-media-agent.ps1 -Configuration Release",
     "rebuild": "electron-rebuild -f",
     "prepare-server-release": "node scripts/prepare-server-release.js",
     "build:release": "npm run build && npm run prepare-server-release"
@@ -33,6 +38,15 @@
     "files": [
       "desktop/**/*",
       "server/public/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "runtime/media-agent",
+        "to": "runtime/media-agent",
+        "filter": [
+          "**/*"
+        ]
+      }
     ],
     "win": {
       "target": "nsis",

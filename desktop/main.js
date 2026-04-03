@@ -2,11 +2,18 @@ const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, desktopCapturer, s
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { autoUpdater } = require('electron-updater');
-const { setupAudioCaptureIpc } = require('process-audio-capture/dist/main');
+const { MediaAgentManager } = require('./media-agent-manager');
 
 const SERVER_URL = normalizeBaseUrl(process.env.SERVER_URL || 'https://boshan.s.3q.hair');
 const DISCONNECT_GRACE_MS = Number(process.env.DISCONNECT_GRACE_MS || 30000);
+const PREFERRED_AUDIO_BACKEND = String(process.env.VDS_PREFERRED_AUDIO_BACKEND || '').trim().toLowerCase();
+const ENABLE_NATIVE_HOST_SESSION_BRIDGE = true;
+const VERBOSE_MEDIA_LOGS = process.env.VDS_VERBOSE_MEDIA_LOGS === '1';
+const ENABLE_AGENT_HOST_CAPTURE_PROCESS = process.env.VDS_ENABLE_AGENT_HOST_CAPTURE_PROCESS === '1';
+const ENABLE_NATIVE_HOST_PREVIEW_SURFACE = true;
+const ENABLE_NATIVE_PEER_TRANSPORT = true;
+const ENABLE_NATIVE_SURFACE_EMBEDDING = process.env.VDS_ENABLE_NATIVE_SURFACE_EMBEDDING !== '0';
+const DEBUG_CATEGORIES = ['connection', 'video', 'audio', 'update', 'misc'];
 
 let mainWindow = null;
 let tray = null;
@@ -15,8 +22,79 @@ const updateLogSessionStamp = createUpdateLogSessionStamp();
 const updateLogEntries = [];
 const UPDATE_LOG_ENTRY_LIMIT = 200;
 let win32WindowCaptureApi = undefined;
+let mediaAgentManager = null;
+let autoUpdater = null;
+let autoUpdaterConfigured = false;
+let rendererDebugConfig = buildDefaultRendererDebugConfig(false);
+let quitInProgress = false;
+let quitFinalizeTimer = null;
+let audioCapture = undefined;
+let audioCaptureLoadError = null;
+let audioBridgeAttached = false;
 
 configureProfilePaths();
+
+function buildDefaultRendererDebugConfig(enabled = false) {
+  return DEBUG_CATEGORIES.reduce((config, key) => {
+    config[key] = Boolean(enabled);
+    return config;
+  }, {});
+}
+
+function normalizeRendererDebugConfig(config, fallbackEnabled = false) {
+  if (typeof config === 'boolean') {
+    return buildDefaultRendererDebugConfig(config);
+  }
+
+  const normalized = buildDefaultRendererDebugConfig(fallbackEnabled);
+  if (!config || typeof config !== 'object') {
+    return normalized;
+  }
+
+  for (const key of DEBUG_CATEGORIES) {
+    if (Object.prototype.hasOwnProperty.call(config, key)) {
+      normalized[key] = Boolean(config[key]);
+    }
+  }
+
+  return normalized;
+}
+
+function isRendererDebugEnabled(category = 'misc') {
+  return VERBOSE_MEDIA_LOGS || Boolean(rendererDebugConfig[category]);
+}
+
+function getMediaEngineDebugCategory(method) {
+  switch (method) {
+    case 'createPeer':
+    case 'closePeer':
+    case 'setRemoteDescription':
+    case 'addRemoteIceCandidate':
+      return 'connection';
+    case 'startHostSession':
+    case 'stopHostSession':
+    case 'attachPeerMediaSource':
+    case 'detachPeerMediaSource':
+    case 'attachSurface':
+    case 'updateSurface':
+    case 'detachSurface':
+    case 'listCaptureTargets':
+      return 'video';
+    case 'getAudioBackendStatus':
+    case 'startAudioSession':
+    case 'stopAudioSession':
+    case 'setViewerVolume':
+    case 'getViewerVolume':
+      return 'audio';
+    case 'getStatus':
+    case 'getCapabilities':
+    case 'getStats':
+    case 'start':
+    case 'stop':
+    default:
+      return 'misc';
+  }
+}
 
 app.commandLine.appendSwitch(
   'enable-features',
@@ -30,35 +108,21 @@ if (process.env.HW_ACCEL === 'false') {
   app.commandLine.appendSwitch('disable-software-rasterizer');
 }
 
-try {
-  setupAudioCaptureIpc();
-  console.log('Audio capture IPC ready');
-} catch (error) {
-  console.error('Failed to setup audio capture IPC:', error);
-}
-
 ipcMain.handle('get-runtime-config', () => ({
   serverUrl: SERVER_URL,
-  disconnectGraceMs: DISCONNECT_GRACE_MS
+  disconnectGraceMs: DISCONNECT_GRACE_MS,
+  preferredAudioBackend: PREFERRED_AUDIO_BACKEND,
+  enableNativeHostSessionBridge: ENABLE_NATIVE_HOST_SESSION_BRIDGE,
+  verboseMediaLogs: VERBOSE_MEDIA_LOGS,
+  enableAgentHostCaptureProcess: ENABLE_AGENT_HOST_CAPTURE_PROCESS,
+  enableNativeHostPreviewSurface: ENABLE_NATIVE_HOST_PREVIEW_SURFACE,
+  enableNativePeerTransport: ENABLE_NATIVE_PEER_TRANSPORT,
+  enableNativeSurfaceEmbedding: ENABLE_NATIVE_SURFACE_EMBEDDING
 }));
 
 ipcMain.handle('get-desktop-sources', async () => {
   try {
-    const rawSources = await desktopCapturer.getSources({
-      types: ['window', 'screen'],
-      thumbnailSize: { width: 320, height: 180 },
-      fetchWindowIcons: true
-    });
-
-    const sources = rawSources.map(normalizeDesktopSource);
-    const fullscreenFallbackSource = buildFullscreenFallbackSource(sources);
-    const minimizedWindowFallbackSources = buildMinimizedWindowFallbackSources(sources);
-    const orderedSources = sortDesktopSources(
-      (fullscreenFallbackSource ? [fullscreenFallbackSource] : [])
-        .concat(sources, minimizedWindowFallbackSources)
-    );
-
-    return orderedSources;
+    return await listDesktopSources();
   } catch (error) {
     console.error('Error getting desktop sources:', error);
     return [];
@@ -70,7 +134,79 @@ ipcMain.handle('get-update-log-snapshot', () => ({
   path: getUpdateLogFilePath(),
   entries: updateLogEntries.slice()
 }));
+ipcMain.handle('media-engine-get-status', async () => getMediaAgentManager().getStatus());
+ipcMain.handle('media-engine-start', async () => getMediaAgentManager().start());
+ipcMain.handle('media-engine-stop', async () => getMediaAgentManager().stop());
+ipcMain.handle('media-engine-list-capture-targets', async () => {
+  try {
+    return await listCaptureTargets();
+  } catch (error) {
+    console.error('[media-agent] listCaptureTargets failed:', error);
+    return [];
+  }
+});
+ipcMain.handle('media-engine-audio-is-platform-supported', () => invokeAudioCaptureOperation('isPlatformSupported'));
+ipcMain.handle('media-engine-audio-check-permission', () => invokeAudioCaptureOperation('checkPermission'));
+ipcMain.handle('media-engine-audio-request-permission', () => invokeAudioCaptureOperation('requestPermission'));
+ipcMain.handle('media-engine-audio-get-process-list', () => invokeAudioCaptureOperation('getProcessList'));
+ipcMain.handle('media-engine-audio-get-backend-status', () => getMediaEngineAudioBridgeStatus());
+ipcMain.handle('media-engine-audio-start-capture', (_event, pid) => invokeAudioCaptureOperation('startCapture', pid));
+ipcMain.handle('media-engine-audio-stop-capture', () => invokeAudioCaptureOperation('stopCapture'));
+ipcMain.handle('media-engine-audio-is-capturing', () => {
+  try {
+    const capture = getAudioCapture();
+    return Boolean(audioCapture && audioCapture.isCapturing);
+  } catch (error) {
+    console.error('[media-engine] Failed to read audio capture state:', error);
+    return false;
+  }
+});
+ipcMain.handle('media-engine-start-host-session', async (_event, options) => invokeMediaEngineHostSessionBridge('startHostSession', options || {}));
+ipcMain.handle('media-engine-stop-host-session', async (_event, options) => invokeMediaEngineHostSessionBridge('stopHostSession', options || {}));
+ipcMain.handle('media-engine-get-audio-backend-status', async () => invokeMediaEngine('getAudioBackendStatus'));
+ipcMain.handle('media-engine-start-audio-session', async (_event, options) => invokeMediaEngine('startAudioSession', options || {}));
+ipcMain.handle('media-engine-stop-audio-session', async (_event, options) => invokeMediaEngine('stopAudioSession', options || {}));
+ipcMain.handle('media-engine-create-peer', async (_event, options) => invokeMediaEngine('createPeer', options || {}));
+ipcMain.handle('media-engine-close-peer', async (_event, options) => invokeMediaEngine('closePeer', options || {}));
+ipcMain.handle('media-engine-set-remote-description', async (_event, options) => invokeMediaEngine('setRemoteDescription', options || {}));
+ipcMain.handle('media-engine-add-remote-ice-candidate', async (_event, options) => invokeMediaEngine('addRemoteIceCandidate', options || {}));
+ipcMain.handle('media-engine-attach-peer-media-source', async (_event, options) => invokeMediaEngine('attachPeerMediaSource', options || {}));
+ipcMain.handle('media-engine-detach-peer-media-source', async (_event, options) => invokeMediaEngine('detachPeerMediaSource', options || {}));
+ipcMain.handle('media-engine-attach-surface', async (_event, options) => invokeMediaEngine('attachSurface', enrichEmbeddedSurfaceOptions(options || {})));
+ipcMain.handle('media-engine-update-surface', async (_event, options) => invokeMediaEngine('updateSurface', enrichEmbeddedSurfaceOptions(options || {})));
+ipcMain.handle('media-engine-detach-surface', async (_event, options) => invokeMediaEngine('detachSurface', options || {}));
+ipcMain.handle('media-engine-set-viewer-volume', async (_event, volume) => invokeMediaEngine('setViewerVolume', {
+  pid: getRendererProcessId(),
+  volume
+}));
+ipcMain.handle('media-engine-get-viewer-volume', async () => {
+  try {
+    return await invokeMediaEngine('getViewerVolume', {
+      pid: getRendererProcessId()
+    });
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    if (message.includes('No active render audio session was found')) {
+      return {
+        volume: 1
+      };
+    }
+    throw error;
+  }
+});
+ipcMain.handle('media-engine-get-capabilities', async () => invokeMediaEngine('getCapabilities'));
+ipcMain.handle('media-engine-get-stats', async (_event, options) => invokeMediaEngine('getStats', options || {}));
 ipcMain.handle('window-is-maximized', () => Boolean(mainWindow && mainWindow.isMaximized()));
+ipcMain.handle('window-get-bounds', () => {
+  if (!mainWindow) {
+    return null;
+  }
+  return mainWindow.getBounds();
+});
+ipcMain.handle('window-set-fullscreen', (_event, enabled) => {
+  return applyWindowFullscreenState(enabled);
+});
+ipcMain.handle('window-is-fullscreen', () => Boolean(mainWindow && mainWindow.isFullScreen()));
 
 ipcMain.on('window-minimize', () => {
   if (mainWindow) {
@@ -102,19 +238,16 @@ ipcMain.on('window-maximize', () => {
 });
 
 ipcMain.on('window-close', () => {
-  app.isQuitting = true;
-  if (mainWindow) {
-    mainWindow.close();
-  }
+  requestAppQuit();
 });
 
-autoUpdater.logger = {
-  info: (message) => writeUpdateLog('info', message),
-  warn: (message) => writeUpdateLog('warn', message),
-  error: (message) => writeUpdateLog('error', message)
-};
-autoUpdater.autoDownload = false;
-autoUpdater.autoInstallOnAppQuit = true;
+ipcMain.on('renderer-debug-config-changed', (_event, config) => {
+  rendererDebugConfig = normalizeRendererDebugConfig(config, false);
+});
+
+ipcMain.on('renderer-debug-mode-changed', (_event, enabled) => {
+  rendererDebugConfig = buildDefaultRendererDebugConfig(Boolean(enabled));
+});
 
 ipcMain.handle('check-for-updates', async () => {
   if (!app.isPackaged) {
@@ -123,14 +256,15 @@ ipcMain.handle('check-for-updates', async () => {
   }
 
   try {
+    const updater = getAutoUpdater();
     writeUpdateLog('info', `Starting update check. version=${app.getVersion()} feed=${getUpdateFeedBaseUrl()}`);
-    autoUpdater.setFeedURL({
+    updater.setFeedURL({
       provider: 'generic',
       url: getUpdateFeedBaseUrl(),
       useMultipleRangeRequest: false
     });
     writeUpdateLog('info', `Feed URL configured: ${getUpdateManifestUrl()} (multi-range disabled)`);
-    return await autoUpdater.checkForUpdates();
+    return await updater.checkForUpdates();
   } catch (error) {
     writeUpdateLog('error', `Update check failed before completion: ${formatLogMessage(error)}`);
     console.error('Update check error:', error);
@@ -145,8 +279,9 @@ ipcMain.handle('download-update', async () => {
   }
 
   try {
+    const updater = getAutoUpdater();
     writeUpdateLog('info', 'Starting update download from renderer request.');
-    await autoUpdater.downloadUpdate();
+    await updater.downloadUpdate();
     return true;
   } catch (error) {
     writeUpdateLog('error', `Update download failed before completion: ${formatLogMessage(error)}`);
@@ -157,76 +292,10 @@ ipcMain.handle('download-update', async () => {
 
 ipcMain.handle('quit-and-install', () => {
   if (app.isPackaged) {
+    const updater = getAutoUpdater();
     writeUpdateLog('info', 'quitAndInstall requested by renderer.');
-    autoUpdater.quitAndInstall();
+    updater.quitAndInstall();
   }
-});
-
-autoUpdater.on('checking-for-update', () => {
-  writeUpdateLog('info', `checking-for-update: currentVersion=${app.getVersion()} manifest=${getUpdateManifestUrl()}`);
-  sendToRenderer('update-status', {
-    status: 'checking',
-    currentVersion: app.getVersion(),
-    feedUrl: getUpdateManifestUrl()
-  });
-});
-
-autoUpdater.on('update-available', (info) => {
-  writeUpdateLog('info', `update-available: currentVersion=${app.getVersion()} nextVersion=${info.version} files=${formatUpdateFiles(info.files)}`);
-  sendToRenderer('update-status', {
-    status: 'available',
-    version: info.version,
-    currentVersion: app.getVersion(),
-    feedUrl: getUpdateManifestUrl(),
-    releaseDate: info.releaseDate || null
-  });
-});
-
-autoUpdater.on('update-not-available', (info) => {
-  writeUpdateLog('info', `update-not-available: currentVersion=${app.getVersion()} latestVersion=${(info && info.version) || app.getVersion()}`);
-  sendToRenderer('update-status', {
-    status: 'not-available',
-    version: (info && info.version) || app.getVersion(),
-    currentVersion: app.getVersion(),
-    feedUrl: getUpdateManifestUrl()
-  });
-});
-
-autoUpdater.on('download-progress', (progress) => {
-  writeUpdateLog(
-    'info',
-    `download-progress: percent=${safeNumber(progress.percent).toFixed(2)} transferred=${safeNumber(progress.transferred)} total=${safeNumber(progress.total)} bytesPerSecond=${safeNumber(progress.bytesPerSecond)}`
-  );
-  sendToRenderer('update-status', {
-    status: 'downloading',
-    percent: progress.percent,
-    bytesPerSecond: progress.bytesPerSecond,
-    total: progress.total,
-    transferred: progress.transferred,
-    remaining: progress.remaining,
-    currentVersion: app.getVersion(),
-    feedUrl: getUpdateManifestUrl()
-  });
-});
-
-autoUpdater.on('update-downloaded', (info) => {
-  writeUpdateLog('info', `update-downloaded: version=${info.version} releaseDate=${info.releaseDate || 'n/a'}`);
-  sendToRenderer('update-status', {
-    status: 'downloaded',
-    version: info.version,
-    currentVersion: app.getVersion(),
-    feedUrl: getUpdateManifestUrl()
-  });
-});
-
-autoUpdater.on('error', (error) => {
-  writeUpdateLog('error', `autoUpdater error event: ${formatLogMessage(error)}`);
-  sendToRenderer('update-status', {
-    status: 'error',
-    error: error.message,
-    currentVersion: app.getVersion(),
-    feedUrl: getUpdateManifestUrl()
-  });
 });
 
 function createWindow() {
@@ -266,6 +335,10 @@ function createWindow() {
     }
   });
 
+  mainWindow.webContents.on('did-finish-load', () => {
+    sendToRenderer('media-engine-status', getMediaAgentManager().getStatus());
+  });
+
   mainWindow.loadFile(path.resolve(__dirname, '../server/public', 'index.html'));
 
   mainWindow.on('close', (event) => {
@@ -276,15 +349,81 @@ function createWindow() {
 
   mainWindow.on('maximize', () => {
     sendToRenderer('window-maximized-changed', true);
+    sendToRenderer('window-bounds-changed', mainWindow.getBounds());
   });
 
   mainWindow.on('unmaximize', () => {
     sendToRenderer('window-maximized-changed', false);
+    sendToRenderer('window-bounds-changed', mainWindow.getBounds());
+  });
+
+  mainWindow.on('enter-full-screen', () => {
+    syncWindowFullscreenZOrder(true);
+    sendToRenderer('window-fullscreen-changed', true);
+    sendToRenderer('window-bounds-changed', mainWindow.getBounds());
+  });
+
+  mainWindow.on('leave-full-screen', () => {
+    syncWindowFullscreenZOrder(false);
+    sendToRenderer('window-fullscreen-changed', false);
+    sendToRenderer('window-bounds-changed', mainWindow.getBounds());
+  });
+
+  mainWindow.on('move', () => {
+    sendToRenderer('window-bounds-changed', mainWindow.getBounds());
+  });
+
+  mainWindow.on('resize', () => {
+    sendToRenderer('window-bounds-changed', mainWindow.getBounds());
   });
 
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
+}
+
+function syncWindowFullscreenZOrder(enabled) {
+  if (!mainWindow || mainWindow.isDestroyed() || process.platform !== 'win32') {
+    return;
+  }
+
+  if (enabled) {
+    mainWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+    if (typeof mainWindow.moveTop === 'function') {
+      mainWindow.moveTop();
+    }
+    mainWindow.focus();
+    return;
+  }
+
+  mainWindow.setAlwaysOnTop(false);
+}
+
+function applyWindowFullscreenState(enabled) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return false;
+  }
+
+  const shouldEnable = Boolean(enabled);
+  if (shouldEnable) {
+    syncWindowFullscreenZOrder(true);
+  }
+
+  mainWindow.setFullScreen(shouldEnable);
+
+  if (!shouldEnable) {
+    syncWindowFullscreenZOrder(false);
+  }
+
+  return mainWindow.isFullScreen();
+}
+
+function getRendererProcessId() {
+  if (!mainWindow || !mainWindow.webContents) {
+    throw new Error('main-window-unavailable');
+  }
+
+  return Number(mainWindow.webContents.getOSProcessId() || 0);
 }
 
 function createTray() {
@@ -305,8 +444,7 @@ function createTray() {
     {
       label: '退出',
       click: () => {
-        app.isQuitting = true;
-        app.quit();
+        requestAppQuit();
       }
     }
   ]));
@@ -324,12 +462,671 @@ function sendToRenderer(channel, payload) {
   }
 }
 
+function finalizeQuit() {
+  if (quitFinalizeTimer) {
+    clearTimeout(quitFinalizeTimer);
+    quitFinalizeTimer = null;
+  }
+
+  app.isQuitting = true;
+
+  if (tray) {
+    try {
+      tray.destroy();
+    } catch (_error) {
+      // ignore tray destroy errors during quit
+    }
+    tray = null;
+  }
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.destroy();
+  }
+
+  app.quit();
+}
+
+function requestAppQuit() {
+  if (quitInProgress) {
+    return;
+  }
+  quitInProgress = true;
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.hide();
+  }
+
+  quitFinalizeTimer = setTimeout(() => {
+    app.isQuitting = true;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.destroy();
+    }
+    app.exit(0);
+  }, 5000);
+
+  Promise.resolve()
+    .then(async () => {
+      if (mediaAgentManager) {
+        await mediaAgentManager.stop();
+      }
+    })
+    .catch((error) => {
+      console.error('[media-agent] Failed to stop during quit:', error);
+    })
+    .finally(() => {
+      finalizeQuit();
+    });
+}
+
+function shouldLogMediaDebug(category = 'misc') {
+  // Terminal/media-engine diagnostics should only be enabled explicitly via
+  // environment variable, not by renderer-persisted debug menu state.
+  return VERBOSE_MEDIA_LOGS;
+}
+
+function shouldLogMediaInvoke(method, category = 'misc') {
+  return shouldLogMediaDebug(category);
+}
+
+function enrichEmbeddedSurfaceOptions(options) {
+  const normalized = { ...(options || {}) };
+  if (shouldLogMediaDebug('video')) {
+    console.log('[media-engine surface] enrich input:', JSON.stringify(summarizeMediaEnginePayload(normalized)));
+  }
+  if (!normalized.embedded) {
+    if (shouldLogMediaDebug('video')) {
+      console.log('[media-engine surface] non-embedded surface request');
+    }
+    return normalized;
+  }
+
+  const parentWindowHandle = getMainWindowHandleValue();
+  if (!parentWindowHandle) {
+    throw new Error('main-window-handle-unavailable');
+  }
+  normalized.parentWindowHandle = parentWindowHandle;
+  if (shouldLogMediaDebug('video')) {
+    console.log('[media-engine surface] enrich output:', JSON.stringify(summarizeMediaEnginePayload(normalized)));
+  }
+  return normalized;
+}
+
+function getMainWindowHandleValue() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return null;
+  }
+
+  const handleBuffer = mainWindow.getNativeWindowHandle();
+  if (!handleBuffer || !handleBuffer.length) {
+    return null;
+  }
+
+  let handleValue = 0n;
+  for (let index = handleBuffer.length - 1; index >= 0; index -= 1) {
+    handleValue = (handleValue << 8n) + BigInt(handleBuffer[index]);
+  }
+  if (handleValue === 0n) {
+    return null;
+  }
+
+  return `0x${handleValue.toString(16)}`;
+}
+
+function attachMediaEngineAudioBridge() {
+  const capture = getAudioCapture();
+  if (!capture || typeof capture.on !== 'function' || audioBridgeAttached) {
+    return;
+  }
+
+  capture.on('audio-data', (audioData) => {
+    sendToRenderer('media-engine-audio-data', audioData);
+  });
+
+  capture.on('capturing', (capturing) => {
+    sendToRenderer('media-engine-audio-capturing', Boolean(capturing));
+  });
+  audioBridgeAttached = true;
+}
+
+function getAudioCapture() {
+  if (audioCapture !== undefined) {
+    return audioCapture;
+  }
+
+  try {
+    const loaded = require('process-audio-capture/dist');
+    audioCapture = loaded && loaded.audioCapture ? loaded.audioCapture : null;
+    audioCaptureLoadError = null;
+    if (audioCapture) {
+      attachMediaEngineAudioBridge();
+      if (shouldLogMediaDebug('audio')) {
+        console.log('Media engine audio bridge ready');
+      }
+    }
+  } catch (error) {
+    audioCapture = null;
+    audioCaptureLoadError = error;
+    console.error('Failed to setup media engine audio bridge:', error);
+  }
+
+  return audioCapture;
+}
+
+function invokeAudioCaptureOperation(method, ...args) {
+  const capture = getAudioCapture();
+  if (!capture || typeof capture[method] !== 'function') {
+    throw new Error(`audio-capture-method-unavailable:${method}`);
+  }
+
+  try {
+    return capture[method](...args);
+  } catch (error) {
+    console.error(`[media-engine] audio ${method} failed:`, error);
+    throw error;
+  }
+}
+
+async function listDesktopSources() {
+  const rawSources = await desktopCapturer.getSources({
+    types: ['window', 'screen'],
+    thumbnailSize: { width: 320, height: 180 },
+    fetchWindowIcons: true
+  });
+
+  return sortDesktopSources(rawSources.map(normalizeDesktopSource));
+}
+
+async function listCaptureTargets() {
+  const sources = await listDesktopSources();
+  const audioDiscovery = inspectAudioDiscovery();
+  const windowMetadata = getTopLevelWindowMetadataMap();
+
+  return sources.map((source) => buildCaptureTarget(source, audioDiscovery, windowMetadata));
+}
+
+function inspectAudioDiscovery() {
+  const snapshot = {
+    supported: false,
+    permissionStatus: 'unsupported',
+    permission: null,
+    processes: [],
+    error: null
+  };
+
+  try {
+    const capture = getAudioCapture();
+    snapshot.supported = Boolean(capture && capture.isPlatformSupported && capture.isPlatformSupported());
+    if (!snapshot.supported) {
+      if (audioCaptureLoadError) {
+        snapshot.error = audioCaptureLoadError.message;
+      }
+      return snapshot;
+    }
+
+    snapshot.permission = capture.checkPermission ? capture.checkPermission() : { status: 'unknown' };
+    snapshot.permissionStatus = String(snapshot.permission && snapshot.permission.status ? snapshot.permission.status : 'unknown');
+
+    if (snapshot.permissionStatus === 'authorized' && capture.getProcessList) {
+      const processes = capture.getProcessList();
+      snapshot.processes = Array.isArray(processes) ? processes : [];
+    }
+  } catch (error) {
+    snapshot.permissionStatus = 'error';
+    snapshot.error = error.message;
+  }
+
+  return snapshot;
+}
+
+function getMediaEngineAudioBridgeStatus() {
+  const discovery = inspectAudioDiscovery();
+  return {
+    implementation: 'main-process-process-audio-capture',
+    backendMode: 'renderer-web-audio-bridge',
+    supported: discovery.supported,
+    permissionStatus: discovery.permissionStatus,
+    isCapturing: Boolean(getAudioCapture() && getAudioCapture().isCapturing),
+    processCount: Array.isArray(discovery.processes) ? discovery.processes.length : 0,
+    error: discovery.error || null
+  };
+}
+
+function buildCaptureTarget(source, audioDiscovery, windowMetadata) {
+  const sourceHandle = getDesktopWindowHandleFromSourceId(source.id);
+  const windowInfo = sourceHandle ? windowMetadata.get(String(sourceHandle)) : null;
+  const pid = normalizePid(windowInfo && windowInfo.pid);
+  const title = (windowInfo && windowInfo.title) || source.name;
+  const audioCandidates = buildAudioCandidatesForSource(title, pid, audioDiscovery);
+
+  return {
+    id: source.id,
+    sourceId: source.id,
+    title,
+    appName: deriveAppName(source, title),
+    kind: source.kind === 'screen' ? 'display' : 'window',
+    state: getCaptureTargetState(source),
+    captureMode: source.captureMode,
+    displayId: source.displayId || null,
+    pid,
+    hwnd: sourceHandle || null,
+    thumbnail: source.thumbnail || null,
+    icon: source.appIcon || null,
+    isSynthetic: false,
+    audioSupported: audioDiscovery.supported,
+    audioPermissionStatus: audioDiscovery.permissionStatus,
+    audioCandidates,
+    defaultAudioMode: audioCandidates.length > 0 ? 'process' : 'none',
+    defaultAudioTargetId: audioCandidates.length > 0 ? audioCandidates[0].id : null,
+    warnings: buildCaptureTargetWarnings(source, pid, audioCandidates, audioDiscovery),
+    discoveryProvider: 'electron'
+  };
+}
+
+function buildAudioCandidatesForSource(title, pid, audioDiscovery) {
+  if (!audioDiscovery.supported || audioDiscovery.permissionStatus !== 'authorized') {
+    return [];
+  }
+
+  const processes = Array.isArray(audioDiscovery.processes) ? audioDiscovery.processes : [];
+  if (!processes.length) {
+    return [];
+  }
+
+  const exactMatches = pid
+    ? processes.filter((processInfo) => normalizePid(processInfo.pid) === pid)
+    : [];
+  if (exactMatches.length > 0) {
+    return exactMatches.map((processInfo) => buildAudioCandidate(processInfo, 1, 'window-pid-match'));
+  }
+
+  const normalizedTitle = normalizeProcessMatchValue(title);
+  if (!normalizedTitle) {
+    return [];
+  }
+
+  const fuzzyMatches = [];
+  for (const processInfo of processes) {
+    const processToken = normalizeProcessMatchValue(processInfo.name);
+    if (!processToken) {
+      continue;
+    }
+
+    if (normalizedTitle.includes(processToken) || processToken.includes(normalizedTitle)) {
+      fuzzyMatches.push(buildAudioCandidate(processInfo, 0.35, 'window-title-match'));
+    }
+
+    if (fuzzyMatches.length >= 3) {
+      break;
+    }
+  }
+
+  return fuzzyMatches;
+}
+
+function buildAudioCandidate(processInfo, confidence, reason) {
+  const pid = normalizePid(processInfo && processInfo.pid);
+  const processName = String(processInfo && processInfo.name ? processInfo.name : `PID ${pid || 'unknown'}`);
+
+  return {
+    id: pid ? `process:${pid}` : `process:${processName}`,
+    mode: 'process',
+    pid,
+    processName,
+    confidence,
+    reason
+  };
+}
+
+function buildCaptureTargetWarnings(source, pid, audioCandidates, audioDiscovery) {
+  const warnings = [];
+
+  if (!audioDiscovery.supported) {
+    return warnings;
+  }
+
+  if (pid && audioDiscovery.permissionStatus !== 'authorized') {
+    warnings.push('Process audio capture is available but permission has not been granted yet.');
+    return warnings;
+  }
+
+  if (pid && audioDiscovery.permissionStatus === 'authorized' && audioCandidates.length === 0) {
+    warnings.push('No active audio session could be matched to this capture target.');
+  }
+
+  if (audioDiscovery.error) {
+    warnings.push(`Audio discovery warning: ${audioDiscovery.error}`);
+  }
+
+  return warnings;
+}
+
+function deriveAppName(source, title) {
+  if (source.kind === 'screen') {
+    return 'Display';
+  }
+
+  const comparableTitle = normalizeComparableWindowTitle(title || source.name || '');
+  if (!comparableTitle) {
+    return 'Window';
+  }
+
+  const dashIndex = comparableTitle.lastIndexOf(' - ');
+  if (dashIndex > 0) {
+    return comparableTitle.slice(dashIndex + 3).trim();
+  }
+
+  return comparableTitle;
+}
+
+function getCaptureTargetState(source) {
+  if (source.kind === 'screen') {
+    return 'display';
+  }
+
+  return 'normal';
+}
+
+function normalizePid(value) {
+  const normalized = Number(value);
+  return Number.isFinite(normalized) && normalized > 0 ? normalized : null;
+}
+
+function normalizeProcessMatchValue(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\.exe$/i, '')
+    .replace(/\[[^\]]+\]/g, ' ')
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, ' ')
+    .trim();
+}
+
+function getTopLevelWindowMetadataMap() {
+  const api = getWin32WindowCaptureApi();
+  const metadata = new Map();
+  if (!api || !api.EnumWindows) {
+    return metadata;
+  }
+
+  try {
+    api.EnumWindows((hwnd) => {
+      if (!hwnd) {
+        return true;
+      }
+
+      if (api.GetWindow && api.GW_OWNER && api.GetWindow(hwnd, api.GW_OWNER)) {
+        return true;
+      }
+
+      const handleValue = getWindowHandleValue(api, hwnd);
+      if (!handleValue) {
+        return true;
+      }
+
+      const title = getWindowTitle(api, hwnd);
+      if (!title) {
+        return true;
+      }
+
+      metadata.set(String(handleValue), {
+        hwnd: String(handleValue),
+        pid: getWindowProcessId(api, hwnd),
+        title,
+        isVisible: api.IsWindowVisible ? Boolean(api.IsWindowVisible(hwnd)) : true,
+        isMinimized: api.IsIconic ? Boolean(api.IsIconic(hwnd)) : false
+      });
+
+      return true;
+    }, 0);
+  } catch (error) {
+    console.warn('Unable to build top-level window metadata map:', error);
+  }
+
+  return metadata;
+}
+
+function getMediaAgentManager() {
+  if (!mediaAgentManager) {
+    mediaAgentManager = new MediaAgentManager({ logger: console });
+    mediaAgentManager.on('status', (status) => {
+      sendToRenderer('media-engine-status', status);
+    });
+    mediaAgentManager.on('event', (event) => {
+      if (event && event.event === 'audio-data') {
+        sendToRenderer('media-engine-native-audio-data', event.params || null);
+        return;
+      }
+
+      sendToRenderer('media-engine-event', event);
+    });
+  }
+
+  return mediaAgentManager;
+}
+
+async function invokeMediaEngine(method, params) {
+  const debugCategory = getMediaEngineDebugCategory(method);
+  if (shouldLogMediaInvoke(method, debugCategory)) {
+    console.log(`[media-agent invoke] ${method} request:`, JSON.stringify(summarizeMediaEnginePayload(params)));
+  }
+  try {
+    const result = await getMediaAgentManager().invoke(method, params);
+    if (shouldLogMediaInvoke(method, debugCategory)) {
+      console.log(`[media-agent invoke] ${method} result:`, JSON.stringify(summarizeMediaEnginePayload(result)));
+    }
+    return result;
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    if (method === 'getViewerVolume' && message.includes('No active render audio session was found')) {
+      throw error;
+    }
+    console.error(`[media-agent] ${method} failed:`, error);
+    throw error;
+  }
+}
+
+async function invokeMediaEngineHostSessionBridge(method, params) {
+  if (!ENABLE_NATIVE_HOST_SESSION_BRIDGE) {
+    return {
+      running: false,
+      implementation: 'disabled'
+    };
+  }
+
+  try {
+    return await invokeMediaEngine(method, params);
+  } catch (error) {
+    console.error(`[media-agent bridge] ${method} failed:`, error);
+    throw error;
+  }
+}
+
+function summarizeMediaEnginePayload(value, depth = 0) {
+  if (value == null) {
+    return value;
+  }
+
+  if (
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    (
+      Object.prototype.hasOwnProperty.call(value, 'embeddedParentDebug') ||
+      Object.prototype.hasOwnProperty.call(value, 'surfaceWindowDebug')
+    )
+  ) {
+    return {
+      attached: value.attached,
+      running: value.running,
+      decoderReady: value.decoderReady,
+      decodedFramesRendered: value.decodedFramesRendered,
+      processId: value.processId,
+      implementation: value.implementation,
+      layout: summarizeMediaEnginePayload(value.layout, depth + 1),
+      windowTitle: value.windowTitle,
+      reason: value.reason,
+      lastError: summarizeMediaEnginePayload(value.lastError, depth + 1),
+      embeddedParentDebug: summarizeMediaEnginePayload(value.embeddedParentDebug, depth + 1),
+      surfaceWindowDebug: summarizeMediaEnginePayload(value.surfaceWindowDebug, depth + 1)
+    };
+  }
+
+  if (depth >= 2) {
+    if (Array.isArray(value)) {
+      return `[array:${value.length}]`;
+    }
+    if (typeof value === 'object') {
+      return '[object]';
+    }
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    return value.length > 240 ? `${value.slice(0, 240)}...<${value.length}>` : value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 8).map((entry) => summarizeMediaEnginePayload(entry, depth + 1));
+  }
+
+  if (typeof value === 'object') {
+    const output = {};
+    for (const [key, entry] of Object.entries(value)) {
+      output[key] = summarizeMediaEnginePayload(entry, depth + 1);
+    }
+    return output;
+  }
+
+  return value;
+}
+
+function getAutoUpdater() {
+  if (!autoUpdater) {
+    ({ autoUpdater } = require('electron-updater'));
+  }
+
+  configureAutoUpdater();
+  return autoUpdater;
+}
+
+function configureAutoUpdater() {
+  if (!autoUpdater || autoUpdaterConfigured) {
+    return;
+  }
+
+  autoUpdater.logger = {
+    info: (message) => writeUpdateLog('info', message),
+    warn: (message) => writeUpdateLog('warn', message),
+    error: (message) => writeUpdateLog('error', message)
+  };
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('checking-for-update', () => {
+    writeUpdateLog('info', `checking-for-update: currentVersion=${app.getVersion()} manifest=${getUpdateManifestUrl()}`);
+    sendToRenderer('update-status', {
+      status: 'checking',
+      currentVersion: app.getVersion(),
+      feedUrl: getUpdateManifestUrl()
+    });
+  });
+
+  autoUpdater.on('update-available', (info) => {
+    writeUpdateLog('info', `update-available: currentVersion=${app.getVersion()} nextVersion=${info.version} files=${formatUpdateFiles(info.files)}`);
+    sendToRenderer('update-status', {
+      status: 'available',
+      version: info.version,
+      currentVersion: app.getVersion(),
+      feedUrl: getUpdateManifestUrl(),
+      releaseDate: info.releaseDate || null
+    });
+  });
+
+  autoUpdater.on('update-not-available', (info) => {
+    writeUpdateLog('info', `update-not-available: currentVersion=${app.getVersion()} latestVersion=${(info && info.version) || app.getVersion()}`);
+    sendToRenderer('update-status', {
+      status: 'not-available',
+      version: (info && info.version) || app.getVersion(),
+      currentVersion: app.getVersion(),
+      feedUrl: getUpdateManifestUrl()
+    });
+  });
+
+  autoUpdater.on('download-progress', (progress) => {
+    writeUpdateLog(
+      'info',
+      `download-progress: percent=${safeNumber(progress.percent).toFixed(2)} transferred=${safeNumber(progress.transferred)} total=${safeNumber(progress.total)} bytesPerSecond=${safeNumber(progress.bytesPerSecond)}`
+    );
+    sendToRenderer('update-status', {
+      status: 'downloading',
+      percent: progress.percent,
+      bytesPerSecond: progress.bytesPerSecond,
+      total: progress.total,
+      transferred: progress.transferred,
+      remaining: progress.remaining,
+      currentVersion: app.getVersion(),
+      feedUrl: getUpdateManifestUrl()
+    });
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    writeUpdateLog('info', `update-downloaded: version=${info.version} releaseDate=${info.releaseDate || 'n/a'}`);
+    cacheDownloadedInstallerForDifferentialUpdate(info.downloadedFile);
+    sendToRenderer('update-status', {
+      status: 'downloaded',
+      version: info.version,
+      currentVersion: app.getVersion(),
+      feedUrl: getUpdateManifestUrl()
+    });
+  });
+
+  autoUpdater.on('error', (error) => {
+    writeUpdateLog('error', `autoUpdater error event: ${formatLogMessage(error)}`);
+    sendToRenderer('update-status', {
+      status: 'error',
+      error: error.message,
+      currentVersion: app.getVersion(),
+      feedUrl: getUpdateManifestUrl()
+    });
+  });
+
+  autoUpdaterConfigured = true;
+}
+
 function getUpdateFeedBaseUrl() {
   return `${SERVER_URL}/updates/`;
 }
 
 function getUpdateManifestUrl() {
   return `${getUpdateFeedBaseUrl()}latest.yml`;
+}
+
+function getAutoUpdaterCacheDir() {
+  if (!autoUpdater || !autoUpdater.downloadedUpdateHelper || !autoUpdater.downloadedUpdateHelper.cacheDir) {
+    return '';
+  }
+  return String(autoUpdater.downloadedUpdateHelper.cacheDir || '');
+}
+
+function cacheDownloadedInstallerForDifferentialUpdate(downloadedFile) {
+  const cacheDir = getAutoUpdaterCacheDir();
+  const sourcePath = String(downloadedFile || '').trim();
+  if (!cacheDir || !sourcePath) {
+    writeUpdateLog('warn', 'Differential update cache seed skipped: updater cache dir or downloaded file is missing.');
+    return;
+  }
+
+  if (!fs.existsSync(sourcePath)) {
+    writeUpdateLog('warn', `Differential update cache seed skipped: downloaded installer not found at ${sourcePath}`);
+    return;
+  }
+
+  const targetPath = path.join(cacheDir, 'installer.exe');
+  try {
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.copyFileSync(sourcePath, targetPath);
+    writeUpdateLog('info', `Seeded differential update installer cache: ${targetPath}`);
+  } catch (error) {
+    writeUpdateLog('warn', `Failed to seed differential update installer cache: ${formatLogMessage(error)}`);
+  }
 }
 
 function normalizeDesktopSource(source) {
@@ -360,16 +1157,8 @@ function sortDesktopSources(sources) {
 }
 
 function getDesktopSourceSortScore(source) {
-  if (source.captureMode === 'fullscreen-display-fallback') {
-    return 0;
-  }
-
-  if (!source.isSynthetic && source.kind === 'window') {
+  if (source.kind === 'window') {
     return 1;
-  }
-
-  if (source.captureMode === 'minimized-window-fallback') {
-    return 2;
   }
 
   return 3;
@@ -384,204 +1173,17 @@ function getDesktopSourceDisplayId(source) {
   return match ? String(match[1]) : null;
 }
 
-function buildFullscreenFallbackSource(sources) {
-  if (process.platform !== 'win32') {
-    return null;
-  }
 
-  const fullscreenWindow = getActiveFullscreenWindowInfo();
-  if (!fullscreenWindow) {
-    return null;
-  }
 
-  const windowSourceExists = sources.some((source) => {
-    if (source.kind !== 'window') {
-      return false;
-    }
 
-    return normalizeComparableWindowTitle(source.name) === normalizeComparableWindowTitle(fullscreenWindow.title);
-  });
-
-  if (windowSourceExists) {
-    return null;
-  }
-
-  const displaySource = sources.find((source) => (
-    source.kind === 'screen' &&
-    String(source.displayId || '') === String(fullscreenWindow.displayId || '')
-  ));
-
-  if (!displaySource) {
-    return null;
-  }
-
-  const title = fullscreenWindow.title || `PID ${fullscreenWindow.pid}`;
-  console.log(`Adding fullscreen display fallback source for "${title}" on display ${fullscreenWindow.displayId}`);
-  return {
-    ...displaySource,
-    id: displaySource.id,
-    name: `${title} [全屏回退]`,
-    kind: 'screen',
-    isSynthetic: true,
-    captureMode: 'fullscreen-display-fallback',
-    fallbackWindowPid: fullscreenWindow.pid,
-    fallbackWindowTitle: title,
-    fallbackReason: 'Windows 独占全屏窗口通常不会出现在常规窗口列表中；此项会改为采集该窗口所在显示器。'
-  };
-}
-
-function buildMinimizedWindowFallbackSources(sources) {
-  if (process.platform !== 'win32') {
-    return [];
-  }
-
-  const api = getWin32WindowCaptureApi();
-  if (!api || !api.EnumWindows || !api.IsIconic) {
-    return [];
-  }
-
-  const existingWindowHandles = new Set(
-    sources
-      .map((source) => getDesktopWindowHandleFromSourceId(source && source.id))
-      .filter(Boolean)
-  );
-  const fallbackSources = [];
-
-  try {
-    api.EnumWindows((hwnd) => {
-      if (!hwnd) {
-        return true;
-      }
-
-      if (api.IsWindowVisible && !api.IsWindowVisible(hwnd)) {
-        return true;
-      }
-
-      if (api.IsIconic && !api.IsIconic(hwnd)) {
-        return true;
-      }
-
-      if (api.GetWindow && api.GW_OWNER && api.GetWindow(hwnd, api.GW_OWNER)) {
-        return true;
-      }
-
-      const title = getWindowTitle(api, hwnd);
-      if (!title) {
-        return true;
-      }
-
-      const hwndValue = getWindowHandleValue(api, hwnd);
-      if (!hwndValue || existingWindowHandles.has(hwndValue)) {
-        return true;
-      }
-
-      const pid = getWindowProcessId(api, hwnd);
-      if (!pid || pid === process.pid) {
-        return true;
-      }
-
-      existingWindowHandles.add(hwndValue);
-      fallbackSources.push({
-        id: createDesktopWindowSourceId(hwndValue, pid),
-        name: `${title} [最小化窗口]`,
-        kind: 'window',
-        displayId: null,
-        isSynthetic: true,
-        captureMode: 'minimized-window-fallback',
-        fallbackWindowPid: pid,
-        fallbackWindowTitle: title,
-        fallbackWindowHandle: hwndValue,
-        fallbackReason: 'Windows 最小化到任务栏的窗口通常不会出现在常规窗口列表中；此项会按窗口句柄直接尝试附着。窗口保持最小化时，部分应用可能只输出静帧或黑屏。',
-        appIcon: null,
-        thumbnail: null
-      });
-      return true;
-    }, 0);
-  } catch (error) {
-    console.warn('Unable to enumerate minimized windows for source selection:', error);
-    return [];
-  }
-
-  if (fallbackSources.length > 0) {
-    console.log(`Added ${fallbackSources.length} minimized window fallback source(s).`);
-  }
-
-  return fallbackSources;
-}
 
 function normalizeComparableWindowTitle(title) {
-  return String(title || '')
-    .replace(/\s*\[(fullscreen -> display capture|全屏回退)\]\s*$/i, '')
-    .replace(/\s*\[(minimized window|最小化窗口)\]\s*$/i, '')
-    .trim()
-    .toLowerCase();
+  return String(title || '').trim().toLowerCase();
 }
 
-function getActiveFullscreenWindowInfo() {
-  const api = getWin32WindowCaptureApi();
-  if (!api) {
-    return null;
-  }
 
-  try {
-    const hwnd = api.GetForegroundWindow();
-    if (!hwnd) {
-      return null;
-    }
 
-    if (api.IsWindowVisible && !api.IsWindowVisible(hwnd)) {
-      return null;
-    }
 
-    const pid = [0];
-    const threadId = api.GetWindowThreadProcessId(hwnd, pid);
-    if (!threadId || !pid[0]) {
-      return null;
-    }
-
-    const rect = {};
-    if (!api.GetWindowRect(hwnd, rect)) {
-      return null;
-    }
-
-    const width = Number(rect.right) - Number(rect.left);
-    const height = Number(rect.bottom) - Number(rect.top);
-    if (width < 320 || height < 240) {
-      return null;
-    }
-
-    const center = {
-      x: Number(rect.left) + Math.round(width / 2),
-      y: Number(rect.top) + Math.round(height / 2)
-    };
-    const display = screen.getDisplayNearestPoint(center);
-    if (!display || !isRectCloseToDisplay(rect, display.bounds)) {
-      return null;
-    }
-
-    return {
-      pid: Number(pid[0]),
-      title: getWindowTitle(api, hwnd),
-      displayId: String(display.id)
-    };
-  } catch (error) {
-    console.warn('Unable to inspect foreground fullscreen window:', error);
-    return null;
-  }
-}
-
-function isRectCloseToDisplay(rect, bounds) {
-  const tolerance = 12;
-  const width = Number(rect.right) - Number(rect.left);
-  const height = Number(rect.bottom) - Number(rect.top);
-
-  return (
-    Math.abs(Number(rect.left) - Number(bounds.x)) <= tolerance &&
-    Math.abs(Number(rect.top) - Number(bounds.y)) <= tolerance &&
-    Math.abs(width - Number(bounds.width)) <= tolerance &&
-    Math.abs(height - Number(bounds.height)) <= tolerance
-  );
-}
 
 function getWindowTitle(api, hwnd) {
   try {
@@ -626,10 +1228,7 @@ function getDesktopWindowHandleFromSourceId(sourceId) {
   return match ? match[1] : null;
 }
 
-function createDesktopWindowSourceId(hwndValue, pid) {
-  const sameProcessFlag = Number(pid) === process.pid ? 1 : 0;
-  return `window:${hwndValue}:${sameProcessFlag}`;
-}
+
 
 function getWin32WindowCaptureApi() {
   if (process.platform !== 'win32') {
@@ -659,10 +1258,12 @@ function getWin32WindowCaptureApi() {
       GW_OWNER: 4,
       GetForegroundWindow: user32.func('HWND __stdcall GetForegroundWindow(void)'),
       GetWindowTextW: user32.func('int __stdcall GetWindowTextW(HWND hWnd, _Out_ uint16_t *lpString, int nMaxCount)'),
+      GetClassNameW: user32.func('int __stdcall GetClassNameW(HWND hWnd, _Out_ uint16_t *lpClassName, int nMaxCount)'),
       GetWindowThreadProcessId: user32.func('DWORD __stdcall GetWindowThreadProcessId(HWND hWnd, _Out_ DWORD *lpdwProcessId)'),
       GetWindowRect: user32.func('bool __stdcall GetWindowRect(HWND hWnd, _Out_ RECT *lpRect)'),
       GetWindow: user32.func('HWND __stdcall GetWindow(HWND hWnd, uint32_t uCmd)'),
       EnumWindows: user32.func('bool __stdcall EnumWindows(EnumWindowsProc *lpEnumFunc, long lParam)'),
+      EnumChildWindows: user32.func('bool __stdcall EnumChildWindows(HWND hWndParent, EnumWindowsProc *lpEnumFunc, long lParam)'),
       IsWindowVisible: user32.func('bool __stdcall IsWindowVisible(HWND hWnd)'),
       IsIconic: user32.func('bool __stdcall IsIconic(HWND hWnd)')
     };
@@ -788,6 +1389,7 @@ function normalizeBaseUrl(baseUrl) {
 app.isQuitting = false;
 
 app.whenReady().then(() => {
+  getMediaAgentManager();
   createWindow();
 
   app.on('activate', () => {
@@ -799,6 +1401,15 @@ app.whenReady().then(() => {
 
 app.on('before-quit', () => {
   app.isQuitting = true;
+  if (quitFinalizeTimer) {
+    clearTimeout(quitFinalizeTimer);
+    quitFinalizeTimer = null;
+  }
+  if (mediaAgentManager) {
+    mediaAgentManager.stop().catch((error) => {
+      console.error('[media-agent] Failed to stop before quit:', error);
+    });
+  }
 });
 
 app.on('window-all-closed', () => {

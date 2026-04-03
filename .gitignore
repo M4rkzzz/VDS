@@ -1,9 +1,14 @@
 node_modules/
 .claude/
+.vscode/
 build/
 dist/
+dist-*/
 runtime/
+media-agent/build/
 server/updates/
+tmp/
+SKILL.md
 *.pem
 *.key
 .DS_Store

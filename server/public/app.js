@@ -15,6 +15,32 @@ const runtimeConfig = getRuntimeConfig();
 const serverBaseUrl = runtimeConfig.serverUrl;
 const wsBaseUrl = toWebSocketUrl(serverBaseUrl);
 const clientId = runtimeConfig.clientId || ('client_' + Math.random().toString(36).substring(2, 11));
+const DEBUG_MODE_STORAGE_KEY = 'vds-debug-mode';
+const DEBUG_CONFIG_STORAGE_KEY = 'vds-debug-config';
+const DEBUG_CATEGORY_DEFINITIONS = Object.freeze({
+  connection: {
+    label: '连接',
+    description: 'WebSocket、信令、ICE、Peer 建连与重连'
+  },
+  video: {
+    label: '视频',
+    description: '采集源、Surface、视频链路与预览同步'
+  },
+  audio: {
+    label: '音频',
+    description: '音频会话、音量、播放与原生音频桥'
+  },
+  update: {
+    label: '更新',
+    description: '版本检查、下载、安装与更新日志'
+  },
+  misc: {
+    label: '杂项',
+    description: '启动、能力探测、版本信息与其它诊断'
+  }
+});
+const DEBUG_CATEGORY_KEYS = Object.keys(DEBUG_CATEGORY_DEFINITIONS);
+let debugConfig = readDebugConfig();
 
 // WebSocket连接
 let ws = null;
@@ -26,6 +52,7 @@ let pendingReconnect = false;
 let resumeOnNextConnect = false;
 const pendingMessages = [];
 const pendingRemoteCandidates = new Map();
+const MAX_PENDING_REMOTE_CANDIDATES_PER_PEER = 32;
 let wsManualClose = false; // 标记是否为手动关闭
 
 // Session state
@@ -37,56 +64,59 @@ let myChainPosition = -1; // 观众在链中的位置
 let hostId = null; // Host的clientId
 
 // 音频捕获全局变量（用于资源清理）
-let audioContext = null;
-let audioDataHandler = null;
-let audioMediaStreamDest = null;
-let audioQueue = [];
-let isAudioPlaying = false;
-let audioTimer = null;
 
 // 画质设置
 let qualitySettings = {
+  codecPreference: 'h264',
+  resolutionPreset: '1080p',
   width: 1920,
   height: 1080,
   bitrate: 10000, // kbps
-  frameRate: 60,
-  codecPreference: 'none' // 'none' | 'h264' | 'av1'
+  frameRate: 30,
+  hardwareAcceleration: true,
+  encoderPreset: 'balanced',
+  encoderTune: 'none'
 };
+let qualityCapabilities = null;
+let qualityCapabilitiesPromise = null;
+let qualityCapabilitiesChecked = false;
+let qualityUiBound = false;
 
-const AUDIO_SYNC_PROFILES = {
-  default: {
-    name: 'default',
-    targetLeadMs: 90,
-    scheduleAheadMs: 120,
-    checkIntervalMs: 750,
-    toleranceMs: 20
-  },
-  av1: {
-    name: 'av1',
-    targetLeadMs: 180,
-    scheduleAheadMs: 180,
-    checkIntervalMs: 500,
-    toleranceMs: 15
-  }
-};
+const QUALITY_BITRATE_MIN = 1000;
+const QUALITY_BITRATE_MAX = 80000;
+const QUALITY_BITRATE_STEP = 1000;
+const QUALITY_CODEC_OPTIONS = [
+  { value: 'h264', label: 'H.264' },
+  { value: 'h265', label: 'H.265', disabled: true, badge: 'work in progress' }
+];
+const QUALITY_RESOLUTION_OPTIONS = [
+  { value: '360p', label: '360p', width: 640, height: 360 },
+  { value: '480p', label: '480p', width: 854, height: 480 },
+  { value: '720p', label: '720p', width: 1280, height: 720 },
+  { value: '1080p', label: '1080p', width: 1920, height: 1080 },
+  { value: '2k', label: '2k', width: 2560, height: 1440 },
+  { value: '4k', label: '4k', width: 3840, height: 2160 }
+];
+const QUALITY_FPS_OPTIONS = [
+  { value: 5, label: '5' },
+  { value: 30, label: '30' },
+  { value: 60, label: '60' },
+  { value: 90, label: '90' }
+];
+const QUALITY_PRESET_OPTIONS = [
+  { value: 'quality', label: '质量' },
+  { value: 'balanced', label: '均衡' },
+  { value: 'speed', label: '速度' }
+];
+const QUALITY_TUNE_OPTIONS = [
+  { value: 'none', label: '默认' },
+  { value: 'fastdecode', label: 'fastdecode' },
+  { value: 'zerolatency', label: 'zerolatency' }
+];
+const QUALITY_HARDWARE_ENCODER_PATTERN = /(?:_amf|_mf|_qsv|_nvenc|_vaapi|_vulkan|videotoolbox|_d3d12va)/i;
 
-function getAudioSyncProfile() {
-  return qualitySettings.codecPreference === 'av1'
-    ? AUDIO_SYNC_PROFILES.av1
-    : AUDIO_SYNC_PROFILES.default;
-}
 
-function getAudioChunkDurationSeconds(audioData) {
-  if (!audioData || !audioData.buffer || !audioData.channels || !audioData.sampleRate) {
-    return 0;
-  }
-
-  return audioData.buffer.length / audioData.channels / audioData.sampleRate;
-}
-
-// WebRTC连接管理
-// Host侧: viewerId -> RTCPeerConnection
-// Viewer侧: 最多2个连接 - 前一个(prev)和下一个(next)
+// Native peer/session state
 const peerConnections = new Map();
 let relayPc = null;
 let relayStream = null;
@@ -104,112 +134,10 @@ const UPDATE_LOG_ENTRY_LIMIT = 40;
 let upstreamPeerId = null;
 const peerConnectionMeta = new Map();
 const peerReconnectState = new Map();
-const PEER_RECONNECT_BASE_DELAY_MS = 1000;
-const PEER_RECONNECT_MAX_DELAY_MS = 8000;
-const PEER_CONNECT_TIMEOUT_MS = 15000;
-const PEER_DISCONNECT_GRACE_MS = 4000;
-const INITIAL_ICE_GATHER_MIN_WAIT_MS = 1500;
-const INITIAL_ICE_GATHER_MAX_WAIT_MS = 4500;
-const INITIAL_ICE_CANDIDATE_TARGET = 2;
-const ICE_RESTART_LIMIT = 1;
-/* Legacy declarations kept below for context.
-let relayPc = null; // 转发给下一个观众的PC
-let relayStream = null; // 收到的视频流，用于转发
-let viewerReadySent = false; // 防止重复发送viewer-ready
-let videoStarted = false; // 防止重复播放
-let upstreamConnected = false; // 是否已连接到上游（主机或上一个观众）
+const LANDING_TRANSITION_MS = 520;
+const PANEL_TRANSITION_MS = 340;
+const WORKSPACE_MASK_MS = 140;
 
-// ICE服务器配置 - STUN服务器
-const iceServers = [
-  { urls: 'stun:stun.cloudflare.com:3478' },
-  { urls: 'stun:stun.linphone.org:3478' },
-  { urls: 'stun:stun.freeswitch.org:3478' },
-  { urls: 'stun:stun.pjsip.org:3478' },
-  { urls: 'stun:stun.sip.us:3478' },
-  { urls: 'stun:stun.aa.net.uk:3478' },
-  { urls: 'stun:stun.acrobits.cz:3478' },
-  { urls: 'stun:stun.actionvoip.com:3478' },
-  { urls: 'stun:stun.annatel.net:3478' },
-  { urls: 'stun:stun.antisip.com:3478' },
-  { urls: 'stun:stun.cablenet-as.net:3478' },
-  { urls: 'stun:stun.cheapvoip.com:3478' },
-  { urls: 'stun:stun.commpeak.com:3478' },
-  { urls: 'stun:stun.cope.es:3478' },
-  { urls: 'stun:stun.dcalling.de:3478' },
-  { urls: 'stun:stun.dus.net:3478' },
-  { urls: 'stun:stun.easyvoip.com:3478' },
-  { urls: 'stun:stun.epygi.com:3478' },
-  { urls: 'stun:stun.freecall.com:3478' },
-  { urls: 'stun:stun.freevoipdeal.com:3478' },
-  { urls: 'stun:stun.halonet.pl:3478' },
-  { urls: 'stun:stun.hoiio.com:3478' },
-  { urls: 'stun:stun.infra.net:3478' },
-  { urls: 'stun:stun.internetcalls.com:3478' },
-  { urls: 'stun:stun.intervoip.com:3478' },
-  { urls: 'stun:stun.ipfire.org:3478' },
-  { urls: 'stun:stun.ippi.fr:3478' },
-  { urls: 'stun:stun.it1.hr:3478' },
-  { urls: 'stun:stun.jumblo.com:3478' },
-  { urls: 'stun:stun.justvoip.com:3478' },
-  { urls: 'stun:stun.liveo.fr:3478' },
-  { urls: 'stun:stun.lowratevoip.com:3478' },
-  { urls: 'stun:stun.miwifi.com:3478' },
-  { urls: 'stun:stun.myvoiptraffic.com:3478' },
-  { urls: 'stun:stun.mywatson.it:3478' },
-  { urls: 'stun:stun.netappel.com:3478' },
-  { urls: 'stun:stun.netgsm.com.tr:3478' },
-  { urls: 'stun:stun.nfon.net:3478' },
-  { urls: 'stun:stun.nonoh.net:3478' },
-  { urls: 'stun:stun.ooma.com:3478' },
-  { urls: 'stun:stun.poivy.com:3478' },
-  { urls: 'stun:stun.powervoip.com:3478' },
-  { urls: 'stun:stun.ppdi.com:3478' },
-  { urls: 'stun:stun.rockenstein.de:3478' },
-  { urls: 'stun:stun.rolmail.net:3478' },
-  { urls: 'stun:stun.rynga.com:3478' },
-  { urls: 'stun:stun.sipdiscount.com:3478' },
-  { urls: 'stun:stun.siplogin.de:3478' },
-  { urls: 'stun:stun.sipnet.net:3478' },
-  { urls: 'stun:stun.sipnet.ru:3478' },
-  { urls: 'stun:stun.siptraffic.com:3478' },
-  { urls: 'stun:stun.smartvoip.com:3478' },
-  { urls: 'stun:stun.smsdiscount.com:3478' },
-  { urls: 'stun:stun.solcon.nl:3478' },
-  { urls: 'stun:stun.solnet.ch:3478' },
-  { urls: 'stun:stun.sonetel.com:3478' },
-  { urls: 'stun:stun.sonetel.net:3478' },
-  { urls: 'stun:stun.srce.hr:3478' },
-  { urls: 'stun:stun.tel.lu:3478' },
-  { urls: 'stun:stun.telbo.com:3478' },
-  { urls: 'stun:stun.t-online.de:3478' },
-  { urls: 'stun:stun.twt.it:3478' },
-  { urls: 'stun:stun.uls.co.za:3478' },
-  { urls: 'stun:stun.usfamily.net:3478' },
-  { urls: 'stun:stun.vo.lu:3478' },
-  { urls: 'stun:stun.voicetrading.com:3478' },
-  { urls: 'stun:stun.voip.aebc.com:3478' },
-  { urls: 'stun:stun.voip.blackberry.com:3478' },
-  { urls: 'stun:stun.voip.eutelia.it:3478' },
-  { urls: 'stun:stun.voipblast.com:3478' },
-  { urls: 'stun:stun.voipbuster.com:3478' },
-  { urls: 'stun:stun.voipbusterpro.com:3478' },
-  { urls: 'stun:stun.voipcheap.com:3478' },
-  { urls: 'stun:stun.voipfibre.com:3478' },
-  { urls: 'stun:stun.voipgain.com:3478' },
-  { urls: 'stun:stun.voipinfocenter.com:3478' },
-  { urls: 'stun:stun.voipplanet.nl:3478' },
-  { urls: 'stun:stun.voippro.com:3478' },
-  { urls: 'stun:stun.voipraider.com:3478' },
-  { urls: 'stun:stun.voipstunt.com:3478' },
-  { urls: 'stun:stun.voipwise.com:3478' },
-  { urls: 'stun:stun.voipzoom.com:3478' },
-  { urls: 'stun:stun.voys.nl:3478' },
-  { urls: 'stun:stun.voztele.com:3478' },
-  { urls: 'stun:stun.webcalldirect.com:3478' },
-  { urls: 'stun:stun.zadarma.com:3478' }
-];
-
-*/
 const iceServers = sanitizeIceServers(DEFAULT_ICE_SERVERS);
 
 const config = {
@@ -233,6 +161,310 @@ function getRuntimeConfig() {
     serverUrl: normalizeBaseUrl(window.location.origin || DEFAULT_SERVER_URL),
     disconnectGraceMs: 30000
   };
+}
+
+function readDebugModeFlag() {
+  try {
+    return window.localStorage.getItem(DEBUG_MODE_STORAGE_KEY) === '1';
+  } catch (_error) {
+    return false;
+  }
+}
+
+function buildDefaultDebugConfig(enabled = false) {
+  return DEBUG_CATEGORY_KEYS.reduce((config, key) => {
+    config[key] = Boolean(enabled);
+    return config;
+  }, {});
+}
+
+function normalizeDebugConfig(config, fallbackEnabled = false) {
+  const normalized = buildDefaultDebugConfig(fallbackEnabled);
+  if (!config || typeof config !== 'object') {
+    return normalized;
+  }
+
+  for (const key of DEBUG_CATEGORY_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(config, key)) {
+      normalized[key] = Boolean(config[key]);
+    }
+  }
+
+  return normalized;
+}
+
+function readDebugConfig() {
+  const legacyEnabled = readDebugModeFlag();
+  try {
+    const raw = window.localStorage.getItem(DEBUG_CONFIG_STORAGE_KEY);
+    if (!raw) {
+      return buildDefaultDebugConfig(legacyEnabled);
+    }
+    return normalizeDebugConfig(JSON.parse(raw), legacyEnabled);
+  } catch (_error) {
+    return buildDefaultDebugConfig(legacyEnabled);
+  }
+}
+
+function isAnyDebugEnabled(config = debugConfig) {
+  return DEBUG_CATEGORY_KEYS.some((key) => Boolean(config[key]));
+}
+
+function persistDebugConfig(config) {
+  try {
+    window.localStorage.setItem(DEBUG_CONFIG_STORAGE_KEY, JSON.stringify(config));
+    window.localStorage.setItem(DEBUG_MODE_STORAGE_KEY, isAnyDebugEnabled(config) ? '1' : '0');
+  } catch (_error) {
+    // ignore storage errors
+  }
+}
+
+function syncDebugUi() {
+  const debugEnabled = isAnyDebugEnabled();
+  document.body.classList.toggle('debug-mode-enabled', debugEnabled);
+
+  if (elements && elements.btnDebugToggle) {
+    const enabledLabels = DEBUG_CATEGORY_KEYS
+      .filter((key) => debugConfig[key])
+      .map((key) => DEBUG_CATEGORY_DEFINITIONS[key].label);
+    elements.btnDebugToggle.classList.toggle('active', debugEnabled);
+    elements.btnDebugToggle.title = enabledLabels.length > 0
+      ? `已开启调试：${enabledLabels.join('、')}`
+      : '打开调试菜单';
+    if (elements.debugMenu) {
+      elements.btnDebugToggle.setAttribute(
+        'aria-expanded',
+        elements.debugMenu.classList.contains('hidden') ? 'false' : 'true'
+      );
+    }
+  }
+
+  if (elements && elements.debugMenu) {
+    const checkboxes = elements.debugMenu.querySelectorAll('[data-debug-category]');
+    checkboxes.forEach((input) => {
+      const key = input.getAttribute('data-debug-category');
+      input.checked = Boolean(key && debugConfig[key]);
+    });
+  }
+}
+
+function propagateDebugConfig(config) {
+  if (window.__vdsSetDebugModeState) {
+    window.__vdsSetDebugModeState(isAnyDebugEnabled(config));
+  }
+  if (window.__vdsSetDebugConfigState) {
+    window.__vdsSetDebugConfigState(config);
+  }
+  if (window.electronAPI) {
+    if (typeof window.electronAPI.setDebugConfig === 'function') {
+      window.electronAPI.setDebugConfig(config);
+    } else if (typeof window.electronAPI.setDebugMode === 'function') {
+      window.electronAPI.setDebugMode(isAnyDebugEnabled(config));
+    }
+  }
+}
+
+function isDebugModeEnabled() {
+  return isAnyDebugEnabled();
+}
+
+function isDebugCategoryEnabled(category = 'misc') {
+  if (!Object.prototype.hasOwnProperty.call(DEBUG_CATEGORY_DEFINITIONS, category)) {
+    return false;
+  }
+  return Boolean(debugConfig[category]);
+}
+
+function setDebugConfig(nextConfig, options = {}) {
+  const { persist = true, notify = true } = options;
+  debugConfig = normalizeDebugConfig(nextConfig, false);
+  if (persist) {
+    persistDebugConfig(debugConfig);
+  }
+  if (notify) {
+    propagateDebugConfig(debugConfig);
+  }
+  syncDebugUi();
+}
+
+function setDebugCategoryEnabled(category, enabled) {
+  if (!Object.prototype.hasOwnProperty.call(DEBUG_CATEGORY_DEFINITIONS, category)) {
+    return;
+  }
+  setDebugConfig({
+    ...debugConfig,
+    [category]: Boolean(enabled)
+  });
+}
+
+function debugLog(category, ...args) {
+  let resolvedCategory = category;
+  let resolvedArgs = args;
+  if (!Object.prototype.hasOwnProperty.call(DEBUG_CATEGORY_DEFINITIONS, resolvedCategory)) {
+    resolvedArgs = [category, ...args];
+    resolvedCategory = 'misc';
+  }
+  if (!isDebugCategoryEnabled(resolvedCategory)) {
+    return;
+  }
+  console.log(...resolvedArgs);
+}
+
+window.__vdsIsDebugModeEnabled = isDebugModeEnabled;
+window.__vdsDebugCategoryDefinitions = DEBUG_CATEGORY_DEFINITIONS;
+window.__vdsShouldDebugLog = (category = 'misc') => isDebugCategoryEnabled(category);
+window.__vdsGetDebugConfig = () => ({ ...debugConfig });
+window.__vdsSetDebugConfigState = (config) => {
+  debugConfig = normalizeDebugConfig(config, false);
+  syncDebugUi();
+};
+window.__vdsSetDebugModeState = (enabled) => {
+  debugConfig = buildDefaultDebugConfig(Boolean(enabled));
+  syncDebugUi();
+};
+
+function openDebugMenu() {
+  if (!elements || !elements.debugMenu) {
+    return;
+  }
+  elements.debugMenu.classList.remove('hidden');
+  syncDebugUi();
+}
+
+function closeDebugMenu() {
+  if (!elements || !elements.debugMenu) {
+    return;
+  }
+  elements.debugMenu.classList.add('hidden');
+  syncDebugUi();
+}
+
+function toggleDebugMenu() {
+  if (!elements || !elements.debugMenu) {
+    return;
+  }
+  if (elements.debugMenu.classList.contains('hidden')) {
+    openDebugMenu();
+  } else {
+    closeDebugMenu();
+  }
+}
+
+function setAppView(view) {
+  document.body.dataset.appView = view;
+}
+
+function setLandingFocus(focus = 'idle') {
+  document.body.dataset.landingFocus = focus || 'idle';
+}
+
+function setLandingCommit(target = 'idle') {
+  document.body.dataset.landingCommit = target || 'idle';
+}
+
+function setViewTransition(state = 'idle') {
+  document.body.dataset.viewTransition = state || 'idle';
+}
+
+function setWorkspaceMask(state = 'idle') {
+  if (elements.workspaceTransitionMask) {
+    if (state === 'host') {
+      elements.workspaceTransitionMask.style.background = '#050505';
+    } else if (state === 'viewer') {
+      elements.workspaceTransitionMask.style.background = '#f4efe5';
+    }
+  }
+  document.body.dataset.workspaceMask = state || 'idle';
+}
+
+function setCloseModalState(state = 'closed') {
+  document.body.dataset.closeModal = state || 'closed';
+}
+
+function waitMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function nextPaint() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  });
+}
+
+async function prewarmWorkspacePanels() {
+  document.body.classList.add('workspace-prewarm');
+  elements.hostPanel.classList.remove('hidden');
+  elements.viewerPanel.classList.remove('hidden');
+  await nextPaint();
+  elements.hostPanel.getBoundingClientRect();
+  elements.viewerPanel.getBoundingClientRect();
+  elements.hostPanel.offsetHeight;
+  elements.viewerPanel.offsetHeight;
+  elements.hostPanel.classList.add('hidden');
+  elements.viewerPanel.classList.add('hidden');
+  document.body.classList.remove('workspace-prewarm');
+}
+
+function prepareWorkspacePanel(panel) {
+  if (!panel) {
+    return;
+  }
+  panel.classList.remove('hidden');
+  panel.classList.add('workspace-panel-preparing');
+}
+
+function releaseWorkspacePanel(panel) {
+  if (!panel) {
+    return;
+  }
+  panel.classList.remove('workspace-panel-preparing');
+}
+
+async function transitionToWorkspace(target) {
+  const isHostTarget = target === 'host';
+  const targetPanel = isHostTarget ? elements.hostPanel : elements.viewerPanel;
+  const otherPanel = isHostTarget ? elements.viewerPanel : elements.hostPanel;
+  setLandingFocus('idle');
+  setLandingCommit(target);
+  prepareWorkspacePanel(targetPanel);
+  await nextPaint();
+  targetPanel.getBoundingClientRect();
+  targetPanel.offsetHeight;
+  await waitMs(LANDING_TRANSITION_MS);
+
+  setWorkspaceMask(target);
+  await nextPaint();
+  otherPanel.classList.add('hidden');
+  elements.modeSelect.classList.add('hidden');
+  setAppView(target);
+  setViewTransition(`${target}-enter`);
+  await nextPaint();
+  releaseWorkspacePanel(targetPanel);
+  await nextPaint();
+  await waitMs(WORKSPACE_MASK_MS);
+  setWorkspaceMask('idle');
+  setViewTransition('idle');
+  await waitMs(Math.max(PANEL_TRANSITION_MS - WORKSPACE_MASK_MS, 0));
+  setLandingCommit('idle');
+}
+
+async function transitionToHome(from) {
+  const panel = from === 'host' ? elements.hostPanel : elements.viewerPanel;
+  setLandingFocus('idle');
+  setLandingCommit(from);
+  elements.modeSelect.classList.remove('hidden');
+  setWorkspaceMask(from);
+  setViewTransition(`${from}-exit`);
+  await waitMs(PANEL_TRANSITION_MS);
+  panel.classList.add('hidden');
+  setAppView('home');
+  setViewTransition('idle');
+  await nextPaint();
+  setWorkspaceMask('idle');
+  await nextPaint();
+  setLandingFocus('idle');
+  setLandingCommit('idle');
+  await waitMs(LANDING_TRANSITION_MS);
 }
 
 function normalizeBaseUrl(baseUrl) {
@@ -306,7 +538,7 @@ async function ensureRuntimeConnectionConfig() {
         config.iceServers = sanitizeIceServers(data.iceServers);
       }
     } catch (error) {
-      console.log('Using bundled ICE configuration:', error.message);
+      debugLog('connection', 'Using bundled ICE configuration:', error.message);
     }
 
     return config;
@@ -315,27 +547,63 @@ async function ensureRuntimeConnectionConfig() {
   return runtimeConnectionConfigPromise;
 }
 
+function getNativeAuthorityOverride(name, currentImpl) {
+  if (!window.__vdsNativeAuthorityOverridesInstalled) {
+    return null;
+  }
+
+  const candidate = window[name];
+  if (typeof candidate !== 'function') {
+    return null;
+  }
+
+  if (candidate === currentImpl) {
+    return null;
+  }
+
+  return candidate;
+}
+
+function requireNativeAuthorityOverride(name, currentImpl) {
+  const override = getNativeAuthorityOverride(name, currentImpl);
+  if (!override) {
+    throw new Error(`native-authority-override-missing:${name}`);
+  }
+  return override;
+}
+
 function queueRemoteCandidate(peerId, candidate) {
+  if (!peerId || !candidate) {
+    return;
+  }
   if (!pendingRemoteCandidates.has(peerId)) {
     pendingRemoteCandidates.set(peerId, []);
   }
-  pendingRemoteCandidates.get(peerId).push(candidate);
-}
-
-async function flushRemoteCandidates(peerId, pc) {
   const queued = pendingRemoteCandidates.get(peerId);
-  if (!queued || !queued.length) {
+  const candidateKey = typeof candidate === 'string'
+    ? candidate
+    : JSON.stringify({
+        candidate: candidate.candidate || '',
+        sdpMid: candidate.sdpMid || '',
+        sdpMLineIndex: Number.isFinite(candidate.sdpMLineIndex) ? candidate.sdpMLineIndex : null
+      });
+  const duplicate = queued.some((entry) => {
+    const entryKey = typeof entry === 'string'
+      ? entry
+      : JSON.stringify({
+          candidate: entry.candidate || '',
+          sdpMid: entry.sdpMid || '',
+          sdpMLineIndex: Number.isFinite(entry.sdpMLineIndex) ? entry.sdpMLineIndex : null
+        });
+    return entryKey === candidateKey;
+  });
+  if (duplicate) {
     return;
   }
 
-  pendingRemoteCandidates.delete(peerId);
-
-  for (const candidate of queued) {
-    try {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
-    } catch (error) {
-      console.error('Failed to apply queued ICE candidate:', error);
-    }
+  queued.push(candidate);
+  while (queued.length > MAX_PENDING_REMOTE_CANDIDATES_PER_PEER) {
+    queued.shift();
   }
 }
 
@@ -345,15 +613,6 @@ function clearPeerReconnect(peerId) {
     clearTimeout(state.timerId);
   }
   peerReconnectState.delete(peerId);
-}
-
-function clearAllPeerReconnects() {
-  peerReconnectState.forEach((state) => {
-    if (state && state.timerId) {
-      clearTimeout(state.timerId);
-    }
-  });
-  peerReconnectState.clear();
 }
 
 function clearPeerConnectionTimeout(peerId) {
@@ -372,310 +631,35 @@ function clearPeerDisconnectTimer(peerId) {
   }
 }
 
-function armPeerConnectionTimeout(peerId, pc, meta, message = '连接超时，正在重试...') {
-  clearPeerConnectionTimeout(peerId);
-  if (!meta || !meta.isInitiator) {
-    return;
-  }
-
-  meta.connectTimeoutId = setTimeout(() => {
-    if (peerConnections.get(peerId) !== pc) {
-      return;
-    }
-
-    if (!meta.restartInProgress && meta.hasConnected) {
-      return;
-    }
-
-    console.warn('Peer connection timed out:', peerId);
-    handlePeerConnectionFailure(peerId, meta, message);
-  }, PEER_CONNECT_TIMEOUT_MS);
-}
-
-function describeIceCandidate(candidate) {
-  const candidateLine = typeof candidate === 'string' ? candidate : candidate && candidate.candidate;
-  if (!candidateLine) {
-    return {
-      type: 'unknown',
-      protocol: 'unknown'
-    };
-  }
-
-  const typeMatch = candidateLine.match(/\btyp\s+([a-z0-9]+)/i);
-  const protocolMatch = candidateLine.match(/^candidate:\S+\s+\d+\s+(\S+)/i);
-
-  return {
-    type: typeMatch ? typeMatch[1].toLowerCase() : 'unknown',
-    protocol: protocolMatch ? protocolMatch[1].toLowerCase() : 'unknown'
-  };
-}
-
-function prepareLocalDescription(meta) {
-  if (!meta) {
-    return;
-  }
-
-  meta.localCandidateCount = 0;
-  meta.localCandidateTypes.clear();
-  meta.selectedCandidatePairLogged = false;
-}
-
-function waitForLocalIceWarmup(pc, meta, peerId, label) {
-  if (!pc || !meta) {
-    return Promise.resolve();
-  }
-
-  const startedAt = Date.now();
-
-  return new Promise((resolve) => {
-    let settled = false;
-    let intervalId = null;
-
-    const finish = (reason) => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      if (intervalId) {
-        clearInterval(intervalId);
-      }
-
-      pc.removeEventListener('icecandidate', onIceCandidate);
-      pc.removeEventListener('icegatheringstatechange', onGatheringStateChange);
-
-      const candidateTypes = Array.from(meta.localCandidateTypes);
-      console.log(
-        `ICE warmup [${label}] ${peerId}: ${meta.localCandidateCount} candidates, types=${
-          candidateTypes.join(',') || 'none'
-        }, reason=${reason}, state=${pc.iceGatheringState}`
-      );
-      resolve();
-    };
-
-    const maybeFinish = () => {
-      if (peerConnections.get(peerId) !== pc || pc.signalingState === 'closed') {
-        finish('aborted');
-        return;
-      }
-
-      const elapsedMs = Date.now() - startedAt;
-      const reachedMinWait = elapsedMs >= INITIAL_ICE_GATHER_MIN_WAIT_MS;
-      const enoughCandidates = meta.localCandidateCount >= INITIAL_ICE_CANDIDATE_TARGET;
-      const gatheringComplete = pc.iceGatheringState === 'complete';
-
-      if (reachedMinWait && (enoughCandidates || gatheringComplete)) {
-        finish(enoughCandidates ? 'candidate-target' : 'gather-complete');
-        return;
-      }
-
-      if (elapsedMs >= INITIAL_ICE_GATHER_MAX_WAIT_MS) {
-        finish(gatheringComplete ? 'gather-complete' : 'timeout');
-      }
-    };
-
-    const onIceCandidate = () => {
-      maybeFinish();
-    };
-
-    const onGatheringStateChange = () => {
-      maybeFinish();
-    };
-
-    intervalId = setInterval(maybeFinish, 100);
-    pc.addEventListener('icecandidate', onIceCandidate);
-    pc.addEventListener('icegatheringstatechange', onGatheringStateChange);
-    maybeFinish();
-  });
-}
-
-function assertActivePeerConnection(peerId, pc) {
-  if (peerConnections.get(peerId) !== pc || pc.signalingState === 'closed') {
-    throw new Error('peer-connection-replaced');
-  }
-}
-
-function getPeerStatsLabel(peerId, kind) {
-  if (kind === 'host-viewer') {
-    return `Host->Viewer(${peerId.substring(0, 8)})`;
-  }
-
-  if (kind === 'relay-viewer') {
-    return `Viewer->NextViewer(${peerId.substring(0, 8)})`;
-  }
-
-  if (peerId === upstreamPeerId) {
-    return 'Viewer->Upstream';
-  }
-
-  return null;
-}
-
-async function logSelectedCandidatePair(pc, label) {
-  if (!pc || pc.connectionState !== 'connected') {
-    return;
-  }
-
-  try {
-    const stats = await pc.getStats();
-    let selectedPair = null;
-
-    stats.forEach((report) => {
-      if (!selectedPair && report.type === 'transport' && report.selectedCandidatePairId) {
-        selectedPair = stats.get(report.selectedCandidatePairId) || null;
-      }
-    });
-
-    if (!selectedPair) {
-      stats.forEach((report) => {
-        if (!selectedPair && report.type === 'candidate-pair' && (report.selected || (report.nominated && report.state === 'succeeded'))) {
-          selectedPair = report;
-        }
-      });
-    }
-
-    if (!selectedPair) {
-      console.log(`[ICE Pair] ${label}: no selected pair available yet`);
-      return;
-    }
-
-    const localCandidate = stats.get(selectedPair.localCandidateId);
-    const remoteCandidate = stats.get(selectedPair.remoteCandidateId);
-    const localSummary = localCandidate ? `${localCandidate.candidateType}/${localCandidate.protocol || 'unknown'}` : 'unknown';
-    const remoteSummary = remoteCandidate ? `${remoteCandidate.candidateType}/${remoteCandidate.protocol || 'unknown'}` : 'unknown';
-    const rttMs = selectedPair.currentRoundTripTime ? Math.round(selectedPair.currentRoundTripTime * 1000) : 0;
-
-    console.log(`[ICE Pair] ${label}: local=${localSummary} remote=${remoteSummary} rtt=${rttMs}ms`);
-  } catch (error) {
-    console.log('Failed to inspect selected ICE pair:', error.message);
-  }
-}
-
 function closePeerConnection(peerId, options = {}) {
-  const { clearRetryState = false } = options;
-  const pc = peerConnections.get(peerId);
-  if (pc) {
-    peerConnections.delete(peerId);
-    if (relayPc === pc) {
-      relayPc = null;
-    }
-
-    pc.onicecandidate = null;
-    pc.onicecandidateerror = null;
-    pc.onicegatheringstatechange = null;
-    pc.oniceconnectionstatechange = null;
-    pc.onconnectionstatechange = null;
-    pc.ontrack = null;
-
-    try {
-      pc.close();
-    } catch (_error) {
-      // Ignore close errors from already-closed peer connections.
-    }
-  }
-
-  clearPeerConnectionTimeout(peerId);
-  clearPeerDisconnectTimer(peerId);
-  peerConnectionMeta.delete(peerId);
-  pendingRemoteCandidates.delete(peerId);
-
-  if (clearRetryState) {
-    clearPeerReconnect(peerId);
-  }
+  return requireNativeAuthorityOverride('closePeerConnection', closePeerConnection)(peerId, options);
 }
 
 function clearAllPeerConnections(options = {}) {
-  const peerIds = Array.from(peerConnections.keys());
-  peerIds.forEach((peerId) => closePeerConnection(peerId, options));
-
-  if (options.clearRetryState) {
-    clearAllPeerReconnects();
-  }
+  return requireNativeAuthorityOverride('clearAllPeerConnections', clearAllPeerConnections)(options);
 }
 
 function setViewerConnectionState(message) {
-  elements.waitingMessage.classList.remove('hidden');
-  elements.connectionStatus.textContent = message;
-  elements.connectionStatus.classList.remove('connected');
+  return requireNativeAuthorityOverride('setViewerConnectionState', setViewerConnectionState)(message);
 }
 
-function resetViewerMediaPipeline(message = '等待重新连接...') {
+async function resetViewerMediaPipeline(message = '等待重新连接...') {
   upstreamConnected = false;
   viewerReadySent = false;
   videoStarted = false;
   relayStream = null;
   relayPc = null;
-  clearAllPeerConnections();
+  await clearAllPeerConnections({ clearRetryState: true });
   elements.remoteVideo.srcObject = null;
   setViewerConnectionState(message);
 }
 
-function shouldReconnectPeer(kind) {
-  if (!currentRoomId) {
-    return false;
-  }
-
-  if (kind === 'host-viewer') {
-    return sessionRole === 'host' && Boolean(localStream);
-  }
-
-  if (kind === 'relay-viewer') {
-    return sessionRole === 'viewer' && Boolean(relayStream);
-  }
-
-  return false;
-}
-
-function schedulePeerReconnect(peerId, kind) {
-  if (!shouldReconnectPeer(kind)) {
-    return;
-  }
-
-  const existingState = peerReconnectState.get(peerId);
-  if (existingState && existingState.timerId) {
-    return;
-  }
-
-  const attempts = existingState ? existingState.attempts : 0;
-  const delay = Math.min(
-    PEER_RECONNECT_BASE_DELAY_MS * Math.pow(2, attempts),
-    PEER_RECONNECT_MAX_DELAY_MS
-  );
-
-  console.log(`Scheduling peer reconnect for ${peerId} in ${delay}ms`);
-
-  const timerId = setTimeout(async () => {
-    const state = peerReconnectState.get(peerId);
-    peerReconnectState.set(peerId, {
-      attempts: state ? state.attempts : attempts + 1,
-      timerId: null
-    });
-
-    if (!shouldReconnectPeer(kind)) {
-      clearPeerReconnect(peerId);
-      return;
-    }
-
-    try {
-      if (kind === 'host-viewer') {
-        await createOffer(peerId, { force: true });
-      } else if (kind === 'relay-viewer') {
-        await createOfferToNextViewer(peerId, { force: true });
-      }
-    } catch (error) {
-      console.error('Peer reconnect attempt failed:', peerId, error);
-    }
-  }, delay);
-
-  peerReconnectState.set(peerId, {
-    attempts: attempts + 1,
-    timerId
-  });
-}
-
 // DOM元素
 const elements = {
+  btnDebugToggle: document.getElementById('btn-debug-toggle'),
+  debugMenu: document.getElementById('debug-menu'),
   modeSelect: document.getElementById('mode-select'),
+  workspaceTransitionMask: document.getElementById('workspace-transition-mask'),
   hostPanel: document.getElementById('host-panel'),
   viewerPanel: document.getElementById('viewer-panel'),
   btnHost: document.getElementById('btn-host'),
@@ -707,16 +691,24 @@ const elements = {
   btnConfirmSource: document.getElementById('btn-confirm-source'),
   btnCancelSource: document.getElementById('btn-cancel-source'),
   btnRefreshSources: document.getElementById('btn-refresh-sources'),
-  audioModal: document.getElementById('audio-modal'),
-  audioProcessList: document.getElementById('audio-process-list'),
-  btnConfirmAudio: document.getElementById('btn-confirm-audio'),
-  btnCancelAudio: document.getElementById('btn-cancel-audio'),
+  sourceAudioEnabled: document.getElementById('source-audio-enabled'),
+  sourceAudioSummary: document.getElementById('source-audio-summary'),
+  btnChangeSourceAudio: document.getElementById('btn-change-source-audio'),
+  sourceAudioProcessList: document.getElementById('source-audio-process-list'),
   // 画质设置弹窗
   qualityModal: document.getElementById('quality-modal'),
-  qualityResolution: document.getElementById('quality-resolution'),
+  qualityCodecOptions: document.getElementById('quality-codec-options'),
+  qualityCodecNote: document.getElementById('quality-codec-note'),
+  qualityResolutionOptions: document.getElementById('quality-resolution-options'),
+  qualityFpsOptions: document.getElementById('quality-fps-options'),
   qualityBitrate: document.getElementById('quality-bitrate'),
-  qualityFramerate: document.getElementById('quality-framerate'),
-  qualityCodec: document.getElementById('quality-codec'),
+  qualityBitrateDecrease: document.getElementById('quality-bitrate-decrease'),
+  qualityBitrateIncrease: document.getElementById('quality-bitrate-increase'),
+  qualityHardwareAcceleration: document.getElementById('quality-hardware-acceleration'),
+  qualityHardwareSupport: document.getElementById('quality-hardware-support'),
+  qualityPresetOptions: document.getElementById('quality-preset-options'),
+  qualityPresetNote: document.getElementById('quality-preset-note'),
+  qualityTuneOptions: document.getElementById('quality-tune-options'),
   btnConfirmQuality: document.getElementById('btn-confirm-quality'),
   btnCancelQuality: document.getElementById('btn-cancel-quality'),
   // 更新进度弹窗
@@ -739,16 +731,422 @@ const elements = {
   btnClose: document.getElementById('btn-close'),
   // 关闭确认弹窗
   closeModal: document.getElementById('close-modal'),
+  btnCloseModalDismiss: document.getElementById('btn-close-modal-dismiss'),
   btnMinimizeToTray: document.getElementById('btn-minimize-to-tray'),
   btnExitApp: document.getElementById('btn-exit-app'),
   // 标题栏元素
   titleBar: document.querySelector('.title-bar')
 };
 
+function getResolutionPreset(value) {
+  return QUALITY_RESOLUTION_OPTIONS.find((option) => option.value === value) || QUALITY_RESOLUTION_OPTIONS[3];
+}
+
+function setQualityResolutionPreset(value) {
+  const preset = getResolutionPreset(value);
+  qualitySettings.resolutionPreset = preset.value;
+  qualitySettings.width = preset.width;
+  qualitySettings.height = preset.height;
+}
+
+function setQualityBitrate(value) {
+  const numeric = Number(value);
+  const safeValue = Number.isFinite(numeric) ? numeric : qualitySettings.bitrate;
+  const stepped = Math.round(safeValue / QUALITY_BITRATE_STEP) * QUALITY_BITRATE_STEP;
+  qualitySettings.bitrate = Math.max(QUALITY_BITRATE_MIN, Math.min(QUALITY_BITRATE_MAX, stepped));
+}
+
+function getRequestedCodecPreference() {
+  return qualitySettings.codecPreference === 'h265' ? 'h265' : 'h264';
+}
+
+function getEffectiveCodecPreference() {
+  const requestedCodec = getRequestedCodecPreference();
+  if (requestedCodec === 'h265') {
+    return 'h264';
+  }
+  return requestedCodec;
+}
+
+function getAvailableVideoEncoders() {
+  const ffmpegCapabilities = qualityCapabilities && qualityCapabilities.ffmpeg
+    ? qualityCapabilities.ffmpeg
+    : null;
+  const encoders = ffmpegCapabilities && Array.isArray(ffmpegCapabilities.validatedVideoEncoders)
+    ? ffmpegCapabilities.validatedVideoEncoders
+    : (
+      ffmpegCapabilities && Array.isArray(ffmpegCapabilities.videoEncoders)
+        ? ffmpegCapabilities.videoEncoders
+        : []
+    );
+  return encoders.map((entry) => String(entry || '').trim()).filter(Boolean);
+}
+
+function getHardwareVideoEncoders() {
+  return getAvailableVideoEncoders().filter((encoder) => QUALITY_HARDWARE_ENCODER_PATTERN.test(encoder));
+}
+
+function getLikelyVideoEncoder(codecPreference, hardwareAcceleration) {
+  const codec = codecPreference === 'h265' ? 'h265' : 'h264';
+  const availableEncoders = getAvailableVideoEncoders();
+  if (availableEncoders.length === 0) {
+    return '';
+  }
+
+  const preferredEncoders = codec === 'h265'
+    ? (hardwareAcceleration
+      ? ['hevc_amf', 'hevc_mf', 'hevc_qsv', 'hevc_nvenc', 'hevc_vaapi', 'hevc_vulkan', 'libx265']
+      : ['libx265'])
+    : (hardwareAcceleration
+      ? ['h264_amf', 'h264_mf', 'h264_qsv', 'h264_nvenc', 'h264_vaapi', 'h264_vulkan', 'libopenh264', 'libx264']
+      : ['libopenh264', 'libx264']);
+
+  return preferredEncoders.find((encoder) => availableEncoders.includes(encoder)) || '';
+}
+
+function getPresetMappingForEncoder(encoderName) {
+  const encoder = String(encoderName || '').toLowerCase();
+  if (!encoder) {
+    return null;
+  }
+
+  if (encoder.includes('_nvenc')) {
+    return { quality: 'p7', balanced: 'p4', speed: 'p1' };
+  }
+
+  if (encoder.includes('_amf')) {
+    return { quality: 'quality', balanced: 'balanced', speed: 'speed' };
+  }
+
+  if (encoder.startsWith('libx264') || encoder.startsWith('libx265')) {
+    return { quality: 'slow', balanced: 'medium', speed: 'ultrafast' };
+  }
+
+  return null;
+}
+
+function buildCodecNoteText() {
+  const requestedCodec = getRequestedCodecPreference();
+  const effectiveCodec = getEffectiveCodecPreference();
+  const likelyEncoder = getLikelyVideoEncoder(effectiveCodec, qualitySettings.hardwareAcceleration);
+
+  if (requestedCodec !== effectiveCodec) {
+    return '当前直播链路仍以 H.264 兼容优先，选择 H.265 时会自动按 H.264 启动。';
+  }
+
+  if (likelyEncoder) {
+    return `当前预计使用 ${likelyEncoder}，如初始化失败会自动回退到可用编码器。`;
+  }
+
+  if (!qualitySettings.hardwareAcceleration && getAvailableVideoEncoders().length > 0) {
+    return '关闭硬件加速后未检测到可用的软件编码器，当前配置可能无法启动。';
+  }
+
+  return '当前直播链路默认以 H.264 兼容优先。';
+}
+
+function buildHardwareSupportText() {
+  const hardwareEncoders = getHardwareVideoEncoders();
+  if (!qualityCapabilitiesChecked && window.isElectron && window.electronAPI && window.electronAPI.mediaEngine) {
+    return '正在检测当前设备支持的 FFmpeg 硬件编码器…';
+  }
+
+  if (hardwareEncoders.length === 0) {
+    return qualitySettings.hardwareAcceleration
+      ? '未检测到通过自检的 FFmpeg 硬件编码器，将自动回退到软件编码。'
+      : '未检测到通过自检的 FFmpeg 硬件编码器。';
+  }
+
+  const prefix = qualitySettings.hardwareAcceleration ? '当前设备支持：' : '已关闭硬件加速，可用硬件编码器：';
+  return `${prefix}${hardwareEncoders.join('、')}`;
+}
+
+function buildPresetNoteText() {
+  const likelyEncoder = getLikelyVideoEncoder(getEffectiveCodecPreference(), qualitySettings.hardwareAcceleration);
+  const mapping = getPresetMappingForEncoder(likelyEncoder);
+  if (mapping) {
+    return `预计编码器：${likelyEncoder}。质量→${mapping.quality}，均衡→${mapping.balanced}，速度→${mapping.speed}。`;
+  }
+
+  if (likelyEncoder) {
+    return `预计编码器：${likelyEncoder}。当前编码器不暴露固定三挡预设，将按低延迟默认参数处理。`;
+  }
+
+  if (!qualitySettings.hardwareAcceleration && getAvailableVideoEncoders().length > 0) {
+    return '关闭硬件加速后未检测到可用的软件编码器，预设参数当前不会生效。';
+  }
+
+  return '默认均衡，将按实际编码器映射到对应预设。';
+}
+
+function buildSegmentGroupMarkup(options, activeValue) {
+  return options.map((option) => {
+    const value = String(option.value);
+    const active = String(activeValue) === value;
+    const disabled = Boolean(option.disabled);
+    return `
+      <span class="quality-segment-item">
+        <button
+          type="button"
+          class="quality-segment-btn${active ? ' is-active' : ''}${disabled ? ' is-disabled' : ''}"
+          data-value="${value}"
+          ${disabled ? 'disabled' : ''}
+          aria-pressed="${active ? 'true' : 'false'}"
+          aria-disabled="${disabled ? 'true' : 'false'}"
+        >${option.label}</button>
+        ${option.badge ? `<span class="quality-segment-badge">${option.badge}</span>` : ''}
+      </span>
+    `;
+  }).join('');
+}
+
+function renderQualitySettingsUi() {
+  if (!elements.qualityModal) {
+    return;
+  }
+
+  if (qualitySettings.codecPreference === 'h265') {
+    qualitySettings.codecPreference = 'h264';
+  }
+
+  setQualityResolutionPreset(qualitySettings.resolutionPreset);
+  setQualityBitrate(qualitySettings.bitrate);
+
+  if (elements.qualityCodecOptions) {
+    elements.qualityCodecOptions.innerHTML = buildSegmentGroupMarkup(
+      QUALITY_CODEC_OPTIONS,
+      qualitySettings.codecPreference
+    );
+  }
+
+  if (elements.qualityResolutionOptions) {
+    elements.qualityResolutionOptions.innerHTML = buildSegmentGroupMarkup(
+      QUALITY_RESOLUTION_OPTIONS,
+      qualitySettings.resolutionPreset
+    );
+  }
+
+  if (elements.qualityFpsOptions) {
+    elements.qualityFpsOptions.innerHTML = buildSegmentGroupMarkup(
+      QUALITY_FPS_OPTIONS,
+      String(qualitySettings.frameRate)
+    );
+  }
+
+  if (elements.qualityPresetOptions) {
+    elements.qualityPresetOptions.innerHTML = buildSegmentGroupMarkup(
+      QUALITY_PRESET_OPTIONS,
+      qualitySettings.encoderPreset
+    );
+  }
+
+  if (elements.qualityTuneOptions) {
+    elements.qualityTuneOptions.innerHTML = buildSegmentGroupMarkup(
+      QUALITY_TUNE_OPTIONS,
+      qualitySettings.encoderTune
+    );
+  }
+
+  if (elements.qualityBitrate) {
+    elements.qualityBitrate.value = String(qualitySettings.bitrate);
+  }
+
+  if (elements.qualityHardwareAcceleration) {
+    elements.qualityHardwareAcceleration.checked = Boolean(qualitySettings.hardwareAcceleration);
+  }
+
+  if (elements.qualityCodecNote) {
+    elements.qualityCodecNote.textContent = buildCodecNoteText();
+  }
+
+  if (elements.qualityHardwareSupport) {
+    elements.qualityHardwareSupport.textContent = buildHardwareSupportText();
+  }
+
+  if (elements.qualityPresetNote) {
+    elements.qualityPresetNote.textContent = buildPresetNoteText();
+  }
+}
+
+async function refreshQualityCapabilities(force = false) {
+  if (!force && qualityCapabilities) {
+    return qualityCapabilities;
+  }
+
+  if (qualityCapabilitiesPromise) {
+    return qualityCapabilitiesPromise;
+  }
+
+  qualityCapabilitiesPromise = (async () => {
+    if (!window.isElectron || !window.electronAPI || !window.electronAPI.mediaEngine) {
+      qualityCapabilities = null;
+      return null;
+    }
+
+    try {
+      if (typeof window.electronAPI.mediaEngine.getCapabilities === 'function') {
+        qualityCapabilities = await window.electronAPI.mediaEngine.getCapabilities();
+      } else {
+        qualityCapabilities = null;
+      }
+    } catch (error) {
+      qualityCapabilities = null;
+      debugLog('video', 'Failed to query native media capabilities:', error.message);
+    } finally {
+      qualityCapabilitiesChecked = true;
+      renderQualitySettingsUi();
+    }
+
+    return qualityCapabilities;
+  })();
+
+  try {
+    return await qualityCapabilitiesPromise;
+  } finally {
+    qualityCapabilitiesPromise = null;
+  }
+}
+
+function bindQualitySegmentGroup(container, onSelect) {
+  if (!container) {
+    return;
+  }
+
+  container.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-value]');
+    if (!(button instanceof HTMLButtonElement)) {
+      return;
+    }
+    onSelect(button.dataset.value || '');
+  });
+}
+
+function bindQualitySettingsUi() {
+  if (qualityUiBound) {
+    return;
+  }
+  qualityUiBound = true;
+
+  bindQualitySegmentGroup(elements.qualityCodecOptions, (value) => {
+    qualitySettings.codecPreference = value === 'h265' ? 'h265' : 'h264';
+    renderQualitySettingsUi();
+  });
+
+  bindQualitySegmentGroup(elements.qualityResolutionOptions, (value) => {
+    setQualityResolutionPreset(value);
+    renderQualitySettingsUi();
+  });
+
+  bindQualitySegmentGroup(elements.qualityFpsOptions, (value) => {
+    qualitySettings.frameRate = Number(value) || 30;
+    renderQualitySettingsUi();
+  });
+
+  bindQualitySegmentGroup(elements.qualityPresetOptions, (value) => {
+    qualitySettings.encoderPreset = QUALITY_PRESET_OPTIONS.some((option) => option.value === value)
+      ? value
+      : 'balanced';
+    renderQualitySettingsUi();
+  });
+
+  bindQualitySegmentGroup(elements.qualityTuneOptions, (value) => {
+    qualitySettings.encoderTune = QUALITY_TUNE_OPTIONS.some((option) => option.value === value)
+      ? value
+      : 'none';
+    renderQualitySettingsUi();
+  });
+
+  if (elements.qualityHardwareAcceleration) {
+    elements.qualityHardwareAcceleration.addEventListener('change', () => {
+      qualitySettings.hardwareAcceleration = Boolean(elements.qualityHardwareAcceleration.checked);
+      renderQualitySettingsUi();
+    });
+  }
+
+  if (elements.qualityBitrateDecrease) {
+    elements.qualityBitrateDecrease.addEventListener('click', () => {
+      setQualityBitrate(qualitySettings.bitrate - QUALITY_BITRATE_STEP);
+      renderQualitySettingsUi();
+    });
+  }
+
+  if (elements.qualityBitrateIncrease) {
+    elements.qualityBitrateIncrease.addEventListener('click', () => {
+      setQualityBitrate(qualitySettings.bitrate + QUALITY_BITRATE_STEP);
+      renderQualitySettingsUi();
+    });
+  }
+
+  if (elements.qualityBitrate) {
+    const syncBitrate = () => {
+      setQualityBitrate(elements.qualityBitrate.value);
+      renderQualitySettingsUi();
+    };
+    elements.qualityBitrate.addEventListener('change', syncBitrate);
+    elements.qualityBitrate.addEventListener('blur', syncBitrate);
+  }
+}
+
+async function openQualityModal() {
+  bindQualitySettingsUi();
+  renderQualitySettingsUi();
+  elements.qualityModal.classList.remove('hidden');
+  refreshQualityCapabilities().catch(() => {});
+}
+
+async function confirmQualitySelection() {
+  const requestedCodec = getRequestedCodecPreference();
+  const effectiveCodec = getEffectiveCodecPreference();
+  elements.qualityModal.classList.add('hidden');
+  if (requestedCodec !== effectiveCodec) {
+    showError('当前版本直播链路仍以 H.264 兼容优先，已按兼容模式继续。');
+  }
+  await showSourceSelection();
+}
+
+function cancelQualitySelection() {
+  elements.qualityModal.classList.add('hidden');
+}
+
+window.__vdsRefreshQualitySettingsUi = renderQualitySettingsUi;
+
+function renderDebugMenu() {
+  if (!elements.debugMenu) {
+    return;
+  }
+
+  const items = DEBUG_CATEGORY_KEYS.map((key) => {
+    const definition = DEBUG_CATEGORY_DEFINITIONS[key];
+    return `
+      <label class="debug-menu-item">
+        <span class="debug-menu-item-main">
+          <input type="checkbox" data-debug-category="${key}">
+          <span class="debug-menu-item-label">${definition.label}</span>
+        </span>
+        <span class="debug-menu-item-description">${definition.description}</span>
+      </label>
+    `;
+  }).join('');
+
+  elements.debugMenu.innerHTML = `
+    <div class="debug-menu-header">
+      <span class="debug-menu-title">调试日志</span>
+      <span class="debug-menu-subtitle">按链路分类启用前端诊断输出</span>
+    </div>
+    <div class="debug-menu-body">${items}</div>
+  `;
+}
+
 // 根据运行环境显示/隐藏标题栏
 if (!window.isElectron) {
   elements.titleBar.style.display = 'none';
 }
+
+renderDebugMenu();
+bindQualitySettingsUi();
+renderQualitySettingsUi();
+
+prewarmWorkspacePanels().catch(() => {});
 
 // 事件绑定
 elements.btnHost.addEventListener('click', () => showHostPanel());
@@ -767,30 +1165,18 @@ elements.btnCancelSource.addEventListener('click', cancelSourceSelection);
 elements.btnRefreshSources.addEventListener('click', refreshSources);
 
 // 音频进程选择弹窗事件
-elements.btnConfirmAudio.addEventListener('click', confirmAudioProcess);
-elements.btnCancelAudio.addEventListener('click', skipAudioCapture);
+elements.sourceAudioEnabled.addEventListener('change', updateSourceAudioUi);
+elements.btnChangeSourceAudio.addEventListener('click', cycleSelectedSourceAudioCandidate);
 
 // 画质设置弹窗事件
 elements.btnConfirmQuality.addEventListener('click', () => {
-  // 获取画质设置
-  const resolution = elements.qualityResolution.value.split('x');
-  qualitySettings.width = parseInt(resolution[0]);
-  qualitySettings.height = parseInt(resolution[1]);
-  qualitySettings.bitrate = parseInt(elements.qualityBitrate.value);
-  qualitySettings.frameRate = parseInt(elements.qualityFramerate.value);
-  qualitySettings.codecPreference = elements.qualityCodec.value;
-
-  // 隐藏画质设置弹窗，显示源选择
-  elements.qualityModal.classList.add('hidden');
-  showSourceSelection();
+  confirmQualitySelection().catch((error) => {
+    console.error('Failed to confirm quality selection:', error);
+    showError(error && error.message ? error.message : '无法继续打开采集源列表');
+  });
 });
 
-elements.btnCancelQuality.addEventListener('click', () => {
-  elements.qualityModal.classList.add('hidden');
-  // 取消则返回模式选择页面
-  elements.hostPanel.classList.add('hidden');
-  elements.modeSelect.classList.remove('hidden');
-});
+elements.btnCancelQuality.addEventListener('click', cancelQualitySelection);
 
 // 标题栏按钮事件
 elements.btnCloseUpdate.addEventListener('click', hideUpdateModal);
@@ -813,21 +1199,60 @@ elements.btnMaximize.addEventListener('click', async () => {
 });
 
 elements.btnClose.addEventListener('click', () => {
+  setCloseModalState('open');
   elements.closeModal.classList.remove('hidden');
+});
+
+if (elements.btnDebugToggle) {
+  elements.btnDebugToggle.addEventListener('click', (event) => {
+    event.stopPropagation();
+    toggleDebugMenu();
+  });
+}
+
+if (elements.debugMenu) {
+  elements.debugMenu.addEventListener('click', (event) => {
+    event.stopPropagation();
+  });
+
+  elements.debugMenu.addEventListener('change', (event) => {
+    const input = event.target;
+    if (!(input instanceof HTMLInputElement)) {
+      return;
+    }
+    const category = input.getAttribute('data-debug-category');
+    if (!category) {
+      return;
+    }
+    setDebugCategoryEnabled(category, input.checked);
+  });
+}
+
+document.addEventListener('click', () => {
+  closeDebugMenu();
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    closeDebugMenu();
+  }
 });
 
 // 关闭确认弹窗事件
 elements.btnMinimizeToTray.addEventListener('click', () => {
+  setCloseModalState('closed');
   elements.closeModal.classList.add('hidden');
   window.electronAPI.minimizeToTray();
 });
 
-elements.btnExitApp.addEventListener('click', () => {
+elements.btnCloseModalDismiss.addEventListener('click', () => {
+  setCloseModalState('closed');
   elements.closeModal.classList.add('hidden');
-  // 关闭WebRTC连接
-  peerConnections.forEach(pc => pc.close());
-  peerConnections.clear();
-  if (ws) ws.close();
+});
+
+elements.btnExitApp.addEventListener('click', () => {
+  setCloseModalState('closed');
+  elements.closeModal.classList.add('hidden');
   window.electronAPI.close();
 });
 
@@ -850,12 +1275,11 @@ if (window.electronAPI && window.electronAPI.onMaximizedChange) {
 
 // 页面导航
 initializeStartupTasks().catch((error) => {
-  console.log('Startup initialization failed:', error.message);
+  debugLog('misc', 'Startup initialization failed:', error.message);
 });
 
 async function showHostPanel() {
-  elements.modeSelect.classList.add('hidden');
-  elements.hostPanel.classList.remove('hidden');
+  await transitionToWorkspace('host');
   isHost = true;
   elements.hostStatus.textContent = '正在连接...';
   elements.hostStatus.classList.add('waiting');
@@ -868,8 +1292,7 @@ async function showHostPanel() {
 }
 
 async function showViewerPanel() {
-  elements.modeSelect.classList.add('hidden');
-  elements.viewerPanel.classList.remove('hidden');
+  await transitionToWorkspace('viewer');
   isHost = false;
   elements.connectionStatus.textContent = '正在连接...';
   try {
@@ -880,135 +1303,26 @@ async function showViewerPanel() {
   }
 }
 
-function goBack() {
-  stopScreenShare();
+async function goBack() {
+  try {
+    await stopScreenShare();
+  } catch (error) {
+    console.error('Failed to stop share while leaving host panel:', error);
+  }
   disconnectWebSocket();
-  elements.hostPanel.classList.add('hidden');
-  elements.modeSelect.classList.remove('hidden');
+  await transitionToHome('host');
 }
 
-function goBackViewer() {
-  leaveRoom();
-  elements.viewerPanel.classList.add('hidden');
-  elements.modeSelect.classList.remove('hidden');
+async function goBackViewer() {
+  await leaveRoom();
+  await transitionToHome('viewer');
 }
 
 // WebSocket连接
-function legacyConnectWebSocket() {
-  if (ws && ws.readyState === WebSocket.OPEN) return;
-
-  // 重置重连状态
-  wsManualClose = false;
-
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${protocol}//${window.location.host}`);
-
-  ws.onopen = async () => {
-    console.log('WebSocket connected');
-    wsConnected = true;
-    wsReconnectAttempts = 0; // 重置重连计数
-
-    // 初始化版本号（仅在 Electron 环境中）
-    if (window.electronAPI && window.electronAPI.getAppVersion) {
-      await initVersion();
-    }
-
-    // 检查更新（仅在 Electron 环境中）
-    if (window.electronAPI && window.electronAPI.checkForUpdates) {
-      checkForUpdates();
-    }
-  };
-
-  ws.onmessage = async (event) => {
-    const data = JSON.parse(event.data);
-    await handleMessage(data);
-  };
-
-  ws.onclose = () => {
-    console.log('WebSocket disconnected');
-    wsConnected = false;
-
-    // 如果是手动关闭，不重连
-    if (wsManualClose) {
-      console.log('Manual close, skipping reconnect');
-      return;
-    }
-
-    // 指数退避重连：1s, 2s, 4s, 8s, 16s, 最大 30s
-    const maxDelay = 30000;
-    const baseDelay = 1000;
-    const delay = Math.min(baseDelay * Math.pow(2, wsReconnectAttempts), maxDelay);
-
-    console.log(`Reconnecting in ${delay}ms (attempt ${wsReconnectAttempts + 1})...`);
-
-    // 显示重连状态
-    if (isHost && elements.hostStatus) {
-      elements.hostStatus.textContent = '正在重连...';
-      elements.hostStatus.classList.add('waiting');
-    } else if (!isHost && elements.connectionStatus) {
-      elements.connectionStatus.textContent = '正在重连...';
-    }
-
-    wsReconnectTimer = setTimeout(() => {
-      wsReconnectAttempts++;
-      connectWebSocket();
-    }, delay);
-  };
-
-  ws.onerror = (error) => {
-    console.error('WebSocket error:', error);
-    showError('连接失败，请刷新页面重试');
-  };
-}
-
-function legacyDisconnectWebSocket() {
-  // 标记为手动关闭，不再重连
-  wsManualClose = true;
-
-  // 清除重连定时器
-  if (wsReconnectTimer) {
-    clearTimeout(wsReconnectTimer);
-    wsReconnectTimer = null;
-  }
-  wsReconnectAttempts = 0;
-
-  if (ws) {
-    ws.close();
-    ws = null;
-  }
-  wsConnected = false;
-}
 
 // 等待WebSocket连接
-function legacyWaitForWsConnected() {
-  return new Promise((resolve) => {
-    if (wsConnected && ws && ws.readyState === WebSocket.OPEN) {
-      resolve();
-      return;
-    }
-
-    // 等待连接
-    const checkInterval = setInterval(() => {
-      if (wsConnected && ws && ws.readyState === WebSocket.OPEN) {
-        clearInterval(checkInterval);
-        resolve();
-      }
-    }, 100);
-
-    // 超时5秒后仍然继续
-    setTimeout(() => {
-      clearInterval(checkInterval);
-      resolve();
-    }, 5000);
-  });
-}
 
 // 发送消息
-function legacySendMessage(data) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(data));
-  }
-}
 
 function connectWebSocket() {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1036,7 +1350,7 @@ function connectWebSocket() {
     ws = new WebSocket(wsBaseUrl);
 
     ws.onopen = async () => {
-      console.log('WebSocket connected');
+      debugLog('connection', 'WebSocket connected');
       wsConnected = true;
       wsReconnectAttempts = 0;
       wsConnectPromise = null;
@@ -1062,16 +1376,20 @@ function connectWebSocket() {
 
     ws.onmessage = async (event) => {
       const data = JSON.parse(event.data);
-      await handleMessage(data);
+      try {
+        await handleMessage(data);
+      } catch (error) {
+        console.error('Unhandled message processing error:', error);
+      }
     };
 
     ws.onclose = () => {
-      console.log('WebSocket disconnected');
+      debugLog('connection', 'WebSocket disconnected');
       wsConnected = false;
       wsConnectPromise = null;
 
       if (wsManualClose) {
-        console.log('Manual close, skipping reconnect');
+        debugLog('connection', 'Manual close, skipping reconnect');
         return;
       }
 
@@ -1102,7 +1420,7 @@ function scheduleReconnect() {
   const baseDelay = 1000;
   const delay = Math.min(baseDelay * Math.pow(2, wsReconnectAttempts), maxDelay);
 
-  console.log(`Reconnecting in ${delay}ms (attempt ${wsReconnectAttempts + 1})...`);
+  debugLog('connection', `Reconnecting in ${delay}ms (attempt ${wsReconnectAttempts + 1})...`);
 
   if (isHost && elements.hostStatus) {
     elements.hostStatus.textContent = '正在重连...';
@@ -1186,7 +1504,7 @@ function registerUpdateStatusListener() {
   }
 
   updateStatusUnsubscribe = window.electronAPI.onUpdateStatus((status) => {
-    console.log('Update status:', status);
+    debugLog('update', 'Update status:', status);
     applyUpdateStatus(status);
   });
 }
@@ -1205,7 +1523,7 @@ async function registerUpdateLogListener() {
         snapshot.entries.forEach(rememberUpdateLogEntry);
       }
     } catch (error) {
-      console.log('Unable to load updater log snapshot:', error.message);
+      debugLog('update', 'Unable to load updater log snapshot:', error.message);
     }
   }
 
@@ -1237,6 +1555,8 @@ function initializeStartupTasks() {
     }
   })();
 }
+
+setDebugConfig(debugConfig);
 
 function getUpdateManifestUrl() {
   return `${serverBaseUrl}/updates/latest.yml`;
@@ -1277,7 +1597,7 @@ function rememberUpdateLogEntry(entry) {
   }
 
   const level = entry.level ? String(entry.level).toUpperCase() : 'INFO';
-  console.log(`[Updater:${level}]`, entry.message || entry.line || '');
+  debugLog('update', `[Updater:${level}]`, entry.message || entry.line || '');
 }
 
 function getRecentUpdateLogTail(limit = 5) {
@@ -1447,155 +1767,34 @@ function applyUpdateStatus(status) {
     });
   }
 }
-async function handleMessage(data) {
-  console.log('Received:', data.type);
-
-  switch (data.type) {
-    case 'room-created':
-      currentRoomId = data.roomId;
-      sessionRole = 'host';
-      elements.roomIdDisplay.textContent = data.roomId;
-      elements.roomInfo.classList.remove('hidden');
-      elements.btnStartShare.classList.remove('hidden');
-      elements.hostStatus.textContent = '等待开始共享';
-      break;
-
-    case 'room-joined':
-      currentRoomId = data.roomId;
-      sessionRole = 'viewer';
-      myChainPosition = data.chainPosition;
-      hostId = data.hostId; // 保存Host的ID
-      viewerReadySent = false; // 重置标志
-      videoStarted = false;
-      console.log('Host ID:', hostId);
-      elements.joinForm.classList.add('hidden');
-      elements.viewerStatus.classList.remove('hidden');
-      elements.viewerRoomId.textContent = data.roomId;
-      elements.btnLeave.classList.remove('hidden');
-      elements.chainPosition.textContent = (data.chainPosition + 1);
-      elements.connectionStatus.textContent = '等待连接...';
-      break;
-
-    case 'session-resumed':
-      currentRoomId = data.roomId;
-      sessionRole = data.role;
-      if (data.role === 'host') {
-        isHost = true;
-        elements.roomIdDisplay.textContent = data.roomId;
-        elements.roomInfo.classList.remove('hidden');
-        elements.viewerCount.textContent = String(data.viewerCount || 0);
-        elements.hostStatus.textContent = '已恢复连接';
-      } else {
-        isHost = false;
-        hostId = data.hostId || hostId;
-        myChainPosition = data.chainPosition;
-        elements.joinForm.classList.add('hidden');
-        elements.viewerStatus.classList.remove('hidden');
-        elements.viewerRoomId.textContent = data.roomId;
-        elements.btnLeave.classList.remove('hidden');
-        elements.chainPosition.textContent = (myChainPosition + 1);
-        elements.connectionStatus.textContent = '已恢复连接';
-      }
-      break;
-
-    case 'error':
-      showError(data.message);
-      break;
-
-    case 'viewer-joined':
-      console.log('Host: viewer-joined, viewerId =', data.viewerId);
-      // 防止重复创建连接
-      if (peerConnections.has(data.viewerId)) {
-        console.log('Already connected to', data.viewerId);
-        return;
-      }
-      if (!data.reconnect) {
-        updateViewerCount(data.viewerId);
-      }
-      // 创建WebRTC连接给观众
-      if (localStream) {
-        await createOffer(data.viewerId);
-      }
-      break;
-
-    case 'connect-to-next':
-      // 服务器通知我作为Relay连接到下一个观众
-      console.log('Connecting to next viewer:', data.nextViewerId);
-      await createOfferToNextViewer(data.nextViewerId);
-      break;
-
-    case 'offer':
-      await handleOffer(data);
-      break;
-
-    case 'answer':
-      await handleAnswer(data);
-      break;
-
-    case 'ice-candidate':
-      await handleIceCandidate(data);
-      break;
-
-    case 'host-disconnected':
-      showError('分享者已断开连接');
-      resetViewerState();
-      break;
-
-    case 'viewer-left':
-      updateViewerCount(null, data.leftPosition);
-      // 关闭到离开观众的连接
-      const leftPc = peerConnections.get(data.viewerId);
-      if (leftPc) {
-        leftPc.close();
-        peerConnections.delete(data.viewerId);
-      }
-      break;
-
-    case 'chain-reconnect':
-      // 链重新调整
-      myChainPosition = data.newChainPosition;
-      elements.chainPosition.textContent = (myChainPosition + 1);
-      break;
-  }
-}
 
 // Host: 显示屏幕源选择弹窗
 async function showSourceSelection() {
   try {
-    // 等待WebSocket连接
     await waitForWsConnected();
 
-    let sources = [];
-
-    // 检测是否在Electron环境中
-    if (window.isElectron) {
-      // Electron环境：通过IPC获取桌面源
-      console.log('Getting desktop sources for selection...');
-      sources = await window.electronAPI.getDesktopSources();
-    } else {
-      // 浏览器环境：使用getDisplayMedia（会弹出系统选择器）
-      // 浏览器环境下直接调用getDisplayMedia，不需要选择界面
-      await startScreenShareWithSource(null);
-      return;
+    if (!window.isElectron || !window.electronAPI || !window.electronAPI.mediaEngine) {
+      throw new Error('native-electron-runtime-required');
     }
+
+    debugLog('video', 'Getting capture targets for selection...');
+    const sources = await window.electronAPI.mediaEngine.listCaptureTargets();
 
     if (!sources || sources.length === 0) {
-      throw new Error('没有找到可用的屏幕源');
+      throw new Error('No capture target available');
     }
 
-    // 显示选择弹窗
     showSourceModal(sources);
-
   } catch (error) {
     console.error('Error loading sources:', error);
-    showError('无法获取屏幕列表: ' + error.message);
+    showError('Failed to list capture targets: ' + error.message);
   }
 }
 
 // 刷新屏幕源列表
 async function refreshSources() {
   try {
-    console.log('Refreshing source list...');
+    debugLog('video', 'Refreshing source list...');
     const btn = elements.btnRefreshSources;
     btn.style.animation = 'spin 1s linear infinite';
 
@@ -1603,7 +1802,7 @@ async function refreshSources() {
 
     // 检测是否在Electron环境中
     if (window.isElectron) {
-      sources = await window.electronAPI.getDesktopSources();
+      sources = await window.electronAPI.mediaEngine.listCaptureTargets();
     }
 
     if (!sources || sources.length === 0) {
@@ -1621,6 +1820,75 @@ async function refreshSources() {
 }
 
 // 显示源选择弹窗
+function parseSelectedSourceAudioCandidates(selectedItem) {
+  if (!selectedItem || !selectedItem.dataset.audioCandidates) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(selectedItem.dataset.audioCandidates);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_error) {
+    return [];
+  }
+}
+
+function getSelectedSourceItem() {
+  return document.querySelector('.source-item.selected');
+}
+
+function updateSourceAudioUi() {
+  const selectedItem = getSelectedSourceItem();
+  const candidates = parseSelectedSourceAudioCandidates(selectedItem);
+  const selectedIndex = Math.max(0, Number(selectedItem && selectedItem.dataset.audioIndex) || 0);
+  const selectedCandidate = candidates[selectedIndex] || null;
+  const audioEnabled = Boolean(elements.sourceAudioEnabled && elements.sourceAudioEnabled.checked);
+
+  if (elements.sourceAudioProcessList) {
+    elements.sourceAudioProcessList.innerHTML = '';
+    candidates.forEach((candidate, index) => {
+      const row = document.createElement('div');
+      row.className = `source-audio-process-item${index === selectedIndex ? ' selected' : ''}`;
+      row.textContent = `${candidate.processName || 'PID'} (${candidate.pid || 'n/a'})`;
+      elements.sourceAudioProcessList.appendChild(row);
+    });
+    elements.sourceAudioProcessList.classList.toggle('hidden', candidates.length === 0);
+  }
+
+  if (!elements.sourceAudioSummary) {
+    return;
+  }
+
+  if (!audioEnabled) {
+    elements.sourceAudioSummary.textContent = '当前仅共享画面';
+    return;
+  }
+
+  if (!selectedCandidate) {
+    elements.sourceAudioSummary.textContent = '当前目标没有可用的进程音频匹配';
+    return;
+  }
+
+  elements.sourceAudioSummary.textContent = `当前音频目标: ${selectedCandidate.processName || 'PID'} (${selectedCandidate.pid})`;
+}
+
+function cycleSelectedSourceAudioCandidate() {
+  const selectedItem = getSelectedSourceItem();
+  if (!selectedItem) {
+    return;
+  }
+
+  const candidates = parseSelectedSourceAudioCandidates(selectedItem);
+  if (candidates.length <= 1) {
+    updateSourceAudioUi();
+    return;
+  }
+
+  const currentIndex = Math.max(0, Number(selectedItem.dataset.audioIndex) || 0);
+  selectedItem.dataset.audioIndex = String((currentIndex + 1) % candidates.length);
+  updateSourceAudioUi();
+}
+
 function showSourceModal(sources) {
   const modal = document.getElementById('source-modal');
   const sourceList = document.getElementById('source-list');
@@ -1633,7 +1901,8 @@ function showSourceModal(sources) {
     item.className = 'source-item';
     item.dataset.id = source.id;
     item.dataset.name = source.name;
-    item.dataset.synthetic = source.isSynthetic ? 'true' : 'false';
+    item.dataset.audioCandidates = JSON.stringify(Array.isArray(source.audioCandidates) ? source.audioCandidates : []);
+    item.dataset.audioIndex = '0';
 
     // 缩略图
     if (source.thumbnail) {
@@ -1646,24 +1915,13 @@ function showSourceModal(sources) {
     const name = document.createElement('p');
     name.textContent = source.name;
     item.appendChild(name);
-    if (source.isSynthetic) {
-      const badge = document.createElement('div');
-      badge.className = 'source-badge';
-      badge.textContent = getSourceBadgeLabel(source);
-      item.appendChild(badge);
-    }
-    if (source.fallbackReason) {
-      const note = document.createElement('div');
-      note.className = 'source-note';
-      note.textContent = source.fallbackReason;
-      item.appendChild(note);
-    }
 
     // 点击选择
     item.addEventListener('click', () => {
       // 移除其他选中状态
       document.querySelectorAll('.source-item').forEach(el => el.classList.remove('selected'));
       item.classList.add('selected');
+      updateSourceAudioUi();
     });
 
     sourceList.appendChild(item);
@@ -1675,23 +1933,11 @@ function showSourceModal(sources) {
   });
 
   // 显示弹窗
+  if (elements.sourceAudioEnabled) {
+    elements.sourceAudioEnabled.checked = true;
+  }
+  updateSourceAudioUi();
   modal.classList.remove('hidden');
-}
-
-function getSourceBadgeLabel(source) {
-  if (!source || !source.captureMode) {
-    return '回退源';
-  }
-
-  if (source.captureMode === 'fullscreen-display-fallback') {
-    return '全屏回退';
-  }
-
-  if (source.captureMode === 'minimized-window-fallback') {
-    return '最小化窗口';
-  }
-
-  return '回退源';
 }
 
 // 确认选择并开始共享
@@ -1702,100 +1948,53 @@ async function confirmSourceAndShare() {
   const selectedItem = document.querySelector('.source-item.selected');
 
   if (!selectedItem) {
-    showError('请选择一个要分享的屏幕或窗口');
+    showError('Please select a capture target');
     return;
   }
 
   currentScreenSourceId = selectedItem.dataset.id;
-  const sourceName = selectedItem.dataset.name;
-
-  // 关闭屏幕源弹窗
   document.getElementById('source-modal').classList.add('hidden');
-
-  // 如果是Electron环境，显示音频进程选择
-  if (window.isElectron && window.electronAPI && window.electronAPI.audioCapture) {
-    try {
-      // 检查平台支持
-      const isSupported = await window.electronAPI.audioCapture.isPlatformSupported();
-      if (isSupported) {
-        // 检查权限
-        let permission = await window.electronAPI.audioCapture.checkPermission();
-        if (permission.status !== 'authorized') {
-          permission = await window.electronAPI.audioCapture.requestPermission();
-        }
-
-        if (permission.status === 'authorized') {
-          // 获取进程列表并显示
-          await showAudioProcessSelection(sourceName);
-          return;
-        }
-      }
-    } catch (e) {
-      console.log('Audio selection error:', e);
-    }
+  try {
+    await showAudioProcessSelection();
+  } catch (error) {
+    console.error('Failed to start native share session:', error);
+    showError(error && error.message ? error.message : 'failed-to-start-native-share');
   }
-
-  // 直接开始共享（无音频）
-  await startScreenShareWithSource(currentScreenSourceId);
 }
 
 // 显示音频进程选择弹窗
-async function showAudioProcessSelection() {
-  try {
-    const processes = await window.electronAPI.audioCapture.getProcessList();
-    const audioList = elements.audioProcessList;
-
-    audioList.innerHTML = '';
-
-    processes.forEach((proc, index) => {
-      const item = document.createElement('div');
-      item.className = 'source-item';
-      item.dataset.pid = proc.pid;
-      item.dataset.name = proc.name;
-      item.textContent = `${proc.name} (PID: ${proc.pid})`;
-
-      item.addEventListener('click', () => {
-        document.querySelectorAll('#audio-process-list .source-item').forEach(el => el.classList.remove('selected'));
-        item.classList.add('selected');
-      });
-
-      audioList.appendChild(item);
-
-      // 默认选中第一个
-      if (index === 0) {
-        item.classList.add('selected');
-      }
-    });
-
-    elements.audioModal.classList.remove('hidden');
-
-  } catch (err) {
-    console.error('Error loading audio processes:', err);
-    // 直接开始共享
-    await startScreenShareWithSource(currentScreenSourceId);
-  }
-}
 
 // 确认音频进程选择
-async function confirmAudioProcess() {
-  const selectedItem = document.querySelector('#audio-process-list .source-item.selected');
-
-  elements.audioModal.classList.add('hidden');
-
-  if (selectedItem) {
-    const pid = parseInt(selectedItem.dataset.pid);
-    const name = selectedItem.dataset.name;
-    console.log('Selected audio process:', name, 'PID:', pid);
-    await startScreenShareWithAudio(currentScreenSourceId, pid);
-  } else {
-    // 跳过音频
-    await startScreenShareWithSource(currentScreenSourceId);
-  }
-}
 
 // 跳过音频捕获
+
+// Active source-audio path: one modal only, no secondary audio modal.
+async function showAudioProcessSelection() {
+  const selectedItem = getSelectedSourceItem();
+  const audioEnabled = Boolean(elements.sourceAudioEnabled && elements.sourceAudioEnabled.checked);
+  const audioCandidates = parseSelectedSourceAudioCandidates(selectedItem);
+  const audioIndex = Math.max(0, Number(selectedItem && selectedItem.dataset.audioIndex) || 0);
+  const audioCandidate = audioCandidates[audioIndex] || null;
+
+  if (!audioEnabled) {
+    await startScreenShareWithSource(currentScreenSourceId);
+    return;
+  }
+
+  if (!audioCandidate || !audioCandidate.pid) {
+    showError('当前窗口没有可用音频，将仅共享画面');
+    await startScreenShareWithSource(currentScreenSourceId);
+    return;
+  }
+
+  await startScreenShareWithAudio(currentScreenSourceId, Number(audioCandidate.pid));
+}
+
+async function confirmAudioProcess() {
+  await showAudioProcessSelection();
+}
+
 async function skipAudioCapture() {
-  elements.audioModal.classList.add('hidden');
   await startScreenShareWithSource(currentScreenSourceId);
 }
 
@@ -1805,540 +2004,19 @@ function cancelSourceSelection() {
 }
 
 // 捕获窗口音频（自动选择进程）
-async function captureWindowAudio(sourceId) {
-  if (!window.electronAPI || !window.electronAPI.audioCapture) {
-    console.log('Audio capture API not available');
-    return null;
-  }
-
-  try {
-    // 检查平台支持
-    const isSupported = await window.electronAPI.audioCapture.isPlatformSupported();
-    console.log('Audio platform supported:', isSupported);
-    if (!isSupported) return null;
-
-    // 检查权限
-    let permission = await window.electronAPI.audioCapture.checkPermission();
-    console.log('Audio permission status:', permission.status);
-
-    if (permission.status !== 'authorized') {
-      permission = await window.electronAPI.audioCapture.requestPermission();
-      console.log('Audio permission after request:', permission.status);
-    }
-
-    if (permission.status !== 'authorized') {
-      console.log('Audio permission denied');
-      return null;
-    }
-
-    // 获取进程列表
-    const processes = await window.electronAPI.audioCapture.getProcessList();
-    console.log('Found audio processes:', processes.length);
-
-    // 从sourceId提取窗口标题来匹配进程
-    // sourceId格式: window:PID:index
-    const match = sourceId.match(/window:(\d+):/);
-    const windowPid = match ? parseInt(match[1]) : null;
-
-    // 查找匹配的进程
-    let targetProcess = processes.find(p => p.pid === windowPid);
-
-    if (!targetProcess) {
-      console.log('No matching audio process for PID:', windowPid, '- trying first available');
-      // 尝试使用第一个可用的音频进程
-      if (processes.length > 0) {
-        targetProcess = processes[0];
-      } else {
-        console.log('No audio processes available');
-        return null;
-      }
-    }
-
-    console.log('Auto-selected audio process:', targetProcess.name, 'PID:', targetProcess.pid);
-
-    // 直接调用带PID的版本
-    return captureWindowAudioWithPid(sourceId, targetProcess.pid);
-
-  } catch (err) {
-    console.error('Error in audio capture:', err);
-    return null;
-  }
-}
 
 // 根据sourceId开始屏幕共享
 async function startScreenShareWithSource(sourceId) {
-  try {
-    let stream;
-
-    if (window.isElectron && sourceId) {
-      // Electron环境：使用选中的sourceId
-      console.log('Starting share with source:', sourceId);
-
-      // 获取视频流 - 使用画质设置
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          mandatory: {
-            chromeMediaSource: 'desktop',
-            chromeMediaSourceId: sourceId,
-            width: qualitySettings.width,
-            height: qualitySettings.height,
-            frameRate: qualitySettings.frameRate,
-            // 尝试设置最大码率 (kbps)
-            maxWidth: qualitySettings.width,
-            maxHeight: qualitySettings.height,
-            maxFrameRate: qualitySettings.frameRate
-          }
-        }
-      });
-
-      // 尝试添加音频捕获
-      try {
-        const audioStream = await captureWindowAudio(sourceId);
-        if (audioStream && audioStream.getAudioTracks().length > 0) {
-          // 合并音视频流
-          audioStream.getAudioTracks().forEach(track => {
-            stream.addTrack(track);
-          });
-          console.log('Audio track added to stream');
-        }
-      } catch (audioErr) {
-        console.log('Audio capture failed (non-fatal):', audioErr.message);
-      }
-
-    } else if (!window.isElectron) {
-      // 浏览器环境：直接使用getDisplayMedia
-      stream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          displaySurface: 'window',
-          width: { ideal: qualitySettings.width },
-          height: { ideal: qualitySettings.height },
-          frameRate: { ideal: qualitySettings.frameRate }
-        },
-        audio: true,
-        surfaceSwitching: 'include',
-        selfBrowserSurface: 'exclude',
-        preferCurrentTab: false
-      });
-    } else {
-      throw new Error('无效的屏幕源');
-    }
-
-    localStream = stream;
-
-    // 检查实际视频轨道参数
-    const videoTrack = stream.getVideoTracks()[0];
-    if (videoTrack) {
-      const settings = videoTrack.getSettings();
-      console.log('=== Video Track Settings ===');
-      console.log('width:', settings.width);
-      console.log('height:', settings.height);
-      console.log('frameRate:', settings.frameRate);
-    }
-
-    elements.localVideo.srcObject = stream;
-    elements.localVideo.classList.remove('hidden');
-    elements.btnStartShare.classList.add('hidden');
-    elements.btnStopShare.classList.remove('hidden');
-    elements.hostStatus.textContent = '共享中';
-    elements.hostStatus.classList.remove('waiting');
-
-    // 检查是否有音频轨道
-    const audioTracks = stream.getAudioTracks();
-    if (audioTracks.length > 0) {
-      console.log('Audio track available:', audioTracks[0].label);
-    } else {
-      console.log('No audio track - window may not support system audio');
-    }
-
-    stream.getVideoTracks()[0].onended = () => {
-      stopScreenShare();
-    };
-
-    // 创建房间
-    sendMessage({
-      type: 'create-room',
-      clientId: clientId
-    });
-
-  } catch (error) {
-    console.error('Error starting screen share:', error);
-    if (error.name === 'AbortError') {
-      // 用户取消选择，忽略
-    } else if (error.name === 'NotAllowedError') {
-      showError('请允许屏幕捕获');
-    } else {
-      showError('无法获取屏幕: ' + error.message);
-    }
-  }
-}
-
-// 使用指定PID启动屏幕共享（带音频）
-async function startScreenShareWithAudio(sourceId, audioPid) {
-  try {
-    let stream;
-
-    if (window.isElectron && sourceId) {
-      console.log('Starting share with source:', sourceId, 'audio PID:', audioPid);
-
-      // 获取视频流 - 使用画质设置
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          mandatory: {
-            chromeMediaSource: 'desktop',
-            chromeMediaSourceId: sourceId,
-            width: qualitySettings.width,
-            height: qualitySettings.height,
-            frameRate: qualitySettings.frameRate,
-            maxWidth: qualitySettings.width,
-            maxHeight: qualitySettings.height,
-            maxFrameRate: qualitySettings.frameRate
-          }
-        }
-      });
-
-      // 使用用户选择的PID捕获音频
-      if (audioPid) {
-        try {
-          const audioStream = await captureWindowAudioWithPid(sourceId, audioPid);
-          if (audioStream && audioStream.getAudioTracks().length > 0) {
-            // 合并音视频流
-            audioStream.getAudioTracks().forEach(track => {
-              stream.addTrack(track);
-            });
-            console.log('Audio track added to stream from selected PID:', audioPid);
-          }
-        } catch (audioErr) {
-          console.log('Audio capture failed (non-fatal):', audioErr.message);
-        }
-      }
-
-    } else {
-      throw new Error('无效的屏幕源');
-    }
-
-    localStream = stream;
-
-    // 检查实际视频轨道参数
-    const videoTrack2 = stream.getVideoTracks()[0];
-    if (videoTrack2) {
-      const settings = videoTrack2.getSettings();
-      console.log('=== Video Track Settings ===');
-      console.log('width:', settings.width);
-      console.log('height:', settings.height);
-      console.log('frameRate:', settings.frameRate);
-    }
-
-    elements.localVideo.srcObject = stream;
-    elements.localVideo.classList.remove('hidden');
-    elements.btnStartShare.classList.add('hidden');
-    elements.btnStopShare.classList.remove('hidden');
-    elements.hostStatus.textContent = '共享中';
-    elements.hostStatus.classList.remove('waiting');
-
-    // 检查是否有音频轨道
-    const audioTracks = stream.getAudioTracks();
-    if (audioTracks.length > 0) {
-      console.log('Audio track available:', audioTracks[0].label);
-    } else {
-      console.log('No audio track');
-    }
-
-    stream.getVideoTracks()[0].onended = () => {
-      stopScreenShare();
-    };
-
-    // 创建房间
-    sendMessage({
-      type: 'create-room',
-      clientId: clientId
-    });
-
-  } catch (error) {
-    console.error('Error starting screen share with audio:', error);
-    if (error.name === 'AbortError') {
-      // 用户取消选择，忽略
-    } else if (error.name === 'NotAllowedError') {
-      showError('请允许屏幕捕获');
-    } else {
-      showError('无法获取屏幕: ' + error.message);
-    }
-  }
+  return requireNativeAuthorityOverride('startScreenShareWithSource', startScreenShareWithSource)(sourceId);
 }
 
 // 使用指定PID捕获窗口音频
-async function captureWindowAudioWithPid(_sourceId, pid) {
-  if (!window.electronAPI || !window.electronAPI.audioCapture) {
-    console.log('Audio capture API not available');
-    return null;
-  }
-
-  // 清理之前的音频资源
-  if (audioContext) {
-    audioContext.close().catch(() => {});
-    audioContext = null;
-  }
-  // 调用返回的取消函数
-  if (typeof audioDataHandler === 'function') {
-    audioDataHandler();
-  }
-  audioDataHandler = null;
-  audioQueue = [];
-  isAudioPlaying = false;
-  if (audioTimer) {
-    clearTimeout(audioTimer);
-    audioTimer = null;
-  }
-
-  try {
-    // 检查平台支持
-    const isSupported = await window.electronAPI.audioCapture.isPlatformSupported();
-    console.log('Audio platform supported:', isSupported);
-    if (!isSupported) return null;
-
-    // 检查权限
-    let permission = await window.electronAPI.audioCapture.checkPermission();
-    console.log('Audio permission status:', permission.status);
-
-    if (permission.status !== 'authorized') {
-      permission = await window.electronAPI.audioCapture.requestPermission();
-      console.log('Audio permission after request:', permission.status);
-    }
-
-    if (permission.status !== 'authorized') {
-      console.log('Audio permission denied');
-      return null;
-    }
-
-    // 获取进程列表验证PID有效
-    const processes = await window.electronAPI.audioCapture.getProcessList();
-    const targetProcess = processes.find(p => p.pid === pid);
-
-    if (!targetProcess) {
-      console.log('No audio process found for PID:', pid);
-      return null;
-    }
-
-    console.log('Starting audio capture for:', targetProcess.name, 'PID:', targetProcess.pid);
-
-    // 使用全局 AudioContext
-    audioContext = new AudioContext();
-    console.log('AudioContext state:', audioContext.state);
-
-    // 确保AudioContext处于运行状态
-    if (audioContext.state === 'suspended') {
-      await audioContext.resume();
-      console.log('AudioContext resumed');
-    }
-
-    audioMediaStreamDest = audioContext.createMediaStreamDestination();
-    const audioSyncProfile = getAudioSyncProfile();
-    const targetLeadSec = audioSyncProfile.targetLeadMs / 1000;
-    const scheduleAheadSec = audioSyncProfile.scheduleAheadMs / 1000;
-    const syncToleranceSec = audioSyncProfile.toleranceMs / 1000;
-    let queuedDurationSec = 0;
-    let lastSyncCheckAt = 0;
-    let lastSyncLogAt = 0;
-
-    console.log(
-      'Audio sync profile:',
-      audioSyncProfile.name,
-      'targetLeadMs:',
-      audioSyncProfile.targetLeadMs,
-      'scheduleAheadMs:',
-      audioSyncProfile.scheduleAheadMs
-    );
-
-    const logAudioSync = (message, force = false) => {
-      const now = Date.now();
-      if (!force && now - lastSyncLogAt < 1500) {
-        return;
-      }
-      lastSyncLogAt = now;
-      console.log(message);
-    };
-
-    const ensureAudioLead = (reason) => {
-      const currentTime = audioContext.currentTime;
-      const desiredStartTime = currentTime + targetLeadSec;
-      const currentLeadSec = nextPlayTime - currentTime;
-      const scheduledLeadSec = Math.max(0, currentLeadSec);
-      const effectiveLeadSec = scheduledLeadSec + queuedDurationSec;
-
-      if (!Number.isFinite(nextPlayTime) || nextPlayTime <= 0) {
-        nextPlayTime = desiredStartTime;
-        logAudioSync(`[Audio Sync] initialized lead=${audioSyncProfile.targetLeadMs}ms reason=${reason}`, true);
-        return;
-      }
-
-      if (effectiveLeadSec < targetLeadSec - syncToleranceSec) {
-        nextPlayTime = desiredStartTime;
-        logAudioSync(
-          `[Audio Sync] corrected reason=${reason} lead=${Math.round(scheduledLeadSec * 1000)}ms effective=${Math.round(effectiveLeadSec * 1000)}ms target=${audioSyncProfile.targetLeadMs}ms queue=${Math.round(queuedDurationSec * 1000)}ms`,
-          true
-        );
-      }
-    };
-
-    // 方案：使用队列平滑播放音频
-    let nextPlayTime = 0;
-    const SCHEDULE_AHEAD_TIME = 0.1; // 提前100ms调度
-
-    const processAudioQueue = () => {
-      if (!isAudioPlaying) return;
-
-      const currentTime = audioContext.currentTime;
-      const now = Date.now();
-
-      if (!lastSyncCheckAt || now - lastSyncCheckAt >= audioSyncProfile.checkIntervalMs) {
-        lastSyncCheckAt = now;
-        ensureAudioLead('periodic');
-      }
-
-      // 如果没有下一个播放时间，设置当前时间
-      if (nextPlayTime < currentTime) {
-        nextPlayTime = currentTime + targetLeadSec;
-        logAudioSync(`[Audio Sync] underrun recovered with ${audioSyncProfile.targetLeadMs}ms lead`);
-      }
-
-      // 处理队列中的音频数据
-      while (audioQueue.length > 0 && nextPlayTime < currentTime + scheduleAheadSec) {
-        const audioData = audioQueue.shift();
-        const chunkDurationSec = getAudioChunkDurationSeconds(audioData);
-        queuedDurationSec = Math.max(0, queuedDurationSec - chunkDurationSec);
-
-        try {
-          // 创建 AudioBuffer
-          const sampleCount = audioData.buffer.length / audioData.channels;
-          const audioBuffer = audioContext.createBuffer(audioData.channels, sampleCount, audioData.sampleRate);
-
-          // 复制数据到每个通道
-          for (let channel = 0; channel < audioData.channels; channel++) {
-            const channelData = audioBuffer.getChannelData(channel);
-            for (let i = 0; i < sampleCount; i++) {
-              channelData[i] = audioData.buffer[i * audioData.channels + channel] || 0;
-            }
-          }
-
-          // 创建音频源，只连接到 MediaStreamDestination 用于传输
-          const source = audioContext.createBufferSource();
-          source.buffer = audioBuffer;
-          source.connect(audioMediaStreamDest);
-          // 不连接到 audioContext.destination，避免本地播放
-
-          // 在正确的时间播放
-          source.start(nextPlayTime);
-
-          // 更新下次播放时间
-          nextPlayTime += chunkDurationSec;
-        } catch (e) {
-          console.log('Play error:', e);
-        }
-      }
-
-      // 继续调度
-      if (isAudioPlaying) {
-        audioTimer = setTimeout(processAudioQueue, 25);
-      }
-    };
-
-    // 保存监听器到全局变量（on 返回取消监听函数）
-    audioDataHandler = window.electronAPI.audioCapture.on('audio-data', (audioData) => {
-      if (audioData && audioData.buffer) {
-        audioQueue.push(audioData);
-        queuedDurationSec += getAudioChunkDurationSeconds(audioData);
-      }
-    });
-
-    // 开始捕获
-    await window.electronAPI.audioCapture.startCapture(targetProcess.pid);
-    console.log('Audio capture started');
-
-    // 开始播放
-    isAudioPlaying = true;
-    nextPlayTime = audioContext.currentTime + targetLeadSec;
-    lastSyncCheckAt = Date.now();
-    processAudioQueue();
-
-    // 检查生成的音频轨道
-    const audioTracks = audioMediaStreamDest.stream.getAudioTracks();
-    if (audioTracks.length > 0) {
-      console.log('Audio track created:', audioTracks[0].label, 'sampleRate:', audioTracks[0].getSettings().sampleRate);
-    }
-
-    return audioMediaStreamDest.stream;
-
-  } catch (err) {
-    console.error('Audio capture error:', err);
-    return null;
-  }
+async function startScreenShareWithAudio(sourceId, audioPid) {
+  return requireNativeAuthorityOverride('startScreenShareWithAudio', startScreenShareWithAudio)(sourceId, audioPid);
 }
 
-// Host: 开始屏幕共享（保留兼容性）
 async function startScreenShare() {
-  // 先显示画质设置弹窗
-  elements.qualityModal.classList.remove('hidden');
-}
-
-// Host: 停止屏幕共享
-function stopScreenShare() {
-  // 停止音频捕获并清理资源
-  if (window.electronAPI && window.electronAPI.audioCapture) {
-    window.electronAPI.audioCapture.stopCapture().catch(() => {});
-  }
-
-  // 移除音频数据监听器（调用取消函数）
-  if (typeof audioDataHandler === 'function') {
-    audioDataHandler();
-  }
-  audioDataHandler = null;
-
-  // 停止音频队列处理定时器
-  isAudioPlaying = false;
-  if (audioTimer) {
-    clearTimeout(audioTimer);
-    audioTimer = null;
-  }
-  audioQueue = [];
-
-  // 关闭 AudioContext
-  if (audioContext) {
-    audioContext.close().catch(() => {});
-    audioContext = null;
-  }
-  audioMediaStreamDest = null;
-
-  if (localStream) {
-    localStream.getTracks().forEach(track => track.stop());
-    localStream = null;
-  }
-
-  // 清理 Host 状态
-  peerConnections.forEach((pc) => {
-    pc.close();
-  });
-  peerConnections.clear();
-
-  if (currentRoomId && sessionRole === 'host') {
-    sendMessage({
-      type: 'leave-room',
-      roomId: currentRoomId,
-      clientId: clientId
-    }, { queueIfDisconnected: false });
-  }
-
-  sessionRole = null;
-  currentRoomId = null;
-  hostId = null;
-  elements.roomInfo.classList.add('hidden');
-  elements.viewerCount.textContent = '0';
-
-  elements.localVideo.srcObject = null;
-  elements.localVideo.classList.add('hidden');
-  elements.btnStartShare.classList.remove('hidden');
-  elements.btnStopShare.classList.add('hidden');
-  elements.hostStatus.textContent = '准备就绪';
+  await openQualityModal();
 }
 
 // Viewer: 加入房间
@@ -2359,7 +2037,7 @@ function joinRoom() {
 }
 
 // Viewer: 离开房间
-function leaveRoom() {
+async function leaveRoom() {
   sendMessage({
     type: 'leave-room',
     roomId: currentRoomId,
@@ -2367,53 +2045,7 @@ function leaveRoom() {
   }, { queueIfDisconnected: false });
 
   // resetViewerState 会清理 peerConnections
-  resetViewerState();
-}
-
-// 重置Viewer状态
-function resetViewerState() {
-  currentRoomId = null;
-  sessionRole = null;
-  hostId = null;
-  myChainPosition = -1;
-  viewerReadySent = false;
-  videoStarted = false;
-  upstreamConnected = false;
-  relayPc = null;
-  relayStream = null;
-
-  // 清理音频资源
-  isAudioPlaying = false;
-  if (audioTimer) {
-    clearTimeout(audioTimer);
-    audioTimer = null;
-  }
-  audioQueue = [];
-
-  if (audioContext) {
-    audioContext.close().catch(() => {});
-    audioContext = null;
-  }
-  audioMediaStreamDest = null;
-  // 调用返回的取消函数
-  if (typeof audioDataHandler === 'function') {
-    audioDataHandler();
-  }
-  audioDataHandler = null;
-
-  // 清理连接
-  peerConnections.forEach((pc) => {
-    pc.close();
-  });
-  peerConnections.clear();
-
-  elements.joinForm.classList.remove('hidden');
-  elements.viewerStatus.classList.add('hidden');
-  elements.btnLeave.classList.add('hidden');
-  elements.remoteVideo.srcObject = null;
-  elements.waitingMessage.classList.remove('hidden');
-  elements.connectionStatus.textContent = '等待连接...';
-  elements.connectionStatus.classList.remove('connected');
+  await resetViewerState();
 }
 
 // 更新观众数量
@@ -2430,10 +2062,9 @@ function updateViewerCount(viewerId, leftPosition) {
   countElement.textContent = count;
 }
 
-// 复制房间号
 function copyRoomId() {
   navigator.clipboard.writeText(currentRoomId).then(() => {
-    showError('房间号已复制');
+    showError('Room ID copied');
   });
 }
 
@@ -2446,498 +2077,19 @@ function showError(message) {
   }, 3000);
 }
 
-// ========== WebRTC 核心逻辑 ==========
-
-// 创建PeerConnection
-function legacyCreatePeerConnection(peerId, _isInitiator) {
-  const pc = new RTCPeerConnection(config);
-
-  // ICE收集状态监听
-  pc.onicegatheringstatechange = () => {
-    console.log('ICE gathering state:', pc.iceGatheringState, 'peerId:', peerId);
-  };
-
-  pc.onicecandidate = (event) => {
-    // 等待remote description设置完成后再发送ICE候选
-    if (event.candidate && pc.remoteDescription && pc.remoteDescription.type) {
-      console.log('Sending ICE candidate to', peerId);
-      sendMessage({
-        type: 'ice-candidate',
-        targetId: peerId,
-        candidate: event.candidate,
-        roomId: currentRoomId
-      });
-    }
-  };
-
-  pc.ontrack = (event) => {
-    console.log('Received track from', peerId);
-    const [stream] = event.streams;
-
-    console.log('Stream tracks:', stream.getTracks().map(t => t.kind));
-    console.log('Video tracks:', stream.getVideoTracks().length);
-    console.log('Audio tracks:', stream.getAudioTracks().length);
-
-    if (stream.getVideoTracks().length > 0) {
-      const videoTrack = stream.getVideoTracks()[0];
-      console.log('Video track enabled:', videoTrack.enabled);
-      console.log('Video track readyState:', videoTrack.readyState);
-    }
-
-    // 如果已经连接到上游，再收到新连接就是转发连接
-    const isRelayConnection = (upstreamConnected && !isHost);
-    if (isRelayConnection) {
-      console.log('Relay connection track received, only forwarding');
-      // 更新relayStream用于转发
-      relayStream = stream;
-      // 添加轨道到转发PC
-      if (relayPc && relayPc !== pc) {
-        const existingSenders = relayPc.getSenders();
-        stream.getTracks().forEach(track => {
-          const alreadyAdded = existingSenders.some(s => s.track === track);
-          if (!alreadyAdded) {
-            console.log('Adding track to relay PC:', track.kind);
-            relayPc.addTrack(track, stream);
-          }
-        });
-        // 设置转发码率
-        setVideoBitrate(relayPc).catch(err => console.log('Set bitrate error:', err));
-      }
-      return; // 转发连接不更新UI，不重复处理音频
-    }
-
-    // 主连接（Host）的处理逻辑
-    // 保存收到的流用于转发
-    relayStream = stream;
-
-    // 如果有转发PC，添加track（防重复）
-    if (relayPc) {
-      const existingSenders = relayPc.getSenders();
-      stream.getTracks().forEach(track => {
-        const alreadyAdded = existingSenders.some(s => s.track === track);
-        if (!alreadyAdded) {
-          console.log('Adding track to relay PC:', track.kind);
-          relayPc.addTrack(track, stream);
-        }
-      });
-      // 设置转发码率
-      setVideoBitrate(relayPc);
-    }
-
-    // 显示视频（只播放一次）
-    if (!videoStarted && stream.getVideoTracks().length > 0) {
-      videoStarted = true;
-      upstreamConnected = true; // 标记已连接到上游
-      elements.remoteVideo.srcObject = stream;
-      elements.remoteVideo.play().then(() => {
-        console.log('Video playing successfully');
-      }).catch(e => console.log('Play error:', e));
-      elements.waitingMessage.classList.add('hidden');
-      elements.connectionStatus.textContent = '已连接';
-      elements.connectionStatus.classList.add('connected');
-    }
-
-    // 如果是观众且收到视频，需要作为Relay转发给下一个（只发一次）
-    if (!isHost && myChainPosition >= 0 && !viewerReadySent) {
-      viewerReadySent = true;
-      // 通知服务器我已收到视频，可以开始转发
-      sendMessage({
-        type: 'viewer-ready',
-        roomId: currentRoomId,
-        clientId: clientId,
-        chainPosition: myChainPosition
-      });
-    }
-  };
-
-  pc.onconnectionstatechange = () => {
-    console.log('Connection state:', pc.connectionState, 'peerId:', peerId, 'ICE:', pc.iceGatheringState);
-    // 只更新主连接（Host）的状态，不更新转发连接的状态
-    // 转发连接的peerId是下一个观众的ID，不影响连接状态显示
-    const isHostConnection = (peerId === hostId);
-    if (isHostConnection) {
-      if (pc.connectionState === 'connected') {
-        console.log('WebRTC connected with', peerId);
-        elements.connectionStatus.textContent = '已连接';
-        elements.connectionStatus.classList.add('connected');
-        // 启动统计日志
-        startStatsLogging(pc, isHost ? 'Host->Viewer' : 'Viewer->Upstream');
-      } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        console.log('WebRTC connection failed:', pc.connectionState);
-        elements.connectionStatus.textContent = '连接失败';
-        elements.connectionStatus.classList.remove('connected');
-        stopStatsLogging();
-      }
-    }
-  };
-
-  peerConnections.set(peerId, pc);
-  return pc;
-}
-
-// 设置视频码率
-function createPeerConnection(peerId, _isInitiator) {
-  const pc = new RTCPeerConnection(config);
-
-  pc.onicegatheringstatechange = () => {
-    console.log('ICE gathering state:', pc.iceGatheringState, 'peerId:', peerId);
-  };
-
-  pc.onicecandidate = (event) => {
-    if (!event.candidate) {
-      return;
-    }
-
-    console.log('Sending ICE candidate to', peerId);
-    sendMessage({
-      type: 'ice-candidate',
-      targetId: peerId,
-      candidate: event.candidate,
-      roomId: currentRoomId
-    });
-  };
-
-  pc.onicecandidateerror = (event) => {
-    console.log('ICE candidate error:', peerId, event.errorText || event.errorCode);
-  };
-
-  pc.ontrack = (event) => {
-    console.log('Received track from', peerId);
-    const [stream] = event.streams;
-
-    if (!stream) {
-      return;
-    }
-
-    console.log('Stream tracks:', stream.getTracks().map((track) => track.kind));
-
-    const isRelayConnection = upstreamConnected && !isHost;
-    if (isRelayConnection) {
-      relayStream = stream;
-      if (relayPc && relayPc !== pc) {
-        const existingSenders = relayPc.getSenders();
-        stream.getTracks().forEach((track) => {
-          const alreadyAdded = existingSenders.some((sender) => sender.track === track);
-          if (!alreadyAdded) {
-            relayPc.addTrack(track, stream);
-          }
-        });
-        setVideoBitrate(relayPc).catch((error) => console.log('Set bitrate error:', error));
-      }
-      return;
-    }
-
-    relayStream = stream;
-
-    if (relayPc) {
-      const existingSenders = relayPc.getSenders();
-      stream.getTracks().forEach((track) => {
-        const alreadyAdded = existingSenders.some((sender) => sender.track === track);
-        if (!alreadyAdded) {
-          relayPc.addTrack(track, stream);
-        }
-      });
-      setVideoBitrate(relayPc).catch((error) => console.log('Set bitrate error:', error));
-    }
-
-    if (!videoStarted && stream.getVideoTracks().length > 0) {
-      videoStarted = true;
-      upstreamConnected = true;
-      elements.remoteVideo.srcObject = stream;
-      elements.remoteVideo.play().catch((error) => console.log('Play error:', error));
-      elements.waitingMessage.classList.add('hidden');
-      elements.connectionStatus.textContent = '已连接';
-      elements.connectionStatus.classList.add('connected');
-    }
-
-    if (!isHost && myChainPosition >= 0 && !viewerReadySent) {
-      viewerReadySent = true;
-      sendMessage({
-        type: 'viewer-ready',
-        roomId: currentRoomId,
-        clientId: clientId,
-        chainPosition: myChainPosition
-      });
-    }
-  };
-
-  pc.onconnectionstatechange = () => {
-    console.log('Connection state:', pc.connectionState, 'peerId:', peerId, 'ICE:', pc.iceGatheringState);
-
-    const isUpstreamConnection = peerId === hostId;
-    if (!isUpstreamConnection) {
-      return;
-    }
-
-    if (pc.connectionState === 'connected') {
-      elements.connectionStatus.textContent = '已连接';
-      elements.connectionStatus.classList.add('connected');
-      startStatsLogging(pc, isHost ? 'Host->Viewer' : 'Viewer->Upstream');
-      return;
-    }
-
-    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-      elements.connectionStatus.textContent = '连接失败';
-      elements.connectionStatus.classList.remove('connected');
-      stopStatsLogging();
-    }
-  };
-
-  peerConnections.set(peerId, pc);
-  return pc;
-}
-
-async function setVideoBitrate(pc) {
-  const senders = pc.getSenders();
-  const videoSender = senders.find(s => s.track && s.track.kind === 'video');
-
-  if (videoSender) {
-    const parameters = videoSender.getParameters();
-    if (!parameters.encodings) {
-      parameters.encodings = [{}];
-    }
-    // 使用画质设置中的码率 (kbps -> bps)
-    parameters.encodings[0].maxBitrate = qualitySettings.bitrate * 1000;
-    parameters.encodings[0].maxFramerate = qualitySettings.frameRate;
-
-    console.log('Setting video bitrate:', qualitySettings.bitrate * 1000, 'bps, framerate:', qualitySettings.frameRate);
-
-    try {
-      await videoSender.setParameters(parameters);
-      console.log('Video parameters set successfully');
-    } catch (err) {
-      console.log('Failed to set video parameters:', err);
-    }
-  } else {
-    console.log('No video sender found in setVideoBitrate');
-  }
-}
-
-// 强制使用H.264编码（修改SDP）
-function preferH264Codec(sdp) {
-  // 查找m=video行中的H.264格式
-  const videoLineMatch = sdp.match(/m=video (\d+) RTP\/AVP ([^\r\n]+)/);
-  if (!videoLineMatch) return sdp;
-
-  const mediaPort = videoLineMatch[1];
-  const existingPayloads = videoLineMatch[2].trim().split(' ');
-
-  // 查找H.264的payload type
-  let h264Pt = null;
-  const h264Regex = /a=rtpmap:(\d+) H264\/90000/i;
-  const lines = sdp.split('\n');
-  for (const line of lines) {
-    const match = line.match(h264Regex);
-    if (match) {
-      // 检查是否是High Profile
-      if (line.includes('packetization-mode=1') && line.includes('profile-level-id')) {
-        h264Pt = match[1];
-        break;
-      }
-    }
-  }
-
-  if (!h264Pt) {
-    console.log('H.264 codec not found in SDP');
-    return sdp;
-  }
-
-  console.log('Found H.264 payload type:', h264Pt);
-
-  // 将H.264移到最前面
-  const otherPayloads = existingPayloads.filter(pt => pt !== h264Pt);
-  const newPayloads = [h264Pt, ...otherPayloads].join(' ');
-
-  // 替换m=video行
-  sdp = sdp.replace(
-    /m=video \d+ RTP\/AVP [^\r\n]+/,
-    `m=video ${mediaPort} RTP/AVP ${newPayloads}`
-  );
-
-  return sdp;
-}
-
-// 强制使用AV1编码（修改SDP）
-function preferAV1Codec(sdp) {
-  // 查找m=video行中的AV1格式
-  const videoLineMatch = sdp.match(/m=video (\d+) RTP\/AVP ([^\r\n]+)/);
-  if (!videoLineMatch) return sdp;
-
-  const mediaPort = videoLineMatch[1];
-  const existingPayloads = videoLineMatch[2].trim().split(' ');
-
-  // 查找AV1的payload type
-  let av1Pt = null;
-  const av1Regex = /a=rtpmap:(\d+) AV1\/90000/i;
-  const lines = sdp.split('\n');
-  for (const line of lines) {
-    const match = line.match(av1Regex);
-    if (match) {
-      av1Pt = match[1];
-      break;
-    }
-  }
-
-  if (!av1Pt) {
-    console.log('AV1 codec not found in SDP');
-    return sdp;
-  }
-
-  console.log('Found AV1 payload type:', av1Pt);
-
-  // 将AV1移到最前面
-  const otherPayloads = existingPayloads.filter(pt => pt !== av1Pt);
-  const newPayloads = [av1Pt, ...otherPayloads].join(' ');
-
-  // 替换m=video行
-  sdp = sdp.replace(
-    /m=video \d+ RTP\/AVP [^\r\n]+/,
-    `m=video ${mediaPort} RTP/AVP ${newPayloads}`
-  );
-
-  return sdp;
-}
-
-// 设置编码偏好（通用函数）
-function setCodecPreferencesForPC(pc) {
-  const codec = qualitySettings.codecPreference;
-  if (codec === 'none') return;
-
-  try {
-    const videoCapabilities = RTCRtpSender.getCapabilities('video');
-    if (!videoCapabilities || !Array.isArray(videoCapabilities.codecs)) {
-      console.log('Video capabilities unavailable for codec preference');
-      return;
-    }
-
-    let allCodecs = videoCapabilities.codecs;
-    let preferredCodecs = [];
-    const capabilitySummary = allCodecs.map((entry) => ({
-      mimeType: entry.mimeType,
-      sdpFmtpLine: entry.sdpFmtpLine || '',
-      clockRate: entry.clockRate
-    }));
-    console.log('Video codec capabilities:', capabilitySummary);
-
-    // 根据配置构建偏好列表
-    if (codec === 'av1') {
-      const av1Codecs = allCodecs.filter(c => c.mimeType.toLowerCase() === 'video/av1');
-      if (av1Codecs.length > 0) {
-        console.log('AV1 codec available, will prefer it');
-        preferredCodecs = preferredCodecs.concat(av1Codecs);
-      } else {
-        console.log('AV1 codec not available');
-      }
-    }
-    if (codec === 'h264') {
-      const h264Codecs = allCodecs.filter(c => c.mimeType.toLowerCase() === 'video/h264');
-      if (h264Codecs.length > 0) {
-        console.log('H.264 codec available, will prefer it');
-        preferredCodecs = preferredCodecs.concat(h264Codecs);
-      } else {
-        console.log('H.264 codec not available');
-      }
-    }
-
-    // 如果没有强制任何编码器，则使用全部（保持默认顺序）
-    if (preferredCodecs.length === 0) {
-      console.log('No specific codec preference, using default');
-      return;
-    } else {
-      // 将其他未列出的编码器也添加进去，确保协商不会失败
-      const otherCodecs = allCodecs.filter(c => !preferredCodecs.includes(c));
-      preferredCodecs = preferredCodecs.concat(otherCodecs);
-    }
-
-    // 应用到所有video transceiver
-    pc.getTransceivers().forEach(t => {
-      if (t.sender && t.sender.track && t.sender.track.kind === 'video') {
-        t.setCodecPreferences(preferredCodecs);
-      }
-    });
-    console.log(
-      'Applied codec preference order:',
-      preferredCodecs.map((entry) => `${entry.mimeType}${entry.sdpFmtpLine ? ` (${entry.sdpFmtpLine})` : ''}`)
-    );
-  } catch (err) {
-    console.log('Failed to set codec preferences:', err);
-  }
-}
-
-// WebRTC 统计日志
-let statsInterval = null;
-
-async function logWebRTCStats(pc, label) {
-  if (!pc || pc.connectionState !== 'connected') return;
-
-  try {
-    const stats = await pc.getStats();
-    let output = `\n=== WebRTC Stats [${label}] ===`;
-
-    stats.forEach(report => {
-      if (report.type === 'inbound-rtp' && report.kind === 'video') {
-        const codec = report.codecId ? stats.get(report.codecId) : null;
-        output += `\n[Inbound Video]
-  framesDecoded: ${report.framesDecoded || 0}
-  framesDropped: ${report.framesDropped || 0}
-  framesReceived: ${report.framesReceived || 0}
-  packetsLost: ${report.packetsLost || 0}
-  bytesReceived: ${report.bytesReceived || 0}
-  jitter: ${report.jitter || 0}ms
-  roundTripTime: ${report.roundTripTime || 0}ms
-  decoderImplementation: ${report.decoderImplementation || 'unknown'}
-  powerEfficientDecoder: ${report.powerEfficientDecoder ?? 'unknown'}
-  codec: ${codec ? codec.mimeType : 'unknown'}`;
-      }
-
-      if (report.type === 'outbound-rtp' && report.kind === 'video') {
-        const codec = report.codecId ? stats.get(report.codecId) : null;
-        output += `\n[Outbound Video]
-  framesEncoded: ${report.framesEncoded || 0}
-  packetsSent: ${report.packetsSent || 0}
-  bytesSent: ${report.bytesSent || 0}
-  targetBitrate: ${report.targetBitrate || 0}
-  encoderBitrate: ${report.encoderBitrate || 0}
-  encoderImplementation: ${report.encoderImplementation || 'unknown'}
-  powerEfficientEncoder: ${report.powerEfficientEncoder ?? 'unknown'}
-  codec: ${codec ? codec.mimeType : 'unknown'}`;
-      }
-
-      if (report.type === 'codec' && report.mimeType && report.mimeType.includes('video')) {
-        output += `\n[Codec]
-  mimeType: ${report.mimeType}
-  clockRate: ${report.clockRate}
-  channels: ${report.channels}`;
-      }
-
-      if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-        const localCandidate = stats.get(report.localCandidateId);
-        const remoteCandidate = stats.get(report.remoteCandidateId);
-        output += `\n[Candidate Pair]
-  rtt: ${report.currentRoundTripTime ? report.currentRoundTripTime * 1000 : 0}ms
-  availableOutgoingBitrate: ${report.availableOutgoingBitrate || 0}
-  localCandidate: ${localCandidate ? `${localCandidate.candidateType}/${localCandidate.protocol || 'unknown'}` : 'unknown'}
-  remoteCandidate: ${remoteCandidate ? `${remoteCandidate.candidateType}/${remoteCandidate.protocol || 'unknown'}` : 'unknown'}`;
-      }
-    });
-
-    console.log(output);
-  } catch (err) {
-    console.log('Stats error:', err);
-  }
-}
+// Native mainline only
 
 // 版本检查和自动更新
-let currentVersion = '1.5.0'; // 默认版本（Electron环境会动态获取）
+let currentVersion = '1.5.3'; // 默认版本（Electron环境会动态获取）
 
 // 初始化版本号（从 Electron app 获取）
 async function initVersion() {
   if (window.electronAPI && window.electronAPI.getAppVersion) {
     try {
       currentVersion = await window.electronAPI.getAppVersion();
-      console.log('App version:', currentVersion);
+      debugLog('misc', 'App version:', currentVersion);
     } catch (err) {
-      console.log('Failed to get app version:', err);
+      debugLog('misc', 'Failed to get app version:', err);
     }
   }
 }
@@ -2967,480 +2119,6 @@ function formatTime(ms) {
   }
 }
 
-async function legacyCheckForUpdates() {
-  return checkForUpdates();
-}
-
-
-function startStatsLogging(pc, label) {
-  if (statsInterval) clearInterval(statsInterval);
-
-  statsInterval = setInterval(() => {
-    logWebRTCStats(pc, label);
-  }, 3000);
-}
-
-function stopStatsLogging() {
-  if (statsInterval) {
-    clearInterval(statsInterval);
-    statsInterval = null;
-  }
-}
-
-// Host: 创建offer给观众
-async function legacyCreateOffer(viewerId) {
-  console.log('Host: createOffer for viewerId =', viewerId);
-  const pc = createPeerConnection(viewerId, true);
-
-  // 监听连接状态变化
-  pc.onconnectionstatechange = () => {
-    console.log(`Connection state [Host->${viewerId}]:`, pc.connectionState);
-    if (pc.connectionState === 'connected') {
-      startStatsLogging(pc, `Host->Viewer(${viewerId.substr(0, 8)})`);
-    }
-  };
-
-  if (localStream) {
-    localStream.getTracks().forEach(track => {
-      pc.addTrack(track, localStream);
-    });
-  }
-
-  // 设置编码器偏好
-  setCodecPreferencesForPC(pc);
-
-  const offer = await pc.createOffer();
-
-  // 在SDP中设置带宽限制
-  let sdp = offer.sdp;
-  // 添加 b=AS (Application Specific) 带宽限制
-  // 如果指定了编码偏好，修改SDP
-  if (qualitySettings.codecPreference === 'h264') {
-    sdp = preferH264Codec(sdp);
-  } else if (qualitySettings.codecPreference === 'av1') {
-    sdp = preferAV1Codec(sdp);
-  }
-
-  const modifiedOffer = {
-    type: offer.type,
-    sdp: sdp
-  };
-  await pc.setLocalDescription(modifiedOffer);
-
-  // 设置视频码率和帧率（在连接建立后）
-  await setVideoBitrate(pc);
-
-  // 等待至少3个ICE候选后再发送offer（加快连接速度）
-  let candidateCount = 0;
-  const candidatePromise = new Promise(resolve => {
-    const checkCandidate = (event) => {
-      if (event.candidate) {
-        candidateCount++;
-        console.log('ICE candidate #' + candidateCount + ' for', viewerId);
-        if (candidateCount >= 2) {
-          pc.removeEventListener('icecandidate', checkCandidate);
-          resolve();
-        }
-      }
-    };
-    pc.addEventListener('icecandidate', checkCandidate);
-  });
-
-  // 同时监听ICE收集完成，作为后备
-  const gatherPromise = new Promise(resolve => {
-    const checkState = () => {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', checkState);
-        resolve();
-      }
-    };
-    pc.addEventListener('icegatheringstatechange', checkState);
-  });
-
-  // 任一条件满足就继续
-  await Promise.race([candidatePromise, gatherPromise]);
-  console.log('ICE candidates ready (' + candidateCount + '), sending offer');
-
-  sendMessage({
-    type: 'offer',
-    targetId: viewerId,
-    sdp: pc.localDescription,
-    roomId: currentRoomId
-  });
-}
-
-// 观众: 连接到下一个观众（作为Relay）
-async function legacyCreateOfferToNextViewer(nextViewerId) {
-  // 防止重复创建
-  if (peerConnections.has(nextViewerId)) {
-    console.log('Already connected to', nextViewerId);
-    return;
-  }
-
-  // 等待 relayStream 可用（最多等 10 秒）
-  const maxWait = 10000;
-  const startTime = Date.now();
-  while (!relayStream && Date.now() - startTime < maxWait) {
-  console.log('Waiting for relayStream...');
-    await new Promise(resolve => setTimeout(resolve, 200));
-  }
-
-  if (!relayStream) {
-    console.error('Timeout waiting for relayStream, cannot create offer');
-    showError('无法建立转发连接：等待视频流超时');
-    return;
-  }
-
-  console.log('Relay stream available, creating offer');
-
-  const pc = createPeerConnection(nextViewerId, true);
-  relayPc = pc; // 保存转发PC的引用
-
-  // 监听连接状态变化
-  pc.onconnectionstatechange = () => {
-    console.log(`Connection state [Relay->${nextViewerId}]:`, pc.connectionState);
-    if (pc.connectionState === 'connected') {
-      startStatsLogging(pc, `Viewer->NextViewer(${nextViewerId.substr(0, 8)})`);
-    }
-  };
-
-  // 如果已经收到了视频流，先添加track
-  if (relayStream) {
-    console.log('Adding track to relay PC BEFORE offer');
-    relayStream.getTracks().forEach(track => {
-      pc.addTrack(track, relayStream);
-    });
-    // 设置视频码率
-    await setVideoBitrate(pc);
-  } else {
-    console.log('No relay stream yet, will add later');
-  }
-
-  // 设置编码器偏好
-  setCodecPreferencesForPC(pc);
-
-  const offer = await pc.createOffer();
-
-  // 在SDP中设置带宽限制
-  let sdp = offer.sdp;
-  // 如果指定了编码偏好，修改SDP
-  if (qualitySettings.codecPreference === 'h264') {
-    sdp = preferH264Codec(sdp);
-  } else if (qualitySettings.codecPreference === 'av1') {
-    sdp = preferAV1Codec(sdp);
-  }
-
-  const modifiedOffer = {
-    type: offer.type,
-    sdp: sdp
-  };
-  await pc.setLocalDescription(modifiedOffer);
-
-  // 在连接建立后再次设置码率
-  await setVideoBitrate(pc);
-
-  // 等待至少3个ICE候选后再发送offer
-  let candidateCount = 0;
-  const candidatePromise = new Promise(resolve => {
-    const checkCandidate = (event) => {
-      if (event.candidate) {
-        candidateCount++;
-        console.log('Relay ICE candidate #' + candidateCount + ' for', nextViewerId);
-        if (candidateCount >= 2) {
-          pc.removeEventListener('icecandidate', checkCandidate);
-          resolve();
-        }
-      }
-    };
-    pc.addEventListener('icecandidate', checkCandidate);
-  });
-
-  const gatherPromise = new Promise(resolve => {
-    const checkState = () => {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', checkState);
-        resolve();
-      }
-    };
-    pc.addEventListener('icegatheringstatechange', checkState);
-  });
-
-  await Promise.race([candidatePromise, gatherPromise]);
-  console.log('Relay ICE candidates ready (' + candidateCount + '), sending offer');
-
-  sendMessage({
-    type: 'offer',
-    targetId: nextViewerId,
-    sdp: pc.localDescription,
-    roomId: currentRoomId,
-    isRelay: true
-  });
-}
-
-// 收到offer
-async function legacyHandleOffer(data) {
-  const fromId = data.fromClientId;
-  console.log('Viewer: received offer from', fromId);
-  const pc = createPeerConnection(fromId, false);
-
-  // createPeerConnection already sets up ontrack handler
-
-  await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-
-  // 等待至少3个ICE候选后再发送answer
-  let candidateCount = 0;
-  const candidatePromise = new Promise(resolve => {
-    const checkCandidate = (event) => {
-      if (event.candidate) {
-        candidateCount++;
-        console.log('Viewer ICE candidate #' + candidateCount + ' for', fromId);
-        if (candidateCount >= 2) {
-          pc.removeEventListener('icecandidate', checkCandidate);
-          resolve();
-        }
-      }
-    };
-    pc.addEventListener('icecandidate', checkCandidate);
-  });
-
-  const gatherPromise = new Promise(resolve => {
-    const checkState = () => {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', checkState);
-        resolve();
-      }
-    };
-    pc.addEventListener('icegatheringstatechange', checkState);
-  });
-
-  await Promise.race([candidatePromise, gatherPromise]);
-  console.log('Viewer ICE candidates ready (' + candidateCount + '), sending answer');
-
-  console.log('Viewer: sending answer to', fromId);
-  sendMessage({
-    type: 'answer',
-    targetId: fromId,
-    sdp: pc.localDescription,
-    roomId: currentRoomId
-  });
-}
-
-// 收到answer
-async function legacyHandleAnswer(data) {
-  console.log('handleAnswer: targetId =', data.targetId, ', fromClientId =', data.fromClientId);
-  console.log('peerConnections keys:', [...peerConnections.keys()]);
-  // 使用fromClientId查找PC（服务器会设置这个为发送者的ID）
-  const pc = peerConnections.get(data.fromClientId) || peerConnections.get(data.targetId);
-  console.log('handleAnswer: pc found =', !!pc);
-  if (pc) {
-    await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-    console.log('Remote description set');
-    // track添加已在createOfferToNextViewer中处理
-  } else {
-    console.log('ERROR: PC not found');
-  }
-}
-
-// 收到ICE候选
-async function legacyHandleIceCandidate(data) {
-  // 使用 fromClientId 来查找对应的PeerConnection
-  console.log('Received ICE candidate from', data.fromClientId);
-  const pc = peerConnections.get(data.fromClientId);
-  if (pc && data.candidate) {
-    // 等待remote description设置完成后再添加ICE候选
-    if (!pc.remoteDescription || !pc.remoteDescription.type) {
-      console.log('Remote description not set yet, will retry...');
-      // 延迟重试
-      setTimeout(async () => {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-          console.log('ICE candidate added (retry)');
-        } catch (error) {
-          console.error('Error adding ICE candidate (retry):', error);
-        }
-      }, 100);
-      return;
-    }
-    try {
-      await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-      console.log('ICE candidate added successfully');
-    } catch (error) {
-      console.error('Error adding ICE candidate:', error);
-    }
-  } else {
-    console.log('PeerConnection not found for', data.fromClientId);
-  }
-}
-
-async function createOffer(viewerId) {
-  console.log('Host: createOffer for viewerId =', viewerId);
-  const pc = createPeerConnection(viewerId, true);
-
-  pc.addEventListener('connectionstatechange', () => {
-    console.log(`Connection state [Host->${viewerId}]:`, pc.connectionState);
-    if (pc.connectionState === 'connected') {
-      startStatsLogging(pc, `Host->Viewer(${viewerId.substr(0, 8)})`);
-    }
-  });
-
-  if (localStream) {
-    localStream.getTracks().forEach((track) => {
-      pc.addTrack(track, localStream);
-    });
-  }
-
-  setCodecPreferencesForPC(pc);
-
-  const offer = await pc.createOffer();
-  let sdp = offer.sdp;
-
-  if (qualitySettings.codecPreference === 'h264') {
-    sdp = preferH264Codec(sdp);
-  } else if (qualitySettings.codecPreference === 'av1') {
-    sdp = preferAV1Codec(sdp);
-  }
-
-  await pc.setLocalDescription({
-    type: offer.type,
-    sdp: sdp
-  });
-
-  await setVideoBitrate(pc);
-
-  sendMessage({
-    type: 'offer',
-    targetId: viewerId,
-    sdp: pc.localDescription,
-    roomId: currentRoomId
-  });
-}
-
-async function createOfferToNextViewer(nextViewerId) {
-  if (peerConnections.has(nextViewerId)) {
-    console.log('Already connected to', nextViewerId);
-    return;
-  }
-
-  const maxWait = 10000;
-  const startTime = Date.now();
-  while (!relayStream && Date.now() - startTime < maxWait) {
-  console.log('Waiting for relayStream...');
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
-
-  if (!relayStream) {
-    console.error('Timeout waiting for relayStream, cannot create offer');
-    showError('无法建立转发连接：等待视频流超时');
-    return;
-  }
-
-  const pc = createPeerConnection(nextViewerId, true);
-  relayPc = pc;
-
-  pc.addEventListener('connectionstatechange', () => {
-    console.log(`Connection state [Relay->${nextViewerId}]:`, pc.connectionState);
-    if (pc.connectionState === 'connected') {
-      startStatsLogging(pc, `Viewer->NextViewer(${nextViewerId.substr(0, 8)})`);
-    }
-  });
-
-  relayStream.getTracks().forEach((track) => {
-    pc.addTrack(track, relayStream);
-  });
-
-  setCodecPreferencesForPC(pc);
-
-  const offer = await pc.createOffer();
-  let sdp = offer.sdp;
-
-  if (qualitySettings.codecPreference === 'h264') {
-    sdp = preferH264Codec(sdp);
-  } else if (qualitySettings.codecPreference === 'av1') {
-    sdp = preferAV1Codec(sdp);
-  }
-
-  await pc.setLocalDescription({
-    type: offer.type,
-    sdp: sdp
-  });
-
-  await setVideoBitrate(pc);
-
-  sendMessage({
-    type: 'offer',
-    targetId: nextViewerId,
-    sdp: pc.localDescription,
-    roomId: currentRoomId,
-    isRelay: true
-  });
-}
-
-async function handleOffer(data) {
-  const fromId = data.fromClientId;
-  console.log('Viewer: received offer from', fromId);
-
-  const pc = createPeerConnection(fromId, false);
-  await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-  await flushRemoteCandidates(fromId, pc);
-
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-
-  sendMessage({
-    type: 'answer',
-    targetId: fromId,
-    sdp: pc.localDescription,
-    roomId: currentRoomId
-  });
-}
-
-async function handleAnswer(data) {
-  const fromId = data.fromClientId || data.targetId;
-  console.log('handleAnswer: targetId =', data.targetId, ', fromClientId =', data.fromClientId);
-
-  const pc = peerConnections.get(fromId) || peerConnections.get(data.targetId);
-  if (!pc) {
-    console.log('ERROR: PC not found');
-    return;
-  }
-
-  await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-  await flushRemoteCandidates(fromId, pc);
-  console.log('Remote description set');
-}
-
-async function handleIceCandidate(data) {
-  const peerId = data.fromClientId;
-  console.log('Received ICE candidate from', peerId);
-
-  if (!data.candidate) {
-    return;
-  }
-
-  const pc = peerConnections.get(peerId);
-  if (!pc) {
-    queueRemoteCandidate(peerId, data.candidate);
-    console.log('PeerConnection not found yet, candidate queued for', peerId);
-    return;
-  }
-
-  if (!pc.remoteDescription || !pc.remoteDescription.type) {
-    queueRemoteCandidate(peerId, data.candidate);
-    console.log('Remote description not set yet, candidate queued for', peerId);
-    return;
-  }
-
-  try {
-    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-    console.log('ICE candidate added successfully');
-  } catch (error) {
-    console.error('Error adding ICE candidate:', error);
-  }
-}
-
 async function checkForUpdates() {
   if (!window.electronAPI || !window.electronAPI.checkForUpdates) {
     return null;
@@ -3458,7 +2136,7 @@ async function checkForUpdates() {
       timeText: '正在请求更新元数据'
     });
 
-    console.log('Checking for updates...');
+    debugLog('update', 'Checking for updates...');
     const result = await window.electronAPI.checkForUpdates();
 
     if (result && result.devMode) {
@@ -3467,7 +2145,7 @@ async function checkForUpdates() {
 
     return result;
   } catch (error) {
-    console.log('Update check failed:', error.message);
+    debugLog('update', 'Update check failed:', error.message);
     applyUpdateStatus({
       status: 'error',
       currentVersion,
@@ -3478,138 +2156,11 @@ async function checkForUpdates() {
   }
 }
 
-
-async function attemptIceRestart(peerId, meta) {
-  if (!meta || !meta.isInitiator || meta.restartInProgress || meta.restartAttempts >= ICE_RESTART_LIMIT) {
-    return false;
-  }
-
-  const pc = peerConnections.get(peerId);
-  if (!pc || pc.signalingState === 'closed' || pc.connectionState === 'closed') {
-    return false;
-  }
-
-  if (pc.signalingState !== 'stable' || !shouldReconnectPeer(meta.kind)) {
-    return false;
-  }
-
-  meta.restartAttempts += 1;
-  meta.restartInProgress = true;
-
-  try {
-    console.log('Attempting ICE restart for', peerId, 'kind=', meta.kind);
-
-    const offer = await pc.createOffer({ iceRestart: true });
-    prepareLocalDescription(meta);
-    await pc.setLocalDescription({
-      type: offer.type,
-      sdp: preferAV1Codec(preferH264Codec(offer.sdp))
-    });
-
-    await setVideoBitrate(pc);
-    await waitForLocalIceWarmup(pc, meta, peerId, 'ice-restart');
-    assertActivePeerConnection(peerId, pc);
-    armPeerConnectionTimeout(peerId, pc, meta, 'ICE 重启超时，正在重建连接...');
-
-    sendMessage({
-      type: 'offer',
-      targetId: peerId,
-      sdp: pc.localDescription,
-      roomId: currentRoomId,
-      reconnect: true,
-      iceRestart: true,
-      isRelay: meta.kind === 'relay-viewer'
-    });
-
-    return true;
-  } catch (error) {
-    meta.restartInProgress = false;
-    console.log('ICE restart failed:', peerId, error.message);
-    return false;
-  }
+async function stopScreenShare() {
+  return requireNativeAuthorityOverride('stopScreenShare', stopScreenShare)();
 }
 
-async function handlePeerConnectionFailure(peerId, meta, message) {
-  stopStatsLogging();
-
-  if (await attemptIceRestart(peerId, meta)) {
-    return;
-  }
-
-  if (meta) {
-    meta.restartInProgress = false;
-  }
-
-  if (!isHost && peerId === upstreamPeerId) {
-    resetViewerMediaPipeline(message);
-  } else {
-    closePeerConnection(peerId);
-  }
-
-  if (meta && meta.isInitiator) {
-    schedulePeerReconnect(peerId, meta.kind);
-  }
-}
-
-function stopScreenShare() {
-  if (window.electronAPI && window.electronAPI.audioCapture) {
-    window.electronAPI.audioCapture.stopCapture().catch(() => {});
-  }
-
-  if (typeof audioDataHandler === 'function') {
-    audioDataHandler();
-  }
-  audioDataHandler = null;
-
-  isAudioPlaying = false;
-  if (audioTimer) {
-    clearTimeout(audioTimer);
-    audioTimer = null;
-  }
-  audioQueue = [];
-
-  if (audioContext) {
-    audioContext.close().catch(() => {});
-    audioContext = null;
-  }
-  audioMediaStreamDest = null;
-
-  if (localStream) {
-    localStream.getTracks().forEach((track) => track.stop());
-    localStream = null;
-  }
-
-  if (currentRoomId && sessionRole === 'host') {
-    sendMessage({
-      type: 'leave-room',
-      roomId: currentRoomId,
-      clientId: clientId
-    }, { queueIfDisconnected: false });
-  }
-
-  clearAllPeerConnections({ clearRetryState: true });
-  relayPc = null;
-  relayStream = null;
-  upstreamPeerId = null;
-  upstreamConnected = false;
-  viewerReadySent = false;
-  videoStarted = false;
-
-  sessionRole = null;
-  currentRoomId = null;
-  hostId = null;
-  myChainPosition = -1;
-  elements.roomInfo.classList.add('hidden');
-  elements.viewerCount.textContent = '0';
-
-  elements.localVideo.srcObject = null;
-  elements.localVideo.classList.add('hidden');
-  elements.btnStartShare.classList.remove('hidden');
-  elements.btnStopShare.classList.add('hidden');
-  elements.hostStatus.textContent = '准备就绪';
-}
-
-function resetViewerState() {
+async function resetViewerState() {
   currentRoomId = null;
   sessionRole = null;
   hostId = null;
@@ -3621,27 +2172,7 @@ function resetViewerState() {
   relayPc = null;
   relayStream = null;
 
-  isAudioPlaying = false;
-  if (audioTimer) {
-    clearTimeout(audioTimer);
-    audioTimer = null;
-  }
-  audioQueue = [];
-
-  if (audioContext) {
-    audioContext.close().catch(() => {});
-    audioContext = null;
-  }
-  audioMediaStreamDest = null;
-
-  if (typeof audioDataHandler === 'function') {
-    audioDataHandler();
-  }
-  audioDataHandler = null;
-
-  clearAllPeerConnections({ clearRetryState: true });
-  stopStatsLogging();
-
+  await clearAllPeerConnections({ clearRetryState: true });
   elements.joinForm.classList.remove('hidden');
   elements.viewerStatus.classList.add('hidden');
   elements.btnLeave.classList.add('hidden');
@@ -3652,463 +2183,29 @@ function resetViewerState() {
 }
 
 async function handleMessage(data) {
-  console.log('Received:', data.type);
-
-  switch (data.type) {
-    case 'room-created':
-      currentRoomId = data.roomId;
-      sessionRole = 'host';
-      elements.roomIdDisplay.textContent = data.roomId;
-      elements.roomInfo.classList.remove('hidden');
-      elements.btnStartShare.classList.remove('hidden');
-      elements.hostStatus.textContent = '可以开始共享';
-      break;
-
-    case 'room-joined':
-      currentRoomId = data.roomId;
-      sessionRole = 'viewer';
-      myChainPosition = data.chainPosition;
-      hostId = data.hostId;
-      upstreamPeerId = data.upstreamPeerId || data.hostId;
-      viewerReadySent = false;
-      videoStarted = false;
-      upstreamConnected = false;
-      elements.joinForm.classList.add('hidden');
-      elements.viewerStatus.classList.remove('hidden');
-      elements.viewerRoomId.textContent = data.roomId;
-      elements.btnLeave.classList.remove('hidden');
-      elements.chainPosition.textContent = String(data.chainPosition + 1);
-      setViewerConnectionState('等待上游连接...');
-      break;
-
-    case 'session-resumed':
-      currentRoomId = data.roomId;
-      sessionRole = data.role;
-      if (data.role === 'host') {
-        isHost = true;
-        elements.roomIdDisplay.textContent = data.roomId;
-        elements.roomInfo.classList.remove('hidden');
-        elements.viewerCount.textContent = String(data.viewerCount || 0);
-        elements.hostStatus.textContent = '会话已恢复';
-      } else {
-        isHost = false;
-        hostId = data.hostId || hostId;
-        upstreamPeerId = data.upstreamPeerId || hostId;
-        myChainPosition = data.chainPosition;
-        elements.joinForm.classList.add('hidden');
-        elements.viewerStatus.classList.remove('hidden');
-        elements.viewerRoomId.textContent = data.roomId;
-        elements.btnLeave.classList.remove('hidden');
-        elements.chainPosition.textContent = String(myChainPosition + 1);
-        if (!upstreamConnected) {
-          setViewerConnectionState('正在恢复连接...');
-        } else {
-          elements.connectionStatus.textContent = '已连接';
-        }
-      }
-      break;
-
-    case 'error':
-      showError(data.message);
-      break;
-
-    case 'viewer-joined':
-      if (!data.reconnect) {
-        updateViewerCount(data.viewerId);
-      }
-      if (localStream) {
-        await createOffer(data.viewerId, { force: Boolean(data.reconnect) });
-      }
-      break;
-
-    case 'connect-to-next':
-      await createOfferToNextViewer(data.nextViewerId, { force: true });
-      break;
-
-    case 'offer':
-      await handleOffer(data);
-      break;
-
-    case 'answer':
-      await handleAnswer(data);
-      break;
-
-    case 'ice-candidate':
-      await handleIceCandidate(data);
-      break;
-
-    case 'host-disconnected':
-      showError('分享者已断开连接');
-      resetViewerState();
-      break;
-
-    case 'viewer-left':
-      updateViewerCount(null, data.leftPosition);
-      closePeerConnection(data.viewerId, { clearRetryState: true });
-      break;
-
-    case 'chain-reconnect':
-      myChainPosition = data.newChainPosition;
-      upstreamPeerId = data.upstreamPeerId || hostId;
-      resetViewerMediaPipeline('正在重建上游连接...');
-      elements.chainPosition.textContent = String(myChainPosition + 1);
-      break;
-  }
+  return requireNativeAuthorityOverride('handleMessage', handleMessage)(data);
 }
 
 function createPeerConnection(peerId, isInitiator, kind = 'direct') {
-  closePeerConnection(peerId);
-
-  const pc = new RTCPeerConnection(config);
-  const meta = {
-    isInitiator: Boolean(isInitiator),
-    kind,
-    hasConnected: false,
-    connectTimeoutId: null,
-    disconnectTimerId: null,
-    localCandidateCount: 0,
-    localCandidateTypes: new Set(),
-    restartAttempts: 0,
-    restartInProgress: false,
-    selectedCandidatePairLogged: false
-  };
-
-  peerConnections.set(peerId, pc);
-  peerConnectionMeta.set(peerId, meta);
-
-  if (meta.isInitiator) {
-    armPeerConnectionTimeout(peerId, pc, meta);
-  }
-
-  pc.onicegatheringstatechange = () => {
-    console.log('ICE gathering state:', pc.iceGatheringState, 'peerId:', peerId);
-  };
-
-  pc.oniceconnectionstatechange = () => {
-    console.log('ICE connection state:', pc.iceConnectionState, 'peerId:', peerId);
-  };
-
-  pc.onicecandidate = (event) => {
-    if (!event.candidate) {
-      return;
-    }
-
-    const candidateInfo = describeIceCandidate(event.candidate);
-    meta.localCandidateCount += 1;
-    meta.localCandidateTypes.add(candidateInfo.type);
-    console.log('Local ICE candidate:', peerId, candidateInfo.type, candidateInfo.protocol);
-
-    sendMessage({
-      type: 'ice-candidate',
-      targetId: peerId,
-      candidate: event.candidate,
-      roomId: currentRoomId
-    });
-  };
-
-  pc.onicecandidateerror = (event) => {
-    console.log('ICE candidate error:', peerId, event.errorText || event.errorCode);
-  };
-
-  pc.ontrack = (event) => {
-    const [stream] = event.streams;
-    if (!stream) {
-      return;
-    }
-
-    relayStream = stream;
-
-    if (isHost || peerId !== upstreamPeerId) {
-      return;
-    }
-
-    upstreamConnected = true;
-    videoStarted = true;
-    clearPeerConnectionTimeout(peerId);
-    clearPeerDisconnectTimer(peerId);
-    clearPeerReconnect(peerId);
-
-    if (elements.remoteVideo.srcObject !== stream) {
-      elements.remoteVideo.srcObject = stream;
-    }
-
-    elements.remoteVideo.play().catch((error) => console.log('Play error:', error));
-    elements.waitingMessage.classList.add('hidden');
-    elements.connectionStatus.textContent = '已连接';
-    elements.connectionStatus.classList.add('connected');
-
-    if (myChainPosition >= 0 && !viewerReadySent) {
-      viewerReadySent = true;
-      sendMessage({
-        type: 'viewer-ready',
-        roomId: currentRoomId,
-        clientId: clientId,
-        chainPosition: myChainPosition
-      });
-    }
-  };
-
-  pc.onconnectionstatechange = () => {
-    if (peerConnections.get(peerId) !== pc) {
-      return;
-    }
-
-    const state = pc.connectionState;
-    console.log('Connection state:', state, 'peerId:', peerId, 'ICE:', pc.iceConnectionState);
-
-    if (state === 'connected') {
-      meta.hasConnected = true;
-      meta.restartAttempts = 0;
-      meta.restartInProgress = false;
-      clearPeerConnectionTimeout(peerId);
-      clearPeerDisconnectTimer(peerId);
-      clearPeerReconnect(peerId);
-
-      const statsLabel = getPeerStatsLabel(peerId, kind);
-      if (statsLabel) {
-        startStatsLogging(pc, statsLabel);
-        if (!meta.selectedCandidatePairLogged) {
-          meta.selectedCandidatePairLogged = true;
-          logSelectedCandidatePair(pc, statsLabel);
-        }
-      }
-      return;
-    }
-
-    if (state === 'connecting') {
-      return;
-    }
-
-    if (state === 'disconnected') {
-      if (!meta.disconnectTimerId) {
-        if (!isHost && peerId === upstreamPeerId) {
-          setViewerConnectionState('连接不稳定，正在恢复...');
-        }
-
-        meta.disconnectTimerId = setTimeout(() => {
-          meta.disconnectTimerId = null;
-          if (peerConnections.get(peerId) !== pc || pc.connectionState !== 'disconnected') {
-            return;
-          }
-
-          handlePeerConnectionFailure(peerId, meta, '连接已中断，正在重试...');
-        }, PEER_DISCONNECT_GRACE_MS);
-      }
-      return;
-    }
-
-    handlePeerConnectionFailure(peerId, meta, '连接失败，正在重试...');
-  };
-
-  return pc;
-}
-
-function preferH264Codec(sdp) {
-  return sdp;
-}
-
-function preferAV1Codec(sdp) {
-  return sdp;
+  return requireNativeAuthorityOverride('createPeerConnection', createPeerConnection)(peerId, isInitiator, kind);
 }
 
 async function createOffer(viewerId, options = {}) {
-  const { force = false } = options;
-  const existingPc = peerConnections.get(viewerId);
-  if (existingPc && !force && ['new', 'connecting', 'connected'].includes(existingPc.connectionState)) {
-    return existingPc;
-  }
-
-  if (existingPc) {
-    closePeerConnection(viewerId);
-  }
-
-  const pc = createPeerConnection(viewerId, true, 'host-viewer');
-  const meta = peerConnectionMeta.get(viewerId);
-
-  try {
-    if (localStream) {
-      localStream.getTracks().forEach((track) => {
-        pc.addTrack(track, localStream);
-      });
-    }
-
-    setCodecPreferencesForPC(pc);
-
-    const offer = await pc.createOffer();
-    prepareLocalDescription(meta);
-    await pc.setLocalDescription({
-      type: offer.type,
-      sdp: preferAV1Codec(preferH264Codec(offer.sdp))
-    });
-
-    await setVideoBitrate(pc);
-    await waitForLocalIceWarmup(pc, meta, viewerId, 'host-offer');
-    assertActivePeerConnection(viewerId, pc);
-
-    sendMessage({
-      type: 'offer',
-      targetId: viewerId,
-      sdp: pc.localDescription,
-      roomId: currentRoomId
-    });
-    return pc;
-  } catch (error) {
-    closePeerConnection(viewerId);
-    schedulePeerReconnect(viewerId, 'host-viewer');
-    throw error;
-  }
+  return requireNativeAuthorityOverride('createOffer', createOffer)(viewerId, options);
 }
 
 async function createOfferToNextViewer(nextViewerId, options = {}) {
-  const { force = false } = options;
-  const existingPc = peerConnections.get(nextViewerId);
-  if (existingPc && !force && ['new', 'connecting', 'connected'].includes(existingPc.connectionState)) {
-    return existingPc;
-  }
-
-  if (existingPc) {
-    closePeerConnection(nextViewerId);
-  }
-
-  const maxWait = 10000;
-  const startTime = Date.now();
-  while (!relayStream && Date.now() - startTime < maxWait) {
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
-
-  if (!relayStream) {
-    throw new Error('relay-stream-timeout');
-  }
-
-  const pc = createPeerConnection(nextViewerId, true, 'relay-viewer');
-  const meta = peerConnectionMeta.get(nextViewerId);
-  relayPc = pc;
-
-  try {
-    relayStream.getTracks().forEach((track) => {
-      pc.addTrack(track, relayStream);
-    });
-
-    setCodecPreferencesForPC(pc);
-
-    const offer = await pc.createOffer();
-    prepareLocalDescription(meta);
-    await pc.setLocalDescription({
-      type: offer.type,
-      sdp: preferAV1Codec(preferH264Codec(offer.sdp))
-    });
-
-    await setVideoBitrate(pc);
-    await waitForLocalIceWarmup(pc, meta, nextViewerId, 'relay-offer');
-    assertActivePeerConnection(nextViewerId, pc);
-
-    sendMessage({
-      type: 'offer',
-      targetId: nextViewerId,
-      sdp: pc.localDescription,
-      roomId: currentRoomId,
-      isRelay: true
-    });
-    return pc;
-  } catch (error) {
-    closePeerConnection(nextViewerId);
-    schedulePeerReconnect(nextViewerId, 'relay-viewer');
-    throw error;
-  }
+  return requireNativeAuthorityOverride('createOfferToNextViewer', createOfferToNextViewer)(nextViewerId, options);
 }
 
 async function handleOffer(data) {
-  const fromId = data.fromClientId;
-
-  if (!isHost && upstreamPeerId && upstreamPeerId !== fromId) {
-    resetViewerMediaPipeline('正在切换上游连接...');
-  }
-
-  if (!isHost) {
-    upstreamPeerId = fromId;
-  }
-
-  let pc = peerConnections.get(fromId);
-  let meta = peerConnectionMeta.get(fromId);
-  const canReusePc = pc &&
-    meta &&
-    meta.kind === 'upstream' &&
-    pc.signalingState === 'stable' &&
-    pc.connectionState !== 'failed';
-
-  if (!canReusePc) {
-    pc = createPeerConnection(fromId, false, 'upstream');
-    meta = peerConnectionMeta.get(fromId);
-  } else {
-    clearPeerConnectionTimeout(fromId);
-    clearPeerDisconnectTimer(fromId);
-  }
-
-  try {
-    await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-    await flushRemoteCandidates(fromId, pc);
-
-    const answer = await pc.createAnswer();
-    prepareLocalDescription(meta);
-    await pc.setLocalDescription(answer);
-    await waitForLocalIceWarmup(pc, meta, fromId, 'answer');
-    assertActivePeerConnection(fromId, pc);
-
-    sendMessage({
-      type: 'answer',
-      targetId: fromId,
-      sdp: pc.localDescription,
-      roomId: currentRoomId
-    });
-  } catch (error) {
-    closePeerConnection(fromId);
-    throw error;
-  }
+  return requireNativeAuthorityOverride('handleOffer', handleOffer)(data);
 }
 
 async function handleAnswer(data) {
-  const fromId = data.fromClientId || data.targetId;
-  const peerId = peerConnections.has(fromId) ? fromId : data.targetId;
-  const pc = peerConnections.get(peerId);
-  if (!pc) {
-    return;
-  }
-
-  await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-  await flushRemoteCandidates(peerId, pc);
-
-  const meta = peerConnectionMeta.get(peerId);
-  if (meta && meta.restartInProgress && pc.connectionState === 'connected') {
-    meta.restartInProgress = false;
-    clearPeerConnectionTimeout(peerId);
-
-    const statsLabel = getPeerStatsLabel(peerId, meta.kind);
-    if (statsLabel) {
-      logSelectedCandidatePair(pc, statsLabel);
-    }
-  }
+  return requireNativeAuthorityOverride('handleAnswer', handleAnswer)(data);
 }
 
 async function handleIceCandidate(data) {
-  const peerId = data.fromClientId;
-  if (!data.candidate) {
-    return;
-  }
-
-  const pc = peerConnections.get(peerId);
-  if (!pc) {
-    queueRemoteCandidate(peerId, data.candidate);
-    return;
-  }
-
-  if (!pc.remoteDescription || !pc.remoteDescription.type) {
-    queueRemoteCandidate(peerId, data.candidate);
-    return;
-  }
-
-  try {
-    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-  } catch (error) {
-    console.error('Failed to add ICE candidate:', peerId, error);
-  }
+  return requireNativeAuthorityOverride('handleIceCandidate', handleIceCandidate)(data);
 }
