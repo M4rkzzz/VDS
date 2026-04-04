@@ -1,6 +1,6 @@
 {
   "name": "screenshare-server",
-  "version": "1.5.6",
+  "version": "1.5.7",
   "description": "Screen sharing signaling server",
   "main": "index.js",
   "scripts": {

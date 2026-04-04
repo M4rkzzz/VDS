@@ -2324,7 +2324,7 @@ function showError(message) {
 // Native mainline only
 
 // 版本检查和自动更新
-let currentVersion = '1.5.6'; // 默认版本（Electron环境会动态获取）
+let currentVersion = '1.5.7'; // 默认版本（Electron环境会动态获取）
 
 // 初始化版本号（从 Electron app 获取）
 async function initVersion() {

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.7
+
+- release rollover for the latest native media stack and packaging outputs
+- refreshed installer, blockmap, and update manifest for the new desktop version
+
 ## 1.5.6
 
 ### Media
