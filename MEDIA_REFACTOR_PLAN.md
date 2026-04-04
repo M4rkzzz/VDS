@@ -2,8 +2,12 @@
 
 ## 1. 目的
 
-这份文档记录仓库在 `1.5.3` 时点的真实媒体架构、真实边界、真实验证结果和真实未解问题。  
-它不是愿景文档，也不是历史回顾；它只描述当前代码里已经落地的东西，以及下一步应该继续收的部分。
+这份文档记录仓库在 `1.5.6` 时点的真实媒体架构、真实边界、真实验证结果、真实未解问题，以及接下来明确的执行方向。  
+它同时承担三种职责：
+
+- 真相文档：说明当前代码真实在做什么
+- 计划文档：说明接下来优先级和验收目标
+- 交接文档：让后来接手的人能快速理解当前系统、风险和约束
 
 强制原则：
 
@@ -12,6 +16,13 @@
 - 未完成项必须明确写成风险或下一步
 - 不允许用“以后可能”掩盖当前事实
 
+产品定位约束：
+
+- 项目目标是“稳定可用的工具”
+- 不是内测展示品
+- 也不是面向公开发行的泛用产品
+- 所有取舍以稳定可用优先，而不是追求概念完整或形式漂亮
+
 ## 2. 当前结论
 
 项目当前已经完全进入 native authority 路线。
@@ -19,13 +30,13 @@
 当前主链路是：
 
 - Host 采集：`media-agent` 负责
-- Host 编码：native `H.264` 主链路
+- Host 编码：native `H.264 / H.265` codec-aware 主链路
 - Host 音频：native `Opus 48k stereo` 主链路
 - Peer transport：native `libdatachannel`
 - Viewer 解码：native
 - Viewer 画面：native surface
 - Viewer 音量：native authority
-- Relay：中间 viewer 直接扇出收到的 `H.264/Opus`，不做重新解码再编码
+- Relay：中间 viewer 直接扇出收到的 `H.264/H.265 + Opus`，不做重新解码再编码
 
 当前已经不是旧的：
 
@@ -40,14 +51,19 @@
 - native surface 当前实际仍运行在 owner-attached overlay popup 方案上
 - 也就是说：产品体验上是嵌进页面，技术形态上仍不是 Chromium 真正 child HWND 终态
 
-这条显示路线当前可用，已支撑日常调试与联调；是否保留为最终正式方案，仍取决于后续工程验证。
+这条显示路线当前可用，已支撑日常调试与联调。  
+当前决策已经明确：
+
+- popup overlay 路线继续打磨成正式方案
+- 不再把 child embed 当作近期主目标
+- child embed 只保留为背景知识，不再作为主线工程牵引
 
 ## 3. 当前代码真实状态
 
 ### 3.1 版本与产物
 
-- 桌面端版本：`1.5.3`
-- 服务端版本：`1.5.3`
+- 桌面端版本：`1.5.6`
+- 服务端版本：`1.5.6`
 - 构建方式：`electron-builder + nsis`
 - 更新源：`generic provider`
 - 更新目录：`server/updates/`
@@ -93,14 +109,31 @@
 
 - 采集后端：`Windows Graphics Capture`
 - 预览：native live preview surface
-- 视频编码主链路：`H.264`
+- 视频编码主链路：`H.264 / H.265`
 - 音频编码主链路：`Opus 48k stereo`
 - 硬件编码优先：会探测并优先使用自检通过的硬件编码器
 
 当前真实限制：
 
-- `H.265` 在 UI 中仍为禁用态，仅显示 `work in progress`
 - “原始分辨率”入口已从前端移除，native 侧也不再接受 `0x0` 作为原始分辨率语义
+- 当前画质设置支持：
+  - `H.264 / H.265`
+  - 本地预览开关
+  - 手动指定已通过自检的硬件编码器
+
+当前已确认的关键修复：
+
+- Win11 24H2 下，`GraphicsCaptureSession.MinUpdateInterval` 不设置时，WGC 高帧率采集会稳定卡在约 `56-57fps`
+- native 侧现已在支持该属性的系统上显式设置 `MinUpdateInterval(1ms)`
+- WGC session 现已显式设置：
+  - `IsCursorCaptureEnabled(...)`
+  - `IsBorderRequired(false)`
+
+当前已验证的结论：
+
+- 不开 preview 时仍出现的 `56-57fps` 上限，不是 preview 造成
+- 纯本地、无 Electron、无 sender、仅 `display capture + native preview` 的 smoke 在补上 `MinUpdateInterval(1ms)` 后，`10s` 内达到约 `194fps`
+- 这说明此前的 `56-57fps` 主要不是编码器、网络、viewer 或 CPU readback 自身上限，而是 WGC 在当前系统上的默认更新间隔问题
 
 ### 4.2 Viewer
 
@@ -122,10 +155,17 @@
 
 当前实现是：
 
-- `v1` 作为上游 viewer 收到编码后的 `H.264/Opus`
+- `v1` 作为上游 viewer 收到编码后的 `H.264/H.265 + Opus`
 - `v1` 创建下游 relay peer
 - `attachPeerMediaSource` 直接绑定 `peer-video:<upstreamPeerId>`
 - native 直接把收到的编码帧扇出到下游
+
+当前拓扑约束已经明确：
+
+- relay 按严格链式设计
+- 不做“尽量浅链”的动态分配
+- 正常场景目标观众数以 3 人为主
+- 极限场景按不超过 5 人规划
 
 这意味着：
 
@@ -134,7 +174,7 @@
 
 为保证第二跳可解码，relay 现在已经补了：
 
-- H.264 decoder config / keyframe bootstrap 缓存
+- H.264 / H.265 decoder config / random access bootstrap 缓存
 - 新下游接入时先发 bootstrap，再发正常视频 AU
 
 ## 5. 接收侧同步与启动逻辑
@@ -172,16 +212,31 @@
 - 当前接收侧已经从“经常 freeze”推进到了“可工作、可继续细调”
 - 但这里还不是“永久免维护”状态
 
+### 5.4 当前验收目标
+
+连接稳健性的核心验收目标已经明确：
+
+- 重点避免连接失败
+- 重点避免重连失败
+- 重点避免偶发无声无画
+- 成功连接的标准不是“连上就算成功”，而是 `5 秒内音画稳定`
+
+自动恢复约束：
+
+- 中间 relay 节点退出后，下游要自动接回
+- 下游恢复必须自动协商，不依赖用户重新点加入
+
 ## 6. 质量设置现状
 
 当前质量设置 UI 和 native 参数已经对齐：
 
-- 编码：`H.264`
-- `H.265`：按钮禁用，显示 `work in progress`
+- 编码：`H.264 / H.265`
 - 分辨率：`360p / 480p / 720p / 1080p / 2k / 4k`
 - 帧率：`5 / 30 / 60 / 90`
 - 码率：默认 `10000 kbps`，步长 `1000`
 - 硬件加速编码：开关可用
+- 本地预览：开关可用
+- 硬件编码器：支持自动选择，或手动指定“已通过自检”的硬件编码器
 - 编码器预设：`质量 / 均衡 / 速度`
 - 调优：`fastdecode / zerolatency`
 
@@ -189,6 +244,12 @@
 
 - 优先展示 native self-test 验证通过的编码器
 - 不再把“FFmpeg 编进去了但机器不能用”的编码器误报成可用
+
+后续编码路线约束：
+
+- `H.265` 不是可有可无的附加项
+- 当前已经进入主链路，但还需要继续做完整双端、三端、晚加入、重连、长时间 soak 验证
+- 目标不是只有 host 单跳可演示，而是完整 `host -> viewer -> relay viewer` 链路稳健可用
 
 ## 7. 更新与打包现状
 
@@ -213,11 +274,18 @@
 - 第一次从手动安装包升级时，仍可能走整包
 - 只要成功经历过一次自动下载，后续差分更新才有稳定前提
 
-### 7.3 当前仍未解决的更新问题
+当前更新目标约束已经明确：
 
-- WGC 黄色边框无法在当前 `NSIS + generic` 方案下可靠去除
-- 要关边框，仍然需要有 package identity 的 `AppX/MSIX` 路线
-- 但切 `MSIX` 的成本和风险都明显高于当前链路
+- 第一次整包可接受
+- 但后续版本升级必须把差分更新成功率做高
+- 这件事的优先级高于“功能看起来已经能 fallback 到整包”
+
+### 7.3 当前与 WGC 边框相关的真实状态
+
+- native 代码层面已经显式加入 `IsBorderRequired(false)` 开关
+- 这意味着在支持该属性的系统上，不再只靠系统默认值，而是主动请求关闭黄框
+- 但“所有机器、所有打包形态、所有系统版本都已验证完全消失”这件事，目前还不能写成已完全收口
+- 是否仍存在 package identity / 系统策略 / 权限模型导致的个别机器残留问题，还需要继续做跨机器验证
 
 ## 8. 当前验证能力
 
@@ -252,12 +320,26 @@
 
 - 单跳 native host -> viewer 基本建连
 - 接收侧启动与 steady-state 调度回归
-- relay 链路的 H.264 bootstrap 修复后继续推进
+- relay 链路的 codec-aware bootstrap 修复后继续推进
+- WGC 高帧率瓶颈已定位并打穿：
+  - 不加 `MinUpdateInterval` 时，本地 preview 稳定卡在约 `56-57fps`
+  - 加上 `MinUpdateInterval(1ms)` 后，纯本地 `display capture + native preview` smoke `10s` 内达到约 `194fps`
 
 但仍要强调：
 
 - “通过测试”不等于“已经千锤不烂”
 - 当前最该继续做的是 soak、重连、断链恢复、三端长时间播放
+
+### 8.4 popup 正式方案验收项
+
+popup overlay 作为正式方案，当前最重要的验收点已经明确为：
+
+- 跟随稳定
+- 全屏稳定
+- 弹窗遮挡正确
+- 点击前台正确
+
+后续所有 popup 相关改动都必须围绕这 4 项，而不是继续分散在无关细节上。
 
 ## 9. 分层边界
 
@@ -337,12 +419,14 @@
 - 调试日志前后端联动已收口
 - PowerShell 正常运行时不再默认刷屏
 - 质量设置与 native 参数贯通
-- `H.265` 在 UI 中明确禁用
+- `H.265` 已进入主链路并可在 UI 中选择
 - “原始分辨率”前后端都已下线
 - 音频主链路从 `PCMU` 升级为 `Opus`
 - relay 从 browser stream 转发切到 native encoded fanout
-- relay 第二跳 H.264 bootstrap 已补
+- relay 的 codec-aware bootstrap 已补
 - 差分更新 installer cache seed 已补
+- WGC 高帧率问题已定位到 `GraphicsCaptureSession.MinUpdateInterval`
+- WGC session 已显式设置 `MinUpdateInterval(1ms)` / `IsCursorCaptureEnabled(...)` / `IsBorderRequired(false)`
 
 ## 11. 当前未完成项
 
@@ -350,13 +434,22 @@
 
 - 接收侧 A/V 调度还需继续 soak
 - relay 长链稳健性还需继续验证
-- popup overlay 是否成为最终显示方案尚未最终定案
-- WGC 黄色边框问题当前仍接受为已知限制
-- `H.265` 仍未进入可用状态
+- popup overlay 虽已选定为正式路线，但仍需把正式验收项全部打磨完成
+- `H.265` 虽已进入主链路，但双端 / 三端 / 晚加入 / 重连 / 长时间 soak 还需继续验证
+- WGC 黄框虽然已有代码级关闭开关，但跨机器、跨系统、跨打包形态的最终验证还未完成
+- 差分更新成功率还没有达到目标状态
 
 ## 12. 下一阶段顺序
 
-### 阶段 A：接收侧稳健性继续打磨
+### 阶段 A：验证并稳住 H.265 主链路
+
+目标：
+
+- 持续验证 `H.265` 在 host / viewer / relay 链路中的真实稳健性
+- 重点覆盖双端、三端、晚加入、断线重连、长时间播放
+- 继续保持 `H.264 / H.265` 都走同一套 codec-aware 主骨架，避免重新长出分叉专用路线
+
+### 阶段 B：全链路稳健性
 
 目标：
 
@@ -364,22 +457,18 @@
 - 继续提高首帧成功率和启动平滑度
 - 继续观察 `queuedVideo / queuedAudio / dropped* / submitted* / dispatched*`
 - 做更长时间的双端、三端 soak
+- 强化中间 relay 节点退出后的自动恢复
+- 重点消灭“连接失败 / 重连失败 / 偶发无声无画”
+- 继续验证高帧率 WGC 在正式双端链路中是否稳定传递，而不是只停留在本地 preview smoke
 
-### 阶段 B：relay 稳健性
-
-目标：
-
-- 强化 `host -> v1 -> v2` 重连恢复
-- 验证下游晚加入、上游重连、链式断点恢复
-- 确认 fail-fast 路径不会留下坏状态
-
-### 阶段 C：显示方案定型
+### 阶段 C：代码打磨
 
 目标：
 
-- 决定 overlay popup 是否正式保留
-- 如果不保留，明确 child embed 的可行路径和退出条件
-- 如果保留，删除“过渡方案”语义，正式化约束和测试基线
+- 在效果一致或更优的前提下，提高运行效率
+- 逐步优化掉旧逻辑
+- 在微观层面继续寻找更优算法，而不是单纯堆补丁
+- 保持边界清晰，避免一边修稳健性一边再次长出旧路线兼容层
 
 ### 阶段 D：发布链继续收口
 
@@ -387,6 +476,7 @@
 
 - 差分更新继续实测
 - 明确线上保留版本策略
+- 提高后续版本差分更新成功率
 - 评估是否真的需要独立 `MSIX` 实验线，而不是直接切主线
 
 ## 13. 明确禁止
@@ -401,9 +491,18 @@
 
 ## 14. 本次文档更新结论
 
-截至 `1.5.3` 当前仓库状态，最准确的总结是：
+截至 `1.5.6` 当前仓库状态，最准确的总结是：
 
 - native authority 已经是唯一主链路
-- `H.264 + Opus + native relay fanout` 已经落地
+- `H.264 / H.265 + Opus + native relay fanout` 已经落地
 - 更新、UI、调试、fullscreen、质量设置都已跟这条主链路对齐
-- 当前最大的工程重点不再是“切不切 native”，而是把 native 接收与 relay 稳健性磨到可长期维护的水平
+- popup overlay 已经被确定为正式打磨路线
+- Win11 24H2 下 WGC 高帧率瓶颈已经定位到 `GraphicsCaptureSession.MinUpdateInterval`
+- 当前最大的工程重点顺序已经明确：
+  - 先验证并稳住 `H.265` 与高帧率正式链路
+  - 再完善全链路稳健性
+  - 最后持续打磨代码和效率
+
+## 15. 给下一个 Agent 的交接说明
+
+如果你是接手这个项目的下一个 agent，不要先发散找“是不是还要保留旧浏览器链路”，也不要先去碰 child embed。当前主线已经明确：native authority 是唯一媒体主链路，popup overlay 是正式打磨路线，接下来优先级是 `H.265 / 高帧率正式链路验证 -> 全链路稳健性 -> 代码打磨`。先读本文，再看 [app-native-overrides.js](/d:/project/videosharing/server/public/app-native-overrides.js)、[main.js](/d:/project/videosharing/desktop/main.js)、[main.cpp](/d:/project/videosharing/media-agent/src/main.cpp) 这三个入口文件，确认当前 host、viewer、relay、update 的真实行为；然后优先用 `npm run dev:dual:native` 和 `npm run dev:triple:native` 复现实况。处理连接问题时，先看 `native-peer-stats` 里的 `queuedVideo / queuedAudio / submittedVideo / dispatchedAudio / dropped* / receiverReason`，不要凭感觉加新阈值；处理高帧率问题时，优先确认 `GraphicsCaptureSession.MinUpdateInterval` 是否生效，再看 host / viewer FPS 指标，不要重新回到猜编码器或猜 WebRTC 的路径。处理更新问题时，先区分“服务端产物不一致”和“客户端本地 installer 基底不匹配”，不要一上来就怀疑 blockmap 生成。任何改动都要坚持 fail-fast、边界单一、不要静默 fallback 到旧 authority。

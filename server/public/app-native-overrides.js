@@ -35,7 +35,6 @@
 
   const hostVideoContainer = document.getElementById('video-container');
   const remoteVideoContainer = document.getElementById('remote-video-container');
-  const sourcePreviewEnabled = document.getElementById('source-preview-enabled');
   const hostFullscreenButton = document.getElementById('btn-host-fullscreen');
   const viewerFullscreenButton = document.getElementById('btn-viewer-fullscreen');
   const viewerVolumeInput = document.getElementById('viewer-volume');
@@ -63,6 +62,13 @@
   let wheelDrivenSyncFramesRemaining = 0;
   let currentWindowBounds = null;
   let hostPreviewRequested = true;
+  let hostSourceFramesSample = null;
+  let hostPreviewFramesSample = null;
+  let hostSendFramesSample = null;
+  let viewerReceivedFramesSample = null;
+  let viewerRenderedFramesSample = null;
+  let viewerFramesSampleAtMs = 0;
+  let hostFramesSampleAtMs = 0;
 
   function isDebugModeEnabled() {
     if (typeof window.__vdsIsDebugModeEnabled === 'function') {
@@ -770,8 +776,24 @@
     }
   }
 
-  function parseCaptureSource(sourceId) {
-    const normalized = String(sourceId || '').trim();
+  function normalizeNativeVideoCodec(codec, fallback = 'h264') {
+    const normalized = String(codec || '').trim().toLowerCase();
+    if (normalized === 'h265' || normalized === 'hevc') {
+      return 'h265';
+    }
+    if (normalized === 'h264') {
+      return 'h264';
+    }
+    return fallback;
+  }
+
+  function parseCaptureSource(source) {
+    const sourceObject = source && typeof source === 'object' ? source : null;
+    const normalized = String(
+      sourceObject && (sourceObject.sourceId || sourceObject.id || sourceObject.captureTargetId)
+        ? (sourceObject.sourceId || sourceObject.id || sourceObject.captureTargetId)
+        : (source || '')
+    ).trim();
     if (!normalized) {
       throw new Error('必须提供采集源');
     }
@@ -783,7 +805,7 @@
     const effectiveCodec =
       typeof getEffectiveCodecPreference === 'function'
         ? getEffectiveCodecPreference()
-        : 'h264';
+        : requestedCodec;
     const sharedConfig = {
       codec: effectiveCodec,
       requestedCodec,
@@ -792,18 +814,33 @@
       frameRate: qualitySettings.frameRate,
       bitrateKbps: qualitySettings.bitrate,
       hardwareAcceleration: qualitySettings.hardwareAcceleration !== false,
+      videoEncoderPreference:
+        qualitySettings.hardwareAcceleration !== false &&
+        qualitySettings.hardwareEncoderPreference &&
+        qualitySettings.hardwareEncoderPreference !== 'auto'
+          ? String(qualitySettings.hardwareEncoderPreference).trim().toLowerCase()
+          : '',
       encoderPreset: qualitySettings.encoderPreset || 'balanced',
       encoderTune: qualitySettings.encoderTune === 'none' ? '' : (qualitySettings.encoderTune || '')
     };
 
     if (normalized.startsWith('screen:')) {
-      const [, displayId = ''] = normalized.split(':');
+      const [, fallbackDisplayId = ''] = normalized.split(':');
+      const sourceDisplayId =
+        sourceObject && sourceObject.nativeMonitorIndex != null && String(sourceObject.nativeMonitorIndex).trim()
+          ? String(sourceObject.nativeMonitorIndex).trim()
+          : (
+            sourceObject && sourceObject.displayId != null && String(sourceObject.displayId).trim()
+              ? String(sourceObject.displayId).trim()
+              : fallbackDisplayId
+          );
       return {
         captureTargetId: normalized,
         sourceId: normalized,
         captureKind: 'display',
         captureState: 'display',
-        displayId,
+        displayId: sourceDisplayId,
+        captureTitle: sourceObject && sourceObject.title ? String(sourceObject.title) : '',
         ...sharedConfig
       };
     }
@@ -815,7 +852,10 @@
         sourceId: normalized,
         captureKind: 'window',
         captureState: 'normal',
-        captureHwnd: parts[1] || '',
+        captureHwnd: sourceObject && sourceObject.hwnd != null
+          ? String(sourceObject.hwnd).trim()
+          : (parts[1] || ''),
+        captureTitle: sourceObject && sourceObject.title ? String(sourceObject.title) : '',
         ...sharedConfig
       };
     }
@@ -1189,6 +1229,14 @@
 
     if (params.state === 'host-session-started') {
       nativeHostSessionRunning = true;
+      if (typeof qualitySettings === 'object' && qualitySettings) {
+        const effectiveCodec = normalizeNativeVideoCodec(
+          params.effectiveCodec || params.codec,
+          normalizeNativeVideoCodec(params.requestedCodec, qualitySettings.codecPreference || 'h264')
+        );
+        qualitySettings.codecPreference = effectiveCodec;
+      }
+      lockCodecUiToNativeH264();
       return;
     }
 
@@ -1327,11 +1375,145 @@
     }
   }
 
+  function resetHostFpsIndicators() {
+    hostSourceFramesSample = null;
+    hostPreviewFramesSample = null;
+    hostSendFramesSample = null;
+    hostFramesSampleAtMs = 0;
+    if (elements.hostSourceFps) {
+      elements.hostSourceFps.textContent = '-';
+    }
+    if (elements.hostCaptureFps) {
+      elements.hostCaptureFps.textContent = '-';
+    }
+    if (elements.hostSendFps) {
+      elements.hostSendFps.textContent = '-';
+    }
+  }
+
+  function updateHostFpsIndicators(sourceFrames, previewFrames, sentFrames) {
+    const nowMs = Date.now();
+    if (
+      hostFramesSampleAtMs <= 0 ||
+      hostSourceFramesSample === null ||
+      hostPreviewFramesSample === null ||
+      hostSendFramesSample === null
+    ) {
+      hostSourceFramesSample = Number.isFinite(sourceFrames) ? sourceFrames : 0;
+      hostPreviewFramesSample = Number.isFinite(previewFrames) ? previewFrames : 0;
+      hostSendFramesSample = Number.isFinite(sentFrames) ? sentFrames : 0;
+      hostFramesSampleAtMs = nowMs;
+      if (elements.hostSourceFps) {
+        elements.hostSourceFps.textContent = Number.isFinite(sourceFrames) && sourceFrames > 0 ? '0 fps' : '-';
+      }
+      if (elements.hostCaptureFps) {
+        elements.hostCaptureFps.textContent = Number.isFinite(previewFrames) && previewFrames > 0 ? '0 fps' : '-';
+      }
+      if (elements.hostSendFps) {
+        elements.hostSendFps.textContent = Number.isFinite(sentFrames) && sentFrames > 0 ? '0 fps' : '-';
+      }
+      return;
+    }
+
+    const deltaMs = Math.max(1, nowMs - hostFramesSampleAtMs);
+    const sourceFps = Number.isFinite(sourceFrames)
+      ? Math.max(0, sourceFrames - hostSourceFramesSample) * 1000 / deltaMs
+      : NaN;
+    const previewFps = Number.isFinite(previewFrames)
+      ? Math.max(0, previewFrames - hostPreviewFramesSample) * 1000 / deltaMs
+      : NaN;
+    const sendFps = Number.isFinite(sentFrames)
+      ? Math.max(0, sentFrames - hostSendFramesSample) * 1000 / deltaMs
+      : NaN;
+
+    if (elements.hostSourceFps) {
+      elements.hostSourceFps.textContent = Number.isFinite(sourceFps) ? `${Math.round(sourceFps)} fps` : '-';
+    }
+    if (elements.hostCaptureFps) {
+      elements.hostCaptureFps.textContent = Number.isFinite(previewFps) ? `${Math.round(previewFps)} fps` : '-';
+    }
+    if (elements.hostSendFps) {
+      elements.hostSendFps.textContent = Number.isFinite(sendFps) ? `${Math.round(sendFps)} fps` : '-';
+    }
+
+    hostSourceFramesSample = Number.isFinite(sourceFrames) ? sourceFrames : hostSourceFramesSample;
+    hostPreviewFramesSample = Number.isFinite(previewFrames) ? previewFrames : hostPreviewFramesSample;
+    hostSendFramesSample = Number.isFinite(sentFrames) ? sentFrames : hostSendFramesSample;
+    hostFramesSampleAtMs = nowMs;
+  }
+
+  function resetViewerFpsIndicator() {
+    viewerReceivedFramesSample = null;
+    viewerRenderedFramesSample = null;
+    viewerFramesSampleAtMs = 0;
+    if (elements.viewerReceiveFps) {
+      elements.viewerReceiveFps.textContent = '-';
+    }
+    if (elements.viewerRenderFps) {
+      elements.viewerRenderFps.textContent = '-';
+    }
+  }
+
+  function updateViewerFpsIndicator(receivedFrames, renderedFrames) {
+    if ((!elements.viewerReceiveFps && !elements.viewerRenderFps) ||
+        !Number.isFinite(receivedFrames) ||
+        !Number.isFinite(renderedFrames) ||
+        receivedFrames < 0 ||
+        renderedFrames < 0) {
+      return;
+    }
+
+    const nowMs = Date.now();
+    if (viewerReceivedFramesSample === null || viewerRenderedFramesSample === null || viewerFramesSampleAtMs <= 0) {
+      viewerReceivedFramesSample = receivedFrames;
+      viewerRenderedFramesSample = renderedFrames;
+      viewerFramesSampleAtMs = nowMs;
+      if (elements.viewerReceiveFps) {
+        elements.viewerReceiveFps.textContent = receivedFrames > 0 ? '0 fps' : '-';
+      }
+      if (elements.viewerRenderFps) {
+        elements.viewerRenderFps.textContent = renderedFrames > 0 ? '0 fps' : '-';
+      }
+      return;
+    }
+
+    const deltaMs = Math.max(1, nowMs - viewerFramesSampleAtMs);
+    const receiveFps = Math.max(0, receivedFrames - viewerReceivedFramesSample) * 1000 / deltaMs;
+    const renderFps = Math.max(0, renderedFrames - viewerRenderedFramesSample) * 1000 / deltaMs;
+    if (elements.viewerReceiveFps) {
+      elements.viewerReceiveFps.textContent = `${Math.round(receiveFps)} fps`;
+    }
+    if (elements.viewerRenderFps) {
+      elements.viewerRenderFps.textContent = `${Math.round(renderFps)} fps`;
+    }
+    viewerReceivedFramesSample = receivedFrames;
+    viewerRenderedFramesSample = renderedFrames;
+    viewerFramesSampleAtMs = nowMs;
+  }
+
   function stopNativeHostStatsPolling() {
     if (nativeHostStatsIntervalId) {
       clearInterval(nativeHostStatsIntervalId);
       nativeHostStatsIntervalId = null;
     }
+  }
+
+  function updateHostEncoderDetail(pipeline) {
+    if (!elements.hostStatusDetail) {
+      return;
+    }
+
+    const encoder = pipeline && pipeline.selectedVideoEncoder
+      ? String(pipeline.selectedVideoEncoder).trim()
+      : '';
+    if (!encoder) {
+      elements.hostStatusDetail.textContent = '';
+      elements.hostStatusDetail.classList.add('hidden');
+      return;
+    }
+
+    elements.hostStatusDetail.textContent = `编码器：${encoder}`;
+    elements.hostStatusDetail.classList.remove('hidden');
   }
 
   async function pollNativeHostStats(reason = 'periodic') {
@@ -1350,6 +1532,19 @@
           (entry.target === 'host-session-video' || entry.target === 'host-capture-artifact')
       );
       const hostPlan = stats && stats.hostCapturePlan ? stats.hostCapturePlan : null;
+      const hostPipeline = stats && stats.hostPipeline ? stats.hostPipeline : null;
+      const sourceFrames = peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.sourceFramesCaptured)
+        ? peer.mediaBinding.sourceFramesCaptured
+        : NaN;
+      const captureFrames = surface && Number.isFinite(surface.decodedFramesRendered)
+        ? surface.decodedFramesRendered
+        : NaN;
+      const sentFrames = peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.framesSent)
+        ? peer.mediaBinding.framesSent
+        : NaN;
+
+      updateHostEncoderDetail(hostPipeline);
+      updateHostFpsIndicators(sourceFrames, captureFrames, sentFrames);
 
       if (shouldShowDebugLogsFor('video')) {
         console.log(
@@ -1359,6 +1554,11 @@
           `captureReady=${Boolean(hostPlan && hostPlan.ready)}`,
           `captureValidated=${Boolean(hostPlan && hostPlan.validated)}`,
           `captureReason=${hostPlan && hostPlan.reason ? hostPlan.reason : 'n/a'}`,
+          `sourceFramesCaptured=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.sourceFramesCaptured) ? peer.mediaBinding.sourceFramesCaptured : 0}`,
+          `avgCopyUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceCopyResourceUs) ? peer.mediaBinding.avgSourceCopyResourceUs : 0}`,
+          `avgMapUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceMapUs) ? peer.mediaBinding.avgSourceMapUs : 0}`,
+          `avgMemcpyUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceMemcpyUs) ? peer.mediaBinding.avgSourceMemcpyUs : 0}`,
+          `avgReadbackUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceTotalReadbackUs) ? peer.mediaBinding.avgSourceTotalReadbackUs : 0}`,
           `surfaceRunning=${Boolean(surface && surface.running)}`,
           `surfaceFramesRendered=${surface && Number.isFinite(surface.decodedFramesRendered) ? surface.decodedFramesRendered : 0}`,
           `surfaceReason=${surface && surface.reason ? surface.reason : 'n/a'}`,
@@ -1379,6 +1579,7 @@
 
   function startNativeHostStatsPolling() {
     stopNativeHostStatsPolling();
+    resetHostFpsIndicators();
     nativeHostStatsIntervalId = setInterval(() => {
       if (!nativeHostSessionRunning || sessionRole !== 'host') {
         stopNativeHostStatsPolling();
@@ -1409,6 +1610,7 @@
         peer.peerTransport.decodedFramesRendered || 0,
         surface && surface.decodedFramesRendered ? surface.decodedFramesRendered : 0
       );
+      updateViewerFpsIndicator(peer.peerTransport.remoteVideoFramesReceived || 0, renderedFrames);
       if (shouldShowDebugLogsFor('video')) {
         console.log(
           '[media-engine native-peer-stats]',
@@ -1465,6 +1667,7 @@
 
   function startNativeViewerStatsPolling() {
     stopNativeViewerStatsPolling();
+    resetViewerFpsIndicator();
     nativeViewerStatsIntervalId = setInterval(() => {
       if (!upstreamPeerId || sessionRole !== 'viewer') {
         stopNativeViewerStatsPolling();
@@ -1518,9 +1721,23 @@
       throw new Error(pipelineReason);
     }
 
+    const requestedCodec = normalizeNativeVideoCodec(
+      session && session.requestedCodec,
+      normalizeNativeVideoCodec(parsedSource.requestedCodec, 'h264')
+    );
+    const effectiveCodec = normalizeNativeVideoCodec(
+      session && (session.effectiveCodec || session.codec),
+      requestedCodec
+    );
+
+    if (typeof qualitySettings === 'object' && qualitySettings) {
+      qualitySettings.codecPreference = effectiveCodec;
+    }
+    lockCodecUiToNativeH264();
+
     nativeHostSessionRunning = true;
     localStream = null;
-    hostPreviewRequested = sourcePreviewEnabled ? Boolean(sourcePreviewEnabled.checked) : true;
+    hostPreviewRequested = !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
     hideLegacyVideoElements();
     if (hostVideoContainer) {
       hostVideoContainer.classList.toggle('hidden', !hostPreviewRequested);
@@ -1529,8 +1746,9 @@
 
     elements.btnStartShare.classList.add('hidden');
     elements.btnStopShare.classList.remove('hidden');
-    elements.hostStatus.textContent = '正在共享（原生）';
+    elements.hostStatus.textContent = `正在共享（原生，${effectiveCodec.toUpperCase()}）`;
     elements.hostStatus.classList.remove('waiting');
+    updateHostEncoderDetail(session && session.pipeline ? session.pipeline : null);
 
     if (nativeHostPreviewEnabled && hostPreviewRequested) {
       try {
@@ -1571,10 +1789,6 @@
     stopNativeHostStatsPolling();
     stopNativeViewerStatsPolling();
     await detachNativeHostPreviewSurface().catch(() => {});
-    hostPreviewRequested = true;
-    if (hostVideoContainer) {
-      hostVideoContainer.classList.remove('hidden');
-    }
 
     const peerIds = Array.from(nativePeerHandles.keys());
     for (const peerId of peerIds) {
@@ -1612,7 +1826,13 @@
     elements.btnStartShare.classList.remove('hidden');
     elements.btnStopShare.classList.add('hidden');
     elements.hostStatus.textContent = '准备就绪';
+    updateHostEncoderDetail(null);
+    resetHostFpsIndicators();
     hideLegacyVideoElements();
+    hostPreviewRequested = !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
+    if (hostVideoContainer) {
+      hostVideoContainer.classList.toggle('hidden', !hostPreviewRequested);
+    }
   }
 
   function createPeerConnection(peerId, isInitiator, kind = 'direct') {
@@ -1873,6 +2093,7 @@
       case 'room-joined':
         clearAllRelayOfferRetries();
         await clearAllPeerConnections({ clearRetryState: true });
+        resetViewerFpsIndicator();
         currentRoomId = data.roomId;
         sessionRole = 'viewer';
         myChainPosition = data.chainPosition;
@@ -1906,6 +2127,7 @@
         isHost = false;
         clearAllRelayOfferRetries();
         await clearAllPeerConnections({ clearRetryState: true });
+        resetViewerFpsIndicator();
         hostId = data.hostId || hostId;
         upstreamPeerId = data.upstreamPeerId || hostId;
         myChainPosition = data.chainPosition;

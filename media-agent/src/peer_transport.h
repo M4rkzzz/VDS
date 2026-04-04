@@ -169,9 +169,10 @@ bool clear_peer_transport_audio_sender(
   std::string* error
 );
 
-bool send_peer_transport_h264_video_frame(
+bool send_peer_transport_video_frame(
   const std::shared_ptr<PeerTransportSession>& session,
   const std::vector<std::uint8_t>& frame,
+  const std::string& codec,
   std::uint64_t timestamp_us,
   std::string* error
 );

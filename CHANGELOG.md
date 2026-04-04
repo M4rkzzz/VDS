@@ -1,0 +1,30 @@
+# Changelog
+
+## 1.5.6
+
+### Media
+
+- landed codec-aware native video path for `H.264 / H.265`
+- enabled H.265 selection in desktop quality settings
+- kept relay on native encoded fanout instead of browser-side re-encode
+- tightened bootstrap and startup gating around decoder config plus random access frames
+
+### Capture and Performance
+
+- fixed Win11 24H2 WGC high-FPS capture by setting `GraphicsCaptureSession.MinUpdateInterval(1ms)` when supported
+- explicitly set WGC cursor capture and border flags when the platform exposes those properties
+- added local preview toggle in quality settings
+- added host/viewer FPS diagnostics in the UI
+
+### Encoder Detection
+
+- replaced raw FFmpeg encoder listing with per-encoder self-test validation
+- added manual hardware encoder selection from the validated encoder list
+- improved hardware/software encoder messaging in the quality settings UI
+
+### Reliability and Diagnostics
+
+- fixed screen/display capture source mapping issues in native host session startup
+- reduced repeated encoder self-test spam during repeated host entry
+- gated verbose native stderr behind video debug logging
+- improved native stats and host/viewer diagnostics for capture, send, receive, and render flow

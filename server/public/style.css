@@ -365,6 +365,10 @@ body:not(.native-embedded-fullscreen) .workspace-panel.workspace-panel-preparing
 
 .status-bar {
   margin-bottom: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
 }
 
 .status {
@@ -383,6 +387,13 @@ body:not(.native-embedded-fullscreen) .workspace-panel.workspace-panel-preparing
 .status.error {
   background: rgba(255, 107, 107, 0.2);
   color: #ff6b6b;
+}
+
+.status-detail {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.68);
 }
 
 #room-info {
@@ -2178,6 +2189,14 @@ body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .status.error {
   color: #f5f1e8;
 }
 
+body:not(.native-embedded-fullscreen) .status-detail {
+  color: rgba(255, 255, 255, 0.62);
+}
+
+body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .status-detail {
+  color: rgba(0, 0, 0, 0.58);
+}
+
 body:not(.native-embedded-fullscreen) .btn {
   width: auto;
   padding: 14px 20px;
@@ -3027,6 +3046,23 @@ body:not(.native-embedded-fullscreen) .quality-setting-control {
   display: flex;
   justify-content: flex-start;
   width: 100%;
+}
+
+body:not(.native-embedded-fullscreen) .quality-select {
+  width: min(100%, 280px);
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: rgba(255, 255, 255, 0.92);
+  color: #111111;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+body:not(.native-embedded-fullscreen) .quality-select:disabled {
+  opacity: 0.56;
+  cursor: not-allowed;
 }
 
 body:not(.native-embedded-fullscreen) .quality-setting-control-toggle {

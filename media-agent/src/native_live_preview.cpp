@@ -1319,6 +1319,17 @@ class NativeLivePreview::Impl {
       frame_height_ = frame.height;
       bgra_buffer_ = frame.bgra;
       snapshot_.decoded_frames_rendered += 1;
+      if (snapshot_.decoded_frames_rendered > 0) {
+        const std::uint64_t rendered = snapshot_.decoded_frames_rendered;
+        snapshot_.avg_copy_resource_us =
+          ((snapshot_.avg_copy_resource_us * (rendered - 1)) + frame.copy_resource_us) / rendered;
+        snapshot_.avg_map_us =
+          ((snapshot_.avg_map_us * (rendered - 1)) + frame.map_us) / rendered;
+        snapshot_.avg_memcpy_us =
+          ((snapshot_.avg_memcpy_us * (rendered - 1)) + frame.memcpy_us) / rendered;
+        snapshot_.avg_total_readback_us =
+          ((snapshot_.avg_total_readback_us * (rendered - 1)) + frame.total_readback_us) / rendered;
+      }
       snapshot_.last_decoded_frame_at_unix_ms = current_time_millis();
       snapshot_.decoder_ready = true;
       snapshot_.reason = "live-preview-frame-rendered";

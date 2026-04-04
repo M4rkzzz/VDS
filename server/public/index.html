@@ -103,6 +103,10 @@
 
           <div class="status-bar workspace-block">
             <span id="host-status" class="status">准备就绪</span>
+            <p id="host-status-detail" class="status-detail hidden"></p>
+            <p class="status-detail">源线程帧率：<span id="host-source-fps">-</span></p>
+            <p class="status-detail">预览帧率：<span id="host-capture-fps">-</span></p>
+            <p class="status-detail">发送帧率：<span id="host-send-fps">-</span></p>
           </div>
 
           <div id="room-info" class="workspace-card workspace-block hidden">
@@ -157,6 +161,8 @@
             <p>房间号：<strong id="viewer-room-id"></strong></p>
             <p>连接状态：<span id="connection-status">等待连接...</span></p>
             <p>你在链中的位置：<span id="chain-position">-</span></p>
+            <p>接收帧率：<span id="viewer-receive-fps">-</span></p>
+            <p>渲染帧率：<span id="viewer-render-fps">-</span></p>
           </div>
 
           <div class="workspace-card workspace-block workspace-action-card">
@@ -185,10 +191,6 @@
         <h3>选择要分享的内容 <button id="btn-refresh-sources" class="btn-icon" title="刷新">↻</button></h3>
         <div class="source-list" id="source-list"></div>
         <div class="source-audio-panel">
-          <label class="checkbox-label source-preview-toggle">
-            <input type="checkbox" id="source-preview-enabled" checked>
-            <span>开启本地预览</span>
-          </label>
           <label class="checkbox-label source-audio-toggle">
             <input type="checkbox" id="source-audio-enabled">
             <span>共享进程音频</span>
@@ -219,8 +221,7 @@
             <p class="quality-section-heading">基础设置</p>
             <div class="quality-setting-row">
               <div class="quality-setting-copy">
-                <label>编码</label>
-                <p id="quality-codec-note" class="quality-setting-note">当前直播链路默认以 H.264 兼容优先。</p>
+                <label>编码格式</label>
               </div>
               <div class="quality-setting-control">
                 <div id="quality-codec-options" class="quality-segment-group quality-segment-group-compact" aria-label="编码选项"></div>
@@ -229,14 +230,35 @@
 
             <div class="quality-setting-row quality-setting-row-toggle">
               <div class="quality-setting-copy">
+                <label>本地预览</label>
+              </div>
+              <div class="quality-setting-control quality-setting-control-toggle">
+                <label class="quality-switch" for="quality-preview-enabled">
+                  <input id="quality-preview-enabled" type="checkbox" checked>
+                  <span class="quality-switch-track" aria-hidden="true"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="quality-setting-row quality-setting-row-toggle">
+              <div class="quality-setting-copy">
                 <label>硬件加速编码</label>
-                <p id="quality-hardware-support" class="quality-setting-note">正在检测当前设备支持的 FFmpeg 硬件编码器…</p>
+                <p id="quality-hardware-support" class="quality-setting-note">正在检测设备支持的硬件编码器…</p>
               </div>
               <div class="quality-setting-control quality-setting-control-toggle">
                 <label class="quality-switch" for="quality-hardware-acceleration">
                   <input id="quality-hardware-acceleration" type="checkbox" checked>
                   <span class="quality-switch-track" aria-hidden="true"></span>
                 </label>
+              </div>
+            </div>
+
+            <div class="quality-setting-row">
+              <div class="quality-setting-copy">
+                <label for="quality-hardware-encoder-select">硬件编码器</label>
+              </div>
+              <div class="quality-setting-control">
+                <select id="quality-hardware-encoder-select" class="quality-select" aria-label="硬件编码器选择"></select>
               </div>
             </div>
           </section>
@@ -246,7 +268,6 @@
             <div class="quality-setting-row">
               <div class="quality-setting-copy">
                 <label>分辨率</label>
-                <p class="quality-setting-note">默认 1080p，可按设备和网络条件选择固定输出分辨率。</p>
               </div>
               <div class="quality-setting-control">
                 <div id="quality-resolution-options" class="quality-segment-group quality-segment-group-wrap quality-segment-group-compact" aria-label="分辨率选项"></div>
@@ -256,7 +277,6 @@
             <div class="quality-setting-row">
               <div class="quality-setting-copy">
                 <label>帧率</label>
-                <p class="quality-setting-note">更高帧率会显著提高编码压力与带宽占用。</p>
               </div>
               <div class="quality-setting-control">
                 <div id="quality-fps-options" class="quality-segment-group quality-segment-group-compact" aria-label="帧率选项"></div>
@@ -266,7 +286,6 @@
             <div class="quality-setting-row">
               <div class="quality-setting-copy">
                 <label>码率</label>
-                <p class="quality-setting-note">默认 10000 kbps，加减步长 1000。</p>
               </div>
               <div class="quality-setting-control">
                 <div class="quality-stepper">
@@ -291,7 +310,6 @@
             <div class="quality-setting-row">
               <div class="quality-setting-copy">
                 <label>调优</label>
-                <p class="quality-setting-note">可不选，也可选择其中一项。</p>
               </div>
               <div class="quality-setting-control">
                 <div id="quality-tune-options" class="quality-segment-group quality-segment-group-compact" aria-label="调优选项"></div>

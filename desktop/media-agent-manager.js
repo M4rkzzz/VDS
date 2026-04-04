@@ -17,6 +17,7 @@ class MediaAgentManager extends EventEmitter {
     this.pendingRequests = new Map();
     this.requestId = 1;
     this.startPromise = null;
+    this.recentStderrLines = [];
     this.status = {
       state: 'idle',
       available: false,
@@ -25,6 +26,24 @@ class MediaAgentManager extends EventEmitter {
       binaryPath: null,
       implementation: 'native-media-agent'
     };
+  }
+
+  recordStderr(message) {
+    const normalized = String(message || '').trim();
+    if (!normalized) {
+      return;
+    }
+    this.recentStderrLines.push(normalized);
+    if (this.recentStderrLines.length > 12) {
+      this.recentStderrLines.shift();
+    }
+  }
+
+  buildExitError(code, signal) {
+    const suffix = this.recentStderrLines.length
+      ? `:stderr=${this.recentStderrLines.join(' | ')}`
+      : '';
+    return new Error(`media-agent-exited:${code ?? 'null'}:${signal ?? 'null'}${suffix}`);
   }
 
   getStatus() {
@@ -172,6 +191,7 @@ class MediaAgentManager extends EventEmitter {
       child.stderr.on('data', (chunk) => {
         const message = String(chunk || '').trim();
         if (message) {
+          this.recordStderr(message);
           this.logger.warn(`[media-agent:stderr] ${message}`);
         }
       });
@@ -184,7 +204,7 @@ class MediaAgentManager extends EventEmitter {
         if (settled) {
           return;
         }
-        finishReject(new Error(`media-agent-exited:${code ?? 'null'}:${signal ?? 'null'}`));
+        finishReject(this.buildExitError(code, signal));
       });
 
       lineReader = readline.createInterface({ input: child.stdout });
@@ -267,11 +287,13 @@ class MediaAgentManager extends EventEmitter {
     const child = spawn(binaryPath, [], {
       stdio: ['pipe', 'pipe', 'pipe']
     });
+    this.recentStderrLines = [];
 
     child.stdin.setDefaultEncoding('utf8');
     child.stderr.on('data', (chunk) => {
       const message = String(chunk || '').trim();
       if (message) {
+        this.recordStderr(message);
         this.logger.warn(`[media-agent:stderr] ${message}`);
       }
     });
@@ -290,7 +312,9 @@ class MediaAgentManager extends EventEmitter {
 
     child.once('exit', (code, signal) => {
       this.disposeLineReader();
-      this.rejectAllPending(new Error(`media-agent-exited:${code ?? 'null'}:${signal ?? 'null'}`));
+      const exitError = this.buildExitError(code, signal);
+      this.logger.error('[media-agent] process exited:', exitError.message);
+      this.rejectAllPending(exitError);
       this.child = null;
       this.updateStatus({
         state: 'stopped',

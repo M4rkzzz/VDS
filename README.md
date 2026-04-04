@@ -6,7 +6,7 @@ Current media path:
 
 - host capture: native `Windows Graphics Capture`
 - transport: native `libdatachannel`
-- video: `H.264`
+- video: `H.264 / H.265`
 - audio: `Opus 48k stereo`
 - relay: native encoded fanout (`host -> v1 -> v2`), not browser re-encode
 - rendering: native preview / native viewer surface
@@ -46,14 +46,23 @@ npm run build:release
 
 Current desktop UI supports:
 
-- codec: `H.264`
-- `H.265`: disabled in UI as `work in progress`
+- codec: `H.264 / H.265`
 - resolution: `360p / 480p / 720p / 1080p / 2k / 4k`
 - frame rate: `5 / 30 / 60 / 90`
 - bitrate: step `1000 kbps`
 - hardware acceleration toggle
+- local preview toggle
+- hardware encoder selection: auto or manually select validated hardware encoders
 - encoder preset: `quality / balanced / speed`
 - tune: `fastdecode / zerolatency`
+
+## Current Highlights
+
+- H.265 is now part of the native mainline for host, viewer, and relay fanout
+- hardware encoder detection uses native self-test instead of raw FFmpeg enumeration
+- host and viewer UI expose native FPS diagnostics
+- Win11 24H2 WGC high-FPS capture requires `GraphicsCaptureSession.MinUpdateInterval(1ms)`
+- WGC session now explicitly sets cursor capture and border behavior when the platform exposes those properties
 
 ## Release and Deployment
 
@@ -63,6 +72,7 @@ Current desktop UI supports:
   - prepares `server/` for Docker upload
 - `server/` is the deployable server directory
 - desktop auto-update feed is served from `server/updates/`
+- release notes for recent versions are tracked in [CHANGELOG.md](/d:/project/videosharing/CHANGELOG.md)
 
 ## Source Control Rules
 

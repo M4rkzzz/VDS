@@ -27,7 +27,9 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/dict.h>
+#include <libavutil/error.h>
 #include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
 #include <libavutil/samplefmt.h>
@@ -87,6 +89,12 @@ struct PeerState {
     bool launch_attempted = false;
     bool running = false;
     unsigned long process_id = 0;
+    unsigned long long source_frames_captured = 0;
+    unsigned long long source_bytes_captured = 0;
+    unsigned long long source_copy_resource_us_total = 0;
+    unsigned long long source_map_us_total = 0;
+    unsigned long long source_memcpy_us_total = 0;
+    unsigned long long source_total_readback_us_total = 0;
     unsigned long long frames_sent = 0;
     unsigned long long bytes_sent = 0;
     unsigned long long next_frame_timestamp_us = 0;
@@ -97,11 +105,13 @@ struct PeerState {
     int last_exit_code = std::numeric_limits<int>::min();
     std::string command_line;
     std::string source_backend = "gdigrab";
+    std::string codec_path = "h264";
     std::string reason = "peer-video-sender-idle";
     std::string last_error;
-    std::vector<std::uint8_t> cached_h264_decoder_config_au;
-    std::vector<std::uint8_t> cached_h264_keyframe_au;
-    bool pending_h264_bootstrap = true;
+    std::vector<std::uint8_t> pending_video_annexb_bytes;
+    std::vector<std::uint8_t> cached_video_decoder_config_au;
+    std::vector<std::uint8_t> cached_video_random_access_au;
+    bool pending_video_bootstrap = true;
     std::atomic<bool> stop_requested { false };
 #ifdef _WIN32
     HANDLE process_handle = nullptr;
@@ -182,9 +192,9 @@ struct PeerState {
     std::shared_ptr<NativeVideoSurface> surface;
     std::shared_ptr<PeerAudioDecoderRuntime> audio_decoder_runtime;
     NativeEmbeddedSurfaceLayout surface_layout;
-    std::vector<std::uint8_t> pending_h264_annexb_bytes;
-    std::vector<std::uint8_t> startup_h264_decoder_config_au;
-    bool startup_waiting_for_idr = true;
+    std::vector<std::uint8_t> pending_video_annexb_bytes;
+    std::vector<std::uint8_t> startup_video_decoder_config_au;
+    bool startup_waiting_for_random_access = true;
     std::deque<ScheduledVideoUnit> scheduled_video_queue;
     std::deque<ScheduledAudioBlock> scheduled_audio_queue;
     std::condition_variable av_sync_cv;
@@ -219,6 +229,12 @@ struct PeerState {
     std::string reason = "peer-media-not-attached";
     std::string last_error;
     unsigned long process_id = 0;
+    unsigned long long source_frames_captured = 0;
+    unsigned long long source_bytes_captured = 0;
+    unsigned long long avg_source_copy_resource_us = 0;
+    unsigned long long avg_source_map_us = 0;
+    unsigned long long avg_source_memcpy_us = 0;
+    unsigned long long avg_source_total_readback_us = 0;
     unsigned long long frames_sent = 0;
     unsigned long long bytes_sent = 0;
     std::string command_line;
@@ -235,17 +251,37 @@ struct CommandResult {
   std::string output;
 };
 
+struct VideoEncoderProbeResult {
+  std::string name;
+  bool exists = false;
+  bool hardware = false;
+  bool supports_low_latency = false;
+  bool requires_hw_device = false;
+  std::string hw_device_type;
+  bool hw_device_ready = false;
+  bool open_succeeded = false;
+  bool output_succeeded = false;
+  bool validated = false;
+  int priority = 0;
+  std::string reason;
+  std::string error;
+};
+
 struct FfmpegProbeResult {
   bool available = false;
   std::string path;
   std::string version;
   std::vector<std::string> hwaccels;
+  std::vector<std::string> bitstream_filters;
   std::vector<std::string> input_devices;
   std::vector<std::string> video_encoders;
   std::vector<std::string> validated_video_encoders;
+  std::vector<VideoEncoderProbeResult> video_encoder_probes;
   std::vector<std::string> video_decoders;
   std::vector<std::string> audio_encoders;
   std::vector<std::string> audio_decoders;
+  bool h264_metadata_bsf_available = false;
+  bool hevc_metadata_bsf_available = false;
   std::string error;
 };
 
@@ -292,6 +328,7 @@ struct HostPipelineState {
   bool validated = false;
   bool prefer_hardware = true;
   std::string requested_video_codec = "h264";
+  std::string requested_video_encoder;
   std::string requested_preset = "balanced";
   std::string requested_tune;
   std::string selected_video_encoder;
@@ -414,8 +451,10 @@ struct HostCaptureArtifactProbe {
 struct AgentRuntimeState {
   bool host_session_running = false;
   std::string host_capture_target_id;
+  std::string host_requested_codec = "h264";
   std::string host_codec = "h264";
   bool host_hardware_acceleration = true;
+  std::string host_video_encoder_preference;
   std::string host_encoder_preset = "balanced";
   std::string host_encoder_tune;
   std::string host_capture_kind = "window";
@@ -487,7 +526,7 @@ struct RelaySubscriberState {
   std::string upstream_peer_id;
   std::weak_ptr<PeerTransportSession> session;
   bool audio_enabled = false;
-  bool pending_h264_bootstrap = true;
+  bool pending_video_bootstrap = true;
   unsigned long long frames_sent = 0;
   unsigned long long bytes_sent = 0;
   std::string reason = "relay-subscriber-idle";
@@ -496,8 +535,9 @@ struct RelaySubscriberState {
 };
 
 struct RelayUpstreamVideoBootstrapState {
+  std::string codec_path = "h264";
   std::vector<std::uint8_t> decoder_config_au;
-  std::vector<std::uint8_t> keyframe_au;
+  std::vector<std::uint8_t> random_access_au;
 };
 
 struct RelayDispatchState {
@@ -518,8 +558,14 @@ RelayDispatchState& relay_dispatch_state() {
   return state;
 }
 
-bool h264_access_unit_has_decoder_config_nal(const std::vector<std::uint8_t>& access_unit);
-bool h264_access_unit_has_idr_nal(const std::vector<std::uint8_t>& access_unit);
+std::string normalize_video_codec(const std::string& codec, const std::string& fallback = "h264");
+bool video_access_unit_has_decoder_config_nal(const std::string& codec, const std::vector<std::uint8_t>& access_unit);
+bool video_access_unit_has_random_access_nal(const std::string& codec, const std::vector<std::uint8_t>& access_unit);
+bool video_bootstrap_is_complete(
+  const std::string& codec,
+  const std::vector<std::uint8_t>& decoder_config_au,
+  const std::vector<std::uint8_t>& random_access_au);
+bool is_hardware_video_encoder(const std::string& encoder);
 
 std::int64_t current_time_micros_steady() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1399,7 +1445,7 @@ void register_relay_subscriber(
     if (subscriber.peer_id == peer_id) {
       subscriber.session = session;
       subscriber.audio_enabled = audio_enabled;
-      subscriber.pending_h264_bootstrap = true;
+      subscriber.pending_video_bootstrap = true;
       subscriber.reason = "relay-subscriber-registered";
       subscriber.last_error.clear();
       subscriber.updated_at_unix_ms = current_time_millis();
@@ -1412,7 +1458,7 @@ void register_relay_subscriber(
   subscriber.upstream_peer_id = upstream_peer_id;
   subscriber.session = session;
   subscriber.audio_enabled = audio_enabled;
-  subscriber.pending_h264_bootstrap = true;
+  subscriber.pending_video_bootstrap = true;
   subscriber.reason = "relay-subscriber-registered";
   subscriber.updated_at_unix_ms = current_time_millis();
   subscribers.push_back(std::move(subscriber));
@@ -1444,8 +1490,9 @@ void unregister_relay_subscriber(const std::string& peer_id) {
   }
 }
 
-void cache_relay_h264_bootstrap_access_unit(
+void cache_relay_video_bootstrap_access_unit(
   const std::string& upstream_peer_id,
+  const std::string& codec,
   const std::vector<std::uint8_t>& access_unit) {
   if (upstream_peer_id.empty() || access_unit.empty()) {
     return;
@@ -1454,15 +1501,29 @@ void cache_relay_h264_bootstrap_access_unit(
   auto& state = relay_dispatch_state();
   std::lock_guard<std::mutex> lock(state.mutex);
   auto& bootstrap = state.video_bootstrap_by_upstream_peer[upstream_peer_id];
-  if (h264_access_unit_has_decoder_config_nal(access_unit)) {
+  const std::string normalized_codec = normalize_video_codec(codec);
+  if (bootstrap.codec_path != normalized_codec) {
+    bootstrap.codec_path = normalized_codec;
+    bootstrap.decoder_config_au.clear();
+    bootstrap.random_access_au.clear();
+
+    auto subscribers_it = state.subscribers_by_upstream_peer.find(upstream_peer_id);
+    if (subscribers_it != state.subscribers_by_upstream_peer.end()) {
+      for (auto& subscriber : subscribers_it->second) {
+        subscriber.pending_video_bootstrap = true;
+      }
+    }
+  }
+
+  if (video_access_unit_has_decoder_config_nal(bootstrap.codec_path, access_unit)) {
     bootstrap.decoder_config_au = access_unit;
   }
-  if (h264_access_unit_has_idr_nal(access_unit)) {
-    bootstrap.keyframe_au = access_unit;
+  if (video_access_unit_has_random_access_nal(bootstrap.codec_path, access_unit)) {
+    bootstrap.random_access_au = access_unit;
   }
 }
 
-bool collect_relay_h264_bootstrap_access_units(
+bool collect_relay_video_bootstrap_access_units(
   const std::string& upstream_peer_id,
   const std::string& peer_id,
   std::vector<std::vector<std::uint8_t>>* out_access_units) {
@@ -1484,7 +1545,7 @@ bool collect_relay_h264_bootstrap_access_units(
       break;
     }
   }
-  if (!matched_subscriber || !matched_subscriber->pending_h264_bootstrap) {
+  if (!matched_subscriber || !matched_subscriber->pending_video_bootstrap) {
     return false;
   }
 
@@ -1493,18 +1554,25 @@ bool collect_relay_h264_bootstrap_access_units(
     return false;
   }
 
+  if (!video_bootstrap_is_complete(
+        bootstrap_it->second.codec_path,
+        bootstrap_it->second.decoder_config_au,
+        bootstrap_it->second.random_access_au)) {
+    return false;
+  }
+
   if (!bootstrap_it->second.decoder_config_au.empty()) {
     out_access_units->push_back(bootstrap_it->second.decoder_config_au);
   }
-  if (!bootstrap_it->second.keyframe_au.empty() &&
-      bootstrap_it->second.keyframe_au != bootstrap_it->second.decoder_config_au) {
-    out_access_units->push_back(bootstrap_it->second.keyframe_au);
+  if (!bootstrap_it->second.random_access_au.empty() &&
+      bootstrap_it->second.random_access_au != bootstrap_it->second.decoder_config_au) {
+    out_access_units->push_back(bootstrap_it->second.random_access_au);
   }
   if (out_access_units->empty()) {
     return false;
   }
 
-  matched_subscriber->pending_h264_bootstrap = false;
+  matched_subscriber->pending_video_bootstrap = false;
   return true;
 }
 
@@ -1601,6 +1669,7 @@ void update_relay_subscriber_runtime(
 
 void fanout_relay_video_units(
   const std::string& upstream_peer_id,
+  const std::string& codec,
   const std::vector<std::vector<std::uint8_t>>& access_units,
   std::uint32_t rtp_timestamp) {
   if (upstream_peer_id.empty() || access_units.empty()) {
@@ -1608,7 +1677,7 @@ void fanout_relay_video_units(
   }
 
   for (const auto& access_unit : access_units) {
-    cache_relay_h264_bootstrap_access_unit(upstream_peer_id, access_unit);
+    cache_relay_video_bootstrap_access_unit(upstream_peer_id, codec, access_unit);
   }
 
   const auto targets = collect_relay_dispatch_targets(upstream_peer_id);
@@ -1647,10 +1716,10 @@ void fanout_relay_video_units(
     unsigned long long sent_frames = 0;
     unsigned long long sent_bytes = 0;
     std::vector<std::vector<std::uint8_t>> units_to_send;
-    collect_relay_h264_bootstrap_access_units(upstream_peer_id, target.peer_id, &units_to_send);
+    collect_relay_video_bootstrap_access_units(upstream_peer_id, target.peer_id, &units_to_send);
     units_to_send.insert(units_to_send.end(), access_units.begin(), access_units.end());
     for (const auto& access_unit : units_to_send) {
-      if (!send_peer_transport_h264_video_frame(target.session, access_unit, timestamp_us, &send_error)) {
+      if (!send_peer_transport_video_frame(target.session, access_unit, codec, timestamp_us, &send_error)) {
         send_failed = true;
         break;
       }
@@ -2060,9 +2129,9 @@ void consume_remote_peer_audio_frame(
   fanout_relay_audio_frame(peer_id, frame, lowered_codec, rtp_timestamp);
 
   std::lock_guard<std::mutex> lock(runtime_ptr->mutex);
-  if (runtime_ptr->startup_waiting_for_idr) {
+  if (runtime_ptr->startup_waiting_for_random_access) {
     runtime_ptr->dropped_audio_blocks += 1;
-    runtime_ptr->reason = "peer-av-sync-audio-waiting-for-idr";
+    runtime_ptr->reason = "peer-av-sync-audio-waiting-for-random-access";
     return;
   }
   PeerState::PeerVideoReceiverRuntime::ScheduledAudioBlock block;
@@ -2227,6 +2296,45 @@ std::string json_array_from_strings(const std::vector<std::string>& values) {
       payload << ",";
     }
     payload << "\"" << json_escape(values[index]) << "\"";
+  }
+  payload << "]";
+  return payload.str();
+}
+
+std::string ffmpeg_error_string(int error_code) {
+  char buffer[AV_ERROR_MAX_STRING_SIZE] = {};
+  av_strerror(error_code, buffer, sizeof(buffer));
+  return std::string(buffer);
+}
+
+std::string json_object_from_video_encoder_probe(const VideoEncoderProbeResult& probe) {
+  std::ostringstream payload;
+  payload
+    << "{\"name\":\"" << json_escape(probe.name) << "\""
+    << ",\"exists\":" << (probe.exists ? "true" : "false")
+    << ",\"hardware\":" << (probe.hardware ? "true" : "false")
+    << ",\"supportsLowLatency\":" << (probe.supports_low_latency ? "true" : "false")
+    << ",\"requiresHwDevice\":" << (probe.requires_hw_device ? "true" : "false")
+    << ",\"hwDeviceType\":\"" << json_escape(probe.hw_device_type) << "\""
+    << ",\"hwDeviceReady\":" << (probe.hw_device_ready ? "true" : "false")
+    << ",\"openSucceeded\":" << (probe.open_succeeded ? "true" : "false")
+    << ",\"outputSucceeded\":" << (probe.output_succeeded ? "true" : "false")
+    << ",\"validated\":" << (probe.validated ? "true" : "false")
+    << ",\"priority\":" << probe.priority
+    << ",\"reason\":\"" << json_escape(probe.reason) << "\""
+    << ",\"error\":\"" << json_escape(probe.error) << "\""
+    << "}";
+  return payload.str();
+}
+
+std::string json_array_from_video_encoder_probes(const std::vector<VideoEncoderProbeResult>& probes) {
+  std::ostringstream payload;
+  payload << "[";
+  for (std::size_t index = 0; index < probes.size(); ++index) {
+    if (index > 0) {
+      payload << ",";
+    }
+    payload << json_object_from_video_encoder_probe(probes[index]);
   }
   payload << "]";
   return payload.str();
@@ -2590,8 +2698,13 @@ bool update_surface_attachment_layout(
   SurfaceAttachmentState& state,
   const NativeEmbeddedSurfaceLayout& layout,
   std::string* error);
-bool h264_access_unit_has_decoder_config_nal(const std::vector<std::uint8_t>& access_unit);
-bool h264_access_unit_has_idr_nal(const std::vector<std::uint8_t>& access_unit);
+std::string normalize_video_codec(const std::string& codec, const std::string& fallback);
+bool video_access_unit_has_decoder_config_nal(const std::string& codec, const std::vector<std::uint8_t>& access_unit);
+bool video_access_unit_has_random_access_nal(const std::string& codec, const std::vector<std::uint8_t>& access_unit);
+bool video_bootstrap_is_complete(
+  const std::string& codec,
+  const std::vector<std::uint8_t>& decoder_config_au,
+  const std::vector<std::uint8_t>& random_access_au);
 void update_peer_decoder_state_from_runtime(
   const std::shared_ptr<PeerState::PeerVideoReceiverRuntime>& runtime,
   const std::shared_ptr<PeerTransportSession>& transport_session);
@@ -2944,9 +3057,9 @@ bool start_peer_video_surface_attachment(
     codec_path = runtime.codec_path.empty() ? "h264" : runtime.codec_path;
     runtime.window_title = window_title;
     runtime.command_line.clear();
-    runtime.pending_h264_annexb_bytes.clear();
-    runtime.startup_h264_decoder_config_au.clear();
-    runtime.startup_waiting_for_idr = true;
+    runtime.pending_video_annexb_bytes.clear();
+    runtime.startup_video_decoder_config_au.clear();
+    runtime.startup_waiting_for_random_access = true;
     runtime.launch_attempted = true;
     runtime.last_start_attempt_at_unix_ms = current_time_millis();
     runtime.last_error.clear();
@@ -3018,9 +3131,9 @@ void stop_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& run
   runtime.running = false;
   runtime.decoder_ready = false;
   runtime.process_id = 0;
-  runtime.pending_h264_annexb_bytes.clear();
-  runtime.startup_h264_decoder_config_au.clear();
-  runtime.startup_waiting_for_idr = true;
+  runtime.pending_video_annexb_bytes.clear();
+  runtime.startup_video_decoder_config_au.clear();
+  runtime.startup_waiting_for_random_access = true;
   runtime.av_sync_cv.notify_all();
   runtime.reason = reason;
   runtime.last_stop_at_unix_ms = current_time_millis();
@@ -3567,6 +3680,345 @@ CommandResult run_ffmpeg_encoder_self_test(
   const std::string& video_encoder,
   const std::string& audio_encoder);
 
+int video_encoder_probe_priority(const std::string& encoder) {
+  const std::string normalized = to_lower_copy(trim_copy(encoder));
+  if (normalized.find("_nvenc") != std::string::npos) {
+    return 10;
+  }
+  if (normalized.find("_amf") != std::string::npos) {
+    return 20;
+  }
+  if (normalized.find("_qsv") != std::string::npos) {
+    return 30;
+  }
+  if (normalized.find("_d3d12va") != std::string::npos) {
+    return 40;
+  }
+  if (normalized.find("_mf") != std::string::npos) {
+    return 50;
+  }
+  if (normalized == "libx264" || normalized == "libx265") {
+    return 90;
+  }
+  if (normalized == "libopenh264") {
+    return 95;
+  }
+  return 100;
+}
+
+bool encoder_supports_low_latency(const std::string& encoder) {
+  const std::string normalized = to_lower_copy(trim_copy(encoder));
+  return is_hardware_video_encoder(normalized) ||
+    normalized == "libx264" ||
+    normalized == "libx265" ||
+    normalized == "libopenh264";
+}
+
+AVHWDeviceType required_hw_device_type_for_encoder(const std::string& encoder) {
+  const std::string normalized = to_lower_copy(trim_copy(encoder));
+  if (normalized.find("_d3d12va") != std::string::npos) {
+    return AV_HWDEVICE_TYPE_D3D12VA;
+  }
+  return AV_HWDEVICE_TYPE_NONE;
+}
+
+bool codec_supports_hw_device(const AVCodec* codec, AVHWDeviceType device_type) {
+  if (!codec || device_type == AV_HWDEVICE_TYPE_NONE) {
+    return false;
+  }
+
+  for (int index = 0;; ++index) {
+    const AVCodecHWConfig* config = avcodec_get_hw_config(codec, index);
+    if (!config) {
+      return false;
+    }
+    if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) == 0) {
+      continue;
+    }
+    if (config->device_type == device_type) {
+      return true;
+    }
+  }
+}
+
+AVPixelFormat select_probe_pixel_format(const AVCodec* codec) {
+  if (!codec) {
+    return AV_PIX_FMT_NONE;
+  }
+
+  const void* supported_configs = nullptr;
+  int supported_config_count = 0;
+  if (avcodec_get_supported_config(
+    nullptr,
+    codec,
+    AV_CODEC_CONFIG_PIX_FORMAT,
+    0,
+    &supported_configs,
+    &supported_config_count
+  ) < 0 || !supported_configs || supported_config_count <= 0) {
+    return AV_PIX_FMT_NONE;
+  }
+
+  const auto* pixel_formats = static_cast<const AVPixelFormat*>(supported_configs);
+  AVPixelFormat first_supported = AV_PIX_FMT_NONE;
+  for (int index = 0; index < supported_config_count; ++index) {
+    const AVPixelFormat format = pixel_formats[index];
+    if (first_supported == AV_PIX_FMT_NONE) {
+      first_supported = format;
+    }
+    if (format == AV_PIX_FMT_NV12) {
+      return format;
+    }
+  }
+
+  for (int index = 0; index < supported_config_count; ++index) {
+    const AVPixelFormat format = pixel_formats[index];
+    if (format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P) {
+      return format;
+    }
+  }
+
+  return first_supported;
+}
+
+bool fill_probe_test_frame(AVFrame* frame, std::string* error) {
+  if (!frame) {
+    if (error) {
+      *error = "encoder-frame-missing";
+    }
+    return false;
+  }
+
+  if (frame->format == AV_PIX_FMT_NV12) {
+    for (int y = 0; y < frame->height; ++y) {
+      std::memset(frame->data[0] + (y * frame->linesize[0]), 0x10, static_cast<std::size_t>(frame->width));
+    }
+
+    for (int y = 0; y < frame->height / 2; ++y) {
+      std::memset(frame->data[1] + (y * frame->linesize[1]), 0x80, static_cast<std::size_t>(frame->width));
+    }
+    return true;
+  }
+
+  if (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P) {
+    for (int y = 0; y < frame->height; ++y) {
+      std::memset(frame->data[0] + (y * frame->linesize[0]), 0x10, static_cast<std::size_t>(frame->width));
+    }
+    for (int y = 0; y < frame->height / 2; ++y) {
+      std::memset(frame->data[1] + (y * frame->linesize[1]), 0x80, static_cast<std::size_t>(frame->width / 2));
+      std::memset(frame->data[2] + (y * frame->linesize[2]), 0x80, static_cast<std::size_t>(frame->width / 2));
+    }
+    return true;
+  }
+
+  if (error) {
+    *error = "unsupported-probe-pixel-format";
+  }
+  return false;
+}
+
+VideoEncoderProbeResult run_video_encoder_probe(const std::string& video_encoder) {
+  VideoEncoderProbeResult probe;
+  probe.name = trim_copy(video_encoder);
+  probe.hardware = is_hardware_video_encoder(probe.name);
+  probe.supports_low_latency = encoder_supports_low_latency(probe.name);
+  probe.priority = video_encoder_probe_priority(probe.name);
+
+  const AVCodec* codec = avcodec_find_encoder_by_name(probe.name.c_str());
+  if (!codec) {
+    probe.reason = "encoder-missing";
+    probe.error = "avcodec-find-encoder-by-name-failed";
+    return probe;
+  }
+
+  probe.exists = true;
+
+  AVBufferRef* device_ref = nullptr;
+  AVCodecContext* codec_context = nullptr;
+  AVFrame* frame = nullptr;
+  AVPacket* packet = nullptr;
+
+  const AVHWDeviceType device_type = required_hw_device_type_for_encoder(probe.name);
+  if (device_type != AV_HWDEVICE_TYPE_NONE) {
+    probe.requires_hw_device = true;
+    probe.hw_device_type = av_hwdevice_get_type_name(device_type);
+
+    if (!codec_supports_hw_device(codec, device_type)) {
+      probe.reason = "encoder-hw-device-unsupported";
+      probe.error = "encoder-does-not-support-hw-device-context";
+      return probe;
+    }
+
+    const int hw_result = av_hwdevice_ctx_create(&device_ref, device_type, nullptr, nullptr, 0);
+    if (hw_result < 0 || !device_ref) {
+      probe.reason = "hardware-device-unavailable";
+      probe.error = hw_result < 0 ? ffmpeg_error_string(hw_result) : "av-hwdevice-ctx-create-failed";
+      if (device_ref) {
+        av_buffer_unref(&device_ref);
+      }
+      return probe;
+    }
+
+    probe.hw_device_ready = true;
+  }
+
+  codec_context = avcodec_alloc_context3(codec);
+  if (!codec_context) {
+    probe.reason = "encoder-context-allocation-failed";
+    probe.error = "avcodec-alloc-context3-failed";
+    av_buffer_unref(&device_ref);
+    return probe;
+  }
+
+  codec_context->width = 640;
+  codec_context->height = 480;
+  codec_context->time_base = AVRational { 1, 30 };
+  codec_context->framerate = AVRational { 30, 1 };
+  codec_context->bit_rate = 1000000;
+  codec_context->pix_fmt = select_probe_pixel_format(codec);
+  codec_context->gop_size = 30;
+  codec_context->max_b_frames = 0;
+  codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
+  if (codec_context->pix_fmt == AV_PIX_FMT_NONE) {
+    probe.reason = "encoder-pixel-format-unsupported";
+    probe.error = "encoder-has-no-supported-probe-pixel-format";
+    avcodec_free_context(&codec_context);
+    av_buffer_unref(&device_ref);
+    return probe;
+  }
+
+  if (device_ref) {
+    codec_context->hw_device_ctx = av_buffer_ref(device_ref);
+    if (!codec_context->hw_device_ctx) {
+      probe.reason = "encoder-hw-device-attach-failed";
+      probe.error = "av-buffer-ref-failed";
+      avcodec_free_context(&codec_context);
+      av_buffer_unref(&device_ref);
+      return probe;
+    }
+  }
+
+  const int open_result = avcodec_open2(codec_context, codec, nullptr);
+  if (open_result < 0) {
+    probe.reason = "encoder-open-failed";
+    probe.error = ffmpeg_error_string(open_result);
+    avcodec_free_context(&codec_context);
+    av_buffer_unref(&device_ref);
+    return probe;
+  }
+
+  probe.open_succeeded = true;
+
+  frame = av_frame_alloc();
+  packet = av_packet_alloc();
+  if (!frame || !packet) {
+    probe.reason = "encoder-frame-allocation-failed";
+    probe.error = "av-frame-or-packet-allocation-failed";
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&codec_context);
+    av_buffer_unref(&device_ref);
+    return probe;
+  }
+
+  frame->format = codec_context->pix_fmt;
+  frame->width = codec_context->width;
+  frame->height = codec_context->height;
+
+  int buffer_result = av_frame_get_buffer(frame, 32);
+  if (buffer_result < 0) {
+    probe.reason = "encoder-frame-buffer-failed";
+    probe.error = ffmpeg_error_string(buffer_result);
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&codec_context);
+    av_buffer_unref(&device_ref);
+    return probe;
+  }
+
+  buffer_result = av_frame_make_writable(frame);
+  if (buffer_result < 0) {
+    probe.reason = "encoder-frame-not-writable";
+    probe.error = ffmpeg_error_string(buffer_result);
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&codec_context);
+    av_buffer_unref(&device_ref);
+    return probe;
+  }
+
+  std::string fill_error;
+  if (!fill_probe_test_frame(frame, &fill_error)) {
+    probe.reason = "encoder-test-frame-fill-failed";
+    probe.error = fill_error;
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&codec_context);
+    av_buffer_unref(&device_ref);
+    return probe;
+  }
+  frame->pts = 0;
+
+  int send_result = avcodec_send_frame(codec_context, frame);
+  if (send_result < 0) {
+    probe.reason = "encoder-send-frame-failed";
+    probe.error = ffmpeg_error_string(send_result);
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&codec_context);
+    av_buffer_unref(&device_ref);
+    return probe;
+  }
+
+  const int flush_result = avcodec_send_frame(codec_context, nullptr);
+  if (flush_result < 0 && flush_result != AVERROR_EOF) {
+    probe.reason = "encoder-flush-failed";
+    probe.error = ffmpeg_error_string(flush_result);
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&codec_context);
+    av_buffer_unref(&device_ref);
+    return probe;
+  }
+
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    const int receive_result = avcodec_receive_packet(codec_context, packet);
+    if (receive_result == 0) {
+      if (packet->size > 0) {
+        probe.output_succeeded = true;
+        probe.validated = true;
+        probe.reason = "encoder-self-test-passed";
+        probe.error.clear();
+        av_packet_unref(packet);
+        break;
+      }
+
+      av_packet_unref(packet);
+      continue;
+    }
+
+    if (receive_result == AVERROR(EAGAIN) || receive_result == AVERROR_EOF) {
+      continue;
+    }
+
+    probe.reason = "encoder-receive-packet-failed";
+    probe.error = ffmpeg_error_string(receive_result);
+    break;
+  }
+
+  if (!probe.validated && probe.reason.empty()) {
+    probe.reason = "encoder-self-test-no-output";
+    probe.error = "encoded-packet-not-produced";
+  }
+
+  av_frame_free(&frame);
+  av_packet_free(&packet);
+  avcodec_free_context(&codec_context);
+  av_buffer_unref(&device_ref);
+  return probe;
+}
+
 std::string select_preferred_audio_encoder(const std::vector<std::string>& audio_encoders) {
   if (std::find(audio_encoders.begin(), audio_encoders.end(), "libopus") != audio_encoders.end()) {
     return "libopus";
@@ -3711,50 +4163,47 @@ FfmpegProbeResult probe_ffmpeg(const std::string& agent_binary_path) {
       probe.hwaccels = collect_flag_list(hwaccels_result.output);
     }
 
+    const CommandResult bsfs_result = run_command_capture(command_target + " -hide_banner -bsfs 2>&1");
+    if (bsfs_result.launched && bsfs_result.exit_code == 0) {
+      probe.bitstream_filters = collect_flag_list(bsfs_result.output);
+      probe.h264_metadata_bsf_available =
+        std::find(probe.bitstream_filters.begin(), probe.bitstream_filters.end(), "h264_metadata") != probe.bitstream_filters.end();
+      probe.hevc_metadata_bsf_available =
+        std::find(probe.bitstream_filters.begin(), probe.bitstream_filters.end(), "hevc_metadata") != probe.bitstream_filters.end();
+    }
+
     const CommandResult devices_result = run_command_capture(command_target + " -hide_banner -devices 2>&1");
     if (devices_result.launched && !trim_copy(devices_result.output).empty()) {
       probe.input_devices = collect_ffmpeg_devices(devices_result.output, true);
     }
 
+    const std::vector<std::string> capability_probe_encoders = {
+      "h264_nvenc",
+      "h264_amf",
+      "h264_qsv",
+      "h264_d3d12va",
+      "h264_mf",
+      "libx264",
+      "libopenh264",
+      "hevc_nvenc",
+      "hevc_amf",
+      "hevc_qsv",
+      "hevc_d3d12va",
+      "hevc_mf",
+      "libx265"
+    };
+
     const CommandResult encoders_result = run_command_capture(command_target + " -hide_banner -encoders 2>&1");
     if (encoders_result.launched && encoders_result.exit_code == 0) {
       probe.video_encoders = collect_codec_names(encoders_result.output, { "264", "265", "hevc" });
       probe.audio_encoders = collect_codec_names(encoders_result.output, { "opus" });
-      const std::string probe_audio_encoder = select_preferred_audio_encoder(probe.audio_encoders);
+    }
 
-      if (!probe.video_encoders.empty() && !probe_audio_encoder.empty()) {
-        const std::vector<std::string> capability_probe_encoders = {
-          "h264_amf",
-          "h264_mf",
-          "h264_qsv",
-          "h264_nvenc",
-          "h264_vaapi",
-          "h264_vulkan",
-          "libopenh264",
-          "libx264",
-          "hevc_amf",
-          "hevc_mf",
-          "hevc_qsv",
-          "hevc_nvenc",
-          "hevc_vaapi",
-          "hevc_vulkan",
-          "libx265"
-        };
-
-        for (const std::string& encoder : capability_probe_encoders) {
-          if (std::find(probe.video_encoders.begin(), probe.video_encoders.end(), encoder) == probe.video_encoders.end()) {
-            continue;
-          }
-
-          CommandResult validation = run_ffmpeg_encoder_self_test(
-            probe,
-            encoder,
-            probe_audio_encoder
-          );
-          if (validation.launched && validation.exit_code == 0) {
-            probe.validated_video_encoders.push_back(encoder);
-          }
-        }
+    for (const std::string& encoder : capability_probe_encoders) {
+      VideoEncoderProbeResult validation = run_video_encoder_probe(encoder);
+      probe.video_encoder_probes.push_back(validation);
+      if (validation.validated) {
+        probe.validated_video_encoders.push_back(encoder);
       }
     }
 
@@ -3782,12 +4231,16 @@ std::string ffmpeg_probe_json(const FfmpegProbeResult& probe) {
     << ",\"path\":\"" << json_escape(probe.path) << "\""
     << ",\"version\":\"" << json_escape(probe.version) << "\""
     << ",\"hwaccels\":" << json_array_from_strings(probe.hwaccels)
+    << ",\"bitstreamFilters\":" << json_array_from_strings(probe.bitstream_filters)
     << ",\"inputDevices\":" << json_array_from_strings(probe.input_devices)
     << ",\"videoEncoders\":" << json_array_from_strings(probe.video_encoders)
     << ",\"validatedVideoEncoders\":" << json_array_from_strings(probe.validated_video_encoders)
+    << ",\"videoEncoderProbes\":" << json_array_from_video_encoder_probes(probe.video_encoder_probes)
     << ",\"videoDecoders\":" << json_array_from_strings(probe.video_decoders)
     << ",\"audioEncoders\":" << json_array_from_strings(probe.audio_encoders)
     << ",\"audioDecoders\":" << json_array_from_strings(probe.audio_decoders)
+    << ",\"h264MetadataBsfAvailable\":" << (probe.h264_metadata_bsf_available ? "true" : "false")
+    << ",\"hevcMetadataBsfAvailable\":" << (probe.hevc_metadata_bsf_available ? "true" : "false")
     << ",\"error\":\"" << json_escape(probe.error) << "\""
     << "}";
   return payload.str();
@@ -3852,13 +4305,55 @@ bool contains_value(const std::vector<std::string>& values, const std::string& t
   return std::find(values.begin(), values.end(), target) != values.end();
 }
 
+const VideoEncoderProbeResult* find_video_encoder_probe(
+  const FfmpegProbeResult& ffmpeg,
+  const std::string& target) {
+  const std::string normalized = to_lower_copy(trim_copy(target));
+  for (const VideoEncoderProbeResult& probe : ffmpeg.video_encoder_probes) {
+    if (to_lower_copy(trim_copy(probe.name)) == normalized) {
+      return &probe;
+    }
+  }
+  return nullptr;
+}
+
+bool encoder_exists_for_runtime(const FfmpegProbeResult& ffmpeg, const std::string& target) {
+  if (contains_value(ffmpeg.video_encoders, target)) {
+    return true;
+  }
+  const VideoEncoderProbeResult* probe = find_video_encoder_probe(ffmpeg, target);
+  return probe && probe->exists;
+}
+
+std::string normalize_video_encoder_preference(const std::string& encoder) {
+  const std::string normalized = to_lower_copy(trim_copy(encoder));
+  if (normalized.empty() || normalized == "auto") {
+    return {};
+  }
+  return normalized;
+}
+
+bool video_encoder_matches_codec(const std::string& encoder, const std::string& requested_codec) {
+  const std::string lowered = to_lower_copy(trim_copy(encoder));
+  if (lowered.empty()) {
+    return false;
+  }
+
+  const bool wants_hevc = requested_codec == "h265" || requested_codec == "hevc";
+  if (wants_hevc) {
+    return lowered.find("265") != std::string::npos || lowered.find("hevc") != std::string::npos;
+  }
+
+  return lowered.find("264") != std::string::npos &&
+    lowered.find("265") == std::string::npos &&
+    lowered.find("hevc") == std::string::npos;
+}
+
 bool is_hardware_video_encoder(const std::string& encoder) {
   return encoder.find("_amf") != std::string::npos ||
     encoder.find("_mf") != std::string::npos ||
     encoder.find("_qsv") != std::string::npos ||
     encoder.find("_nvenc") != std::string::npos ||
-    encoder.find("_vaapi") != std::string::npos ||
-    encoder.find("_vulkan") != std::string::npos ||
     encoder.find("_d3d12va") != std::string::npos;
 }
 
@@ -3871,19 +4366,15 @@ CommandResult run_ffmpeg_encoder_self_test(
     return result;
   }
 
-  const std::string ffmpeg_command = quote_command_path(ffmpeg.path);
-  const std::string command =
-    ffmpeg_command +
-    " -hide_banner -loglevel error"
-    " -f lavfi -i testsrc=size=128x72:rate=30"
-    " -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000"
-    " -t 0.20"
-    " -pix_fmt yuv420p"
-    " -c:v " + video_encoder +
-    " -c:a " + audio_encoder +
-    " -f null - 2>&1";
-
-  return run_command_capture(command);
+  (void)audio_encoder;
+  const VideoEncoderProbeResult* cached_probe = find_video_encoder_probe(ffmpeg, video_encoder);
+  const VideoEncoderProbeResult probe = cached_probe
+    ? *cached_probe
+    : run_video_encoder_probe(video_encoder);
+  result.launched = probe.exists;
+  result.exit_code = probe.validated ? 0 : 1;
+  result.output = probe.error.empty() ? probe.reason : (probe.reason + ": " + probe.error);
+  return result;
 }
 
 std::string host_pipeline_json(const HostPipelineState& pipeline) {
@@ -3894,6 +4385,7 @@ std::string host_pipeline_json(const HostPipelineState& pipeline) {
     << ",\"validated\":" << (pipeline.validated ? "true" : "false")
     << ",\"preferHardware\":" << (pipeline.prefer_hardware ? "true" : "false")
     << ",\"requestedVideoCodec\":\"" << json_escape(pipeline.requested_video_codec) << "\""
+    << ",\"requestedVideoEncoder\":\"" << json_escape(pipeline.requested_video_encoder) << "\""
     << ",\"requestedPreset\":\"" << json_escape(pipeline.requested_preset) << "\""
     << ",\"requestedTune\":\"" << json_escape(pipeline.requested_tune) << "\""
     << ",\"selectedVideoEncoder\":\"" << json_escape(pipeline.selected_video_encoder) << "\""
@@ -4078,6 +4570,11 @@ bool is_h264_video_encoder(const std::string& encoder) {
   return lowered.find("264") != std::string::npos;
 }
 
+bool is_h265_video_encoder(const std::string& encoder) {
+  const std::string lowered = to_lower_copy(encoder);
+  return lowered.find("265") != std::string::npos || lowered.find("hevc") != std::string::npos;
+}
+
 int normalize_host_output_dimension(int value, int fallback) {
   return value > 0 ? value : fallback;
 }
@@ -4135,12 +4632,11 @@ std::vector<std::string> build_preferred_video_encoder_list(const std::string& r
   if (wants_hevc) {
     if (prefer_hardware) {
       return {
-        "hevc_amf",
-        "hevc_mf",
-        "hevc_qsv",
         "hevc_nvenc",
-        "hevc_vaapi",
-        "hevc_vulkan",
+        "hevc_amf",
+        "hevc_qsv",
+        "hevc_d3d12va",
+        "hevc_mf",
         "libx265"
       };
     }
@@ -4152,21 +4648,32 @@ std::vector<std::string> build_preferred_video_encoder_list(const std::string& r
 
   if (prefer_hardware) {
     return {
-      "h264_amf",
-      "h264_mf",
-      "h264_qsv",
       "h264_nvenc",
-      "h264_vaapi",
-      "h264_vulkan",
-      "libopenh264",
-      "libx264"
+      "h264_amf",
+      "h264_qsv",
+      "h264_d3d12va",
+      "h264_mf",
+      "libx264",
+      "libopenh264"
     };
   }
 
   return {
-    "libopenh264",
-    "libx264"
+    "libx264",
+    "libopenh264"
   };
+}
+
+std::vector<std::string> build_candidate_video_encoder_list(
+  const std::string& requested_codec,
+  bool prefer_hardware,
+  const std::string& requested_video_encoder) {
+  const std::string manual_encoder = normalize_video_encoder_preference(requested_video_encoder);
+  if (prefer_hardware && !manual_encoder.empty() && video_encoder_matches_codec(manual_encoder, requested_codec)) {
+    return { manual_encoder };
+  }
+
+  return build_preferred_video_encoder_list(requested_codec, prefer_hardware);
 }
 
 void append_video_encoder_runtime_flags(std::ostringstream& command, const HostPipelineState& pipeline) {
@@ -4223,7 +4730,9 @@ std::string build_ffmpeg_peer_video_sender_command(
     return {};
   }
 
-  if (!is_h264_video_encoder(pipeline.selected_video_encoder)) {
+  const std::string codec = normalize_video_codec(plan.codec_path, normalize_video_codec(pipeline.requested_video_codec));
+  if ((codec == "h265" && !is_h265_video_encoder(pipeline.selected_video_encoder)) ||
+      (codec != "h265" && !is_h264_video_encoder(pipeline.selected_video_encoder))) {
     return {};
   }
 
@@ -4267,7 +4776,13 @@ std::string build_ffmpeg_peer_video_sender_command(
 
   append_video_encoder_runtime_flags(command, pipeline);
 
-  command << " -bsf:v h264_metadata=aud=insert -f h264 pipe:1";
+  if (codec == "h265") {
+    // Several Windows HEVC hardware encoders already emit AUD in Annex B output,
+    // and hevc_metadata can fail to initialize before the first VPS/SPS is available.
+    command << " -f hevc pipe:1";
+  } else {
+    command << " -bsf:v h264_metadata=aud=insert -f h264 pipe:1";
+  }
   return command.str();
 }
 
@@ -4275,11 +4790,13 @@ HostPipelineState select_host_pipeline(
   const FfmpegProbeResult& ffmpeg,
   const std::string& requested_codec,
   bool prefer_hardware,
+  const std::string& requested_video_encoder,
   const std::string& requested_preset,
   const std::string& requested_tune) {
   HostPipelineState pipeline;
   pipeline.prefer_hardware = prefer_hardware;
   pipeline.requested_video_codec = requested_codec.empty() ? "h264" : to_lower_copy(requested_codec);
+  pipeline.requested_video_encoder = normalize_video_encoder_preference(requested_video_encoder);
   pipeline.requested_preset = normalize_host_encoder_preset(requested_preset);
   pipeline.requested_tune = normalize_host_encoder_tune(requested_tune);
   pipeline.selected_audio_encoder = select_preferred_audio_encoder(ffmpeg.audio_encoders);
@@ -4296,13 +4813,14 @@ HostPipelineState select_host_pipeline(
     pipeline.requested_video_codec = "h264";
   }
 
-  const std::vector<std::string> preferred_video_encoders = build_preferred_video_encoder_list(
+  const std::vector<std::string> preferred_video_encoders = build_candidate_video_encoder_list(
     pipeline.requested_video_codec,
-    pipeline.prefer_hardware
+    pipeline.prefer_hardware,
+    pipeline.requested_video_encoder
   );
 
   for (const std::string& encoder : preferred_video_encoders) {
-    if (contains_value(ffmpeg.video_encoders, encoder)) {
+    if (encoder_exists_for_runtime(ffmpeg, encoder)) {
       pipeline.selected_video_encoder = encoder;
       pipeline.video_encoder_backend = infer_video_encoder_backend(encoder);
       break;
@@ -4323,7 +4841,9 @@ HostPipelineState select_host_pipeline(
   }
 
   pipeline.hardware = is_hardware_video_encoder(pipeline.selected_video_encoder);
-  pipeline.reason = pipeline.hardware ? "hardware-pipeline-selected" : "software-pipeline-selected";
+  pipeline.reason = pipeline.requested_video_encoder.empty()
+    ? (pipeline.hardware ? "hardware-pipeline-selected" : "software-pipeline-selected")
+    : (pipeline.hardware ? "manual-hardware-pipeline-selected" : "manual-software-pipeline-selected");
   pipeline.validation_reason = "pipeline-selection-only";
   return pipeline;
 }
@@ -4332,12 +4852,14 @@ HostPipelineState select_and_validate_host_pipeline(
   const FfmpegProbeResult& ffmpeg,
   const std::string& requested_codec,
   bool prefer_hardware,
+  const std::string& requested_video_encoder,
   const std::string& requested_preset,
   const std::string& requested_tune) {
   HostPipelineState base_pipeline = select_host_pipeline(
     ffmpeg,
     requested_codec,
     prefer_hardware,
+    requested_video_encoder,
     requested_preset,
     requested_tune
   );
@@ -4349,26 +4871,28 @@ HostPipelineState select_and_validate_host_pipeline(
     ? "h264"
     : base_pipeline.requested_video_codec;
 
-  const std::vector<std::string> preferred_video_encoders = build_preferred_video_encoder_list(
+  const std::vector<std::string> preferred_video_encoders = build_candidate_video_encoder_list(
     normalized_codec,
-    base_pipeline.prefer_hardware
+    base_pipeline.prefer_hardware,
+    base_pipeline.requested_video_encoder
   );
 
   std::string last_validation_error;
   for (const std::string& encoder : preferred_video_encoders) {
-    if (!contains_value(ffmpeg.video_encoders, encoder)) {
+    if (!encoder_exists_for_runtime(ffmpeg, encoder)) {
       continue;
     }
 
     CommandResult validation = run_ffmpeg_encoder_self_test(ffmpeg, encoder, base_pipeline.selected_audio_encoder);
     if (validation.launched && validation.exit_code == 0) {
       base_pipeline.selected_video_encoder = encoder;
+      base_pipeline.video_encoder_backend = infer_video_encoder_backend(encoder);
       base_pipeline.hardware = is_hardware_video_encoder(encoder);
       base_pipeline.ready = true;
       base_pipeline.validated = true;
-      base_pipeline.reason = base_pipeline.hardware
-        ? "hardware-pipeline-validated"
-        : "software-pipeline-validated";
+      base_pipeline.reason = base_pipeline.requested_video_encoder.empty()
+        ? (base_pipeline.hardware ? "hardware-pipeline-validated" : "software-pipeline-validated")
+        : (base_pipeline.hardware ? "manual-hardware-pipeline-validated" : "manual-software-pipeline-validated");
       base_pipeline.validation_reason = "encoder-self-test-passed";
       base_pipeline.last_error.clear();
       return base_pipeline;
@@ -4384,7 +4908,12 @@ HostPipelineState select_and_validate_host_pipeline(
   base_pipeline.validated = false;
   base_pipeline.validation_reason = "encoder-self-test-failed";
   base_pipeline.last_error = last_validation_error;
-  if (base_pipeline.reason == "hardware-pipeline-selected" || base_pipeline.reason == "software-pipeline-selected") {
+  if (
+    base_pipeline.reason == "hardware-pipeline-selected" ||
+    base_pipeline.reason == "software-pipeline-selected" ||
+    base_pipeline.reason == "manual-hardware-pipeline-selected" ||
+    base_pipeline.reason == "manual-software-pipeline-selected"
+  ) {
     base_pipeline.reason = "pipeline-selected-but-not-validated";
   }
   return base_pipeline;
@@ -4872,7 +5401,7 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
 
   PeerVideoTrackConfig config;
   config.enabled = true;
-  config.codec = "h264";
+  config.codec = normalize_video_codec(state.host_codec);
   config.mid = "video";
   config.stream_id = "vds-host-stream";
   config.track_id = peer.peer_id + "-video";
@@ -4901,7 +5430,7 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
     peer.media_binding.sender_configured = peer.transport.video_track_configured;
     peer.media_binding.active = peer.transport.video_track_open;
     peer.media_binding.video_encoder_backend = state.host_pipeline.video_encoder_backend;
-    peer.media_binding.implementation = "wgc-ffmpeg-libdatachannel-h264-track";
+    peer.media_binding.implementation = "wgc-ffmpeg-libdatachannel-video-track";
     peer.media_binding.reason = peer.transport.video_track_open
       ? "peer-media-attached"
       : "peer-video-sender-waiting-for-video-track-open";
@@ -4942,7 +5471,7 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
   peer.media_binding.source = config.source;
   peer.media_binding.codec = config.codec;
   peer.media_binding.video_encoder_backend = state.host_pipeline.video_encoder_backend;
-  peer.media_binding.implementation = "wgc-ffmpeg-libdatachannel-h264-track";
+  peer.media_binding.implementation = "wgc-ffmpeg-libdatachannel-video-track";
   peer.media_binding.reason = "peer-media-configured";
   peer.media_binding.last_error.clear();
   peer.media_binding.attached_at_unix_ms = current_time_millis();
@@ -5052,7 +5581,7 @@ bool attach_relay_video_media_binding(
   const std::string upstream_video_codec = to_lower_copy(
     upstream_peer.transport.codec_path.empty() ? upstream_peer.transport.video_codec : upstream_peer.transport.codec_path
   );
-  if (upstream_video_codec != "h264") {
+  if (upstream_video_codec != "h264" && upstream_video_codec != "h265" && upstream_video_codec != "hevc") {
     if (error) {
       *error = "relay-upstream-video-codec-unsupported";
     }
@@ -5061,7 +5590,7 @@ bool attach_relay_video_media_binding(
 
   PeerVideoTrackConfig video_config;
   video_config.enabled = true;
-  video_config.codec = "h264";
+  video_config.codec = normalize_video_codec(upstream_video_codec);
   video_config.mid = "video";
   video_config.stream_id = "vds-relay-stream";
   video_config.track_id = peer.peer_id + "-video";
@@ -5099,6 +5628,7 @@ bool attach_relay_video_media_binding(
     clear_peer_transport_audio_sender(peer.transport_session, nullptr);
   }
 
+  unregister_relay_subscriber(peer.peer_id);
   register_relay_subscriber(upstream_peer_id, peer.peer_id, peer.transport_session, audio_enabled);
   peer.transport = get_peer_transport_snapshot(peer.transport_session);
   peer.media_binding.attached = true;
@@ -5282,6 +5812,51 @@ size_t find_next_h264_aud_offset(const std::vector<std::uint8_t>& data, size_t s
   }
 }
 
+size_t find_next_h265_aud_offset(const std::vector<std::uint8_t>& data, size_t start_offset) {
+  size_t offset = start_offset;
+  while (true) {
+    offset = find_next_annexb_start_code(data, offset);
+    if (offset == std::string::npos) {
+      return offset;
+    }
+
+    const size_t start_code_size = annexb_start_code_size(data, offset);
+    if (start_code_size == 0 || offset + start_code_size + 1 >= data.size()) {
+      return std::string::npos;
+    }
+
+    const std::uint8_t nal_type = (data[offset + start_code_size] >> 1) & 0x3F;
+    if (nal_type == 35) {
+      return offset;
+    }
+
+    offset += start_code_size;
+  }
+}
+
+bool h265_vcl_nal_is_first_slice_segment(
+  const std::vector<std::uint8_t>& data,
+  size_t offset,
+  size_t start_code_size) {
+  const size_t payload_offset = offset + start_code_size + 2;
+  if (payload_offset >= data.size()) {
+    return false;
+  }
+
+  return (data[payload_offset] & 0x80) != 0;
+}
+
+std::string normalize_video_codec(const std::string& codec, const std::string& fallback) {
+  const std::string normalized = to_lower_copy(trim_copy(codec));
+  if (normalized == "h265" || normalized == "hevc") {
+    return "h265";
+  }
+  if (normalized == "h264") {
+    return "h264";
+  }
+  return fallback;
+}
+
 bool h264_access_unit_has_vcl_nal(const std::vector<std::uint8_t>& access_unit) {
   size_t offset = 0;
   while (true) {
@@ -5348,9 +5923,117 @@ bool h264_access_unit_has_idr_nal(const std::vector<std::uint8_t>& access_unit) 
   }
 }
 
+bool h265_access_unit_has_vcl_nal(const std::vector<std::uint8_t>& access_unit) {
+  size_t offset = 0;
+  while (true) {
+    offset = find_next_annexb_start_code(access_unit, offset);
+    if (offset == std::string::npos) {
+      return false;
+    }
+
+    const size_t start_code_size = annexb_start_code_size(access_unit, offset);
+    if (start_code_size == 0 || offset + start_code_size + 1 >= access_unit.size()) {
+      return false;
+    }
+
+    const std::uint8_t nal_type = (access_unit[offset + start_code_size] >> 1) & 0x3F;
+    if (nal_type <= 31) {
+      return true;
+    }
+
+    offset += start_code_size;
+  }
+}
+
+bool h265_access_unit_has_decoder_config_nal(const std::vector<std::uint8_t>& access_unit) {
+  size_t offset = 0;
+  while (true) {
+    offset = find_next_annexb_start_code(access_unit, offset);
+    if (offset == std::string::npos) {
+      return false;
+    }
+
+    const size_t start_code_size = annexb_start_code_size(access_unit, offset);
+    if (start_code_size == 0 || offset + start_code_size + 1 >= access_unit.size()) {
+      return false;
+    }
+
+    const std::uint8_t nal_type = (access_unit[offset + start_code_size] >> 1) & 0x3F;
+    if (nal_type == 32 || nal_type == 33 || nal_type == 34) {
+      return true;
+    }
+
+    offset += start_code_size;
+  }
+}
+
+bool h265_access_unit_has_random_access_nal(const std::vector<std::uint8_t>& access_unit) {
+  size_t offset = 0;
+  while (true) {
+    offset = find_next_annexb_start_code(access_unit, offset);
+    if (offset == std::string::npos) {
+      return false;
+    }
+
+    const size_t start_code_size = annexb_start_code_size(access_unit, offset);
+    if (start_code_size == 0 || offset + start_code_size + 1 >= access_unit.size()) {
+      return false;
+    }
+
+    const std::uint8_t nal_type = (access_unit[offset + start_code_size] >> 1) & 0x3F;
+    if (nal_type >= 16 && nal_type <= 21) {
+      return true;
+    }
+
+    offset += start_code_size;
+  }
+}
+
 bool should_emit_h264_access_unit(const std::vector<std::uint8_t>& access_unit) {
   return h264_access_unit_has_vcl_nal(access_unit) ||
     h264_access_unit_has_decoder_config_nal(access_unit);
+}
+
+bool should_emit_h265_access_unit(const std::vector<std::uint8_t>& access_unit) {
+  return h265_access_unit_has_vcl_nal(access_unit) ||
+    h265_access_unit_has_decoder_config_nal(access_unit);
+}
+
+bool should_emit_video_access_unit(
+  const std::string& codec,
+  const std::vector<std::uint8_t>& access_unit) {
+  return normalize_video_codec(codec) == "h265"
+    ? should_emit_h265_access_unit(access_unit)
+    : should_emit_h264_access_unit(access_unit);
+}
+
+bool video_access_unit_has_decoder_config_nal(
+  const std::string& codec,
+  const std::vector<std::uint8_t>& access_unit) {
+  return normalize_video_codec(codec) == "h265"
+    ? h265_access_unit_has_decoder_config_nal(access_unit)
+    : h264_access_unit_has_decoder_config_nal(access_unit);
+}
+
+bool video_access_unit_has_random_access_nal(
+  const std::string& codec,
+  const std::vector<std::uint8_t>& access_unit) {
+  return normalize_video_codec(codec) == "h265"
+    ? h265_access_unit_has_random_access_nal(access_unit)
+    : h264_access_unit_has_idr_nal(access_unit);
+}
+
+bool video_bootstrap_is_complete(
+  const std::string& codec,
+  const std::vector<std::uint8_t>& decoder_config_au,
+  const std::vector<std::uint8_t>& random_access_au) {
+  if (decoder_config_au.empty() || random_access_au.empty()) {
+    return false;
+  }
+
+  const std::string normalized_codec = normalize_video_codec(codec);
+  return video_access_unit_has_decoder_config_nal(normalized_codec, decoder_config_au) &&
+    video_access_unit_has_random_access_nal(normalized_codec, random_access_au);
 }
 
 std::vector<std::vector<std::uint8_t>> extract_annexb_h264_access_units(
@@ -5396,6 +6079,107 @@ std::vector<std::vector<std::uint8_t>> extract_annexb_h264_access_units(
   return access_units;
 }
 
+std::vector<std::vector<std::uint8_t>> extract_annexb_h265_access_units(
+  std::vector<std::uint8_t>& buffer,
+  bool flush) {
+  std::vector<std::vector<std::uint8_t>> access_units;
+  std::vector<size_t> nal_offsets;
+  size_t search_offset = 0;
+  while (true) {
+    const size_t nal_offset = find_next_annexb_start_code(buffer, search_offset);
+    if (nal_offset == std::string::npos) {
+      break;
+    }
+    nal_offsets.push_back(nal_offset);
+    search_offset = nal_offset + 3;
+  }
+
+  if (nal_offsets.empty()) {
+    if (!flush && buffer.size() > (1024 * 1024)) {
+      buffer.clear();
+    }
+    return access_units;
+  }
+
+  const size_t parsable_nal_count = flush
+    ? nal_offsets.size()
+    : (nal_offsets.size() > 1 ? nal_offsets.size() - 1 : 0);
+  if (parsable_nal_count == 0) {
+    if (!flush && nal_offsets.front() > 0) {
+      buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(nal_offsets.front()));
+    }
+    return access_units;
+  }
+
+  size_t current_access_unit_start = std::string::npos;
+  bool current_access_unit_has_vcl = false;
+
+  for (size_t index = 0; index < parsable_nal_count; ++index) {
+    const size_t nal_offset = nal_offsets[index];
+    const size_t nal_end = (index + 1 < nal_offsets.size()) ? nal_offsets[index + 1] : buffer.size();
+    const size_t start_code_size = annexb_start_code_size(buffer, nal_offset);
+    if (start_code_size == 0 || nal_offset + start_code_size + 1 >= nal_end) {
+      continue;
+    }
+
+    const std::uint8_t nal_type = (buffer[nal_offset + start_code_size] >> 1) & 0x3F;
+    const bool is_aud = nal_type == 35;
+    const bool is_vcl = nal_type <= 31;
+    const bool is_first_slice = is_vcl &&
+      h265_vcl_nal_is_first_slice_segment(buffer, nal_offset, start_code_size);
+
+    if (current_access_unit_start == std::string::npos) {
+      current_access_unit_start = nal_offset;
+    } else if ((is_aud || is_first_slice) && current_access_unit_has_vcl) {
+      std::vector<std::uint8_t> access_unit(
+        buffer.begin() + static_cast<std::ptrdiff_t>(current_access_unit_start),
+        buffer.begin() + static_cast<std::ptrdiff_t>(nal_offset)
+      );
+      if (should_emit_h265_access_unit(access_unit)) {
+        access_units.push_back(std::move(access_unit));
+      }
+      current_access_unit_start = nal_offset;
+      current_access_unit_has_vcl = false;
+    }
+
+    if (is_vcl) {
+      current_access_unit_has_vcl = true;
+    }
+  }
+
+  if (flush) {
+    if (current_access_unit_start != std::string::npos &&
+        current_access_unit_start < buffer.size()) {
+      std::vector<std::uint8_t> access_unit(
+        buffer.begin() + static_cast<std::ptrdiff_t>(current_access_unit_start),
+        buffer.end()
+      );
+      if (should_emit_h265_access_unit(access_unit)) {
+        access_units.push_back(std::move(access_unit));
+      }
+    }
+    buffer.clear();
+    return access_units;
+  }
+
+  const size_t retain_offset = current_access_unit_start != std::string::npos
+    ? current_access_unit_start
+    : nal_offsets[parsable_nal_count];
+  if (retain_offset > 0) {
+    buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(retain_offset));
+  }
+  return access_units;
+}
+
+std::vector<std::vector<std::uint8_t>> extract_annexb_video_access_units(
+  const std::string& codec,
+  std::vector<std::uint8_t>& buffer,
+  bool flush) {
+  return normalize_video_codec(codec) == "h265"
+    ? extract_annexb_h265_access_units(buffer, flush)
+    : extract_annexb_h264_access_units(buffer, flush);
+}
+
 bool start_peer_video_sender(
   const FfmpegProbeResult& ffmpeg,
   const HostPipelineState& pipeline,
@@ -5420,6 +6204,7 @@ bool start_peer_video_sender(
   auto runtime = std::make_shared<PeerState::PeerVideoSenderRuntime>();
   runtime->launch_attempted = true;
   runtime->command_line = command_line;
+  runtime->codec_path = normalize_video_codec(plan.codec_path, normalize_video_codec(pipeline.requested_video_codec));
   runtime->frame_interval_us = static_cast<unsigned long long>(
     std::max(1, 1000000 / std::max(1, plan.frame_rate > 0 ? plan.frame_rate : 60))
   );
@@ -5578,6 +6363,12 @@ bool start_peer_video_sender(
 
   if (wgc_source && runtime->stdin_write_handle) {
     runtime->source_thread = std::thread([runtime, wgc_source]() {
+      const std::uint64_t min_frame_interval_100ns =
+        std::max<std::uint64_t>(1, runtime->frame_interval_us) * 10;
+      std::uint64_t next_source_timestamp_100ns = 0;
+      auto next_source_time = std::chrono::steady_clock::time_point {};
+      const auto source_frame_interval = std::chrono::microseconds(runtime->frame_interval_us);
+
       while (!runtime->stop_requested.load()) {
         WgcFrameCpuBuffer frame;
         std::string frame_error;
@@ -5594,6 +6385,40 @@ bool start_peer_video_sender(
           runtime->running = false;
           runtime->updated_at_unix_ms = current_time_millis();
           break;
+        }
+
+        {
+          std::lock_guard<std::mutex> lock(runtime->mutex);
+          runtime->source_frames_captured += 1;
+          runtime->source_bytes_captured += static_cast<unsigned long long>(frame.bgra.size());
+          runtime->source_copy_resource_us_total += frame.copy_resource_us;
+          runtime->source_map_us_total += frame.map_us;
+          runtime->source_memcpy_us_total += frame.memcpy_us;
+          runtime->source_total_readback_us_total += frame.total_readback_us;
+          runtime->updated_at_unix_ms = current_time_millis();
+        }
+
+        if (frame.timestamp_100ns > 0) {
+          if (next_source_timestamp_100ns == 0) {
+            next_source_timestamp_100ns = frame.timestamp_100ns;
+          }
+          if (frame.timestamp_100ns < next_source_timestamp_100ns) {
+            continue;
+          }
+          do {
+            next_source_timestamp_100ns += min_frame_interval_100ns;
+          } while (next_source_timestamp_100ns <= frame.timestamp_100ns);
+        } else {
+          const auto now = std::chrono::steady_clock::now();
+          if (next_source_time == std::chrono::steady_clock::time_point {}) {
+            next_source_time = now;
+          }
+          if (now < next_source_time) {
+            continue;
+          }
+          do {
+            next_source_time += source_frame_interval;
+          } while (next_source_time <= now);
         }
 
         std::size_t total_written = 0;
@@ -5633,21 +6458,21 @@ bool start_peer_video_sender(
   const std::shared_ptr<PeerTransportSession> transport_session = peer.transport_session;
   runtime->pump_thread = std::thread([runtime, transport_session]() {
     std::vector<std::uint8_t> read_buffer(64 * 1024);
-    std::vector<std::uint8_t> pending;
+    const std::string codec_path = normalize_video_codec(runtime->codec_path);
 
-    const auto cache_h264_bootstrap_access_unit = [&runtime](const std::vector<std::uint8_t>& access_unit) {
+    const auto cache_video_bootstrap_access_unit = [&runtime, &codec_path](const std::vector<std::uint8_t>& access_unit) {
       std::lock_guard<std::mutex> lock(runtime->mutex);
-      if (h264_access_unit_has_decoder_config_nal(access_unit)) {
-        runtime->cached_h264_decoder_config_au = access_unit;
-        runtime->pending_h264_bootstrap = true;
+      if (video_access_unit_has_decoder_config_nal(codec_path, access_unit)) {
+        runtime->cached_video_decoder_config_au = access_unit;
+        runtime->pending_video_bootstrap = true;
       }
-      if (h264_access_unit_has_idr_nal(access_unit)) {
-        runtime->cached_h264_keyframe_au = access_unit;
-        runtime->pending_h264_bootstrap = true;
+      if (video_access_unit_has_random_access_nal(codec_path, access_unit)) {
+        runtime->cached_video_random_access_au = access_unit;
+        runtime->pending_video_bootstrap = true;
       }
     };
 
-    const auto send_h264_access_unit = [&runtime, &transport_session](
+    const auto send_video_access_unit = [&runtime, &transport_session, &codec_path](
       const std::vector<std::uint8_t>& access_unit,
       std::string* error) -> bool {
       std::uint64_t timestamp_us = 0;
@@ -5657,7 +6482,7 @@ bool start_peer_video_sender(
         runtime->next_frame_timestamp_us += runtime->frame_interval_us;
       }
 
-      if (!send_peer_transport_h264_video_frame(transport_session, access_unit, timestamp_us, error)) {
+      if (!send_peer_transport_video_frame(transport_session, access_unit, codec_path, timestamp_us, error)) {
         return false;
       }
 
@@ -5670,32 +6495,36 @@ bool start_peer_video_sender(
       return true;
     };
 
-    const auto flush_h264_bootstrap_access_units = [&runtime, &send_h264_access_unit](std::string* error) -> bool {
+    const auto flush_video_bootstrap_access_units = [&runtime, &send_video_access_unit, &codec_path](std::string* error) -> bool {
       std::vector<std::uint8_t> decoder_config_au;
-      std::vector<std::uint8_t> keyframe_au;
+      std::vector<std::uint8_t> random_access_au;
       {
         std::lock_guard<std::mutex> lock(runtime->mutex);
-        if (!runtime->pending_h264_bootstrap) {
+        if (!runtime->pending_video_bootstrap) {
           return true;
         }
-        decoder_config_au = runtime->cached_h264_decoder_config_au;
-        keyframe_au = runtime->cached_h264_keyframe_au;
+        decoder_config_au = runtime->cached_video_decoder_config_au;
+        random_access_au = runtime->cached_video_random_access_au;
+      }
+
+      if (!video_bootstrap_is_complete(codec_path, decoder_config_au, random_access_au)) {
+        return true;
       }
 
       if (!decoder_config_au.empty()) {
-        if (!send_h264_access_unit(decoder_config_au, error)) {
+        if (!send_video_access_unit(decoder_config_au, error)) {
           return false;
         }
       }
 
-      if (!keyframe_au.empty() && keyframe_au != decoder_config_au) {
-        if (!send_h264_access_unit(keyframe_au, error)) {
+      if (!random_access_au.empty() && random_access_au != decoder_config_au) {
+        if (!send_video_access_unit(random_access_au, error)) {
           return false;
         }
       }
 
       std::lock_guard<std::mutex> lock(runtime->mutex);
-      runtime->pending_h264_bootstrap = false;
+      runtime->pending_video_bootstrap = false;
       return true;
     };
 
@@ -5713,30 +6542,69 @@ bool start_peer_video_sender(
         break;
       }
 
-      pending.insert(pending.end(), read_buffer.begin(), read_buffer.begin() + static_cast<std::ptrdiff_t>(bytes_read));
-      auto access_units = extract_annexb_h264_access_units(pending, false);
+      {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        runtime->pending_video_annexb_bytes.insert(
+          runtime->pending_video_annexb_bytes.end(),
+          read_buffer.begin(),
+          read_buffer.begin() + static_cast<std::ptrdiff_t>(bytes_read)
+        );
+      }
+
+      std::vector<std::vector<std::uint8_t>> access_units;
+      {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        access_units = extract_annexb_video_access_units(codec_path, runtime->pending_video_annexb_bytes, false);
+      }
       for (auto& access_unit : access_units) {
         const PeerTransportSnapshot transport_snapshot = get_peer_transport_snapshot(transport_session);
+        const bool access_unit_has_decoder_config =
+          video_access_unit_has_decoder_config_nal(codec_path, access_unit);
+        const bool access_unit_has_random_access =
+          video_access_unit_has_random_access_nal(codec_path, access_unit);
         if (!transport_snapshot.remote_description_set || transport_snapshot.connection_state != "connected") {
-          cache_h264_bootstrap_access_unit(access_unit);
+          cache_video_bootstrap_access_unit(access_unit);
           std::lock_guard<std::mutex> lock(runtime->mutex);
           runtime->reason = "peer-video-sender-waiting-for-peer-connected";
           runtime->updated_at_unix_ms = current_time_millis();
           continue;
         }
         if (!transport_snapshot.video_track_open) {
-          cache_h264_bootstrap_access_unit(access_unit);
+          cache_video_bootstrap_access_unit(access_unit);
           std::lock_guard<std::mutex> lock(runtime->mutex);
           runtime->reason = "peer-video-sender-waiting-for-video-track-open";
           runtime->updated_at_unix_ms = current_time_millis();
           continue;
         }
 
+        if (access_unit_has_decoder_config || access_unit_has_random_access) {
+          cache_video_bootstrap_access_unit(access_unit);
+        }
+
+        bool pending_bootstrap = false;
+        bool bootstrap_complete = false;
+        {
+          std::lock_guard<std::mutex> lock(runtime->mutex);
+          pending_bootstrap = runtime->pending_video_bootstrap;
+          bootstrap_complete = video_bootstrap_is_complete(
+            codec_path,
+            runtime->cached_video_decoder_config_au,
+            runtime->cached_video_random_access_au
+          );
+        }
+        if (pending_bootstrap && !bootstrap_complete) {
+          std::lock_guard<std::mutex> lock(runtime->mutex);
+          runtime->reason = "peer-video-sender-waiting-for-bootstrap";
+          runtime->updated_at_unix_ms = current_time_millis();
+          continue;
+        }
+
         std::string send_error;
-        if (!flush_h264_bootstrap_access_units(&send_error) ||
-            !send_h264_access_unit(access_unit, &send_error)) {
+        if (!flush_video_bootstrap_access_units(&send_error) ||
+            (!(access_unit_has_decoder_config || access_unit_has_random_access) &&
+             !send_video_access_unit(access_unit, &send_error))) {
           if (send_error.find("Track is closed") != std::string::npos) {
-            cache_h264_bootstrap_access_unit(access_unit);
+            cache_video_bootstrap_access_unit(access_unit);
             std::lock_guard<std::mutex> lock(runtime->mutex);
             runtime->last_error = send_error;
             runtime->reason = "peer-video-sender-waiting-for-video-track-open";
@@ -5753,29 +6621,60 @@ bool start_peer_video_sender(
       }
     }
 
-    auto remaining_access_units = extract_annexb_h264_access_units(pending, true);
+    std::vector<std::vector<std::uint8_t>> remaining_access_units;
+    {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      remaining_access_units = extract_annexb_video_access_units(codec_path, runtime->pending_video_annexb_bytes, true);
+    }
     for (auto& access_unit : remaining_access_units) {
       const PeerTransportSnapshot transport_snapshot = get_peer_transport_snapshot(transport_session);
+      const bool access_unit_has_decoder_config =
+        video_access_unit_has_decoder_config_nal(codec_path, access_unit);
+      const bool access_unit_has_random_access =
+        video_access_unit_has_random_access_nal(codec_path, access_unit);
       if (!transport_snapshot.remote_description_set || transport_snapshot.connection_state != "connected") {
-        cache_h264_bootstrap_access_unit(access_unit);
+        cache_video_bootstrap_access_unit(access_unit);
         std::lock_guard<std::mutex> lock(runtime->mutex);
         runtime->reason = "peer-video-sender-waiting-for-peer-connected";
         runtime->updated_at_unix_ms = current_time_millis();
         continue;
       }
       if (!transport_snapshot.video_track_open) {
-        cache_h264_bootstrap_access_unit(access_unit);
+        cache_video_bootstrap_access_unit(access_unit);
         std::lock_guard<std::mutex> lock(runtime->mutex);
         runtime->reason = "peer-video-sender-waiting-for-video-track-open";
         runtime->updated_at_unix_ms = current_time_millis();
         continue;
       }
 
+      if (access_unit_has_decoder_config || access_unit_has_random_access) {
+        cache_video_bootstrap_access_unit(access_unit);
+      }
+
+      bool pending_bootstrap = false;
+      bool bootstrap_complete = false;
+      {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        pending_bootstrap = runtime->pending_video_bootstrap;
+        bootstrap_complete = video_bootstrap_is_complete(
+          codec_path,
+          runtime->cached_video_decoder_config_au,
+          runtime->cached_video_random_access_au
+        );
+      }
+      if (pending_bootstrap && !bootstrap_complete) {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        runtime->reason = "peer-video-sender-waiting-for-bootstrap";
+        runtime->updated_at_unix_ms = current_time_millis();
+        continue;
+      }
+
       std::string send_error;
-      if (!flush_h264_bootstrap_access_units(&send_error) ||
-          !send_h264_access_unit(access_unit, &send_error)) {
+      if (!flush_video_bootstrap_access_units(&send_error) ||
+          (!(access_unit_has_decoder_config || access_unit_has_random_access) &&
+           !send_video_access_unit(access_unit, &send_error))) {
         if (send_error.find("Track is closed") != std::string::npos) {
-          cache_h264_bootstrap_access_unit(access_unit);
+          cache_video_bootstrap_access_unit(access_unit);
           std::lock_guard<std::mutex> lock(runtime->mutex);
           runtime->last_error = send_error;
           runtime->reason = "peer-video-sender-waiting-for-video-track-open";
@@ -5802,6 +6701,12 @@ bool start_peer_video_sender(
   peer.media_binding.runtime = runtime;
   peer.media_binding.process_id = runtime->process_id;
   peer.media_binding.command_line = runtime->command_line;
+  peer.media_binding.source_frames_captured = 0;
+  peer.media_binding.source_bytes_captured = 0;
+  peer.media_binding.avg_source_copy_resource_us = 0;
+  peer.media_binding.avg_source_map_us = 0;
+  peer.media_binding.avg_source_memcpy_us = 0;
+  peer.media_binding.avg_source_total_readback_us = 0;
   peer.media_binding.frames_sent = 0;
   peer.media_binding.bytes_sent = 0;
   return true;
@@ -5812,6 +6717,12 @@ void refresh_peer_media_binding(PeerState& peer) {
     RelaySubscriberState relay_state;
     if (query_relay_subscriber_state(peer.peer_id, &relay_state)) {
       peer.media_binding.process_id = 0;
+      peer.media_binding.source_frames_captured = 0;
+      peer.media_binding.source_bytes_captured = 0;
+      peer.media_binding.avg_source_copy_resource_us = 0;
+      peer.media_binding.avg_source_map_us = 0;
+      peer.media_binding.avg_source_memcpy_us = 0;
+      peer.media_binding.avg_source_total_readback_us = 0;
       peer.media_binding.frames_sent = relay_state.frames_sent;
       peer.media_binding.bytes_sent = relay_state.bytes_sent;
       peer.media_binding.command_line.clear();
@@ -5843,6 +6754,23 @@ void refresh_peer_media_binding(PeerState& peer) {
 
   std::lock_guard<std::mutex> lock(runtime.mutex);
   peer.media_binding.process_id = runtime.process_id;
+  peer.media_binding.source_frames_captured = runtime.source_frames_captured;
+  peer.media_binding.source_bytes_captured = runtime.source_bytes_captured;
+  if (runtime.source_frames_captured > 0) {
+    peer.media_binding.avg_source_copy_resource_us =
+      runtime.source_copy_resource_us_total / runtime.source_frames_captured;
+    peer.media_binding.avg_source_map_us =
+      runtime.source_map_us_total / runtime.source_frames_captured;
+    peer.media_binding.avg_source_memcpy_us =
+      runtime.source_memcpy_us_total / runtime.source_frames_captured;
+    peer.media_binding.avg_source_total_readback_us =
+      runtime.source_total_readback_us_total / runtime.source_frames_captured;
+  } else {
+    peer.media_binding.avg_source_copy_resource_us = 0;
+    peer.media_binding.avg_source_map_us = 0;
+    peer.media_binding.avg_source_memcpy_us = 0;
+    peer.media_binding.avg_source_total_readback_us = 0;
+  }
   peer.media_binding.frames_sent = runtime.frames_sent;
   peer.media_binding.bytes_sent = runtime.bytes_sent;
   peer.media_binding.command_line = runtime.command_line;
@@ -5859,6 +6787,12 @@ void refresh_peer_media_binding(PeerState& peer) {
 bool stop_peer_video_sender(PeerState& peer, const std::string& reason, std::string* error) {
   if (!peer.media_binding.runtime) {
     peer.media_binding.process_id = 0;
+    peer.media_binding.source_frames_captured = 0;
+    peer.media_binding.source_bytes_captured = 0;
+    peer.media_binding.avg_source_copy_resource_us = 0;
+    peer.media_binding.avg_source_map_us = 0;
+    peer.media_binding.avg_source_memcpy_us = 0;
+    peer.media_binding.avg_source_total_readback_us = 0;
     peer.media_binding.active = false;
     peer.media_binding.reason = reason;
     peer.media_binding.updated_at_unix_ms = current_time_millis();
@@ -5896,6 +6830,12 @@ bool stop_peer_video_sender(PeerState& peer, const std::string& reason, std::str
   close_peer_video_sender_handles(*runtime);
 
   peer.media_binding.process_id = 0;
+  peer.media_binding.source_frames_captured = 0;
+  peer.media_binding.source_bytes_captured = 0;
+  peer.media_binding.avg_source_copy_resource_us = 0;
+  peer.media_binding.avg_source_map_us = 0;
+  peer.media_binding.avg_source_memcpy_us = 0;
+  peer.media_binding.avg_source_total_readback_us = 0;
   peer.media_binding.active = false;
   peer.media_binding.updated_at_unix_ms = current_time_millis();
   peer.media_binding.detached_at_unix_ms = peer.media_binding.updated_at_unix_ms;
@@ -5986,9 +6926,9 @@ bool submit_scheduled_video_unit_to_surface(
     std::lock_guard<std::mutex> lock(runtime.mutex);
     runtime.running = false;
     runtime.decoder_ready = false;
-    runtime.pending_h264_annexb_bytes.clear();
-    runtime.startup_h264_decoder_config_au.clear();
-    runtime.startup_waiting_for_idr = true;
+    runtime.pending_video_annexb_bytes.clear();
+    runtime.startup_video_decoder_config_au.clear();
+    runtime.startup_waiting_for_random_access = true;
     runtime.reason = "peer-video-surface-submit-failed";
     runtime.last_error = submit_error;
   }
@@ -6021,66 +6961,74 @@ void consume_remote_peer_video_frame(
 
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
-    runtime.codec_path = codec.empty() ? "h264" : to_lower_copy(codec);
+    runtime.codec_path = normalize_video_codec(codec);
     runtime.remote_frames_received += 1;
     runtime.remote_bytes_received += static_cast<unsigned long long>(frame.size());
     runtime.last_remote_frame_at_unix_ms = current_time_millis();
     codec_path = runtime.codec_path;
 
-    if (codec_path == "h264") {
+    if (codec_path == "h264" || codec_path == "h265") {
       const bool frame_has_annexb_start_code = find_next_annexb_start_code(frame, 0) != std::string::npos;
-      if (runtime.pending_h264_annexb_bytes.empty() && frame_has_annexb_start_code) {
-        if (should_emit_h264_access_unit(frame)) {
+      if (runtime.pending_video_annexb_bytes.empty() && frame_has_annexb_start_code) {
+        if (should_emit_video_access_unit(codec_path, frame)) {
           decode_units.push_back(frame);
         }
       } else {
-        runtime.pending_h264_annexb_bytes.insert(
-          runtime.pending_h264_annexb_bytes.end(),
+        runtime.pending_video_annexb_bytes.insert(
+          runtime.pending_video_annexb_bytes.end(),
           frame.begin(),
           frame.end()
         );
-        decode_units = extract_annexb_h264_access_units(runtime.pending_h264_annexb_bytes, false);
+        decode_units = extract_annexb_video_access_units(codec_path, runtime.pending_video_annexb_bytes, false);
       }
     } else {
       decode_units.push_back(frame);
     }
   }
 
-  if (codec_path == "h264") {
+  if (codec_path == "h264" || codec_path == "h265") {
     std::vector<std::vector<std::uint8_t>> startup_units;
-    bool waiting_for_idr = false;
+    bool waiting_for_random_access = false;
     {
       std::lock_guard<std::mutex> lock(runtime.mutex);
-      if (runtime.startup_waiting_for_idr) {
+      if (runtime.startup_waiting_for_random_access) {
         for (const auto& decode_unit : decode_units) {
-          if (h264_access_unit_has_decoder_config_nal(decode_unit)) {
-            runtime.startup_h264_decoder_config_au = decode_unit;
+          if (video_access_unit_has_decoder_config_nal(codec_path, decode_unit)) {
+            runtime.startup_video_decoder_config_au = decode_unit;
           }
-          if (!h264_access_unit_has_idr_nal(decode_unit)) {
+          if (!video_access_unit_has_random_access_nal(codec_path, decode_unit)) {
+            continue;
+          }
+          if (!video_bootstrap_is_complete(
+                codec_path,
+                runtime.startup_video_decoder_config_au,
+                decode_unit)) {
             continue;
           }
 
           runtime.scheduled_video_queue.clear();
           runtime.scheduled_audio_queue.clear();
           runtime.av_sync_anchor_initialized = false;
-          runtime.startup_waiting_for_idr = false;
-          if (!runtime.startup_h264_decoder_config_au.empty()) {
-            startup_units.push_back(runtime.startup_h264_decoder_config_au);
+          runtime.startup_waiting_for_random_access = false;
+          if (!runtime.startup_video_decoder_config_au.empty()) {
+            startup_units.push_back(runtime.startup_video_decoder_config_au);
           }
-          startup_units.push_back(decode_unit);
-          runtime.reason = "peer-av-sync-video-bootstrap-idr";
+          if (startup_units.empty() || startup_units.back() != decode_unit) {
+            startup_units.push_back(decode_unit);
+          }
+          runtime.reason = "peer-av-sync-video-bootstrap-random-access";
           break;
         }
 
-        if (runtime.startup_waiting_for_idr) {
+        if (runtime.startup_waiting_for_random_access) {
           runtime.dropped_video_units += static_cast<unsigned long long>(decode_units.size());
-          runtime.reason = "peer-av-sync-waiting-for-idr";
-          waiting_for_idr = true;
+          runtime.reason = "peer-av-sync-waiting-for-random-access";
+          waiting_for_random_access = true;
         }
       }
     }
 
-    if (waiting_for_idr) {
+    if (waiting_for_random_access) {
       refresh_peer_video_receiver_runtime(runtime);
       update_peer_decoder_state_from_runtime(runtime_ptr, transport_session);
       return;
@@ -6092,7 +7040,7 @@ void consume_remote_peer_video_frame(
   }
 
   ensure_peer_av_sync_runtime(runtime, g_agent_runtime_for_audio->viewer_audio_playback);
-  fanout_relay_video_units(peer_id, decode_units, rtp_timestamp);
+  fanout_relay_video_units(peer_id, codec_path, decode_units, rtp_timestamp);
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
     for (const auto& decode_unit : decode_units) {
@@ -6268,6 +7216,12 @@ std::string peer_media_binding_json(const PeerState::MediaBindingState& state) {
     << ",\"senderConfigured\":" << (state.sender_configured ? "true" : "false")
     << ",\"active\":" << (state.active ? "true" : "false")
     << ",\"processId\":" << state.process_id
+    << ",\"sourceFramesCaptured\":" << state.source_frames_captured
+    << ",\"sourceBytesCaptured\":" << state.source_bytes_captured
+    << ",\"avgSourceCopyResourceUs\":" << state.avg_source_copy_resource_us
+    << ",\"avgSourceMapUs\":" << state.avg_source_map_us
+    << ",\"avgSourceMemcpyUs\":" << state.avg_source_memcpy_us
+    << ",\"avgSourceTotalReadbackUs\":" << state.avg_source_total_readback_us
     << ",\"framesSent\":" << state.frames_sent
     << ",\"bytesSent\":" << state.bytes_sent
     << ",\"width\":" << state.width
@@ -6428,7 +7382,10 @@ std::string build_host_session_json(AgentRuntimeState& state) {
   payload
     << "{\"running\":" << (state.host_session_running ? "true" : "false")
     << ",\"captureTargetId\":\"" << json_escape(state.host_capture_target_id) << "\""
+    << ",\"requestedCodec\":\"" << json_escape(state.host_requested_codec) << "\""
     << ",\"codec\":\"" << json_escape(state.host_codec) << "\""
+    << ",\"effectiveCodec\":\"" << json_escape(state.host_codec) << "\""
+    << ",\"downgradeReason\":\"\""
     << ",\"pipeline\":" << host_pipeline_json(state.host_pipeline)
     << ",\"capturePlan\":" << host_capture_plan_json(state.host_capture_plan)
     << ",\"captureProcess\":" << host_capture_process_json(state.host_capture_process)
@@ -6460,6 +7417,12 @@ std::string surface_attachment_json(SurfaceAttachmentState& state) {
     refresh_surface_attachment_state(state);
   }
 
+  NativeLivePreviewSnapshot live_preview_snapshot;
+  const bool has_live_preview_snapshot = static_cast<bool>(state.live_preview_runtime);
+  if (has_live_preview_snapshot) {
+    live_preview_snapshot = state.live_preview_runtime->snapshot();
+  }
+
   std::ostringstream payload;
   payload
     << "{\"attached\":" << (state.attached ? "true" : "false")
@@ -6469,6 +7432,10 @@ std::string surface_attachment_json(SurfaceAttachmentState& state) {
     << ",\"decoderReady\":" << (state.decoder_ready ? "true" : "false")
     << ",\"restartCount\":" << state.restart_count
     << ",\"decodedFramesRendered\":" << state.decoded_frames_rendered
+    << ",\"avgCopyResourceUs\":" << (has_live_preview_snapshot ? live_preview_snapshot.avg_copy_resource_us : 0)
+    << ",\"avgMapUs\":" << (has_live_preview_snapshot ? live_preview_snapshot.avg_map_us : 0)
+    << ",\"avgMemcpyUs\":" << (has_live_preview_snapshot ? live_preview_snapshot.avg_memcpy_us : 0)
+    << ",\"avgTotalReadbackUs\":" << (has_live_preview_snapshot ? live_preview_snapshot.avg_total_readback_us : 0)
     << ",\"surface\":\"" << json_escape(state.surface_id) << "\""
     << ",\"target\":\"" << json_escape(state.target) << "\""
     << ",\"processId\":" << state.process_id
@@ -6592,6 +7559,7 @@ int main(int argc, char* argv[]) {
     runtime_state.ffmpeg,
     runtime_state.host_codec,
     runtime_state.host_hardware_acceleration,
+    runtime_state.host_video_encoder_preference,
     runtime_state.host_encoder_preset,
     runtime_state.host_encoder_tune
   );
@@ -6734,8 +7702,15 @@ int main(int argc, char* argv[]) {
       runtime_state.host_capture_title = extract_string_value(line, "captureTitle");
       runtime_state.host_capture_hwnd = extract_string_value(line, "captureHwnd");
       runtime_state.host_capture_display_id = extract_string_value(line, "displayId");
-      runtime_state.host_codec = extract_string_value(line, "codec");
+      runtime_state.host_requested_codec = normalize_video_codec(
+        extract_string_value(line, "requestedCodec"),
+        normalize_video_codec(extract_string_value(line, "codec"))
+      );
+      runtime_state.host_codec = runtime_state.host_requested_codec;
       runtime_state.host_hardware_acceleration = extract_bool_value(line, "hardwareAcceleration", true);
+      runtime_state.host_video_encoder_preference = normalize_video_encoder_preference(
+        extract_string_value(line, "videoEncoderPreference")
+      );
       runtime_state.host_encoder_preset = normalize_host_encoder_preset(extract_string_value(line, "encoderPreset"));
       runtime_state.host_encoder_tune = normalize_host_encoder_tune(extract_string_value(line, "encoderTune"));
       runtime_state.host_width = normalize_host_output_dimension(
@@ -6758,11 +7733,15 @@ int main(int argc, char* argv[]) {
       if (runtime_state.host_codec.empty()) {
         runtime_state.host_codec = "h264";
       }
+      if (runtime_state.host_requested_codec.empty()) {
+        runtime_state.host_requested_codec = runtime_state.host_codec;
+      }
       runtime_state.host_capture_process = build_host_capture_process_state();
       runtime_state.host_pipeline = select_and_validate_host_pipeline(
         runtime_state.ffmpeg,
         runtime_state.host_codec,
         runtime_state.host_hardware_acceleration,
+        runtime_state.host_video_encoder_preference,
         runtime_state.host_encoder_preset,
         runtime_state.host_encoder_tune
       );
@@ -6823,7 +7802,10 @@ int main(int argc, char* argv[]) {
         "media-state",
         std::string("{\"state\":\"host-session-started\",\"captureTargetId\":\"") +
           json_escape(runtime_state.host_capture_target_id) +
+          "\",\"requestedCodec\":\"" + json_escape(runtime_state.host_requested_codec) +
           "\",\"codec\":\"" + json_escape(runtime_state.host_codec) +
+          "\",\"effectiveCodec\":\"" + json_escape(runtime_state.host_codec) +
+          "\",\"downgradeReason\":\"" +
           "\",\"pipeline\":" + host_pipeline_json(runtime_state.host_pipeline) +
           ",\"capturePlan\":" + host_capture_plan_json(runtime_state.host_capture_plan) +
           ",\"captureProcess\":" + host_capture_process_json(runtime_state.host_capture_process) +
@@ -6879,6 +7861,7 @@ int main(int argc, char* argv[]) {
       runtime_state.host_capture_title.clear();
       runtime_state.host_capture_hwnd.clear();
       runtime_state.host_capture_display_id.clear();
+      runtime_state.host_requested_codec = "h264";
       runtime_state.host_codec = "h264";
       runtime_state.host_hardware_acceleration = true;
       runtime_state.host_encoder_preset = "balanced";
@@ -6893,6 +7876,7 @@ int main(int argc, char* argv[]) {
         runtime_state.ffmpeg,
         runtime_state.host_codec,
         runtime_state.host_hardware_acceleration,
+        runtime_state.host_video_encoder_preference,
         runtime_state.host_encoder_preset,
         runtime_state.host_encoder_tune
       );

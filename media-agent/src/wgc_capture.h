@@ -29,6 +29,10 @@ struct WgcFrameCpuBuffer {
   int height = 0;
   int stride = 0;
   std::uint64_t timestamp_100ns = 0;
+  std::uint64_t copy_resource_us = 0;
+  std::uint64_t map_us = 0;
+  std::uint64_t memcpy_us = 0;
+  std::uint64_t total_readback_us = 0;
   std::vector<std::uint8_t> bgra;
 };
 

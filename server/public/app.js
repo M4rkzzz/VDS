@@ -73,7 +73,9 @@ let qualitySettings = {
   height: 1080,
   bitrate: 10000, // kbps
   frameRate: 30,
+  previewEnabled: true,
   hardwareAcceleration: true,
+  hardwareEncoderPreference: 'auto',
   encoderPreset: 'balanced',
   encoderTune: 'none'
 };
@@ -87,7 +89,7 @@ const QUALITY_BITRATE_MAX = 80000;
 const QUALITY_BITRATE_STEP = 1000;
 const QUALITY_CODEC_OPTIONS = [
   { value: 'h264', label: 'H.264' },
-  { value: 'h265', label: 'H.265', disabled: true, badge: 'work in progress' }
+  { value: 'h265', label: 'H.265' }
 ];
 const QUALITY_RESOLUTION_OPTIONS = [
   { value: '360p', label: '360p', width: 640, height: 360 },
@@ -113,7 +115,7 @@ const QUALITY_TUNE_OPTIONS = [
   { value: 'fastdecode', label: 'fastdecode' },
   { value: 'zerolatency', label: 'zerolatency' }
 ];
-const QUALITY_HARDWARE_ENCODER_PATTERN = /(?:_amf|_mf|_qsv|_nvenc|_vaapi|_vulkan|videotoolbox|_d3d12va)/i;
+const QUALITY_HARDWARE_ENCODER_PATTERN = /(?:_amf|_mf|_qsv|_nvenc|videotoolbox|_d3d12va)/i;
 
 
 // Native peer/session state
@@ -651,6 +653,12 @@ async function resetViewerMediaPipeline(message = '等待重新连接...') {
   relayPc = null;
   await clearAllPeerConnections({ clearRetryState: true });
   elements.remoteVideo.srcObject = null;
+  if (elements.viewerReceiveFps) {
+    elements.viewerReceiveFps.textContent = '-';
+  }
+  if (elements.viewerRenderFps) {
+    elements.viewerRenderFps.textContent = '-';
+  }
   setViewerConnectionState(message);
 }
 
@@ -679,7 +687,13 @@ const elements = {
   viewerStatus: document.getElementById('viewer-status'),
   connectionStatus: document.getElementById('connection-status'),
   chainPosition: document.getElementById('chain-position'),
+  viewerReceiveFps: document.getElementById('viewer-receive-fps'),
+  viewerRenderFps: document.getElementById('viewer-render-fps'),
   hostStatus: document.getElementById('host-status'),
+  hostStatusDetail: document.getElementById('host-status-detail'),
+  hostSourceFps: document.getElementById('host-source-fps'),
+  hostCaptureFps: document.getElementById('host-capture-fps'),
+  hostSendFps: document.getElementById('host-send-fps'),
   localVideo: document.getElementById('local-video'),
   remoteVideo: document.getElementById('remote-video'),
   remoteVideoContainer: document.getElementById('remote-video-container'),
@@ -699,6 +713,7 @@ const elements = {
   qualityModal: document.getElementById('quality-modal'),
   qualityCodecOptions: document.getElementById('quality-codec-options'),
   qualityCodecNote: document.getElementById('quality-codec-note'),
+  qualityPreviewEnabled: document.getElementById('quality-preview-enabled'),
   qualityResolutionOptions: document.getElementById('quality-resolution-options'),
   qualityFpsOptions: document.getElementById('quality-fps-options'),
   qualityBitrate: document.getElementById('quality-bitrate'),
@@ -706,6 +721,7 @@ const elements = {
   qualityBitrateIncrease: document.getElementById('quality-bitrate-increase'),
   qualityHardwareAcceleration: document.getElementById('quality-hardware-acceleration'),
   qualityHardwareSupport: document.getElementById('quality-hardware-support'),
+  qualityHardwareEncoderSelect: document.getElementById('quality-hardware-encoder-select'),
   qualityPresetOptions: document.getElementById('quality-preset-options'),
   qualityPresetNote: document.getElementById('quality-preset-note'),
   qualityTuneOptions: document.getElementById('quality-tune-options'),
@@ -761,45 +777,165 @@ function getRequestedCodecPreference() {
 }
 
 function getEffectiveCodecPreference() {
-  const requestedCodec = getRequestedCodecPreference();
-  if (requestedCodec === 'h265') {
-    return 'h264';
-  }
-  return requestedCodec;
+  return getRequestedCodecPreference();
 }
 
-function getAvailableVideoEncoders() {
+function getEnumeratedVideoEncoders() {
+  const ffmpegCapabilities = qualityCapabilities && qualityCapabilities.ffmpeg
+    ? qualityCapabilities.ffmpeg
+    : null;
+  const encoders = ffmpegCapabilities && Array.isArray(ffmpegCapabilities.videoEncoders)
+    ? ffmpegCapabilities.videoEncoders
+    : [];
+  return encoders.map((entry) => String(entry || '').trim()).filter(Boolean);
+}
+
+function getValidatedVideoEncoders() {
   const ffmpegCapabilities = qualityCapabilities && qualityCapabilities.ffmpeg
     ? qualityCapabilities.ffmpeg
     : null;
   const encoders = ffmpegCapabilities && Array.isArray(ffmpegCapabilities.validatedVideoEncoders)
     ? ffmpegCapabilities.validatedVideoEncoders
-    : (
-      ffmpegCapabilities && Array.isArray(ffmpegCapabilities.videoEncoders)
-        ? ffmpegCapabilities.videoEncoders
-        : []
-    );
+    : [];
   return encoders.map((entry) => String(entry || '').trim()).filter(Boolean);
 }
 
+function getAvailableVideoEncoders() {
+  const validatedEncoders = getValidatedVideoEncoders();
+  return validatedEncoders.length > 0 ? validatedEncoders : getEnumeratedVideoEncoders();
+}
+
+function getLaunchableVideoEncoders() {
+  return getAvailableVideoEncoders();
+}
+
+function filterHardwareVideoEncoders(encoders) {
+  return (encoders || []).filter((encoder) => QUALITY_HARDWARE_ENCODER_PATTERN.test(encoder));
+}
+
 function getHardwareVideoEncoders() {
-  return getAvailableVideoEncoders().filter((encoder) => QUALITY_HARDWARE_ENCODER_PATTERN.test(encoder));
+  return filterHardwareVideoEncoders(getAvailableVideoEncoders());
+}
+
+function getVideoEncoderProbes() {
+  const ffmpegCapabilities = qualityCapabilities && qualityCapabilities.ffmpeg
+    ? qualityCapabilities.ffmpeg
+    : null;
+  const probes = ffmpegCapabilities && Array.isArray(ffmpegCapabilities.videoEncoderProbes)
+    ? ffmpegCapabilities.videoEncoderProbes
+    : [];
+  return probes
+    .filter((probe) => probe && typeof probe === 'object')
+    .map((probe) => ({
+      name: String(probe.name || '').trim(),
+      validated: probe.validated === true,
+      hardware: probe.hardware === true,
+      priority: Number.isFinite(Number(probe.priority)) ? Number(probe.priority) : 999,
+      reason: String(probe.reason || '').trim(),
+      error: String(probe.error || '').trim()
+    }))
+    .filter((probe) => probe.name);
+}
+
+function getAvailableH265VideoEncoders() {
+  return getAvailableVideoEncoders().filter((encoder) => /(?:265|hevc)/i.test(encoder));
+}
+
+function getHardwareH265VideoEncoders() {
+  return getAvailableH265VideoEncoders().filter((encoder) => QUALITY_HARDWARE_ENCODER_PATTERN.test(encoder));
+}
+
+function filterCodecEncoders(encoders, codec) {
+  const normalizedCodec = codec === 'h265' ? 'h265' : 'h264';
+  return (encoders || []).filter((encoder) => {
+    const lowered = String(encoder || '').toLowerCase();
+    if (normalizedCodec === 'h265') {
+      return /(?:265|hevc)/i.test(lowered);
+    }
+    return /264/i.test(lowered) && !/(?:265|hevc)/i.test(lowered);
+  });
+}
+
+function getValidatedHardwareEncoderProbes(codecPreference = getEffectiveCodecPreference()) {
+  const codec = codecPreference === 'h265' ? 'h265' : 'h264';
+  return getVideoEncoderProbes()
+    .filter((probe) => probe.validated && probe.hardware)
+    .filter((probe) => filterCodecEncoders([probe.name], codec).length > 0)
+    .sort((left, right) => {
+      if (left.priority !== right.priority) {
+        return left.priority - right.priority;
+      }
+      return left.name.localeCompare(right.name);
+    });
+}
+
+function getSelectedHardwareEncoderPreference() {
+  const value = String(qualitySettings.hardwareEncoderPreference || 'auto').trim().toLowerCase();
+  return value || 'auto';
+}
+
+function getHardwareEncoderSelectOptions(codecPreference = getEffectiveCodecPreference()) {
+  const probes = getValidatedHardwareEncoderProbes(codecPreference);
+  const options = [{ value: 'auto', label: '自动选择' }];
+  probes.forEach((probe, index) => {
+    options.push({
+      value: probe.name,
+      label: `${probe.name}（可用 ${index + 1}）`
+    });
+  });
+  return options;
+}
+
+function getManualHardwareEncoder(codecPreference = getEffectiveCodecPreference()) {
+  if (!qualitySettings.hardwareAcceleration) {
+    return '';
+  }
+  const selected = getSelectedHardwareEncoderPreference();
+  if (selected === 'auto') {
+    return '';
+  }
+  const options = getHardwareEncoderSelectOptions(codecPreference);
+  return options.some((option) => option.value === selected) ? selected : '';
+}
+
+function isH265CodecAvailable() {
+  return getAvailableH265VideoEncoders().length > 0;
+}
+
+function buildCodecOptions() {
+  return QUALITY_CODEC_OPTIONS.map((option) => {
+    if (option.value !== 'h265') {
+      return option;
+    }
+    if (isH265CodecAvailable()) {
+      return option;
+    }
+    return {
+      ...option,
+      disabled: true,
+      badge: 'unavailable'
+    };
+  });
 }
 
 function getLikelyVideoEncoder(codecPreference, hardwareAcceleration) {
   const codec = codecPreference === 'h265' ? 'h265' : 'h264';
-  const availableEncoders = getAvailableVideoEncoders();
+  const manualHardwareEncoder = getManualHardwareEncoder(codec);
+  if (hardwareAcceleration && manualHardwareEncoder) {
+    return manualHardwareEncoder;
+  }
+  const availableEncoders = getLaunchableVideoEncoders();
   if (availableEncoders.length === 0) {
     return '';
   }
 
   const preferredEncoders = codec === 'h265'
     ? (hardwareAcceleration
-      ? ['hevc_amf', 'hevc_mf', 'hevc_qsv', 'hevc_nvenc', 'hevc_vaapi', 'hevc_vulkan', 'libx265']
+      ? ['hevc_nvenc', 'hevc_amf', 'hevc_qsv', 'hevc_d3d12va', 'hevc_mf', 'libx265']
       : ['libx265'])
     : (hardwareAcceleration
-      ? ['h264_amf', 'h264_mf', 'h264_qsv', 'h264_nvenc', 'h264_vaapi', 'h264_vulkan', 'libopenh264', 'libx264']
-      : ['libopenh264', 'libx264']);
+      ? ['h264_nvenc', 'h264_amf', 'h264_qsv', 'h264_d3d12va', 'h264_mf', 'libx264', 'libopenh264']
+      : ['libx264', 'libopenh264']);
 
   return preferredEncoders.find((encoder) => availableEncoders.includes(encoder)) || '';
 }
@@ -829,36 +965,87 @@ function buildCodecNoteText() {
   const requestedCodec = getRequestedCodecPreference();
   const effectiveCodec = getEffectiveCodecPreference();
   const likelyEncoder = getLikelyVideoEncoder(effectiveCodec, qualitySettings.hardwareAcceleration);
+  const availableH265Encoders = getAvailableH265VideoEncoders();
+  const hardwareH265Encoders = getHardwareH265VideoEncoders();
 
-  if (requestedCodec !== effectiveCodec) {
-    return '当前直播链路仍以 H.264 兼容优先，选择 H.265 时会自动按 H.264 启动。';
+  if (requestedCodec === 'h265') {
+    if (availableH265Encoders.length === 0) {
+      return '当前设备未检测到可用的 H.265 编码器，H.265 选项会保持禁用。';
+    }
+    if (!qualitySettings.hardwareAcceleration) {
+      return likelyEncoder
+        ? `当前预计使用 ${likelyEncoder}。H.265 可用，已关闭硬件加速，将走软件编码。`
+        : 'H.265 可用，已关闭硬件加速，将走软件编码。';
+    }
+    if (hardwareH265Encoders.length > 0) {
+      return likelyEncoder
+        ? `当前预计使用 ${likelyEncoder}。检测到 HEVC 硬件编码器：${hardwareH265Encoders.join('、')}。`
+        : `检测到 HEVC 硬件编码器：${hardwareH265Encoders.join('、')}。`;
+    }
+    return likelyEncoder
+      ? `当前预计使用 ${likelyEncoder}。H.265 可用，但未检测到 HEVC 硬件编码器，将走软件编码。`
+      : 'H.265 可用，但未检测到 HEVC 硬件编码器，将走软件编码。';
   }
 
   if (likelyEncoder) {
-    return `当前预计使用 ${likelyEncoder}，如初始化失败会自动回退到可用编码器。`;
+    return `当前预计使用 ${likelyEncoder}。`;
   }
 
   if (!qualitySettings.hardwareAcceleration && getAvailableVideoEncoders().length > 0) {
     return '关闭硬件加速后未检测到可用的软件编码器，当前配置可能无法启动。';
   }
 
-  return '当前直播链路默认以 H.264 兼容优先。';
+  return '当前直播链路将按所选编码启动。';
 }
 
 function buildHardwareSupportText() {
-  const hardwareEncoders = getHardwareVideoEncoders();
+  const requestedCodec = getRequestedCodecPreference();
+  const manualHardwareEncoder = getManualHardwareEncoder(requestedCodec);
+  const availableHardwareEncoders = getHardwareVideoEncoders();
+  const enumeratedHardwareEncoders = filterHardwareVideoEncoders(getEnumeratedVideoEncoders());
+  const relevantHardwareEncoders = requestedCodec === 'h265'
+    ? getHardwareH265VideoEncoders()
+    : availableHardwareEncoders.filter((encoder) => /264/i.test(encoder) && !/(?:265|hevc)/i.test(encoder));
+  const enumeratedRelevantHardwareEncoders = filterCodecEncoders(enumeratedHardwareEncoders, requestedCodec);
+  const unvalidatedRelevantHardwareEncoders = enumeratedRelevantHardwareEncoders
+    .filter((encoder) => !relevantHardwareEncoders.includes(encoder));
+  const otherHardwareEncoders = availableHardwareEncoders.filter((encoder) => !relevantHardwareEncoders.includes(encoder));
+
   if (!qualityCapabilitiesChecked && window.isElectron && window.electronAPI && window.electronAPI.mediaEngine) {
-    return '正在检测当前设备支持的 FFmpeg 硬件编码器…';
+    return '正在检测设备支持的硬件编码器…';
   }
 
-  if (hardwareEncoders.length === 0) {
-    return qualitySettings.hardwareAcceleration
-      ? '未检测到通过自检的 FFmpeg 硬件编码器，将自动回退到软件编码。'
-      : '未检测到通过自检的 FFmpeg 硬件编码器。';
+  const selectedText = manualHardwareEncoder ? `手动指定：${manualHardwareEncoder}；` : '';
+
+  if (requestedCodec === 'h265') {
+    if (relevantHardwareEncoders.length > 0) {
+      const prefix = '设备支持的硬件编码器：';
+      const suffix = unvalidatedRelevantHardwareEncoders.length > 0
+        ? `；未通过自检：${unvalidatedRelevantHardwareEncoders.join('、')}`
+        : '';
+      return `${selectedText}${prefix}${relevantHardwareEncoders.join('、')}${suffix}`;
+    }
+    if (unvalidatedRelevantHardwareEncoders.length > 0) {
+      return `${selectedText}未通过自检：${unvalidatedRelevantHardwareEncoders.join('、')}`;
+    }
+    if (otherHardwareEncoders.length > 0) {
+      return `${selectedText}设备支持的其他硬件编码器：${otherHardwareEncoders.join('、')}`;
+    }
+    return `${selectedText}未检测到可用的硬件编码器。`;
   }
 
-  const prefix = qualitySettings.hardwareAcceleration ? '当前设备支持：' : '已关闭硬件加速，可用硬件编码器：';
-  return `${prefix}${hardwareEncoders.join('、')}`;
+  if (relevantHardwareEncoders.length === 0) {
+    if (unvalidatedRelevantHardwareEncoders.length > 0) {
+      return `${selectedText}未通过自检：${unvalidatedRelevantHardwareEncoders.join('、')}`;
+    }
+    return `${selectedText}未检测到可用的硬件编码器。`;
+  }
+
+  const prefix = '设备支持的硬件编码器：';
+  const suffix = unvalidatedRelevantHardwareEncoders.length > 0
+    ? `；未通过自检：${unvalidatedRelevantHardwareEncoders.join('、')}`
+    : '';
+  return `${selectedText}${prefix}${relevantHardwareEncoders.join('、')}${suffix}`;
 }
 
 function buildPresetNoteText() {
@@ -905,7 +1092,7 @@ function renderQualitySettingsUi() {
     return;
   }
 
-  if (qualitySettings.codecPreference === 'h265') {
+  if (qualitySettings.codecPreference === 'h265' && !isH265CodecAvailable()) {
     qualitySettings.codecPreference = 'h264';
   }
 
@@ -914,7 +1101,7 @@ function renderQualitySettingsUi() {
 
   if (elements.qualityCodecOptions) {
     elements.qualityCodecOptions.innerHTML = buildSegmentGroupMarkup(
-      QUALITY_CODEC_OPTIONS,
+      buildCodecOptions(),
       qualitySettings.codecPreference
     );
   }
@@ -953,6 +1140,24 @@ function renderQualitySettingsUi() {
 
   if (elements.qualityHardwareAcceleration) {
     elements.qualityHardwareAcceleration.checked = Boolean(qualitySettings.hardwareAcceleration);
+  }
+
+  if (elements.qualityPreviewEnabled) {
+    elements.qualityPreviewEnabled.checked = qualitySettings.previewEnabled !== false;
+  }
+
+  if (elements.qualityHardwareEncoderSelect) {
+    const hardwareEncoderOptions = getHardwareEncoderSelectOptions(qualitySettings.codecPreference);
+    const selectedHardwareEncoder = getSelectedHardwareEncoderPreference();
+    if (!hardwareEncoderOptions.some((option) => option.value === selectedHardwareEncoder)) {
+      qualitySettings.hardwareEncoderPreference = 'auto';
+    }
+    elements.qualityHardwareEncoderSelect.innerHTML = hardwareEncoderOptions.map((option) => {
+      const selected = option.value === getSelectedHardwareEncoderPreference();
+      return `<option value="${option.value}"${selected ? ' selected' : ''}>${option.label}</option>`;
+    }).join('');
+    elements.qualityHardwareEncoderSelect.disabled =
+      !qualitySettings.hardwareAcceleration || hardwareEncoderOptions.length <= 1;
   }
 
   if (elements.qualityCodecNote) {
@@ -1063,6 +1268,21 @@ function bindQualitySettingsUi() {
     });
   }
 
+  if (elements.qualityPreviewEnabled) {
+    elements.qualityPreviewEnabled.addEventListener('change', () => {
+      qualitySettings.previewEnabled = Boolean(elements.qualityPreviewEnabled.checked);
+      renderQualitySettingsUi();
+    });
+  }
+
+  if (elements.qualityHardwareEncoderSelect) {
+    elements.qualityHardwareEncoderSelect.addEventListener('change', () => {
+      const value = String(elements.qualityHardwareEncoderSelect.value || 'auto').trim().toLowerCase();
+      qualitySettings.hardwareEncoderPreference = value || 'auto';
+      renderQualitySettingsUi();
+    });
+  }
+
   if (elements.qualityBitrateDecrease) {
     elements.qualityBitrateDecrease.addEventListener('click', () => {
       setQualityBitrate(qualitySettings.bitrate - QUALITY_BITRATE_STEP);
@@ -1095,12 +1315,7 @@ async function openQualityModal() {
 }
 
 async function confirmQualitySelection() {
-  const requestedCodec = getRequestedCodecPreference();
-  const effectiveCodec = getEffectiveCodecPreference();
   elements.qualityModal.classList.add('hidden');
-  if (requestedCodec !== effectiveCodec) {
-    showError('当前版本直播链路仍以 H.264 兼容优先，已按兼容模式继续。');
-  }
   await showSourceSelection();
 }
 
@@ -1837,6 +2052,31 @@ function getSelectedSourceItem() {
   return document.querySelector('.source-item.selected');
 }
 
+function getSelectedCaptureSource() {
+  const selectedItem = getSelectedSourceItem();
+  if (!selectedItem) {
+    return null;
+  }
+
+  if (selectedItem.__captureSource && typeof selectedItem.__captureSource === 'object') {
+    return selectedItem.__captureSource;
+  }
+
+  const sourceId = selectedItem.dataset.id ? String(selectedItem.dataset.id).trim() : '';
+  if (!sourceId) {
+    return null;
+  }
+
+    return {
+      id: sourceId,
+      sourceId,
+      title: selectedItem.dataset.name || '',
+      displayId: selectedItem.dataset.displayId || null,
+      nativeMonitorIndex: selectedItem.dataset.nativeMonitorIndex || null,
+      hwnd: selectedItem.dataset.hwnd || null
+    };
+  }
+
 function updateSourceAudioUi() {
   const selectedItem = getSelectedSourceItem();
   const candidates = parseSelectedSourceAudioCandidates(selectedItem);
@@ -1901,8 +2141,12 @@ function showSourceModal(sources) {
     item.className = 'source-item';
     item.dataset.id = source.id;
     item.dataset.name = source.name;
+    item.dataset.displayId = source.displayId != null ? String(source.displayId) : '';
+    item.dataset.nativeMonitorIndex = source.nativeMonitorIndex != null ? String(source.nativeMonitorIndex) : '';
+    item.dataset.hwnd = source.hwnd != null ? String(source.hwnd) : '';
     item.dataset.audioCandidates = JSON.stringify(Array.isArray(source.audioCandidates) ? source.audioCandidates : []);
     item.dataset.audioIndex = '0';
+    item.__captureSource = source;
 
     // 缩略图
     if (source.thumbnail) {
@@ -1942,17 +2186,16 @@ function showSourceModal(sources) {
 
 // 确认选择并开始共享
 // 保存当前选择的屏幕源
-let currentScreenSourceId = null;
+let currentCaptureSource = null;
 
 async function confirmSourceAndShare() {
-  const selectedItem = document.querySelector('.source-item.selected');
-
-  if (!selectedItem) {
+  const selectedSource = getSelectedCaptureSource();
+  if (!selectedSource) {
     showError('Please select a capture target');
     return;
   }
 
-  currentScreenSourceId = selectedItem.dataset.id;
+  currentCaptureSource = selectedSource;
   document.getElementById('source-modal').classList.add('hidden');
   try {
     await showAudioProcessSelection();
@@ -1977,17 +2220,17 @@ async function showAudioProcessSelection() {
   const audioCandidate = audioCandidates[audioIndex] || null;
 
   if (!audioEnabled) {
-    await startScreenShareWithSource(currentScreenSourceId);
+    await startScreenShareWithSource(currentCaptureSource);
     return;
   }
 
   if (!audioCandidate || !audioCandidate.pid) {
     showError('当前窗口没有可用音频，将仅共享画面');
-    await startScreenShareWithSource(currentScreenSourceId);
+    await startScreenShareWithSource(currentCaptureSource);
     return;
   }
 
-  await startScreenShareWithAudio(currentScreenSourceId, Number(audioCandidate.pid));
+  await startScreenShareWithAudio(currentCaptureSource, Number(audioCandidate.pid));
 }
 
 async function confirmAudioProcess() {
@@ -1995,24 +2238,25 @@ async function confirmAudioProcess() {
 }
 
 async function skipAudioCapture() {
-  await startScreenShareWithSource(currentScreenSourceId);
+  await startScreenShareWithSource(currentCaptureSource);
 }
 
 // 取消选择
 function cancelSourceSelection() {
+  currentCaptureSource = null;
   document.getElementById('source-modal').classList.add('hidden');
 }
 
 // 捕获窗口音频（自动选择进程）
 
 // 根据sourceId开始屏幕共享
-async function startScreenShareWithSource(sourceId) {
-  return requireNativeAuthorityOverride('startScreenShareWithSource', startScreenShareWithSource)(sourceId);
+async function startScreenShareWithSource(source) {
+  return requireNativeAuthorityOverride('startScreenShareWithSource', startScreenShareWithSource)(source);
 }
 
 // 使用指定PID捕获窗口音频
-async function startScreenShareWithAudio(sourceId, audioPid) {
-  return requireNativeAuthorityOverride('startScreenShareWithAudio', startScreenShareWithAudio)(sourceId, audioPid);
+async function startScreenShareWithAudio(source, audioPid) {
+  return requireNativeAuthorityOverride('startScreenShareWithAudio', startScreenShareWithAudio)(source, audioPid);
 }
 
 async function startScreenShare() {
@@ -2080,7 +2324,7 @@ function showError(message) {
 // Native mainline only
 
 // 版本检查和自动更新
-let currentVersion = '1.5.3'; // 默认版本（Electron环境会动态获取）
+let currentVersion = '1.5.6'; // 默认版本（Electron环境会动态获取）
 
 // 初始化版本号（从 Electron app 获取）
 async function initVersion() {
@@ -2180,6 +2424,12 @@ async function resetViewerState() {
   elements.waitingMessage.classList.remove('hidden');
   elements.connectionStatus.textContent = '等待连接...';
   elements.connectionStatus.classList.remove('connected');
+  if (elements.viewerReceiveFps) {
+    elements.viewerReceiveFps.textContent = '-';
+  }
+  if (elements.viewerRenderFps) {
+    elements.viewerRenderFps.textContent = '-';
+  }
 }
 
 async function handleMessage(data) {

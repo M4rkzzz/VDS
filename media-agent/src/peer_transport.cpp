@@ -21,6 +21,7 @@
 #include <rtc/h264rtpdepacketizer.hpp>
 #include <rtc/h264rtppacketizer.hpp>
 #include <rtc/h265rtpdepacketizer.hpp>
+#include <rtc/h265rtppacketizer.hpp>
 #include <rtc/nalunit.hpp>
 #include <rtc/rtpdepacketizer.hpp>
 #include <rtc/rtcpreceivingsession.hpp>
@@ -51,6 +52,14 @@ std::string to_lower_ascii(std::string value) {
     return static_cast<char>(std::tolower(ch));
   });
   return value;
+}
+
+std::string normalize_video_codec_name(const std::string& codec) {
+  const std::string normalized = to_lower_ascii(codec);
+  if (normalized == "h265" || normalized == "hevc") {
+    return "h265";
+  }
+  return "h264";
 }
 
 #ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
@@ -353,15 +362,18 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       throw std::runtime_error("peer-transport-not-initialized");
     }
 
-    if (config.codec != "h264") {
-      throw std::runtime_error("only-h264-video-sender-is-currently-supported");
-    }
+    const std::string normalized_codec = normalize_video_codec_name(config.codec);
+    const bool use_h265 = normalized_codec == "h265";
 
     auto description = rtc::Description::Video(
       config.mid.empty() ? "video" : config.mid,
       rtc::Description::Direction::SendRecv
     );
-    description.addH264Codec(config.payload_type > 0 ? config.payload_type : 96);
+    if (use_h265) {
+      description.addH265Codec(config.payload_type > 0 ? config.payload_type : 96);
+    } else {
+      description.addH264Codec(config.payload_type > 0 ? config.payload_type : 96);
+    }
 
     const std::uint32_t ssrc = config.ssrc != 0 ? config.ssrc : g_next_video_ssrc.fetch_add(1);
     const std::string cname = peer_id + "-video";
@@ -380,16 +392,24 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       ssrc,
       cname,
       static_cast<std::uint8_t>(config.payload_type > 0 ? config.payload_type : 96),
-      rtc::H264RtpPacketizer::ClockRate
+      use_h265 ? rtc::H265RtpPacketizer::ClockRate : rtc::H264RtpPacketizer::ClockRate
     );
     rtp_config->mid = config.mid.empty() ? "video" : config.mid;
 
-    auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
-      rtc::NalUnit::Separator::StartSequence,
-      rtp_config
-    );
     auto sender_reporter = std::make_shared<rtc::RtcpSrReporter>(rtp_config);
-    new_track->setMediaHandler(packetizer);
+    if (use_h265) {
+      auto packetizer = std::make_shared<rtc::H265RtpPacketizer>(
+        rtc::NalUnit::Separator::StartSequence,
+        rtp_config
+      );
+      new_track->setMediaHandler(packetizer);
+    } else {
+      auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
+        rtc::NalUnit::Separator::StartSequence,
+        rtp_config
+      );
+      new_track->setMediaHandler(packetizer);
+    }
     new_track->chainMediaHandler(sender_reporter);
 
     auto weak_self = weak_from_this();
@@ -425,8 +445,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     video_rtp_config = std::move(rtp_config);
     snapshot.video_track_configured = true;
     snapshot.video_mid = config.mid.empty() ? "video" : config.mid;
-    snapshot.video_codec = config.codec;
-    snapshot.codec_path = config.codec;
+    snapshot.video_codec = normalized_codec;
+    snapshot.codec_path = normalized_codec;
     snapshot.video_decoder_backend = "none";
     snapshot.video_source = config.source;
     snapshot.reason = "video-track-configured";
@@ -558,8 +578,12 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     }
   }
 
-  void send_h264_video_frame(const std::vector<std::uint8_t>& frame, std::uint64_t timestamp_us) {
+  void send_video_frame(
+    const std::vector<std::uint8_t>& frame,
+    const std::string& codec,
+    std::uint64_t timestamp_us) {
     std::shared_ptr<rtc::Track> local_video_track;
+    std::string configured_codec;
 
     {
       std::lock_guard<std::mutex> lock(mutex);
@@ -567,6 +591,11 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         throw std::runtime_error("video-track-not-configured");
       }
       local_video_track = video_track;
+      configured_codec = normalize_video_codec_name(snapshot.video_codec);
+    }
+
+    if (normalize_video_codec_name(codec) != configured_codec) {
+      throw std::runtime_error("video-track-codec-mismatch");
     }
 
     rtc::binary payload;
@@ -805,7 +834,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
           codec_supported = true;
           break;
         }
-        if (format == "h265") {
+        if (format == "h265" || format == "hevc") {
           receiver_description.addH265Codec(payload_type, codec_profile_from_rtp_map(*rtp_map));
           negotiated_codec = "h265";
           depacketizer = std::make_shared<rtc::H265RtpDepacketizer>(rtc::NalUnit::Separator::StartSequence);
@@ -1209,7 +1238,7 @@ PeerTransportBackendInfo get_peer_transport_backend_info() {
   info.audio_track_support = true;
   info.backend = "libdatachannel";
   info.implementation = "libdatachannel-native-webrtc";
-  info.mode = "manual-negotiation+h264-send+h264-h265-recv+opus-sendrecv+pcmu-fallback-recv+native-viewer-surface+native-preview-surface";
+  info.mode = "manual-negotiation+h264-h265-sendrecv+opus-sendrecv+pcmu-fallback-recv+native-viewer-surface+native-preview-surface";
   info.reason = "libdatachannel-transport-ready-native-viewer-render-preview-and-opus-audio-available";
 #else
   info.available = false;
@@ -1475,9 +1504,10 @@ bool clear_peer_transport_audio_sender(
 #endif
 }
 
-bool send_peer_transport_h264_video_frame(
+bool send_peer_transport_video_frame(
   const std::shared_ptr<PeerTransportSession>& session,
   const std::vector<std::uint8_t>& frame,
+  const std::string& codec,
   std::uint64_t timestamp_us,
   std::string* error
 ) {
@@ -1490,7 +1520,7 @@ bool send_peer_transport_h264_video_frame(
   }
 
   try {
-    session->send_h264_video_frame(frame, timestamp_us);
+    session->send_video_frame(frame, codec, timestamp_us);
     return true;
   } catch (const std::exception& ex) {
     if (error) {
@@ -1501,6 +1531,7 @@ bool send_peer_transport_h264_video_frame(
 #else
   (void)session;
   (void)frame;
+  (void)codec;
   (void)timestamp_us;
   if (error) {
     *error = "libdatachannel backend is not compiled into this media-agent build";

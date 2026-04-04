@@ -519,9 +519,7 @@ function requestAppQuit() {
 }
 
 function shouldLogMediaDebug(category = 'misc') {
-  // Terminal/media-engine diagnostics should only be enabled explicitly via
-  // environment variable, not by renderer-persisted debug menu state.
-  return VERBOSE_MEDIA_LOGS;
+  return VERBOSE_MEDIA_LOGS || isRendererDebugEnabled(category);
 }
 
 function shouldLogMediaInvoke(method, category = 'misc') {
@@ -639,9 +637,10 @@ async function listDesktopSources() {
 async function listCaptureTargets() {
   const sources = await listDesktopSources();
   const audioDiscovery = inspectAudioDiscovery();
+  const displayMetadata = getDisplayMetadataMap();
   const windowMetadata = getTopLevelWindowMetadataMap();
 
-  return sources.map((source) => buildCaptureTarget(source, audioDiscovery, windowMetadata));
+  return sources.map((source) => buildCaptureTarget(source, audioDiscovery, windowMetadata, displayMetadata));
 }
 
 function inspectAudioDiscovery() {
@@ -691,12 +690,27 @@ function getMediaEngineAudioBridgeStatus() {
   };
 }
 
-function buildCaptureTarget(source, audioDiscovery, windowMetadata) {
+function getDisplayMetadataMap() {
+  const metadata = new Map();
+  const displays = screen.getAllDisplays();
+  displays.forEach((display, index) => {
+    metadata.set(String(display.id), {
+      nativeMonitorIndex: index,
+      bounds: display.bounds || null,
+      scaleFactor: display.scaleFactor || 1,
+      isPrimary: Boolean(display.internal || index === 0)
+    });
+  });
+  return metadata;
+}
+
+function buildCaptureTarget(source, audioDiscovery, windowMetadata, displayMetadata) {
   const sourceHandle = getDesktopWindowHandleFromSourceId(source.id);
   const windowInfo = sourceHandle ? windowMetadata.get(String(sourceHandle)) : null;
   const pid = normalizePid(windowInfo && windowInfo.pid);
   const title = (windowInfo && windowInfo.title) || source.name;
   const audioCandidates = buildAudioCandidatesForSource(title, pid, audioDiscovery);
+  const displayInfo = source.displayId && displayMetadata ? displayMetadata.get(String(source.displayId)) : null;
 
   return {
     id: source.id,
@@ -707,6 +721,13 @@ function buildCaptureTarget(source, audioDiscovery, windowMetadata) {
     state: getCaptureTargetState(source),
     captureMode: source.captureMode,
     displayId: source.displayId || null,
+    nativeMonitorIndex: displayInfo ? displayInfo.nativeMonitorIndex : null,
+    displayBounds: displayInfo && displayInfo.bounds ? {
+      x: displayInfo.bounds.x,
+      y: displayInfo.bounds.y,
+      width: displayInfo.bounds.width,
+      height: displayInfo.bounds.height
+    } : null,
     pid,
     hwnd: sourceHandle || null,
     thumbnail: source.thumbnail || null,
@@ -886,7 +907,23 @@ function getTopLevelWindowMetadataMap() {
 
 function getMediaAgentManager() {
   if (!mediaAgentManager) {
-    mediaAgentManager = new MediaAgentManager({ logger: console });
+    mediaAgentManager = new MediaAgentManager({
+      logger: {
+        log: (...args) => {
+          if (shouldLogMediaDebug('video')) {
+            console.log(...args);
+          }
+        },
+        warn: (...args) => {
+          if (shouldLogMediaDebug('video')) {
+            console.warn(...args);
+          }
+        },
+        error: (...args) => {
+          console.error(...args);
+        }
+      }
+    });
     mediaAgentManager.on('status', (status) => {
       sendToRenderer('media-engine-status', status);
     });
