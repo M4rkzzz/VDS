@@ -59,6 +59,7 @@ if(WIN32)
     Gdi32
     Mmdevapi
     Winmm
+    Ws2_32
     D3D11
     Dwmapi
     Dxgi

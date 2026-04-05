@@ -15,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <regex>
 #include <set>
@@ -25,6 +26,8 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
+#include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/dict.h>
 #include <libavutil/error.h>
@@ -39,6 +42,8 @@ extern "C" {
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <mmsystem.h>
 #endif
@@ -57,6 +62,8 @@ namespace fs = std::filesystem;
 namespace {
 
 struct AgentRuntimeState;
+bool is_obs_ingest_backend(const AgentRuntimeState& state);
+std::string to_lower_copy(const std::string& value);
 
 std::mutex g_output_mutex;
 AgentRuntimeState* g_agent_runtime_for_audio = nullptr;
@@ -84,6 +91,10 @@ constexpr std::size_t kPeerAvSyncVideoBacklogPriorityUnits = 6;
 constexpr std::size_t kPeerAvSyncAudioBacklogTrimTargetBlocks = 12;
 constexpr std::uint64_t kPeerAvSyncCatchupLatencyStepUs = 4000;
 constexpr std::uint64_t kPeerAvSyncAudioDispatchStarveUs = 40000;
+constexpr const char* kObsIngestVirtualUpstreamPeerId = "__obs_ingest_host__";
+constexpr int kDefaultObsIngestPort = 61080;
+constexpr int kMinObsIngestPort = 1024;
+constexpr int kMaxObsIngestPort = 65535;
 
 #ifdef _WIN32
 enum class WindowCaptureAvailability {
@@ -508,10 +519,48 @@ struct HostCaptureArtifactProbe {
   std::string last_error;
 };
 
+struct ObsIngestState {
+  bool prepared = false;
+  bool waiting = false;
+  bool ingest_connected = false;
+  bool stream_running = false;
+  bool video_ready = false;
+  bool audio_ready = false;
+  bool listener_active = false;
+  bool local_only = true;
+  int port = 0;
+  int width = 0;
+  int height = 0;
+  int frame_rate = 0;
+  int audio_sample_rate = 48000;
+  int audio_channel_count = 2;
+  long long started_at_unix_ms = 0;
+  long long connected_at_unix_ms = 0;
+  long long last_packet_at_unix_ms = 0;
+  long long ended_at_unix_ms = 0;
+  unsigned long long video_packets_received = 0;
+  unsigned long long audio_packets_received = 0;
+  unsigned long long video_access_units_emitted = 0;
+  unsigned long long audio_frames_forwarded = 0;
+  std::string url;
+  std::string listen_url;
+  std::string video_codec = "h264";
+  std::string audio_codec = "aac";
+  std::string reason = "obs-ingest-idle";
+  std::string last_error;
+  std::vector<std::uint8_t> pending_video_annexb_bytes;
+  std::atomic<bool> stop_requested { false };
+  mutable std::mutex mutex;
+  std::thread worker;
+};
+
+std::string obs_ingest_json(const ObsIngestState& state);
+
 struct AgentRuntimeState {
   std::string viewer_playback_mode = "synced";
   unsigned int viewer_audio_delay_ms = 0;
   bool host_session_running = false;
+  std::string host_backend = "native";
   std::string host_capture_target_id;
   std::string host_requested_codec = "h264";
   std::string host_codec = "h264";
@@ -543,6 +592,7 @@ struct AgentRuntimeState {
   HostCapturePlan host_capture_plan;
   HostCaptureProcessState host_capture_process;
   HostCaptureArtifactProbe host_capture_artifact;
+  ObsIngestState obs_ingest;
   struct ViewerAudioPlaybackRuntime {
     struct QueuedPcmBlock {
       std::vector<std::int16_t> pcm;
@@ -1061,6 +1111,7 @@ bool send_host_audio_opus_frame_locked(
 
 bool ensure_peer_audio_decoder_runtime(
   const std::shared_ptr<PeerState::PeerVideoReceiverRuntime>& runtime_ptr,
+  const std::string& codec_name,
   std::string* error) {
   if (!runtime_ptr) {
     if (error) {
@@ -1075,17 +1126,37 @@ bool ensure_peer_audio_decoder_runtime(
 
   auto& decoder = *runtime_ptr->audio_decoder_runtime;
   std::lock_guard<std::mutex> decoder_lock(decoder.mutex);
-  if (decoder.context && decoder.packet && decoder.frame) {
+  const std::string normalized_codec = to_lower_copy(codec_name);
+  if (decoder.context && decoder.packet && decoder.frame && decoder.codec == normalized_codec) {
     return true;
   }
 
-  const AVCodec* codec = avcodec_find_decoder_by_name("libopus");
-  if (!codec) {
-    codec = avcodec_find_decoder(AV_CODEC_ID_OPUS);
+  if (decoder.frame) {
+    av_frame_free(&decoder.frame);
+  }
+  if (decoder.packet) {
+    av_packet_free(&decoder.packet);
+  }
+  if (decoder.context) {
+    avcodec_free_context(&decoder.context);
+  }
+  decoder.codec = "none";
+
+  const AVCodec* codec = nullptr;
+  AVCodecID codec_id = AV_CODEC_ID_NONE;
+  if (normalized_codec == "aac") {
+    codec_id = AV_CODEC_ID_AAC;
+    codec = avcodec_find_decoder(codec_id);
+  } else {
+    codec_id = AV_CODEC_ID_OPUS;
+    codec = avcodec_find_decoder_by_name("libopus");
+    if (!codec) {
+      codec = avcodec_find_decoder(codec_id);
+    }
   }
   if (!codec) {
     if (error) {
-      *error = "opus-decoder-unavailable";
+      *error = normalized_codec == "aac" ? "aac-decoder-unavailable" : "opus-decoder-unavailable";
     }
     return false;
   }
@@ -1104,7 +1175,7 @@ bool ensure_peer_audio_decoder_runtime(
       av_frame_free(&frame);
     }
     if (error) {
-      *error = "opus-decoder-allocation-failed";
+      *error = normalized_codec == "aac" ? "aac-decoder-allocation-failed" : "opus-decoder-allocation-failed";
     }
     return false;
   }
@@ -1116,7 +1187,7 @@ bool ensure_peer_audio_decoder_runtime(
     av_packet_free(&packet);
     av_frame_free(&frame);
     if (error) {
-      *error = "opus-decoder-open-failed";
+      *error = normalized_codec == "aac" ? "aac-decoder-open-failed" : "opus-decoder-open-failed";
     }
     return false;
   }
@@ -1124,7 +1195,7 @@ bool ensure_peer_audio_decoder_runtime(
   decoder.context = context;
   decoder.packet = packet;
   decoder.frame = frame;
-  decoder.codec = "opus";
+  decoder.codec = normalized_codec;
   decoder.last_error.clear();
   return true;
 }
@@ -1149,12 +1220,14 @@ void reset_peer_audio_decoder_runtime(PeerState::PeerVideoReceiverRuntime& runti
   decoder.last_error.clear();
 }
 
-std::vector<std::int16_t> decode_opus_to_pcm16(
+std::vector<std::int16_t> decode_audio_to_pcm16(
   const std::shared_ptr<PeerState::PeerVideoReceiverRuntime>& runtime_ptr,
   const std::vector<std::uint8_t>& encoded,
+  const std::string& codec_name,
   std::string* error) {
   std::vector<std::int16_t> pcm;
-  if (!ensure_peer_audio_decoder_runtime(runtime_ptr, error)) {
+  const std::string normalized_codec = to_lower_copy(codec_name);
+  if (!ensure_peer_audio_decoder_runtime(runtime_ptr, normalized_codec, error)) {
     return pcm;
   }
 
@@ -1166,7 +1239,7 @@ std::vector<std::int16_t> decode_opus_to_pcm16(
   const int send_result = avcodec_send_packet(decoder.context, decoder.packet);
   if (send_result < 0) {
     if (error) {
-      *error = "opus-decoder-send-failed";
+      *error = normalized_codec == "aac" ? "aac-decoder-send-failed" : "opus-decoder-send-failed";
     }
     av_packet_unref(decoder.packet);
     return pcm;
@@ -1180,7 +1253,7 @@ std::vector<std::int16_t> decode_opus_to_pcm16(
     }
     if (receive_result < 0) {
       if (error) {
-        *error = "opus-decoder-receive-failed";
+        *error = normalized_codec == "aac" ? "aac-decoder-receive-failed" : "opus-decoder-receive-failed";
       }
       break;
     }
@@ -1226,7 +1299,9 @@ std::vector<std::int16_t> decode_opus_to_pcm16(
       });
     } else {
       if (error) {
-        *error = "opus-decoder-unsupported-sample-format";
+        *error = normalized_codec == "aac"
+          ? "aac-decoder-unsupported-sample-format"
+          : "opus-decoder-unsupported-sample-format";
       }
       av_frame_unref(decoder.frame);
       pcm.clear();
@@ -2084,7 +2159,7 @@ void fanout_relay_audio_frame(
   std::transform(lowered_codec.begin(), lowered_codec.end(), lowered_codec.begin(), [](unsigned char ch) {
     return static_cast<char>(std::tolower(ch));
   });
-  const std::uint64_t clock_rate = lowered_codec == "opus" ? kTransportAudioSampleRate : 8000ull;
+  const std::uint64_t clock_rate = lowered_codec == "pcmu" ? 8000ull : kTransportAudioSampleRate;
   const std::uint64_t timestamp_us = rtp_timestamp_to_us(rtp_timestamp, clock_rate);
 
   const auto targets = collect_relay_dispatch_targets(upstream_peer_id);
@@ -2474,7 +2549,7 @@ void consume_remote_peer_audio_frame(
   if (!local_playback_enabled) {
     return;
   }
-  if (lowered_codec != "pcmu" && lowered_codec != "opus") {
+  if (lowered_codec != "pcmu" && lowered_codec != "opus" && lowered_codec != "aac") {
     std::lock_guard<std::mutex> lock(audio_runtime.mutex);
     audio_runtime.last_error = "viewer-audio-unsupported-codec:" + codec;
     audio_runtime.reason = "viewer-audio-unsupported-codec";
@@ -2482,9 +2557,9 @@ void consume_remote_peer_audio_frame(
   }
 
   std::string decode_error;
-  auto pcm = lowered_codec == "opus"
-    ? decode_opus_to_pcm16(runtime_ptr, frame, &decode_error)
-    : decode_pcmu_to_pcm16(frame);
+  auto pcm = lowered_codec == "pcmu"
+    ? decode_pcmu_to_pcm16(frame)
+    : decode_audio_to_pcm16(runtime_ptr, frame, lowered_codec, &decode_error);
   if (pcm.empty()) {
     if (!decode_error.empty()) {
       std::lock_guard<std::mutex> lock(audio_runtime.mutex);
@@ -2524,7 +2599,7 @@ void consume_remote_peer_audio_frame(
   PeerState::PeerVideoReceiverRuntime::ScheduledAudioBlock block;
   block.remote_timestamp_us = rtp_timestamp_to_us(
     rtp_timestamp,
-    lowered_codec == "opus" ? kTransportAudioSampleRate : 8000
+    (lowered_codec == "pcmu") ? 8000 : kTransportAudioSampleRate
   );
   block.local_arrival_us = current_time_micros_steady();
   block.pcm = std::move(pcm);
@@ -6070,6 +6145,131 @@ void refresh_peer_transport_runtime(AgentRuntimeState& state) {
   }
 }
 
+bool attach_obs_ingest_media_binding(AgentRuntimeState& state, PeerState& peer, std::string* error) {
+  if (!peer.transport_session) {
+    if (error) {
+      *error = "peer-transport-session-missing";
+    }
+    return false;
+  }
+
+  if (!state.host_session_running || !state.obs_ingest.prepared) {
+    if (error) {
+      *error = "obs-ingest-session-not-prepared";
+    }
+    return false;
+  }
+
+  if (!state.obs_ingest.stream_running || !state.obs_ingest.video_ready) {
+    if (error) {
+      *error = "obs-ingest-not-ready-for-video-binding";
+    }
+    return false;
+  }
+
+  const std::string video_codec = normalize_video_codec(
+    state.obs_ingest.video_codec,
+    normalize_video_codec(state.host_codec)
+  );
+
+  PeerVideoTrackConfig video_config;
+  video_config.enabled = true;
+  video_config.codec = video_codec;
+  video_config.mid = "video";
+  video_config.stream_id = "vds-host-stream";
+  video_config.track_id = peer.peer_id + "-video";
+  video_config.source = std::string("peer-video:") + kObsIngestVirtualUpstreamPeerId;
+  video_config.width = state.obs_ingest.width > 0 ? state.obs_ingest.width : std::max(1, state.host_width);
+  video_config.height = state.obs_ingest.height > 0 ? state.obs_ingest.height : std::max(1, state.host_height);
+  video_config.frame_rate = state.obs_ingest.frame_rate > 0 ? state.obs_ingest.frame_rate : std::max(1, state.host_frame_rate);
+  video_config.bitrate_kbps = state.host_bitrate_kbps > 0 ? state.host_bitrate_kbps : 10000;
+
+  const std::string audio_codec = to_lower_copy(state.obs_ingest.audio_codec);
+  const bool audio_enabled = state.obs_ingest.audio_ready && audio_codec == "aac";
+
+  const bool already_attached =
+    peer.media_binding.attached &&
+    peer.transport.video_track_configured &&
+    peer.media_binding.kind == "video" &&
+    peer.media_binding.source == video_config.source &&
+    peer.media_binding.codec == video_config.codec &&
+    peer.media_binding.width == video_config.width &&
+    peer.media_binding.height == video_config.height &&
+    peer.media_binding.frame_rate == video_config.frame_rate &&
+    peer.media_binding.bitrate_kbps == video_config.bitrate_kbps &&
+    peer.transport.audio_track_configured == audio_enabled;
+
+  if (already_attached) {
+    register_relay_subscriber(kObsIngestVirtualUpstreamPeerId, peer.peer_id, peer.transport_session, audio_enabled);
+    peer.transport = get_peer_transport_snapshot(peer.transport_session);
+    peer.media_binding.sender_configured = peer.transport.video_track_configured;
+    peer.media_binding.active = peer.transport.video_track_open;
+    peer.media_binding.video_encoder_backend = "obs-ingest-relay";
+    peer.media_binding.implementation = "obs-ingest-relay-track";
+    peer.media_binding.reason = peer.transport.video_track_open
+      ? "obs-ingest-media-attached"
+      : "obs-ingest-waiting-for-video-track-open";
+    peer.media_binding.updated_at_unix_ms = current_time_millis();
+    if (error) {
+      error->clear();
+    }
+    return true;
+  }
+
+  if (!configure_peer_transport_video_sender(peer.transport_session, video_config, error)) {
+    return false;
+  }
+
+  if (audio_enabled) {
+    PeerAudioTrackConfig audio_config;
+    audio_config.enabled = true;
+    audio_config.codec = "aac";
+    audio_config.mid = "audio";
+    audio_config.stream_id = "vds-host-stream";
+    audio_config.track_id = peer.peer_id + "-audio";
+    audio_config.source = video_config.source;
+    audio_config.sample_rate = state.obs_ingest.audio_sample_rate > 0 ? state.obs_ingest.audio_sample_rate : static_cast<int>(kTransportAudioSampleRate);
+    audio_config.channel_count = state.obs_ingest.audio_channel_count > 0 ? state.obs_ingest.audio_channel_count : static_cast<int>(kTransportAudioChannelCount);
+    audio_config.payload_type = 97;
+    audio_config.bitrate_kbps = static_cast<int>(kTransportAudioBitrateKbps);
+    if (!configure_peer_transport_audio_sender(peer.transport_session, audio_config, error)) {
+      clear_peer_transport_video_sender(peer.transport_session, nullptr);
+      return false;
+    }
+  } else {
+    clear_peer_transport_audio_sender(peer.transport_session, nullptr);
+  }
+
+  unregister_relay_subscriber(peer.peer_id);
+  register_relay_subscriber(kObsIngestVirtualUpstreamPeerId, peer.peer_id, peer.transport_session, audio_enabled);
+  peer.transport = get_peer_transport_snapshot(peer.transport_session);
+  peer.media_binding.attached = true;
+  peer.media_binding.sender_configured = peer.transport.video_track_configured;
+  peer.media_binding.active = peer.transport.video_track_open;
+  peer.media_binding.width = video_config.width;
+  peer.media_binding.height = video_config.height;
+  peer.media_binding.frame_rate = video_config.frame_rate;
+  peer.media_binding.bitrate_kbps = video_config.bitrate_kbps;
+  peer.media_binding.kind = "video";
+  peer.media_binding.source = video_config.source;
+  peer.media_binding.codec = video_config.codec;
+  peer.media_binding.video_encoder_backend = "obs-ingest-relay";
+  peer.media_binding.implementation = "obs-ingest-relay-track";
+  peer.media_binding.reason = "obs-ingest-media-attached";
+  peer.media_binding.last_error.clear();
+  peer.media_binding.command_line.clear();
+  peer.media_binding.process_id = 0;
+  peer.media_binding.frames_sent = 0;
+  peer.media_binding.bytes_sent = 0;
+  peer.media_binding.attached_at_unix_ms = current_time_millis();
+  peer.media_binding.updated_at_unix_ms = peer.media_binding.attached_at_unix_ms;
+  peer.media_binding.detached_at_unix_ms = 0;
+  if (error) {
+    error->clear();
+  }
+  return true;
+}
+
 bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, std::string* error, bool force_restart) {
   emit_breadcrumb(
     std::string("attachHostVideoMediaBinding:start peer=") + peer.peer_id +
@@ -6081,6 +6281,10 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
       *error = "peer-transport-session-missing";
     }
     return false;
+  }
+
+  if (is_obs_ingest_backend(state)) {
+    return attach_obs_ingest_media_binding(state, peer, error);
   }
 
   if (!state.host_session_running || !state.host_capture_plan.ready) {
@@ -6314,7 +6518,7 @@ bool attach_relay_video_media_binding(
   const std::string upstream_audio_codec = to_lower_copy(upstream_peer.transport.audio_codec);
   const bool audio_enabled =
     upstream_peer.transport.audio_receiver_configured &&
-    (upstream_audio_codec == "opus" || upstream_audio_codec == "pcmu");
+    (upstream_audio_codec == "opus" || upstream_audio_codec == "pcmu" || upstream_audio_codec == "aac");
 
   const bool already_attached =
     peer.media_binding.attached &&
@@ -6357,10 +6561,13 @@ bool attach_relay_video_media_binding(
     audio_config.stream_id = "vds-relay-stream";
     audio_config.track_id = peer.peer_id + "-audio";
     audio_config.source = source;
-    audio_config.sample_rate = upstream_audio_codec == "opus" ? static_cast<int>(kTransportAudioSampleRate) : 8000;
-    audio_config.channel_count = upstream_audio_codec == "opus" ? static_cast<int>(kTransportAudioChannelCount) : 1;
-    audio_config.payload_type = upstream_audio_codec == "opus" ? 111 : 0;
-    audio_config.bitrate_kbps = upstream_audio_codec == "opus" ? static_cast<int>(kTransportAudioBitrateKbps) : 64;
+    audio_config.sample_rate = upstream_audio_codec == "pcmu" ? 8000 : static_cast<int>(kTransportAudioSampleRate);
+    audio_config.channel_count = upstream_audio_codec == "pcmu" ? 1 : static_cast<int>(kTransportAudioChannelCount);
+    audio_config.payload_type =
+      upstream_audio_codec == "opus" ? 111 :
+      (upstream_audio_codec == "aac" ? 97 : 0);
+    audio_config.bitrate_kbps =
+      upstream_audio_codec == "pcmu" ? 64 : static_cast<int>(kTransportAudioBitrateKbps);
     if (!configure_peer_transport_audio_sender(peer.transport_session, audio_config, error)) {
       clear_peer_transport_video_sender(peer.transport_session, nullptr);
       return false;
@@ -6953,6 +7160,628 @@ std::vector<std::vector<std::uint8_t>> extract_annexb_video_access_units(
   return normalize_video_codec(codec) == "h265"
     ? extract_annexb_h265_access_units(buffer, flush)
     : extract_annexb_h264_access_units(buffer, flush);
+}
+
+#ifdef _WIN32
+bool ensure_winsock_started(std::string* error) {
+  static std::once_flag winsock_once;
+  static bool winsock_ready = false;
+  static int winsock_error = 0;
+  std::call_once(winsock_once, []() {
+    WSADATA wsa_data;
+    winsock_error = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+    winsock_ready = winsock_error == 0;
+  });
+  if (!winsock_ready && error) {
+    *error = "winsock-startup-failed:" + std::to_string(winsock_error);
+  }
+  return winsock_ready;
+}
+
+bool is_valid_obs_ingest_port(int port) {
+  return port >= kMinObsIngestPort && port <= kMaxObsIngestPort;
+}
+
+int resolve_requested_obs_ingest_port(int requested_port) {
+  return requested_port > 0 ? requested_port : kDefaultObsIngestPort;
+}
+
+bool is_loopback_udp_port_available(int port, std::string* error) {
+  if (!ensure_winsock_started(error)) {
+    return false;
+  }
+
+  if (!is_valid_obs_ingest_port(port)) {
+    if (error) {
+      *error = "obs-ingest-port-out-of-range:" + std::to_string(port);
+    }
+    return false;
+  }
+
+  SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock == INVALID_SOCKET) {
+    if (error) {
+      *error = "obs-ingest-port-socket-create-failed";
+    }
+    return false;
+  }
+
+  sockaddr_in addr {};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons(static_cast<u_short>(port));
+
+  if (bind(sock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+    closesocket(sock);
+    if (error) {
+      *error = "obs-ingest-port-unavailable:" + std::to_string(port);
+    }
+    return false;
+  }
+
+  closesocket(sock);
+  if (error) {
+    error->clear();
+  }
+  return true;
+}
+#else
+bool is_valid_obs_ingest_port(int port) {
+  return port >= kMinObsIngestPort && port <= kMaxObsIngestPort;
+}
+
+int resolve_requested_obs_ingest_port(int requested_port) {
+  return requested_port > 0 ? requested_port : kDefaultObsIngestPort;
+}
+
+bool is_loopback_udp_port_available(int port, std::string* error) {
+  if (!is_valid_obs_ingest_port(port)) {
+    if (error) {
+      *error = "obs-ingest-port-out-of-range:" + std::to_string(port);
+    }
+    return false;
+  }
+  if (error) {
+    *error = "obs-ingest-port-validation-unsupported";
+  }
+  return false;
+}
+#endif
+
+std::string build_obs_ingest_publish_url(int port) {
+  return std::string("srt://127.0.0.1:") + std::to_string(std::max(1, port)) + "?mode=caller&transtype=live";
+}
+
+std::string build_obs_ingest_listen_url(int port) {
+  return std::string("srt://127.0.0.1:") + std::to_string(std::max(1, port)) +
+    "?mode=listener&transtype=live&latency=120&rcvlatency=120&peerlatency=120";
+}
+
+void clear_obs_ingest_prepared_session(AgentRuntimeState& state) {
+  std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+  state.obs_ingest.prepared = false;
+  state.obs_ingest.port = 0;
+  state.obs_ingest.url.clear();
+  state.obs_ingest.listen_url.clear();
+  state.obs_ingest.width = 0;
+  state.obs_ingest.height = 0;
+  state.obs_ingest.frame_rate = 0;
+  state.obs_ingest.audio_sample_rate = 48000;
+  state.obs_ingest.audio_channel_count = 2;
+  state.obs_ingest.video_packets_received = 0;
+  state.obs_ingest.audio_packets_received = 0;
+  state.obs_ingest.video_access_units_emitted = 0;
+  state.obs_ingest.audio_frames_forwarded = 0;
+  state.obs_ingest.video_codec = "h264";
+  state.obs_ingest.audio_codec = "aac";
+  state.obs_ingest.reason = "obs-ingest-idle";
+  state.obs_ingest.last_error.clear();
+  state.obs_ingest.pending_video_annexb_bytes.clear();
+  state.obs_ingest.started_at_unix_ms = 0;
+  state.obs_ingest.connected_at_unix_ms = 0;
+  state.obs_ingest.last_packet_at_unix_ms = 0;
+  state.obs_ingest.ended_at_unix_ms = 0;
+}
+
+bool prepare_obs_ingest_session(AgentRuntimeState& state, bool force_refresh, int requested_port, std::string* error) {
+  const int port = resolve_requested_obs_ingest_port(requested_port);
+  std::string publish_url;
+  std::string listen_url;
+
+  if (!is_valid_obs_ingest_port(port)) {
+    if (error) {
+      *error = "obs-ingest-port-out-of-range:" + std::to_string(port);
+    }
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+    if (!force_refresh && state.obs_ingest.prepared && state.obs_ingest.port == port &&
+        !state.obs_ingest.url.empty() && !state.obs_ingest.listen_url.empty()) {
+      if (error) {
+        error->clear();
+      }
+      return true;
+    }
+  }
+
+  if (!is_loopback_udp_port_available(port, error)) {
+    return false;
+  }
+
+  publish_url = build_obs_ingest_publish_url(port);
+  listen_url = build_obs_ingest_listen_url(port);
+
+  {
+    std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+    state.obs_ingest.prepared = true;
+    state.obs_ingest.local_only = true;
+    state.obs_ingest.port = port;
+    state.obs_ingest.url = publish_url;
+    state.obs_ingest.listen_url = listen_url;
+    state.obs_ingest.reason = "obs-ingest-prepared";
+    state.obs_ingest.last_error.clear();
+  }
+
+  if (error) {
+    error->clear();
+  }
+  return true;
+}
+
+bool is_obs_ingest_backend(const AgentRuntimeState& state) {
+  return to_lower_copy(state.host_backend) == "obs-ingest";
+}
+
+std::string obs_ingest_media_state_payload(
+  const std::string& state_name,
+  AgentRuntimeState& state) {
+  std::ostringstream payload;
+  payload
+    << "{\"state\":\"" << json_escape(state_name) << "\""
+    << ",\"backend\":\"" << json_escape(state.host_backend) << "\""
+    << ",\"captureTargetId\":\"" << json_escape(state.host_capture_target_id) << "\""
+    << ",\"transportReady\":" << (state.peer_transport_backend.transport_ready ? "true" : "false")
+    << ",\"obsIngest\":" << obs_ingest_json(state.obs_ingest)
+    << "}";
+  return payload.str();
+}
+
+int aac_sample_rate_index(int sample_rate) {
+  switch (sample_rate) {
+    case 96000: return 0;
+    case 88200: return 1;
+    case 64000: return 2;
+    case 48000: return 3;
+    case 44100: return 4;
+    case 32000: return 5;
+    case 24000: return 6;
+    case 22050: return 7;
+    case 16000: return 8;
+    case 12000: return 9;
+    case 11025: return 10;
+    case 8000: return 11;
+    case 7350: return 12;
+    default: return 3;
+  }
+}
+
+struct ParsedAacConfig {
+  int audio_object_type = 2;
+  int sample_rate = 48000;
+  int sample_rate_index = 3;
+  int channel_count = 2;
+};
+
+ParsedAacConfig parse_aac_config(const AVCodecParameters* codecpar) {
+  ParsedAacConfig config;
+  if (codecpar) {
+    if (codecpar->sample_rate > 0) {
+      config.sample_rate = codecpar->sample_rate;
+      config.sample_rate_index = aac_sample_rate_index(codecpar->sample_rate);
+    }
+    if (codecpar->ch_layout.nb_channels > 0) {
+      config.channel_count = codecpar->ch_layout.nb_channels;
+    }
+
+    if (codecpar->extradata && codecpar->extradata_size >= 2) {
+      const std::uint8_t byte0 = codecpar->extradata[0];
+      const std::uint8_t byte1 = codecpar->extradata[1];
+      const int audio_object_type = (byte0 >> 3) & 0x1F;
+      const int sampling_index = ((byte0 & 0x07) << 1) | ((byte1 >> 7) & 0x01);
+      const int channel_config = (byte1 >> 3) & 0x0F;
+      if (audio_object_type > 0) {
+        config.audio_object_type = audio_object_type;
+      }
+      if (sampling_index >= 0 && sampling_index <= 12) {
+        config.sample_rate_index = sampling_index;
+      }
+      if (channel_config > 0) {
+        config.channel_count = channel_config;
+      }
+    }
+  }
+  return config;
+}
+
+std::vector<std::uint8_t> build_adts_framed_aac(
+  const std::uint8_t* data,
+  std::size_t size,
+  const ParsedAacConfig& config) {
+  std::vector<std::uint8_t> framed;
+  if (!data || size == 0) {
+    return framed;
+  }
+
+  const bool looks_like_adts =
+    size >= 7 &&
+    data[0] == 0xFF &&
+    (data[1] & 0xF0) == 0xF0;
+  if (looks_like_adts) {
+    framed.assign(data, data + size);
+    return framed;
+  }
+
+  const int profile = std::max(1, config.audio_object_type) - 1;
+  const int sample_rate_index = std::max(0, std::min(12, config.sample_rate_index));
+  const int channel_config = std::max(1, std::min(7, config.channel_count));
+  const int full_frame_length = static_cast<int>(size) + 7;
+
+  framed.resize(size + 7);
+  framed[0] = 0xFF;
+  framed[1] = 0xF1;
+  framed[2] = static_cast<std::uint8_t>(((profile & 0x03) << 6) | ((sample_rate_index & 0x0F) << 2) | ((channel_config >> 2) & 0x01));
+  framed[3] = static_cast<std::uint8_t>(((channel_config & 0x03) << 6) | ((full_frame_length >> 11) & 0x03));
+  framed[4] = static_cast<std::uint8_t>((full_frame_length >> 3) & 0xFF);
+  framed[5] = static_cast<std::uint8_t>(((full_frame_length & 0x07) << 5) | 0x1F);
+  framed[6] = 0xFC;
+  std::memcpy(framed.data() + 7, data, size);
+  return framed;
+}
+
+std::int64_t packet_timestamp_us(const AVStream* stream, const AVPacket* packet) {
+  if (!stream || !packet) {
+    return 0;
+  }
+  const std::int64_t best_ts = packet->pts != AV_NOPTS_VALUE
+    ? packet->pts
+    : packet->dts;
+  if (best_ts == AV_NOPTS_VALUE) {
+    return 0;
+  }
+  return av_rescale_q(best_ts, stream->time_base, AVRational{ 1, 1000000 });
+}
+
+std::uint32_t packet_timestamp_at_clock_rate(
+  const AVStream* stream,
+  const AVPacket* packet,
+  int clock_rate) {
+  if (!stream || !packet || clock_rate <= 0) {
+    return 0;
+  }
+  const std::int64_t best_ts = packet->pts != AV_NOPTS_VALUE
+    ? packet->pts
+    : packet->dts;
+  if (best_ts == AV_NOPTS_VALUE) {
+    return 0;
+  }
+  const std::int64_t scaled = av_rescale_q(best_ts, stream->time_base, AVRational{ clock_rate, 1 });
+  return static_cast<std::uint32_t>(scaled & 0xFFFFFFFFu);
+}
+
+void stop_obs_ingest_runtime(AgentRuntimeState& state, const std::string& reason) {
+  state.obs_ingest.stop_requested.store(true);
+  if (state.obs_ingest.worker.joinable()) {
+    state.obs_ingest.worker.join();
+  }
+  {
+    std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+    state.obs_ingest.waiting = false;
+    state.obs_ingest.ingest_connected = false;
+    state.obs_ingest.stream_running = false;
+    state.obs_ingest.video_ready = false;
+    state.obs_ingest.audio_ready = false;
+    state.obs_ingest.listener_active = false;
+    state.obs_ingest.reason = reason;
+    state.obs_ingest.pending_video_annexb_bytes.clear();
+  }
+  clear_relay_upstream_bootstrap_state(kObsIngestVirtualUpstreamPeerId);
+}
+
+void obs_ingest_worker(AgentRuntimeState* state_ptr) {
+  if (!state_ptr) {
+    return;
+  }
+
+  AgentRuntimeState& state = *state_ptr;
+  while (!state.obs_ingest.stop_requested.load()) {
+    {
+      std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+      state.obs_ingest.waiting = true;
+      state.obs_ingest.ingest_connected = false;
+      state.obs_ingest.stream_running = false;
+      state.obs_ingest.video_ready = false;
+      state.obs_ingest.audio_ready = false;
+      state.obs_ingest.listener_active = true;
+      state.obs_ingest.reason = "waiting-for-obs-ingest";
+      state.obs_ingest.last_error.clear();
+      state.obs_ingest.pending_video_annexb_bytes.clear();
+      state.obs_ingest.started_at_unix_ms = current_time_millis();
+      state.obs_ingest.connected_at_unix_ms = 0;
+      state.obs_ingest.last_packet_at_unix_ms = 0;
+      state.obs_ingest.ended_at_unix_ms = 0;
+    }
+    emit_event("media-state", obs_ingest_media_state_payload("obs-ingest-waiting", state));
+
+    AVFormatContext* format_context = avformat_alloc_context();
+    if (!format_context) {
+      {
+        std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+        state.obs_ingest.last_error = "obs-ingest-format-context-allocation-failed";
+        state.obs_ingest.reason = "obs-ingest-open-failed";
+      }
+      emit_event("warning", "{\"scope\":\"obs-ingest\",\"message\":\"OBS ingest format context allocation failed.\"}");
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      continue;
+    }
+
+    format_context->interrupt_callback.callback = [](void* opaque) -> int {
+      const auto* stop_flag = static_cast<std::atomic<bool>*>(opaque);
+      return stop_flag && stop_flag->load() ? 1 : 0;
+    };
+    format_context->interrupt_callback.opaque = &state.obs_ingest.stop_requested;
+
+    AVDictionary* options = nullptr;
+    av_dict_set(&options, "listen_timeout", "2000", 0);
+    av_dict_set(&options, "timeout", "2000000", 0);
+
+    std::string listen_url;
+    {
+      std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+      listen_url = state.obs_ingest.listen_url.empty() ? state.obs_ingest.url : state.obs_ingest.listen_url;
+    }
+
+    const int open_result = avformat_open_input(&format_context, listen_url.c_str(), nullptr, &options);
+    av_dict_free(&options);
+    if (open_result < 0) {
+      avformat_free_context(format_context);
+      if (state.obs_ingest.stop_requested.load()) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      continue;
+    }
+
+    if (avformat_find_stream_info(format_context, nullptr) < 0) {
+      avformat_close_input(&format_context);
+      {
+        std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+        state.obs_ingest.reason = "obs-ingest-stream-info-failed";
+        state.obs_ingest.last_error = "obs-ingest-stream-info-failed";
+      }
+      emit_event("warning", "{\"scope\":\"obs-ingest\",\"message\":\"OBS ingest stream info probe failed.\"}");
+      if (state.obs_ingest.stop_requested.load()) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      continue;
+    }
+
+    int video_stream_index = -1;
+    int audio_stream_index = -1;
+    std::string video_codec = "h264";
+    ParsedAacConfig aac_config;
+    for (unsigned int index = 0; index < format_context->nb_streams; ++index) {
+      AVStream* stream = format_context->streams[index];
+      if (!stream || !stream->codecpar) {
+        continue;
+      }
+      if (video_stream_index < 0 && stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (stream->codecpar->codec_id == AV_CODEC_ID_H264) {
+          video_stream_index = static_cast<int>(index);
+          video_codec = "h264";
+        } else if (stream->codecpar->codec_id == AV_CODEC_ID_HEVC) {
+          video_stream_index = static_cast<int>(index);
+          video_codec = "h265";
+        }
+      }
+      if (audio_stream_index < 0 && stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && stream->codecpar->codec_id == AV_CODEC_ID_AAC) {
+        audio_stream_index = static_cast<int>(index);
+        aac_config = parse_aac_config(stream->codecpar);
+      }
+    }
+
+    if (video_stream_index < 0) {
+      avformat_close_input(&format_context);
+      {
+        std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+        state.obs_ingest.reason = "obs-ingest-video-codec-unsupported";
+        state.obs_ingest.last_error = "obs-ingest-video-codec-unsupported";
+      }
+      emit_event("warning", "{\"scope\":\"obs-ingest\",\"message\":\"OBS ingest did not expose a supported H.264/H.265 video stream.\"}");
+      if (state.obs_ingest.stop_requested.load()) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      continue;
+    }
+
+    if (audio_stream_index >= 0 && aac_config.sample_rate != 48000) {
+      avformat_close_input(&format_context);
+      {
+        std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+        state.obs_ingest.reason = "obs-ingest-aac-sample-rate-unsupported";
+        state.obs_ingest.last_error = "obs-ingest-aac-sample-rate-unsupported";
+      }
+      emit_event("warning", "{\"scope\":\"obs-ingest\",\"message\":\"OBS ingest AAC sample rate must be 48 kHz.\"}");
+      if (state.obs_ingest.stop_requested.load()) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      continue;
+    }
+
+    AVBSFContext* video_bsf = nullptr;
+    const char* bsf_name = normalize_video_codec(video_codec) == "h265" ? "hevc_mp4toannexb" : "h264_mp4toannexb";
+    const AVBitStreamFilter* bsf = av_bsf_get_by_name(bsf_name);
+    if (bsf) {
+      if (av_bsf_alloc(bsf, &video_bsf) == 0 && video_bsf) {
+        avcodec_parameters_copy(video_bsf->par_in, format_context->streams[video_stream_index]->codecpar);
+        video_bsf->time_base_in = format_context->streams[video_stream_index]->time_base;
+        if (av_bsf_init(video_bsf) < 0) {
+          av_bsf_free(&video_bsf);
+        }
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+      state.obs_ingest.waiting = false;
+      state.obs_ingest.ingest_connected = true;
+      state.obs_ingest.video_ready = false;
+      state.obs_ingest.audio_ready = audio_stream_index >= 0;
+      state.obs_ingest.connected_at_unix_ms = current_time_millis();
+      state.obs_ingest.video_codec = video_codec;
+      state.obs_ingest.audio_codec = audio_stream_index >= 0 ? "aac" : "";
+      state.obs_ingest.audio_sample_rate = aac_config.sample_rate;
+      state.obs_ingest.audio_channel_count = aac_config.channel_count;
+      AVStream* video_stream = format_context->streams[video_stream_index];
+      state.obs_ingest.width = video_stream && video_stream->codecpar ? video_stream->codecpar->width : 0;
+      state.obs_ingest.height = video_stream && video_stream->codecpar ? video_stream->codecpar->height : 0;
+      AVRational fps = video_stream && video_stream->avg_frame_rate.num > 0
+        ? video_stream->avg_frame_rate
+        : (video_stream ? video_stream->r_frame_rate : AVRational{0, 1});
+      state.obs_ingest.frame_rate = fps.num > 0 && fps.den > 0
+        ? static_cast<int>(av_q2d(fps) + 0.5)
+        : 60;
+      state.obs_ingest.reason = "obs-ingest-connected";
+    }
+    emit_event("media-state", obs_ingest_media_state_payload("obs-ingest-connected", state));
+
+    AVPacket packet;
+    av_init_packet(&packet);
+    bool stream_running_emitted = false;
+    while (!state.obs_ingest.stop_requested.load()) {
+      const int read_result = av_read_frame(format_context, &packet);
+      if (read_result < 0) {
+        break;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+        state.obs_ingest.last_packet_at_unix_ms = current_time_millis();
+      }
+
+      if (packet.stream_index == video_stream_index) {
+        auto handle_video_packet = [&](const AVPacket& ready_packet) {
+          std::vector<std::uint8_t> bytes(
+            ready_packet.data,
+            ready_packet.data + ready_packet.size
+          );
+          auto units = extract_annexb_video_access_units(
+            video_codec,
+            bytes,
+            true
+          );
+          if (units.empty()) {
+            std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+            state.obs_ingest.pending_video_annexb_bytes.insert(
+              state.obs_ingest.pending_video_annexb_bytes.end(),
+              bytes.begin(),
+              bytes.end()
+            );
+            units = extract_annexb_video_access_units(
+              video_codec,
+              state.obs_ingest.pending_video_annexb_bytes,
+              false
+            );
+          }
+          if (units.empty()) {
+            return;
+          }
+          const std::uint32_t rtp_timestamp = packet_timestamp_at_clock_rate(
+            format_context->streams[video_stream_index],
+            &ready_packet,
+            static_cast<int>(kPeerAvSyncVideoClockRate)
+          );
+          fanout_relay_video_units(kObsIngestVirtualUpstreamPeerId, video_codec, units, rtp_timestamp);
+          {
+            std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+            state.obs_ingest.video_ready = true;
+            state.obs_ingest.stream_running = true;
+            state.obs_ingest.video_packets_received += 1;
+            state.obs_ingest.video_access_units_emitted += units.size();
+            state.host_codec = video_codec;
+          }
+          if (!stream_running_emitted) {
+            stream_running_emitted = true;
+            emit_event("media-state", obs_ingest_media_state_payload("obs-stream-running", state));
+          }
+        };
+
+        if (video_bsf) {
+          av_bsf_send_packet(video_bsf, &packet);
+          while (true) {
+            AVPacket filtered_packet;
+            av_init_packet(&filtered_packet);
+            const int receive_result = av_bsf_receive_packet(video_bsf, &filtered_packet);
+            if (receive_result == AVERROR(EAGAIN) || receive_result == AVERROR_EOF) {
+              av_packet_unref(&filtered_packet);
+              break;
+            }
+            if (receive_result < 0) {
+              av_packet_unref(&filtered_packet);
+              break;
+            }
+            handle_video_packet(filtered_packet);
+            av_packet_unref(&filtered_packet);
+          }
+        } else {
+          handle_video_packet(packet);
+        }
+      } else if (audio_stream_index >= 0 && packet.stream_index == audio_stream_index) {
+        auto framed = build_adts_framed_aac(packet.data, static_cast<std::size_t>(packet.size), aac_config);
+        if (!framed.empty()) {
+          const std::uint32_t rtp_timestamp = packet_timestamp_at_clock_rate(
+            format_context->streams[audio_stream_index],
+            &packet,
+            48000
+          );
+          fanout_relay_audio_frame(kObsIngestVirtualUpstreamPeerId, framed, "aac", rtp_timestamp);
+          std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+          state.obs_ingest.audio_packets_received += 1;
+          state.obs_ingest.audio_frames_forwarded += 1;
+        }
+      }
+
+      av_packet_unref(&packet);
+    }
+
+    av_packet_unref(&packet);
+    if (video_bsf) {
+      av_bsf_free(&video_bsf);
+    }
+    avformat_close_input(&format_context);
+    clear_relay_upstream_bootstrap_state(kObsIngestVirtualUpstreamPeerId);
+
+    if (state.obs_ingest.stop_requested.load()) {
+      break;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
+      state.obs_ingest.ingest_connected = false;
+      state.obs_ingest.stream_running = false;
+      state.obs_ingest.video_ready = false;
+      state.obs_ingest.audio_ready = false;
+      state.obs_ingest.listener_active = false;
+      state.obs_ingest.ended_at_unix_ms = current_time_millis();
+      state.obs_ingest.reason = "obs-ingest-ended";
+      state.obs_ingest.pending_video_annexb_bytes.clear();
+    }
+    emit_event("media-state", obs_ingest_media_state_payload("obs-ingest-ended", state));
+  }
 }
 
 bool start_peer_video_sender(
@@ -8337,6 +9166,45 @@ std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot) 
   return payload.str();
 }
 
+std::string obs_ingest_json(const ObsIngestState& state) {
+  std::lock_guard<std::mutex> lock(state.mutex);
+  std::ostringstream payload;
+  payload
+    << "{\"prepared\":" << (state.prepared ? "true" : "false")
+    << ",\"waiting\":" << (state.waiting ? "true" : "false")
+    << ",\"ingestConnected\":" << (state.ingest_connected ? "true" : "false")
+    << ",\"streamRunning\":" << (state.stream_running ? "true" : "false")
+    << ",\"videoReady\":" << (state.video_ready ? "true" : "false")
+    << ",\"audioReady\":" << (state.audio_ready ? "true" : "false")
+    << ",\"listenerActive\":" << (state.listener_active ? "true" : "false")
+    << ",\"localOnly\":" << (state.local_only ? "true" : "false")
+    << ",\"port\":" << state.port
+    << ",\"width\":" << state.width
+    << ",\"height\":" << state.height
+    << ",\"frameRate\":" << state.frame_rate
+    << ",\"audioSampleRate\":" << state.audio_sample_rate
+    << ",\"audioChannelCount\":" << state.audio_channel_count
+    << ",\"videoPacketsReceived\":" << state.video_packets_received
+    << ",\"audioPacketsReceived\":" << state.audio_packets_received
+    << ",\"videoAccessUnitsEmitted\":" << state.video_access_units_emitted
+    << ",\"audioFramesForwarded\":" << state.audio_frames_forwarded
+    << ",\"url\":\"" << json_escape(state.url) << "\""
+    << ",\"videoCodec\":\"" << json_escape(state.video_codec) << "\""
+    << ",\"audioCodec\":\"" << json_escape(state.audio_codec) << "\""
+    << ",\"reason\":\"" << json_escape(state.reason) << "\""
+    << ",\"lastError\":\"" << json_escape(state.last_error) << "\""
+    << ",\"startedAtMs\":";
+  append_nullable_int64(payload, state.started_at_unix_ms);
+  payload << ",\"connectedAtMs\":";
+  append_nullable_int64(payload, state.connected_at_unix_ms);
+  payload << ",\"lastPacketAtMs\":";
+  append_nullable_int64(payload, state.last_packet_at_unix_ms);
+  payload << ",\"endedAtMs\":";
+  append_nullable_int64(payload, state.ended_at_unix_ms);
+  payload << "}";
+  return payload.str();
+}
+
 std::string peer_media_binding_json(const PeerState::MediaBindingState& state) {
   std::ostringstream payload;
   payload
@@ -8382,7 +9250,8 @@ std::string capabilities_json(AgentRuntimeState& state) {
     << ",\"transport\":\"native-webrtc\""
     << ",\"transportReady\":" << (state.peer_transport_backend.transport_ready ? "true" : "false")
     << ",\"videoCodecs\":[\"h264\",\"h265\"]"
-    << ",\"audioCodecs\":[\"opus\",\"pcmu\"]"
+    << ",\"audioCodecs\":[\"opus\",\"pcmu\",\"aac\"]"
+    << ",\"hostBackends\":[\"native\",\"obs-ingest\"]"
     << ",\"captureModes\":[\"window\",\"display\"]"
     << ",\"audioModes\":[\"process\",\"none\"]"
     << ",\"surfaceTargets\":[\"host-capture-artifact\",\"peer-video:<peerId>\"]"
@@ -8393,6 +9262,7 @@ std::string capabilities_json(AgentRuntimeState& state) {
     << ",\"hostCapturePlan\":" << host_capture_plan_json(state.host_capture_plan)
     << ",\"hostCaptureProcess\":" << host_capture_process_json(state.host_capture_process)
     << ",\"hostCaptureArtifact\":" << host_capture_artifact_json(state.host_capture_artifact)
+    << ",\"obsIngest\":" << obs_ingest_json(state.obs_ingest)
     << ",\"surfaces\":" << build_surface_attachments_json(state)
     << ",\"peerMethods\":[\"createPeer\",\"closePeer\",\"setRemoteDescription\",\"addRemoteIceCandidate\",\"attachPeerMediaSource\",\"detachPeerMediaSource\",\"attachSurface\",\"updateSurface\",\"detachSurface\",\"setViewerVolume\",\"getViewerVolume\",\"getStats\"]"
     << ",\"implementation\":\"scaffold\""
@@ -8411,6 +9281,7 @@ std::string build_status_json(AgentRuntimeState& state) {
     << ",\"transportReady\":" << (state.peer_transport_backend.transport_ready ? "true" : "false")
     << ",\"peerDriverReady\":true"
     << ",\"hostSessionRunning\":" << (state.host_session_running ? "true" : "false")
+    << ",\"hostBackend\":\"" << json_escape(state.host_backend) << "\""
     << ",\"peerCount\":" << state.peers.size()
     << ",\"surfaceCount\":" << state.attached_surfaces.size()
     << ",\"peerTransport\":" << peer_transport_backend_json(state.peer_transport_backend)
@@ -8421,6 +9292,7 @@ std::string build_status_json(AgentRuntimeState& state) {
     << ",\"hostCapturePlan\":" << host_capture_plan_json(state.host_capture_plan)
     << ",\"hostCaptureProcess\":" << host_capture_process_json(state.host_capture_process)
     << ",\"hostCaptureArtifact\":" << host_capture_artifact_json(state.host_capture_artifact)
+    << ",\"obsIngest\":" << obs_ingest_json(state.obs_ingest)
     << ",\"surfaces\":" << build_surface_attachments_json(state)
     << ",\"ffmpeg\":" << ffmpeg_probe_json(state.ffmpeg)
     << ",\"message\":\"Native media-agent control plane is running. libdatachannel transport is "
@@ -8446,6 +9318,7 @@ std::string build_agent_ready_json(AgentRuntimeState& state) {
     << ",\"hostCapturePlan\":" << host_capture_plan_json(state.host_capture_plan)
     << ",\"hostCaptureProcess\":" << host_capture_process_json(state.host_capture_process)
     << ",\"hostCaptureArtifact\":" << host_capture_artifact_json(state.host_capture_artifact)
+    << ",\"obsIngest\":" << obs_ingest_json(state.obs_ingest)
     << ",\"surfaces\":" << build_surface_attachments_json(state)
     << ",\"ffmpeg\":" << ffmpeg_probe_json(state.ffmpeg)
     << "}";
@@ -8533,6 +9406,7 @@ std::string build_host_session_json(AgentRuntimeState& state) {
   std::ostringstream payload;
   payload
     << "{\"running\":" << (state.host_session_running ? "true" : "false")
+    << ",\"backend\":\"" << json_escape(state.host_backend) << "\""
     << ",\"captureTargetId\":\"" << json_escape(state.host_capture_target_id) << "\""
     << ",\"requestedCodec\":\"" << json_escape(state.host_requested_codec) << "\""
     << ",\"codec\":\"" << json_escape(state.host_codec) << "\""
@@ -8542,6 +9416,7 @@ std::string build_host_session_json(AgentRuntimeState& state) {
     << ",\"capturePlan\":" << host_capture_plan_json(state.host_capture_plan)
     << ",\"captureProcess\":" << host_capture_process_json(state.host_capture_process)
     << ",\"captureArtifact\":" << host_capture_artifact_json(state.host_capture_artifact)
+    << ",\"obsIngest\":" << obs_ingest_json(state.obs_ingest)
     << ",\"surfaces\":" << build_surface_attachments_json(state)
     << ",\"implementation\":\"stub\"}";
   return payload.str();
@@ -8825,6 +9700,29 @@ int main(int argc, char* argv[]) {
       continue;
     }
 
+    if (method == "prepareObsIngest") {
+      const bool refresh = extract_bool_value(line, "refresh", true);
+      const int requested_port = extract_int_value(line, "port", 0);
+      if (runtime_state.host_session_running && !is_obs_ingest_backend(runtime_state)) {
+        write_json_line(build_error_payload(id, "HOST_SESSION_ACTIVE", "Native host session is already running"));
+        continue;
+      }
+
+      std::string prepare_error;
+      if (!prepare_obs_ingest_session(runtime_state, refresh, requested_port, &prepare_error)) {
+        write_json_line(build_error_payload(id, "OBS_INGEST_PREPARE_FAILED", prepare_error));
+        continue;
+      }
+
+      write_json_line(build_result_payload(
+        id,
+        std::string("{\"backend\":\"obs-ingest\",\"transportReady\":") +
+          std::string(runtime_state.peer_transport_backend.transport_ready ? "true" : "false") +
+          ",\"obsIngest\":" + obs_ingest_json(runtime_state.obs_ingest) + "}"
+      ));
+      continue;
+    }
+
     if (method == "stopAudioSession") {
       runtime_state.audio_session = build_audio_session_state(stop_wasapi_process_loopback_session());
       reset_host_audio_transport_sessions();
@@ -8855,7 +9753,13 @@ int main(int argc, char* argv[]) {
         "host-session-restart"
       );
       emit_breadcrumb("startHostSession:after-stop-host-capture-process");
+      stop_obs_ingest_runtime(runtime_state, "host-session-restart");
+      emit_breadcrumb("startHostSession:after-stop-obs-ingest-runtime");
       runtime_state.host_session_running = true;
+      runtime_state.host_backend =
+        to_lower_copy(extract_string_value(line, "backend")) == "obs-ingest"
+          ? "obs-ingest"
+          : "native";
       runtime_state.host_capture_target_id = extract_string_value(line, "captureTargetId");
       runtime_state.host_capture_source_id = extract_string_value(line, "sourceId");
       runtime_state.host_capture_kind = extract_string_value(line, "captureKind");
@@ -8870,6 +9774,7 @@ int main(int argc, char* argv[]) {
         extract_string_value(line, "requestedCodec"),
         normalize_video_codec(extract_string_value(line, "codec"))
       );
+      const int requested_obs_port = extract_int_value(line, "port", 0);
       runtime_state.host_codec = runtime_state.host_requested_codec;
       runtime_state.host_hardware_acceleration = extract_bool_value(line, "hardwareAcceleration", true);
       runtime_state.host_video_encoder_preference = normalize_video_encoder_preference(
@@ -8887,16 +9792,27 @@ int main(int argc, char* argv[]) {
       );
       runtime_state.host_frame_rate = extract_int_value(line, "frameRate", 60);
       runtime_state.host_bitrate_kbps = extract_int_value(line, "bitrateKbps", 10000);
-      if (runtime_state.host_capture_kind.empty()) {
-        runtime_state.host_capture_kind =
-          runtime_state.host_capture_target_id.rfind("screen:", 0) == 0 ? "display" : "window";
+      if (is_obs_ingest_backend(runtime_state)) {
+        runtime_state.host_capture_target_id = "obs-ingest";
+        runtime_state.host_capture_source_id.clear();
+        runtime_state.host_capture_kind = "obs-ingest";
+        runtime_state.host_capture_state = "waiting-for-obs-ingest";
+        runtime_state.host_capture_title = "OBS ingest";
+        runtime_state.host_capture_hwnd.clear();
+        runtime_state.host_capture_display_id.clear();
+        runtime_state.host_window_restore_placeholder_active = false;
+      } else {
+        if (runtime_state.host_capture_kind.empty()) {
+          runtime_state.host_capture_kind =
+            runtime_state.host_capture_target_id.rfind("screen:", 0) == 0 ? "display" : "window";
+        }
+        if (runtime_state.host_capture_state.empty()) {
+          runtime_state.host_capture_state = runtime_state.host_capture_kind == "display" ? "display" : "normal";
+        }
+        runtime_state.host_window_restore_placeholder_active =
+          runtime_state.host_capture_kind == "window" &&
+          runtime_state.host_capture_state == "minimized";
       }
-      if (runtime_state.host_capture_state.empty()) {
-        runtime_state.host_capture_state = runtime_state.host_capture_kind == "display" ? "display" : "normal";
-      }
-      runtime_state.host_window_restore_placeholder_active =
-        runtime_state.host_capture_kind == "window" &&
-        runtime_state.host_capture_state == "minimized";
       if (runtime_state.host_codec.empty()) {
         runtime_state.host_codec = "h264";
       }
@@ -8907,10 +9823,36 @@ int main(int argc, char* argv[]) {
       emit_breadcrumb(
         std::string("startHostSession:config-applied target=") +
         runtime_state.host_capture_target_id +
+        " backend=" + runtime_state.host_backend +
         " codec=" + runtime_state.host_codec +
         " size=" + std::to_string(runtime_state.host_width) + "x" + std::to_string(runtime_state.host_height) +
         " fps=" + std::to_string(runtime_state.host_frame_rate)
       );
+      if (is_obs_ingest_backend(runtime_state)) {
+        runtime_state.host_pipeline = HostPipelineState{};
+        runtime_state.host_capture_plan = HostCapturePlan{};
+        runtime_state.host_capture_artifact = HostCaptureArtifactProbe{};
+        refresh_host_capture_runtime(runtime_state);
+        restart_host_capture_surface_attachments(runtime_state);
+
+        std::string prepare_error;
+        if (!prepare_obs_ingest_session(runtime_state, false, requested_obs_port, &prepare_error)) {
+          runtime_state.host_session_running = false;
+          runtime_state.host_backend = "native";
+          clear_obs_ingest_prepared_session(runtime_state);
+          write_json_line(build_error_payload(id, "OBS_INGEST_PREPARE_FAILED", prepare_error));
+          continue;
+        }
+
+        runtime_state.obs_ingest.stop_requested.store(false);
+        runtime_state.obs_ingest.worker = std::thread(obs_ingest_worker, &runtime_state);
+        emit_breadcrumb("startHostSession:after-start-obs-ingest-worker");
+        emit_breadcrumb("startHostSession:before-result");
+        write_json_line(build_result_payload(id, build_host_session_json(runtime_state)));
+        continue;
+      }
+
+      clear_obs_ingest_prepared_session(runtime_state);
       runtime_state.host_pipeline = select_and_validate_host_pipeline(
         runtime_state.ffmpeg,
         runtime_state.host_codec,
@@ -9020,6 +9962,8 @@ int main(int argc, char* argv[]) {
       emit_breadcrumb("stopHostSession:begin");
       stop_all_surface_attachments(runtime_state, "host-session-stopped");
       emit_breadcrumb("stopHostSession:after-stop-all-surfaces");
+      stop_obs_ingest_runtime(runtime_state, "host-session-stopped");
+      emit_breadcrumb("stopHostSession:after-stop-obs-ingest-runtime");
       for (auto& entry : runtime_state.peers) {
         PeerState& peer = entry.second;
         if (peer.role == "host-downstream") {
@@ -9051,6 +9995,7 @@ int main(int argc, char* argv[]) {
       );
       emit_breadcrumb("stopHostSession:after-stop-host-capture-process");
       runtime_state.host_session_running = false;
+      runtime_state.host_backend = "native";
       runtime_state.host_capture_target_id.clear();
       runtime_state.host_capture_source_id.clear();
       runtime_state.host_capture_title.clear();
@@ -9070,6 +10015,7 @@ int main(int argc, char* argv[]) {
       runtime_state.host_height = 1080;
       runtime_state.host_frame_rate = 60;
       runtime_state.host_bitrate_kbps = 10000;
+      clear_obs_ingest_prepared_session(runtime_state);
       runtime_state.host_pipeline = select_and_validate_host_pipeline(
         runtime_state.ffmpeg,
         runtime_state.host_codec,
@@ -9819,6 +10765,7 @@ int main(int argc, char* argv[]) {
   for (auto& entry : runtime_state.peers) {
     close_peer_transport_session(entry.second.transport_session);
   }
+  stop_obs_ingest_runtime(runtime_state, "agent-shutdown");
   stop_host_capture_process(
     runtime_state.host_capture_process,
     runtime_state.host_pipeline,

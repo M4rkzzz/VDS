@@ -110,6 +110,7 @@ function getMediaEngineDebugCategory(method) {
       return 'connection';
     case 'startHostSession':
     case 'stopHostSession':
+    case 'prepareObsIngest':
     case 'attachPeerMediaSource':
     case 'detachPeerMediaSource':
     case 'attachSurface':
@@ -202,6 +203,7 @@ ipcMain.handle('media-engine-audio-is-capturing', () => {
 });
 ipcMain.handle('media-engine-start-host-session', async (_event, options) => invokeMediaEngineHostSessionBridge('startHostSession', options || {}));
 ipcMain.handle('media-engine-stop-host-session', async (_event, options) => invokeMediaEngineHostSessionBridge('stopHostSession', options || {}));
+ipcMain.handle('media-engine-prepare-obs-ingest', async (_event, options) => invokeMediaEngine('prepareObsIngest', options || {}));
 ipcMain.handle('media-engine-get-audio-backend-status', async () => invokeMediaEngine('getAudioBackendStatus'));
 ipcMain.handle('media-engine-start-audio-session', async (_event, options) => invokeMediaEngine('startAudioSession', options || {}));
 ipcMain.handle('media-engine-stop-audio-session', async (_event, options) => invokeMediaEngine('stopAudioSession', options || {}));

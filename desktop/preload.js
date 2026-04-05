@@ -51,6 +51,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     listCaptureTargets: () => ipcRenderer.invoke('media-engine-list-capture-targets'),
     startHostSession: (options) => ipcRenderer.invoke('media-engine-start-host-session', options),
     stopHostSession: () => ipcRenderer.invoke('media-engine-stop-host-session'),
+    prepareObsIngest: (options) => ipcRenderer.invoke('media-engine-prepare-obs-ingest', options),
     getAudioBackendStatus: () => ipcRenderer.invoke('media-engine-get-audio-backend-status'),
     startAudioSession: (options) => ipcRenderer.invoke('media-engine-start-audio-session', options),
     stopAudioSession: (options) => ipcRenderer.invoke('media-engine-stop-audio-session', options),

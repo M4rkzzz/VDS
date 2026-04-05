@@ -62,6 +62,10 @@ std::string normalize_video_codec_name(const std::string& codec) {
   return "h264";
 }
 
+bool is_aac_audio_format_name(const std::string& format) {
+  return format == "aac" || format == "mpeg4-generic" || format == "mp4a-latm";
+}
+
 #ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
 
 std::once_flag g_rtc_logger_once;
@@ -84,6 +88,13 @@ class OpusRtpDepacketizerCompat final : public rtc::RtpDepacketizer {
   explicit OpusRtpDepacketizerCompat(std::uint32_t clock_rate = 48000)
     : rtc::RtpDepacketizer(clock_rate) {}
   ~OpusRtpDepacketizerCompat() override = default;
+};
+
+class AacRtpDepacketizerCompat final : public rtc::RtpDepacketizer {
+ public:
+  explicit AacRtpDepacketizerCompat(std::uint32_t clock_rate = 48000)
+    : rtc::RtpDepacketizer(clock_rate) {}
+  ~AacRtpDepacketizerCompat() override = default;
 };
 
 std::string to_description_type_string(rtc::Description::Type type) {
@@ -489,12 +500,15 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     const std::string audio_codec = to_lower_ascii(config.codec);
     const bool use_opus = audio_codec == "opus";
     const bool use_pcmu = audio_codec == "pcmu";
-    if (!use_opus && !use_pcmu) {
-      throw std::runtime_error("only-opus-and-pcmu-audio-sender-are-currently-supported");
+    const bool use_aac = audio_codec == "aac";
+    if (!use_opus && !use_pcmu && !use_aac) {
+      throw std::runtime_error("only-opus-pcmu-and-aac-audio-sender-are-currently-supported");
     }
 
     if (use_opus) {
       description.addOpusCodec(config.payload_type > 0 ? config.payload_type : 111);
+    } else if (use_aac) {
+      description.addAACCodec(config.payload_type > 0 ? config.payload_type : 97);
     } else {
       description.addPCMUCodec(config.payload_type >= 0 ? config.payload_type : 0);
     }
@@ -515,14 +529,25 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     auto rtp_config = std::make_shared<rtc::RtpPacketizationConfig>(
       ssrc,
       cname,
-      static_cast<std::uint8_t>(use_opus ? (config.payload_type > 0 ? config.payload_type : 111) : (config.payload_type >= 0 ? config.payload_type : 0)),
-      use_opus ? rtc::OpusRtpPacketizer::DefaultClockRate : rtc::PCMURtpPacketizer::DefaultClockRate
+      static_cast<std::uint8_t>(
+        use_opus
+          ? (config.payload_type > 0 ? config.payload_type : 111)
+          : (use_aac ? (config.payload_type > 0 ? config.payload_type : 97) : (config.payload_type >= 0 ? config.payload_type : 0))
+      ),
+      use_opus
+        ? rtc::OpusRtpPacketizer::DefaultClockRate
+        : (use_aac ? static_cast<std::uint32_t>(config.sample_rate > 0 ? config.sample_rate : 48000) : rtc::PCMURtpPacketizer::DefaultClockRate)
     );
     rtp_config->mid = config.mid.empty() ? "audio" : config.mid;
 
-    std::shared_ptr<rtc::MediaHandler> packetizer = use_opus
-      ? std::static_pointer_cast<rtc::MediaHandler>(std::make_shared<rtc::OpusRtpPacketizer>(rtp_config))
-      : std::static_pointer_cast<rtc::MediaHandler>(std::make_shared<rtc::PCMURtpPacketizer>(rtp_config));
+    std::shared_ptr<rtc::MediaHandler> packetizer;
+    if (use_opus) {
+      packetizer = std::static_pointer_cast<rtc::MediaHandler>(std::make_shared<rtc::OpusRtpPacketizer>(rtp_config));
+    } else if (use_aac) {
+      packetizer = std::static_pointer_cast<rtc::MediaHandler>(std::make_shared<rtc::AACRtpPacketizer>(rtp_config));
+    } else {
+      packetizer = std::static_pointer_cast<rtc::MediaHandler>(std::make_shared<rtc::PCMURtpPacketizer>(rtp_config));
+    }
     auto sender_reporter = std::make_shared<rtc::RtcpSrReporter>(rtp_config);
     new_track->setMediaHandler(packetizer);
     new_track->chainMediaHandler(sender_reporter);
@@ -936,6 +961,15 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
           codec_supported = true;
           break;
         }
+        if (is_aac_audio_format_name(format)) {
+          receiver_description.addAACCodec(payload_type, codec_profile_from_rtp_map(*rtp_map));
+          negotiated_codec = "aac";
+          depacketizer = std::make_shared<AacRtpDepacketizerCompat>(
+            rtp_map->clockRate > 0 ? static_cast<std::uint32_t>(rtp_map->clockRate) : 48000
+          );
+          codec_supported = true;
+          break;
+        }
         if (format == "pcmu") {
           receiver_description.addPCMUCodec(payload_type);
           negotiated_codec = "pcmu";
@@ -947,7 +981,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
       if (!codec_supported) {
         if (callbacks.on_warning) {
-          callbacks.on_warning("Remote offer included an audio m-line, but it did not advertise a native Opus-compatible codec path that the receiver can bind yet.");
+          callbacks.on_warning("Remote offer included an audio m-line, but it did not advertise a native Opus/PCMU/AAC codec path that the receiver can bind yet.");
         }
         return;
       }
@@ -1289,8 +1323,8 @@ PeerTransportBackendInfo get_peer_transport_backend_info() {
   info.audio_track_support = true;
   info.backend = "libdatachannel";
   info.implementation = "libdatachannel-native-webrtc";
-  info.mode = "manual-negotiation+h264-h265-sendrecv+opus-sendrecv+pcmu-fallback-recv+native-viewer-surface+native-preview-surface";
-  info.reason = "libdatachannel-transport-ready-native-viewer-render-preview-and-opus-audio-available";
+  info.mode = "manual-negotiation+h264-h265-sendrecv+opus-aac-sendrecv+pcmu-fallback-recv+native-viewer-surface+native-preview-surface";
+  info.reason = "libdatachannel-transport-ready-native-viewer-render-preview-and-opus-aac-audio-available";
 #else
   info.available = false;
   info.transport_ready = false;

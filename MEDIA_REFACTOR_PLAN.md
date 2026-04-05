@@ -2,7 +2,7 @@
 
 ## 1. 目的
 
-这份文档记录仓库在 `1.6.0` 时点的真实媒体架构、真实边界、真实验证结果、真实未解问题，以及接下来明确的执行方向。  
+这份文档记录仓库在 `1.6.1` 时点的真实媒体架构、真实边界、真实验证结果、真实未解问题，以及接下来明确的执行方向。  
 它同时承担三种职责：
 
 - 真相文档：说明当前代码真实在做什么
@@ -29,14 +29,14 @@
 
 当前主链路是：
 
-- Host 采集：`media-agent` 负责
-- Host 编码：native `H.264 / H.265` codec-aware 主链路
-- Host 音频：native `Opus 48k stereo` 主链路
+- Host backend：`media-agent` 负责，正式支持 `native` 与 `obs-ingest`
+- Host 视频：`H.264 / H.265` codec-aware 主链路
+- Host 音频：native host 走 `Opus 48k stereo`，OBS ingest host 走 `AAC 48k`
 - Peer transport：native `libdatachannel`
 - Viewer 解码：native
 - Viewer 画面：native surface
 - Viewer 音量：native authority
-- Relay：中间 viewer 直接扇出收到的 `H.264/H.265 + Opus`，不做重新解码再编码
+- Relay：中间 viewer 直接扇出收到的 `H.264/H.265 + Opus/AAC/PCMU`，不做重新解码再编码
 
 当前已经不是旧的：
 
@@ -57,16 +57,18 @@
 - popup overlay 路线继续打磨成正式方案
 - 不再把 child embed 当作近期主目标
 - child embed 只保留为背景知识，不再作为主线工程牵引
+- OBS 本地 SRT ingest 已进入正式 host 模式，不再是旁路试验能力
 
 ## 3. 当前代码真实状态
 
 ### 3.1 版本与产物
 
-- 桌面端版本：`1.6.0`
-- 服务端版本：`1.6.0`
+- 桌面端版本：`1.6.1`
+- 服务端版本：`1.6.1`
 - 构建方式：`electron-builder + nsis`
 - 更新源：`generic provider`
 - 更新目录：`server/updates/`
+- 当前已准备好的发布产物：`VDS-Setup-1.6.1.exe` + `latest.yml`
 
 ### 3.2 当前主入口
 
@@ -95,6 +97,9 @@
 - viewer 子页：左侧播放区，右侧控制区
 - topbar、首页转场、返回转场已经重写过一轮
 - 质量设置弹窗已改为项目当前风格，并支持更紧凑的分行布局
+- host 质量弹窗现在有 `原生推流 / OBS 推流` 两个选项卡
+- OBS 选项卡默认只显示一行本地 SRT 地址，默认端口是 `61080`
+- OBS 端口可通过“自定义推流地址”开关展开并持久化保存
 
 需要明确：
 
@@ -105,17 +110,29 @@
 
 ### 4.1 Host
 
-当前 host 主链路：
+当前 host 已经分成两套正式 backend：
 
-- 采集后端：`Windows Graphics Capture`
-- 预览：native live preview surface
-- 视频编码主链路：`H.264 / H.265`
-- 音频编码主链路：`Opus 48k stereo`
-- 硬件编码优先：会探测并优先使用自检通过的硬件编码器
+- `native host backend`
+  - 采集后端：`Windows Graphics Capture`
+  - 预览：native live preview surface
+  - 视频编码主链路：`H.264 / H.265`
+  - 音频编码主链路：`Opus 48k stereo`
+  - 硬件编码优先：会探测并优先使用自检通过的硬件编码器
+- `obs-ingest backend`
+  - 接入方式：本机 `SRT listener`
+  - 接入范围：只允许 `127.0.0.1`
+  - 输入封装：`MPEG-TS over SRT`
+  - 视频：只接受 `H.264 / H.265`
+  - 音频：只接受 `AAC 48k`
+  - VDS 不控制 OBS，不接 `obs-websocket`
+  - OBS 模式不显示 VDS host preview；只在收到有效节目流后建房
+  - OBS 中途断流时，房间立即结束并回到等待/空闲 UI
 
 当前真实限制：
 
 - “原始分辨率”入口已从前端移除，native 侧也不再接受 `0x0` 作为原始分辨率语义
+- OBS 模式不是通用远程 SRT 网关，只是本机 ingest backend
+- OBS 默认端口是 `61080`，也允许手动改成固定自定义端口；但仍只绑定本机
 - 当前画质设置支持：
   - `H.264 / H.265`
   - 本地预览开关
@@ -138,6 +155,7 @@
 - 纯本地、无 Electron、无 sender、仅 `display capture + native preview` 的 smoke 在补上 `MinUpdateInterval(1ms)` 后，`10s` 内达到约 `194fps`
 - 这说明此前的 `56-57fps` 主要不是编码器、网络、viewer 或 CPU readback 自身上限，而是 WGC 在当前系统上的默认更新间隔问题
 - 这也说明“窗口缩放后 host preview 和 viewer 同时花屏”的问题不在 viewer 布局层，而在更上游的 WGC frame-pool 尺寸变化处理
+- OBS 本地推流已经完成基础联调：当前本机 OBS `H.264/AAC` 推流可进 viewer，且音频已确认可播放
 
 ### 4.2 Viewer
 
@@ -152,6 +170,7 @@
 
 - 首选 `Opus`
 - 兼容接收 `PCMU fallback`
+- 正式支持接收与播放 `AAC`
 
 ### 4.3 Relay
 
@@ -159,10 +178,11 @@
 
 当前实现是：
 
-- `v1` 作为上游 viewer 收到编码后的 `H.264/H.265 + Opus`
+- `v1` 作为上游 viewer 收到编码后的 `H.264/H.265 + Opus/AAC/PCMU`
 - `v1` 创建下游 relay peer
 - `attachPeerMediaSource` 直接绑定 `peer-video:<upstreamPeerId>`
 - native 直接把收到的编码帧扇出到下游
+- relay 音频 track 会按上游真实 codec 配置，不再默认 host 音频一定是 `Opus`
 
 当前拓扑约束已经明确：
 
@@ -275,6 +295,7 @@
 
 当前质量设置 UI 和 native 参数已经对齐：
 
+- host backend：`原生推流 / OBS 推流`
 - 编码：`H.264 / H.265`
 - 分辨率：`360p / 480p / 720p / 1080p / 2k / 4k`
 - 帧率：`5 / 30 / 60 / 90`
@@ -284,6 +305,14 @@
 - 硬件编码器：支持自动选择，或手动指定“已通过自检”的硬件编码器
 - 编码器预设：`质量 / 均衡 / 速度`
 - 调优：`fastdecode / zerolatency`
+
+OBS 模式当前真实 UI：
+
+- 默认只显示一行本地 `SRT` 地址
+- 默认端口固定为 `61080`
+- 主按钮是 `复制并开始`
+- 打开“自定义推流地址”后，才会展开端口输入框和保存按钮
+- 确认后进入 `等待 OBS 推流...`，收到有效 OBS 节目流后才真正创建房间
 
 当前硬件能力显示逻辑已修正为：
 
@@ -304,6 +333,7 @@
 - 发布脚本：`npm run build:release`
 - 更新目录刷新脚本：`prepare-server-release`
 - `runtime/media-agent` 已通过 `extraResources` 打包，避免再被错误塞进 `app.asar`
+- `1.6.1` 已完成打包，并已把产物复制到 `server/updates/`
 
 ### 7.2 当前自动更新链
 
@@ -364,10 +394,12 @@
 最近这轮修改后，已经明确通过过的测试类型：
 
 - 单跳 native host -> viewer 基本建连
+- 本机 OBS -> viewer 基础联调已通过：`H.264/AAC` 有音有画
 - 接收侧启动与 steady-state 调度回归
 - WGC 高帧率瓶颈已定位并打穿：
   - 不加 `MinUpdateInterval` 时，本地 preview 稳定卡在约 `56-57fps`
   - 加上 `MinUpdateInterval(1ms)` 后，纯本地 `display capture + native preview` smoke `10s` 内达到约 `194fps`
+- `1.6.1` 已完成 `npm run build:release`，且 server `/api/version` 已返回 `1.6.1`
 
 但仍要强调：
 
@@ -493,9 +525,14 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 - `H.265` 已进入主链路并可在 UI 中选择
 - “原始分辨率”前后端都已下线
 - 音频主链路从 `PCMU` 升级为 `Opus`
+- `AAC` 已正式进入 transport / relay / viewer playback 主链路
 - relay 从 browser stream 转发切到 native encoded fanout
 - relay 的 codec-aware bootstrap 已补
 - relay 新下游起播已改为优先回放缓存 GOP，并在 bootstrap 成功后切回 steady-state
+- host backend 已支持 `native / obs-ingest`
+- OBS 本地 `SRT` ingest 已接入正式 host 模式，并支持 `H.264 / H.265 + AAC`
+- OBS 模式现在会等待有效节目流后再建房，断流会立即结束房间
+- OBS 推流地址已改成默认固定端口 `61080`，并支持持久化自定义端口
 - `viewer-left` 已补上游通知，`v2` 重连不再依赖残留旧下游 peer 被动超时
 - 关闭 `relay-downstream` 时不再误停 `viewer-upstream` 的原生音频运行时
 - 差分更新 installer cache seed 已补
@@ -523,19 +560,21 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 - host preview 的 `native_live_preview` popup attach 仍存在偶发失败，当前正在继续收窄 owner hook / layout / attach 时序问题
 - viewer fullscreen underbar 当前已基本可用，但交互细节仍在打磨，不能写成最终完成
 - `H.265` 虽已进入主链路，但双端 / 三端 / 晚加入 / 重连 / 长时间 soak 还需继续验证
+- OBS 本地推流模式虽已基本可用，但 `H.264/H.265` 双 codec、长时间 soak、断流恢复、端口占用报错等还需继续验证
+- OBS 模式当前仍只支持本机 `127.0.0.1` + `AAC 48k`，不能写成“任意 SRT sender 都已正式支持”
 - WGC 黄框虽然已有代码级关闭开关，但跨机器、跨系统、跨打包形态的最终验证还未完成
 - 差分更新成功率还没有达到目标状态
 - 三端 smoke 还缺真正自动化 harness，当前排障效率受人工点击和人工抄日志限制
 
 ## 12. 下一阶段顺序
 
-### 阶段 A：验证并稳住 H.265 主链路
+### 阶段 A：收口 OBS 本地推流模式
 
 目标：
 
-- 持续验证 `H.265` 在 host / viewer / relay 链路中的真实稳健性
-- 重点覆盖双端、三端、晚加入、断线重连、长时间播放
-- 继续保持 `H.264 / H.265` 都走同一套 codec-aware 主骨架，避免重新长出分叉专用路线
+- 持续验证 OBS `H.264 / H.265 + AAC` 在 host / viewer / relay 链路中的真实稳健性
+- 覆盖默认端口、自定义端口、端口占用、重复开始/停止、断流立即结束房间
+- 保持 OBS ingest 只是一套 host backend，不允许重新长出旁路专用业务状态机
 
 ### 阶段 B：全链路稳健性
 
@@ -550,7 +589,15 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 - 重点消灭“连接失败 / 重连失败 / 偶发无声无画”
 - 继续验证高帧率 WGC 在正式双端链路中是否稳定传递，而不是只停留在本地 preview smoke
 
-### 阶段 C：代码打磨
+### 阶段 C：验证并稳住 H.265 主链路
+
+目标：
+
+- 持续验证 `H.265` 在 native host 与 OBS host 两条 backend 中的真实稳健性
+- 重点覆盖双端、三端、晚加入、断线重连、长时间播放
+- 继续保持 `H.264 / H.265` 都走同一套 codec-aware 主骨架，避免重新长出分叉专用路线
+
+### 阶段 D：代码打磨
 
 目标：
 
@@ -559,7 +606,7 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 - 在微观层面继续寻找更优算法，而不是单纯堆补丁
 - 保持边界清晰，避免一边修稳健性一边再次长出旧路线兼容层
 
-### 阶段 D：发布链继续收口
+### 阶段 E：发布链继续收口
 
 目标：
 
@@ -580,10 +627,11 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 
 ## 14. 本次文档更新结论
 
-截至 `1.6.0` 当前仓库状态，最准确的总结是：
+截至 `1.6.1` 当前仓库状态，最准确的总结是：
 
 - native authority 已经是唯一主链路
-- `H.264 / H.265 + Opus + native relay fanout` 已经落地
+- `H.264 / H.265 + Opus / AAC + native relay fanout` 已经落地
+- OBS 本地 `SRT` ingest 已经进入正式 host backend，并且基础音视频联调已通过
 - 更新、UI、调试、fullscreen、质量设置都已跟这条主链路对齐
 - popup overlay 已经被确定为正式打磨路线
 - Windows fullscreen 已切成窗口化全屏，任务栏覆盖和 maximize / restore viewer surface 错位问题都已收口
@@ -591,12 +639,13 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 - Win11 24H2 下 WGC 高帧率瓶颈已经定位到 `GraphicsCaptureSession.MinUpdateInterval`
 - WGC 运行中尺寸变化现在已经会触发 frame-pool 重建，`host preview` 和 `viewer` 不再共用一条会稳定产出坏帧的旧采集路径
 - “开播即最小化窗口”当前已经能通过启动期 placeholder + 恢复 soft refresh 接回真实视频与音频
+- OBS 推流地址当前默认固定为 `61080`，并支持持久化自定义端口；UI 已改成“复制并开始”的直接工作流
 - 当前最大的未收口问题已经明确收缩到：`viewer-upstream passthrough` 打开后，`host -> v1 -> v2` 的 relay 视频第二跳仍不稳定
 - 当前最大的工程重点顺序已经明确：
-  - 先收口 `v1 passthrough + v2 relay` 当前 regression
+  - 先继续收口 OBS 本地推流模式的边界与稳定性
+  - 再收口 `v1 passthrough + v2 relay` 当前 regression
   - 再验证并稳住 `H.265` 与高帧率正式链路
-  - 再完善全链路稳健性
-  - 最后持续打磨代码和效率
+  - 最后持续打磨代码、效率与发布链
 
 ## 15. 给下一个 Agent 的交接说明
 

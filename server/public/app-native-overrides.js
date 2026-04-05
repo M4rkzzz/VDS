@@ -80,6 +80,9 @@
   let stopScreenShareInFlight = false;
   let hostWaitingWindowRestore = false;
   let nativeHostEffectiveCodec = 'h264';
+  let currentHostBackend = 'native';
+  let obsRoomCreatePending = false;
+  let obsIngestStreamActive = false;
   let viewerFullscreenControlsHideTimerId = 0;
   let viewerFullscreenCursorPollTimerId = 0;
   let viewerFullscreenVolumePopoverHideTimerId = 0;
@@ -310,6 +313,27 @@
     return new Promise((resolve) => {
       window.requestAnimationFrame(() => window.requestAnimationFrame(resolve));
     });
+  }
+
+  function normalizeHostBackendName(backend) {
+    return String(backend || '').trim().toLowerCase() === 'obs-ingest' ? 'obs-ingest' : 'native';
+  }
+
+  function getRequestedHostBackend() {
+    if (typeof qualitySettings === 'object' && qualitySettings) {
+      return normalizeHostBackendName(qualitySettings.hostBackend);
+    }
+    return 'native';
+  }
+
+  function isObsIngestHostBackend(backend = currentHostBackend) {
+    return normalizeHostBackendName(backend) === 'obs-ingest';
+  }
+
+  function shouldShowNativeHostPreviewForBackend(backend = currentHostBackend) {
+    return !isObsIngestHostBackend(backend) &&
+      nativeHostPreviewEnabled &&
+      !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
   }
 
   function isViewerFullscreenMode() {
@@ -559,13 +583,19 @@
       elements.btnStartShare.disabled = Boolean(stopping);
     }
     if (stopping && elements.hostStatus) {
-      elements.hostStatus.textContent = '正在结束原生直播...';
+      elements.hostStatus.textContent = '正在结束直播...';
     }
   }
 
   function syncHostWaitingWindowRestoreUi(waiting, restoredText = '原生分享已恢复') {
     hostWaitingWindowRestore = Boolean(waiting);
     if (!elements.hostStatus) {
+      return;
+    }
+
+    if (isObsIngestHostBackend()) {
+      elements.hostStatus.textContent = waiting ? '等待 OBS 推流...' : restoredText;
+      elements.hostStatus.classList.toggle('waiting', Boolean(waiting));
       return;
     }
 
@@ -582,12 +612,15 @@
   function resetHostUiAfterFailedStart() {
     nativeHostSessionRunning = false;
     hostWaitingWindowRestore = false;
+    obsRoomCreatePending = false;
+    obsIngestStreamActive = false;
+    currentHostBackend = getRequestedHostBackend();
     hostPreviewSurfaceAttached = false;
     stopNativeHostStatsPolling();
     resetHostFpsIndicators();
     updateHostEncoderDetail(null);
     hideLegacyVideoElements();
-    hostPreviewRequested = !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
+    hostPreviewRequested = shouldShowNativeHostPreviewForBackend(currentHostBackend);
     if (hostVideoContainer) {
       hostVideoContainer.classList.toggle('hidden', !hostPreviewRequested);
     }
@@ -1699,6 +1732,10 @@
       return;
     }
 
+    if (params.backend) {
+      currentHostBackend = normalizeHostBackendName(params.backend);
+    }
+
     if (params.state === 'surface-detached' && params.surface) {
       attachedEmbeddedSurfaces.delete(params.surface);
       clearRecoverableSurfaceSyncWarning(params.surface);
@@ -1709,6 +1746,8 @@
 
     if (params.state === 'host-session-started') {
       nativeHostSessionRunning = true;
+      obsRoomCreatePending = false;
+      obsIngestStreamActive = false;
       if (typeof qualitySettings === 'object' && qualitySettings) {
         const effectiveCodec = normalizeNativeVideoCodec(
           params.effectiveCodec || params.codec,
@@ -1724,9 +1763,62 @@
       return;
     }
 
+    if (params.state === 'obs-ingest-waiting') {
+      currentHostBackend = 'obs-ingest';
+      nativeHostSessionRunning = true;
+      hostWaitingWindowRestore = false;
+      obsIngestStreamActive = false;
+      updateHostEncoderDetail(null, params.obsIngest || null);
+      if (elements.hostStatus) {
+        elements.hostStatus.textContent = '等待 OBS 推流...';
+        elements.hostStatus.classList.add('waiting');
+      }
+      return;
+    }
+
+    if (params.state === 'obs-ingest-connected') {
+      currentHostBackend = 'obs-ingest';
+      nativeHostSessionRunning = true;
+      obsIngestStreamActive = false;
+      updateHostEncoderDetail(null, params.obsIngest || null);
+      if (elements.hostStatus) {
+        elements.hostStatus.textContent = 'OBS 已连接，等待有效节目流...';
+        elements.hostStatus.classList.add('waiting');
+      }
+      return;
+    }
+
+    if (params.state === 'obs-stream-running') {
+      currentHostBackend = 'obs-ingest';
+      nativeHostSessionRunning = true;
+      obsIngestStreamActive = true;
+      updateHostEncoderDetail(null, params.obsIngest || null);
+      ensureObsHostRoomCreated();
+      return;
+    }
+
+    if (params.state === 'obs-ingest-ended') {
+      currentHostBackend = 'obs-ingest';
+      nativeHostSessionRunning = true;
+      obsRoomCreatePending = false;
+      obsIngestStreamActive = false;
+      updateHostEncoderDetail(null, params.obsIngest || null);
+      if (currentRoomId || sessionRole === 'host') {
+        teardownHostRoomPreservingSession('obs-ingest-ended').catch((error) => {
+          console.warn('[media-engine] failed to end OBS room after ingest stop:', error);
+        });
+      } else if (elements.hostStatus) {
+        elements.hostStatus.textContent = '等待 OBS 推流...';
+        elements.hostStatus.classList.add('waiting');
+      }
+      return;
+    }
+
     if (params.state === 'host-session-stopped') {
       nativeHostSessionRunning = false;
       hostWaitingWindowRestore = false;
+      obsRoomCreatePending = false;
+      obsIngestStreamActive = false;
     }
   }
 
@@ -2001,8 +2093,38 @@
     }
   }
 
-  function updateHostEncoderDetail(pipeline) {
+  function updateHostEncoderDetail(pipeline, obsIngest = null) {
     if (!elements.hostStatusDetail) {
+      return;
+    }
+
+    if (isObsIngestHostBackend()) {
+      const parts = [];
+      if (obsIngest && Number.isFinite(obsIngest.port) && obsIngest.port > 0) {
+        parts.push(`SRT：127.0.0.1:${obsIngest.port}`);
+      }
+      if (obsIngest && obsIngest.videoCodec) {
+        const videoBits = [String(obsIngest.videoCodec).toUpperCase()];
+        if (Number.isFinite(obsIngest.width) && obsIngest.width > 0 && Number.isFinite(obsIngest.height) && obsIngest.height > 0) {
+          videoBits.push(`${obsIngest.width}x${obsIngest.height}`);
+        }
+        if (Number.isFinite(obsIngest.frameRate) && obsIngest.frameRate > 0) {
+          videoBits.push(`${obsIngest.frameRate}fps`);
+        }
+        parts.push(videoBits.join(' '));
+      }
+      if (obsIngest && obsIngest.audioCodec) {
+        parts.push(`音频：${String(obsIngest.audioCodec).toUpperCase()}`);
+      }
+
+      if (parts.length === 0) {
+        elements.hostStatusDetail.textContent = '';
+        elements.hostStatusDetail.classList.add('hidden');
+        return;
+      }
+
+      elements.hostStatusDetail.textContent = parts.join(' · ');
+      elements.hostStatusDetail.classList.remove('hidden');
       return;
     }
 
@@ -2019,13 +2141,71 @@
     elements.hostStatusDetail.classList.remove('hidden');
   }
 
+  async function teardownHostRoomPreservingSession(reason = 'host-room-ended') {
+    const peerIds = Array.from(nativePeerHandles.keys());
+    await Promise.all(peerIds.map((peerId) => closeNativePeerConnectionImpl(peerId, { clearRetryState: true }).catch(() => {})));
+
+    if (currentRoomId && sessionRole === 'host') {
+      sendMessage({
+        type: 'leave-room',
+        roomId: currentRoomId,
+        clientId
+      }, { queueIfDisconnected: false });
+    }
+
+    sessionRole = null;
+    currentRoomId = null;
+    hostId = null;
+    upstreamPeerId = null;
+    relayStream = null;
+    upstreamConnected = false;
+    viewerReadySent = false;
+    videoStarted = false;
+    obsRoomCreatePending = false;
+    obsIngestStreamActive = false;
+
+    elements.roomInfo.classList.add('hidden');
+    elements.viewerCount.textContent = '0';
+    elements.btnStartShare.classList.add('hidden');
+    elements.btnStopShare.classList.remove('hidden');
+    if (elements.hostStatus) {
+      elements.hostStatus.textContent = '等待 OBS 推流...';
+      elements.hostStatus.classList.add('waiting');
+    }
+
+    logNativeStep('obs-ingest:room-ended', {
+      reason,
+      peerCount: peerIds.length
+    }, 'video');
+  }
+
+  function ensureObsHostRoomCreated() {
+    if (!isHost || !nativeHostSessionRunning || !isObsIngestHostBackend()) {
+      return;
+    }
+    if (currentRoomId || obsRoomCreatePending) {
+      return;
+    }
+
+    obsRoomCreatePending = true;
+    if (elements.hostStatus) {
+      elements.hostStatus.textContent = 'OBS 节目流已接入，正在创建房间...';
+      elements.hostStatus.classList.add('waiting');
+    }
+    sendMessage({
+      type: 'create-room',
+      clientId
+    });
+  }
+
   async function pollNativeHostStats(reason = 'periodic') {
-    if (!nativeHostSessionRunning || sessionRole !== 'host') {
+    if (!nativeHostSessionRunning || !isHost) {
       return null;
     }
 
     try {
       const stats = await mediaEngine.getStats({});
+      currentHostBackend = normalizeHostBackendName(stats && stats.hostBackend ? stats.hostBackend : currentHostBackend);
       const peers = Array.isArray(stats && stats.peers) ? stats.peers : [];
       const peer = peers.find((entry) => entry && entry.role === 'host-downstream');
       const surfaces = Array.isArray(stats && stats.surfaces) ? stats.surfaces : [];
@@ -2036,9 +2216,18 @@
       );
       const hostPlan = stats && stats.hostCapturePlan ? stats.hostCapturePlan : null;
       const hostPipeline = stats && stats.hostPipeline ? stats.hostPipeline : null;
-      const sourceFrames = peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.sourceFramesCaptured)
-        ? peer.mediaBinding.sourceFramesCaptured
-        : NaN;
+      const obsIngest = stats && stats.obsIngest ? stats.obsIngest : null;
+      const sourceFrames = isObsIngestHostBackend()
+        ? (
+          obsIngest && Number.isFinite(obsIngest.videoPacketsReceived)
+            ? obsIngest.videoPacketsReceived
+            : NaN
+        )
+        : (
+          peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.sourceFramesCaptured)
+            ? peer.mediaBinding.sourceFramesCaptured
+            : NaN
+        );
       const captureFrames = surface && Number.isFinite(surface.decodedFramesRendered)
         ? surface.decodedFramesRendered
         : NaN;
@@ -2046,9 +2235,20 @@
         ? peer.mediaBinding.framesSent
         : NaN;
 
-      updateHostEncoderDetail(hostPipeline);
+      updateHostEncoderDetail(hostPipeline, obsIngest);
       updateHostFpsIndicators(sourceFrames, captureFrames, sentFrames);
-      if (hostPlan && hostPlan.captureState === 'minimized') {
+      if (isObsIngestHostBackend()) {
+        if (obsIngest && obsIngest.waiting) {
+          elements.hostStatus.textContent = '等待 OBS 推流...';
+          elements.hostStatus.classList.add('waiting');
+        } else if (obsIngest && obsIngest.ingestConnected && !obsIngest.streamRunning) {
+          elements.hostStatus.textContent = 'OBS 已连接，等待有效节目流...';
+          elements.hostStatus.classList.add('waiting');
+        } else if (currentRoomId) {
+          elements.hostStatus.textContent = '正在共享（OBS）';
+          elements.hostStatus.classList.remove('waiting');
+        }
+      } else if (hostPlan && hostPlan.captureState === 'minimized') {
         syncHostWaitingWindowRestoreUi(true);
       } else if (hostWaitingWindowRestore) {
         syncHostWaitingWindowRestoreUi(
@@ -2061,10 +2261,16 @@
         console.log(
           '[media-engine native-host-stats]',
           `reason=${reason}`,
+          `backend=${currentHostBackend}`,
           `hostRunning=${Boolean(stats && stats.hostSessionRunning)}`,
           `captureReady=${Boolean(hostPlan && hostPlan.ready)}`,
           `captureValidated=${Boolean(hostPlan && hostPlan.validated)}`,
           `captureReason=${hostPlan && hostPlan.reason ? hostPlan.reason : 'n/a'}`,
+          `obsWaiting=${Boolean(obsIngest && obsIngest.waiting)}`,
+          `obsConnected=${Boolean(obsIngest && obsIngest.ingestConnected)}`,
+          `obsRunning=${Boolean(obsIngest && obsIngest.streamRunning)}`,
+          `obsVideoCodec=${obsIngest && obsIngest.videoCodec ? obsIngest.videoCodec : 'n/a'}`,
+          `obsAudioCodec=${obsIngest && obsIngest.audioCodec ? obsIngest.audioCodec : 'n/a'}`,
           `sourceFramesCaptured=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.sourceFramesCaptured) ? peer.mediaBinding.sourceFramesCaptured : 0}`,
           `avgCopyUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceCopyResourceUs) ? peer.mediaBinding.avgSourceCopyResourceUs : 0}`,
           `avgMapUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceMapUs) ? peer.mediaBinding.avgSourceMapUs : 0}`,
@@ -2098,7 +2304,7 @@
     stopNativeHostStatsPolling();
     resetHostFpsIndicators();
     nativeHostStatsIntervalId = setInterval(() => {
-      if (!nativeHostSessionRunning || sessionRole !== 'host') {
+      if (!nativeHostSessionRunning || !isHost) {
         stopNativeHostStatsPolling();
         return;
       }
@@ -2240,8 +2446,12 @@
       throw new Error('native-host-session-disabled');
     }
 
+    currentHostBackend = 'native';
+    obsRoomCreatePending = false;
+    obsIngestStreamActive = false;
     await ensureNativeUiReady();
     const parsedSource = parseCaptureSource(sourceId);
+    parsedSource.backend = 'native';
     logNativeStep('startHostSession:source', {
       sourceId,
       parsedSource
@@ -2338,6 +2548,48 @@
     }
   }
 
+  async function startScreenShareWithObsIngest(options = {}) {
+    if (!nativeHostSessionEnabled) {
+      throw new Error('native-host-session-disabled');
+    }
+
+    currentHostBackend = 'obs-ingest';
+    obsRoomCreatePending = false;
+    obsIngestStreamActive = false;
+    await ensureNativeUiReady();
+    await ensureMediaEngineStarted();
+    await waitForHostUiReady();
+    const requestedPort = Number.isFinite(Number(options && options.port))
+      ? Math.round(Number(options.port))
+      : 0;
+    const session = await mediaEngine.startHostSession({
+      backend: 'obs-ingest',
+      port: requestedPort
+    });
+    logNativeDebug('video', '[media-engine] obs ingest session result:', JSON.stringify(session));
+    if (!session || session.running !== true) {
+      throw new Error(session && session.reason ? session.reason : 'obs-ingest-session-start-failed');
+    }
+
+    nativeHostSessionRunning = true;
+    localStream = null;
+    hostWaitingWindowRestore = false;
+    hostPreviewRequested = false;
+    hideLegacyVideoElements();
+    if (hostVideoContainer) {
+      hostVideoContainer.classList.add('hidden');
+    }
+    startNativeHostStatsPolling();
+
+    elements.roomInfo.classList.add('hidden');
+    elements.viewerCount.textContent = '0';
+    elements.btnStartShare.classList.add('hidden');
+    elements.btnStopShare.classList.remove('hidden');
+    elements.hostStatus.textContent = '等待 OBS 推流...';
+    elements.hostStatus.classList.add('waiting');
+    updateHostEncoderDetail(null, session && session.obsIngest ? session.obsIngest : null);
+  }
+
   async function startScreenShareWithAudio(sourceId, audioPid) {
     await startScreenShareWithSource(sourceId);
 
@@ -2392,6 +2644,9 @@
 
       nativeHostSessionRunning = false;
       hostWaitingWindowRestore = false;
+      obsRoomCreatePending = false;
+      obsIngestStreamActive = false;
+      currentHostBackend = getRequestedHostBackend();
 
       if (currentRoomId && sessionRole === 'host') {
         sendMessage({
@@ -2420,7 +2675,7 @@
       updateHostEncoderDetail(null);
       resetHostFpsIndicators();
       hideLegacyVideoElements();
-      hostPreviewRequested = !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
+      hostPreviewRequested = shouldShowNativeHostPreviewForBackend(currentHostBackend);
       if (hostVideoContainer) {
         hostVideoContainer.classList.toggle('hidden', !hostPreviewRequested);
       }
@@ -2676,16 +2931,31 @@
 
     switch (data.type) {
       case 'room-created':
+        obsRoomCreatePending = false;
+        if (isObsIngestHostBackend() && !obsIngestStreamActive) {
+          sendMessage({
+            type: 'leave-room',
+            roomId: data.roomId,
+            clientId
+          }, { queueIfDisconnected: false });
+          if (elements.hostStatus) {
+            elements.hostStatus.textContent = '等待 OBS 推流...';
+            elements.hostStatus.classList.add('waiting');
+          }
+          return;
+        }
         currentRoomId = data.roomId;
         sessionRole = 'host';
         elements.roomIdDisplay.textContent = data.roomId;
         elements.roomInfo.classList.remove('hidden');
         elements.btnStartShare.classList.add('hidden');
         elements.btnStopShare.classList.remove('hidden');
+        startNativeHostStatsPolling();
         if (hostWaitingWindowRestore) {
           syncHostWaitingWindowRestoreUi(true);
         } else {
-          elements.hostStatus.textContent = '原生分享已就绪';
+          elements.hostStatus.textContent = isObsIngestHostBackend() ? '正在共享（OBS）' : '原生分享已就绪';
+          elements.hostStatus.classList.remove('waiting');
         }
         return;
 
@@ -2716,16 +2986,20 @@
         currentRoomId = data.roomId;
         sessionRole = data.role;
         if (data.role === 'host') {
+          obsRoomCreatePending = false;
+          obsIngestStreamActive = isObsIngestHostBackend() ? true : obsIngestStreamActive;
           isHost = true;
           elements.roomIdDisplay.textContent = data.roomId;
           elements.roomInfo.classList.remove('hidden');
           elements.viewerCount.textContent = String(data.viewerCount || 0);
           elements.btnStartShare.classList.add('hidden');
           elements.btnStopShare.classList.remove('hidden');
+          startNativeHostStatsPolling();
           if (hostWaitingWindowRestore) {
             syncHostWaitingWindowRestoreUi(true);
           } else {
-            elements.hostStatus.textContent = '原生分享已恢复';
+            elements.hostStatus.textContent = isObsIngestHostBackend() ? '正在共享（OBS）' : '原生分享已恢复';
+            elements.hostStatus.classList.remove('waiting');
           }
           return;
         }
@@ -2754,6 +3028,7 @@
         return;
 
       case 'error':
+        obsRoomCreatePending = false;
         showError(data.message);
         return;
 
@@ -3000,7 +3275,7 @@
         event.stopImmediatePropagation();
         stopScreenShare().catch((error) => {
           console.error('[media-engine] stopScreenShare failed:', error);
-          showError(`原生停止失败：${error && error.message ? error.message : String(error)}`);
+          showError(`停止共享失败：${error && error.message ? error.message : String(error)}`);
         });
       }, true);
     }
@@ -3086,6 +3361,7 @@
   window.isNativePeerDriverActive = isNativePeerDriverActive;
   window.isNativePeerHandle = isNativePeerHandle;
   window.startScreenShareWithSource = startScreenShareWithSource;
+  window.startScreenShareWithObsIngest = startScreenShareWithObsIngest;
   window.startScreenShareWithAudio = startScreenShareWithAudio;
   window.stopScreenShare = stopScreenShare;
   window.createPeerConnection = createPeerConnection;

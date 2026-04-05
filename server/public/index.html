@@ -255,106 +255,156 @@
             <p class="quality-modal-subtitle">按当前设备能力选择编码、分辨率、帧率与实时性策略。</p>
           </div>
         </div>
+        <div id="quality-backend-options" class="quality-segment-group quality-segment-group-compact quality-backend-options" aria-label="host 推流模式"></div>
         <div class="quality-settings quality-settings-modern">
-          <section class="quality-section">
-            <p class="quality-section-heading">基础设置</p>
-            <div class="quality-setting-row">
-              <div class="quality-setting-copy">
-                <label>编码格式</label>
-              </div>
-              <div class="quality-setting-control">
-                <div id="quality-codec-options" class="quality-segment-group quality-segment-group-compact" aria-label="编码选项"></div>
-              </div>
-            </div>
-
-            <div class="quality-setting-row quality-setting-row-toggle">
-              <div class="quality-setting-copy">
-                <label>本地预览</label>
-              </div>
-              <div class="quality-setting-control quality-setting-control-toggle">
-                <label class="quality-switch" for="quality-preview-enabled">
-                  <input id="quality-preview-enabled" type="checkbox" checked>
-                  <span class="quality-switch-track" aria-hidden="true"></span>
-                </label>
-              </div>
-            </div>
-
-            <div class="quality-setting-row quality-setting-row-toggle">
-              <div class="quality-setting-copy">
-                <label>硬件加速编码</label>
-                <p id="quality-hardware-support" class="quality-setting-note">正在检测设备支持的硬件编码器…</p>
-              </div>
-              <div class="quality-setting-control quality-setting-control-toggle">
-                <label class="quality-switch" for="quality-hardware-acceleration">
-                  <input id="quality-hardware-acceleration" type="checkbox" checked>
-                  <span class="quality-switch-track" aria-hidden="true"></span>
-                </label>
-              </div>
-            </div>
-
-            <div class="quality-setting-row">
-              <div class="quality-setting-copy">
-                <label for="quality-hardware-encoder-select">硬件编码器</label>
-              </div>
-              <div class="quality-setting-control">
-                <select id="quality-hardware-encoder-select" class="quality-select" aria-label="硬件编码器选择"></select>
-              </div>
-            </div>
-          </section>
-
-          <section class="quality-section">
-            <p class="quality-section-heading">高级设置</p>
-            <div class="quality-setting-row">
-              <div class="quality-setting-copy">
-                <label>分辨率</label>
-              </div>
-              <div class="quality-setting-control">
-                <div id="quality-resolution-options" class="quality-segment-group quality-segment-group-wrap quality-segment-group-compact" aria-label="分辨率选项"></div>
-              </div>
-            </div>
-
-            <div class="quality-setting-row">
-              <div class="quality-setting-copy">
-                <label>帧率</label>
-              </div>
-              <div class="quality-setting-control">
-                <div id="quality-fps-options" class="quality-segment-group quality-segment-group-compact" aria-label="帧率选项"></div>
-              </div>
-            </div>
-
-            <div class="quality-setting-row">
-              <div class="quality-setting-copy">
-                <label>码率</label>
-              </div>
-              <div class="quality-setting-control">
-                <div class="quality-stepper">
-                  <button id="quality-bitrate-decrease" class="quality-stepper-btn" type="button" aria-label="降低码率">-</button>
-                  <input type="number" id="quality-bitrate" value="10000" min="1000" max="80000" step="1000">
-                  <span class="quality-stepper-unit">kbps</span>
-                  <button id="quality-bitrate-increase" class="quality-stepper-btn" type="button" aria-label="提高码率">+</button>
+          <div id="quality-native-panel" class="quality-backend-panel">
+            <section class="quality-section">
+              <p class="quality-section-heading">基础设置</p>
+              <div class="quality-setting-row">
+                <div class="quality-setting-copy">
+                  <label>编码格式</label>
+                  <p id="quality-codec-note" class="quality-setting-note">当前直播链路将按所选编码启动。</p>
+                </div>
+                <div class="quality-setting-control">
+                  <div id="quality-codec-options" class="quality-segment-group quality-segment-group-compact" aria-label="编码选项"></div>
                 </div>
               </div>
-            </div>
 
-            <div class="quality-setting-row">
-              <div class="quality-setting-copy">
-                <label>编码器预设</label>
-                <p id="quality-preset-note" class="quality-setting-note">默认均衡，将按实际编码器映射到对应预设。</p>
+              <div class="quality-setting-row quality-setting-row-toggle">
+                <div class="quality-setting-copy">
+                  <label>本地预览</label>
+                </div>
+                <div class="quality-setting-control quality-setting-control-toggle">
+                  <label class="quality-switch" for="quality-preview-enabled">
+                    <input id="quality-preview-enabled" type="checkbox" checked>
+                    <span class="quality-switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
               </div>
-              <div class="quality-setting-control">
-                <div id="quality-preset-options" class="quality-segment-group quality-segment-group-compact" aria-label="编码器预设"></div>
-              </div>
-            </div>
 
-            <div class="quality-setting-row">
-              <div class="quality-setting-copy">
-                <label>调优</label>
+              <div class="quality-setting-row quality-setting-row-toggle">
+                <div class="quality-setting-copy">
+                  <label>硬件加速编码</label>
+                  <p id="quality-hardware-support" class="quality-setting-note">正在检测设备支持的硬件编码器…</p>
+                </div>
+                <div class="quality-setting-control quality-setting-control-toggle">
+                  <label class="quality-switch" for="quality-hardware-acceleration">
+                    <input id="quality-hardware-acceleration" type="checkbox" checked>
+                    <span class="quality-switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
               </div>
-              <div class="quality-setting-control">
-                <div id="quality-tune-options" class="quality-segment-group quality-segment-group-compact" aria-label="调优选项"></div>
+
+              <div class="quality-setting-row">
+                <div class="quality-setting-copy">
+                  <label for="quality-hardware-encoder-select">硬件编码器</label>
+                </div>
+                <div class="quality-setting-control">
+                  <select id="quality-hardware-encoder-select" class="quality-select" aria-label="硬件编码器选择"></select>
+                </div>
               </div>
-            </div>
-          </section>
+            </section>
+
+            <section class="quality-section">
+              <p class="quality-section-heading">高级设置</p>
+              <div class="quality-setting-row">
+                <div class="quality-setting-copy">
+                  <label>分辨率</label>
+                </div>
+                <div class="quality-setting-control">
+                  <div id="quality-resolution-options" class="quality-segment-group quality-segment-group-wrap quality-segment-group-compact" aria-label="分辨率选项"></div>
+                </div>
+              </div>
+
+              <div class="quality-setting-row">
+                <div class="quality-setting-copy">
+                  <label>帧率</label>
+                </div>
+                <div class="quality-setting-control">
+                  <div id="quality-fps-options" class="quality-segment-group quality-segment-group-compact" aria-label="帧率选项"></div>
+                </div>
+              </div>
+
+              <div class="quality-setting-row">
+                <div class="quality-setting-copy">
+                  <label>码率</label>
+                </div>
+                <div class="quality-setting-control">
+                  <div class="quality-stepper">
+                    <button id="quality-bitrate-decrease" class="quality-stepper-btn" type="button" aria-label="降低码率">-</button>
+                    <input type="number" id="quality-bitrate" value="10000" min="1000" max="80000" step="1000">
+                    <span class="quality-stepper-unit">kbps</span>
+                    <button id="quality-bitrate-increase" class="quality-stepper-btn" type="button" aria-label="提高码率">+</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="quality-setting-row">
+                <div class="quality-setting-copy">
+                  <label>编码器预设</label>
+                  <p id="quality-preset-note" class="quality-setting-note">默认均衡，将按实际编码器映射到对应预设。</p>
+                </div>
+                <div class="quality-setting-control">
+                  <div id="quality-preset-options" class="quality-segment-group quality-segment-group-compact" aria-label="编码器预设"></div>
+                </div>
+              </div>
+
+              <div class="quality-setting-row">
+                <div class="quality-setting-copy">
+                  <label>调优</label>
+                </div>
+                <div class="quality-setting-control">
+                  <div id="quality-tune-options" class="quality-segment-group quality-segment-group-compact" aria-label="调优选项"></div>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <div id="quality-obs-panel" class="quality-backend-panel hidden">
+            <section class="quality-section quality-section-obs">
+              <p class="quality-section-heading">OBS 本地推流</p>
+              <div class="quality-obs-url-card quality-obs-url-card-simple">
+                <div class="quality-obs-url-copy">
+                  <span class="quality-obs-url-label">本地 SRT 地址</span>
+                  <code id="quality-obs-url" class="quality-obs-url">正在生成本地 SRT 地址...</code>
+                  <p id="quality-obs-status" class="quality-setting-note">切换到 OBS 推流后，VDS 会为当前会话准备一个本机 SRT 地址。</p>
+                </div>
+              </div>
+              <div class="quality-setting-row quality-setting-row-toggle quality-setting-row-obs-custom-toggle">
+                <div class="quality-setting-copy">
+                  <label>自定义推流地址</label>
+                  <p class="quality-setting-note">默认直接使用 <code>61080</code>。如果你希望 OBS 长期保存另一条地址，再打开这个开关。</p>
+                </div>
+                <div class="quality-setting-control quality-setting-control-toggle">
+                  <label class="quality-switch" for="quality-obs-custom-port-enabled">
+                    <input id="quality-obs-custom-port-enabled" type="checkbox">
+                    <span class="quality-switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
+              </div>
+              <div id="quality-obs-custom-port-row" class="quality-setting-row quality-setting-row-obs-port hidden">
+                <div class="quality-setting-copy">
+                  <label for="quality-obs-port">自定义端口</label>
+                  <p class="quality-setting-note">保存后会重新检查这个端口是否可用，并更新上面的完整推流地址。</p>
+                </div>
+                <div class="quality-setting-control quality-setting-control-obs-port">
+                  <div class="quality-stepper quality-obs-port-stepper">
+                    <input type="number" id="quality-obs-port" value="61080" min="1024" max="65535" step="1" inputmode="numeric">
+                  </div>
+                  <div class="quality-obs-port-actions">
+                    <button id="btn-save-obs-port" class="btn btn-secondary" type="button">保存</button>
+                  </div>
+                </div>
+              </div>
+              <div class="quality-obs-guide">
+                <p class="quality-obs-guide-title">OBS 设置</p>
+                <p>1. Settings &gt; Stream &gt; Service 选择 Custom。</p>
+                <p>2. Server 粘贴上面的完整 srt://127.0.0.1:PORT... 地址。</p>
+                <p>3. Stream Key 留空。</p>
+                <p>4. 确认后 VDS 会进入等待推流状态，不显示原生 preview，收到有效节目流后才创建房间。</p>
+              </div>
+            </section>
+          </div>
         </div>
         <div class="modal-buttons">
           <button id="btn-confirm-quality" class="btn btn-primary">确认并继续</button>

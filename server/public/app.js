@@ -18,6 +18,7 @@ const clientId = runtimeConfig.clientId || ('client_' + Math.random().toString(3
 const DEBUG_MODE_STORAGE_KEY = 'vds-debug-mode';
 const DEBUG_CONFIG_STORAGE_KEY = 'vds-debug-config';
 const VIEWER_PLAYBACK_PREFS_STORAGE_KEY = 'vds-viewer-playback-prefs';
+const OBS_INGEST_PREFS_STORAGE_KEY = 'vds-obs-ingest-prefs';
 const DEBUG_CATEGORY_DEFINITIONS = Object.freeze({
   connection: {
     label: '连接',
@@ -169,6 +170,10 @@ const VIEWER_PLAYBACK_MODES = Object.freeze({
   PASSTHROUGH: 'passthrough'
 });
 
+const DEFAULT_OBS_INGEST_PORT = 61080;
+const OBS_INGEST_PORT_MIN = 1024;
+const OBS_INGEST_PORT_MAX = 65535;
+
 // WebSocket连接
 let ws = null;
 let wsConnected = false;
@@ -191,11 +196,15 @@ let myChainPosition = -1; // 观众在链中的位置
 let hostId = null; // Host的clientId
 
 let viewerPlaybackPrefs = readViewerPlaybackPrefs();
+const initialObsIngestPrefs = readObsIngestPrefs();
 
 // 音频捕获全局变量（用于资源清理）
 
 // 画质设置
 let qualitySettings = {
+  hostBackend: 'native',
+  obsIngestPort: initialObsIngestPrefs.port,
+  obsIngestCustomPortEnabled: initialObsIngestPrefs.customPortEnabled,
   codecPreference: 'h264',
   resolutionPreset: '1080p',
   width: 1920,
@@ -212,6 +221,9 @@ let qualityCapabilities = null;
 let qualityCapabilitiesPromise = null;
 let qualityCapabilitiesChecked = false;
 let qualityUiBound = false;
+let obsIngestPreview = null;
+let obsIngestPreparePromise = null;
+let obsIngestPrepareRequestPort = 0;
 
 const QUALITY_BITRATE_MIN = 1000;
 const QUALITY_BITRATE_MAX = 80000;
@@ -541,6 +553,53 @@ function normalizeViewerPlaybackPrefs(nextPrefs) {
 function persistViewerPlaybackPrefs() {
   try {
     window.localStorage.setItem(VIEWER_PLAYBACK_PREFS_STORAGE_KEY, JSON.stringify(viewerPlaybackPrefs));
+  } catch (_error) {
+    // Ignore storage failures.
+  }
+}
+
+function parseObsIngestPort(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+  const normalized = Math.round(numeric);
+  if (normalized < OBS_INGEST_PORT_MIN || normalized > OBS_INGEST_PORT_MAX) {
+    return null;
+  }
+  return normalized;
+}
+
+function normalizeObsIngestPort(value, fallback = DEFAULT_OBS_INGEST_PORT) {
+  const parsed = parseObsIngestPort(value);
+  return parsed === null ? fallback : parsed;
+}
+
+function normalizeObsIngestPrefs(nextPrefs) {
+  return {
+    port: normalizeObsIngestPort(nextPrefs && nextPrefs.port, DEFAULT_OBS_INGEST_PORT),
+    customPortEnabled: nextPrefs && nextPrefs.customPortEnabled === true
+  };
+}
+
+function readObsIngestPrefs() {
+  try {
+    const raw = window.localStorage.getItem(OBS_INGEST_PREFS_STORAGE_KEY);
+    if (!raw) {
+      return normalizeObsIngestPrefs(null);
+    }
+    return normalizeObsIngestPrefs(JSON.parse(raw));
+  } catch (_error) {
+    return normalizeObsIngestPrefs(null);
+  }
+}
+
+function persistObsIngestPrefs() {
+  try {
+    window.localStorage.setItem(OBS_INGEST_PREFS_STORAGE_KEY, JSON.stringify({
+      port: normalizeObsIngestPort(qualitySettings && qualitySettings.obsIngestPort, DEFAULT_OBS_INGEST_PORT),
+      customPortEnabled: Boolean(qualitySettings && qualitySettings.obsIngestCustomPortEnabled)
+    }));
   } catch (_error) {
     // Ignore storage failures.
   }
@@ -1071,6 +1130,9 @@ const elements = {
   sourceAudioProcessList: document.getElementById('source-audio-process-list'),
   // 画质设置弹窗
   qualityModal: document.getElementById('quality-modal'),
+  qualityBackendOptions: document.getElementById('quality-backend-options'),
+  qualityNativePanel: document.getElementById('quality-native-panel'),
+  qualityObsPanel: document.getElementById('quality-obs-panel'),
   qualityCodecOptions: document.getElementById('quality-codec-options'),
   qualityCodecNote: document.getElementById('quality-codec-note'),
   qualityPreviewEnabled: document.getElementById('quality-preview-enabled'),
@@ -1085,6 +1147,12 @@ const elements = {
   qualityPresetOptions: document.getElementById('quality-preset-options'),
   qualityPresetNote: document.getElementById('quality-preset-note'),
   qualityTuneOptions: document.getElementById('quality-tune-options'),
+  qualityObsCustomPortEnabled: document.getElementById('quality-obs-custom-port-enabled'),
+  qualityObsCustomPortRow: document.getElementById('quality-obs-custom-port-row'),
+  qualityObsPort: document.getElementById('quality-obs-port'),
+  qualityObsUrl: document.getElementById('quality-obs-url'),
+  qualityObsStatus: document.getElementById('quality-obs-status'),
+  btnSaveObsPort: document.getElementById('btn-save-obs-port'),
   btnConfirmQuality: document.getElementById('btn-confirm-quality'),
   btnCancelQuality: document.getElementById('btn-cancel-quality'),
   // 更新进度弹窗
@@ -1130,6 +1198,189 @@ function setQualityBitrate(value) {
   const safeValue = Number.isFinite(numeric) ? numeric : qualitySettings.bitrate;
   const stepped = Math.round(safeValue / QUALITY_BITRATE_STEP) * QUALITY_BITRATE_STEP;
   qualitySettings.bitrate = Math.max(QUALITY_BITRATE_MIN, Math.min(QUALITY_BITRATE_MAX, stepped));
+}
+
+function normalizeHostBackend(value) {
+  return String(value || '').trim().toLowerCase() === 'obs-ingest' ? 'obs-ingest' : 'native';
+}
+
+function getSelectedHostBackend() {
+  return normalizeHostBackend(qualitySettings.hostBackend || 'native');
+}
+
+function isObsIngestCustomPortEnabled() {
+  return Boolean(qualitySettings.obsIngestCustomPortEnabled);
+}
+
+function setObsIngestCustomPortEnabled(enabled, options = {}) {
+  const { persist = true } = options;
+  qualitySettings.obsIngestCustomPortEnabled = Boolean(enabled);
+  if (persist) {
+    persistObsIngestPrefs();
+  }
+  return qualitySettings.obsIngestCustomPortEnabled;
+}
+
+function getSelectedObsIngestPort() {
+  return normalizeObsIngestPort(qualitySettings.obsIngestPort, DEFAULT_OBS_INGEST_PORT);
+}
+
+function getEffectiveObsIngestPort() {
+  return isObsIngestCustomPortEnabled()
+    ? getSelectedObsIngestPort()
+    : DEFAULT_OBS_INGEST_PORT;
+}
+
+function setSelectedObsIngestPort(value, options = {}) {
+  const { persist = true } = options;
+  qualitySettings.obsIngestPort = normalizeObsIngestPort(value, DEFAULT_OBS_INGEST_PORT);
+  if (persist) {
+    persistObsIngestPrefs();
+  }
+  return qualitySettings.obsIngestPort;
+}
+
+function commitObsIngestPortInput() {
+  if (!elements.qualityObsPort) {
+    return getSelectedObsIngestPort();
+  }
+  const rawValue = String(elements.qualityObsPort.value || '').trim();
+  const parsed = parseObsIngestPort(rawValue);
+  if (parsed === null) {
+    elements.qualityObsPort.value = String(getSelectedObsIngestPort());
+    throw new Error(`请输入 ${OBS_INGEST_PORT_MIN}-${OBS_INGEST_PORT_MAX} 之间的端口`);
+  }
+  return setSelectedObsIngestPort(parsed);
+}
+
+function getObsIngestPortForPrepare(requestedPort = null) {
+  if (requestedPort != null) {
+    return normalizeObsIngestPort(requestedPort, DEFAULT_OBS_INGEST_PORT);
+  }
+  return getEffectiveObsIngestPort();
+}
+
+function buildObsIngestPublishUrl(port) {
+  const normalizedPort = normalizeObsIngestPort(port, DEFAULT_OBS_INGEST_PORT);
+  return `srt://127.0.0.1:${normalizedPort}?mode=caller&transtype=live`;
+}
+
+function isObsHostBackendAvailable() {
+  const hostBackends = qualityCapabilities && Array.isArray(qualityCapabilities.hostBackends)
+    ? qualityCapabilities.hostBackends.map((value) => String(value || '').trim().toLowerCase())
+    : [];
+  if (hostBackends.length === 0) {
+    return true;
+  }
+  return hostBackends.includes('obs-ingest');
+}
+
+function buildHostBackendOptions() {
+  return [
+    { value: 'native', label: '原生推流' },
+    {
+      value: 'obs-ingest',
+      label: 'OBS 推流',
+      disabled: !isObsHostBackendAvailable()
+    }
+  ];
+}
+
+async function prepareObsIngestPreview(forceRefresh = false, requestedPort = null) {
+  if (!window.isElectron || !window.electronAPI || !window.electronAPI.mediaEngine) {
+    obsIngestPreview = {
+      prepared: false,
+      port: getSelectedObsIngestPort(),
+      url: '',
+      lastError: '当前环境不支持 OBS 本地推流接入'
+    };
+    renderQualitySettingsUi();
+    return obsIngestPreview;
+  }
+
+  const mediaEngine = window.electronAPI.mediaEngine;
+  if (typeof mediaEngine.prepareObsIngest !== 'function') {
+    obsIngestPreview = {
+      prepared: false,
+      port: getSelectedObsIngestPort(),
+      url: '',
+      lastError: '当前构建未启用 OBS ingest'
+    };
+    renderQualitySettingsUi();
+    return obsIngestPreview;
+  }
+
+  const targetPort = getObsIngestPortForPrepare(requestedPort);
+  if (requestedPort != null && isObsIngestCustomPortEnabled()) {
+    setSelectedObsIngestPort(targetPort);
+  }
+
+  if (
+    !forceRefresh &&
+    obsIngestPreview &&
+    obsIngestPreview.prepared &&
+    obsIngestPreview.url &&
+    Number(obsIngestPreview.port) === targetPort
+  ) {
+    return obsIngestPreview;
+  }
+
+  if (obsIngestPreparePromise && !forceRefresh && obsIngestPrepareRequestPort === targetPort) {
+    return obsIngestPreparePromise;
+  }
+
+  const request = (async () => {
+    try {
+      const result = await mediaEngine.prepareObsIngest({
+        refresh: Boolean(forceRefresh),
+        port: targetPort
+      });
+      obsIngestPreview = result && result.obsIngest
+        ? result.obsIngest
+        : (result || null);
+      if (obsIngestPreview && Number(obsIngestPreview.port) > 0) {
+        setSelectedObsIngestPort(Number(obsIngestPreview.port));
+      }
+      return obsIngestPreview;
+    } catch (error) {
+      obsIngestPreview = {
+        prepared: false,
+        port: targetPort,
+        url: '',
+        lastError: error && error.message ? error.message : String(error)
+      };
+      throw error;
+    } finally {
+      renderQualitySettingsUi();
+    }
+  })();
+
+  obsIngestPreparePromise = request;
+  obsIngestPrepareRequestPort = targetPort;
+  try {
+    return await request;
+  } finally {
+    if (obsIngestPreparePromise === request) {
+      obsIngestPreparePromise = null;
+      obsIngestPrepareRequestPort = 0;
+      renderQualitySettingsUi();
+    }
+  }
+}
+
+async function copyObsIngestUrl() {
+  const port = isObsIngestCustomPortEnabled()
+    ? commitObsIngestPortInput()
+    : DEFAULT_OBS_INGEST_PORT;
+  const preview = (obsIngestPreview && obsIngestPreview.url && Number(obsIngestPreview.port) === port)
+    ? obsIngestPreview
+    : await prepareObsIngestPreview(false, port);
+  const url = preview && preview.url ? String(preview.url) : '';
+  if (!url) {
+    throw new Error('OBS 推流地址尚未准备完成');
+  }
+  await navigator.clipboard.writeText(url);
+  showError('OBS 推流地址已复制');
 }
 
 function getRequestedCodecPreference() {
@@ -1452,12 +1703,33 @@ function renderQualitySettingsUi() {
     return;
   }
 
+  if (getSelectedHostBackend() === 'obs-ingest' && !isObsHostBackendAvailable()) {
+    qualitySettings.hostBackend = 'native';
+  }
+
   if (qualitySettings.codecPreference === 'h265' && !isH265CodecAvailable()) {
     qualitySettings.codecPreference = 'h264';
   }
 
   setQualityResolutionPreset(qualitySettings.resolutionPreset);
   setQualityBitrate(qualitySettings.bitrate);
+  setSelectedObsIngestPort(qualitySettings.obsIngestPort, { persist: false });
+  setObsIngestCustomPortEnabled(qualitySettings.obsIngestCustomPortEnabled, { persist: false });
+
+  if (elements.qualityBackendOptions) {
+    elements.qualityBackendOptions.innerHTML = buildSegmentGroupMarkup(
+      buildHostBackendOptions(),
+      getSelectedHostBackend()
+    );
+  }
+
+  if (elements.qualityNativePanel) {
+    elements.qualityNativePanel.classList.toggle('hidden', getSelectedHostBackend() !== 'native');
+  }
+
+  if (elements.qualityObsPanel) {
+    elements.qualityObsPanel.classList.toggle('hidden', getSelectedHostBackend() !== 'obs-ingest');
+  }
 
   if (elements.qualityCodecOptions) {
     elements.qualityCodecOptions.innerHTML = buildSegmentGroupMarkup(
@@ -1531,6 +1803,51 @@ function renderQualitySettingsUi() {
   if (elements.qualityPresetNote) {
     elements.qualityPresetNote.textContent = buildPresetNoteText();
   }
+
+  if (elements.qualityObsCustomPortEnabled) {
+    elements.qualityObsCustomPortEnabled.checked = isObsIngestCustomPortEnabled();
+  }
+
+  if (elements.qualityObsCustomPortRow) {
+    elements.qualityObsCustomPortRow.classList.toggle('hidden', !isObsIngestCustomPortEnabled());
+  }
+
+  if (elements.qualityObsPort) {
+    elements.qualityObsPort.value = String(getSelectedObsIngestPort());
+  }
+
+  if (elements.qualityObsUrl) {
+    const requestedPort = getEffectiveObsIngestPort();
+    const obsUrl = obsIngestPreview && obsIngestPreview.url && Number(obsIngestPreview.port) === requestedPort
+      ? String(obsIngestPreview.url)
+      : buildObsIngestPublishUrl(requestedPort);
+    elements.qualityObsUrl.textContent = obsUrl;
+  }
+
+  if (elements.qualityObsStatus) {
+    const requestedPort = getEffectiveObsIngestPort();
+    if (obsIngestPreparePromise) {
+      elements.qualityObsStatus.textContent = `正在检查并预留 127.0.0.1:${requestedPort}...`;
+    } else if (obsIngestPreview && obsIngestPreview.lastError && Number(obsIngestPreview.port) === requestedPort) {
+      elements.qualityObsStatus.textContent = `端口 ${requestedPort} 不可用：${obsIngestPreview.lastError}`;
+    } else if (obsIngestPreview && obsIngestPreview.url && Number(obsIngestPreview.port) === requestedPort) {
+      elements.qualityObsStatus.textContent = isObsIngestCustomPortEnabled()
+        ? `当前使用自定义端口 ${requestedPort}。确认后会复制地址并进入等待推流状态。`
+        : `当前使用默认端口 ${requestedPort}。确认后会复制地址并进入等待推流状态。`;
+    } else {
+      elements.qualityObsStatus.textContent = `默认端口是 ${DEFAULT_OBS_INGEST_PORT}，打开“自定义推流地址”后可以改成你习惯的固定端口。`;
+    }
+  }
+
+  if (elements.btnSaveObsPort) {
+    elements.btnSaveObsPort.disabled = Boolean(obsIngestPreparePromise);
+  }
+
+  if (elements.btnConfirmQuality) {
+    elements.btnConfirmQuality.textContent = getSelectedHostBackend() === 'obs-ingest'
+      ? '复制并开始'
+      : '确认并继续';
+  }
 }
 
 async function refreshQualityCapabilities(force = false) {
@@ -1591,6 +1908,16 @@ function bindQualitySettingsUi() {
     return;
   }
   qualityUiBound = true;
+
+  bindQualitySegmentGroup(elements.qualityBackendOptions, (value) => {
+    qualitySettings.hostBackend = normalizeHostBackend(value);
+    renderQualitySettingsUi();
+    if (qualitySettings.hostBackend === 'obs-ingest') {
+      prepareObsIngestPreview(false, getEffectiveObsIngestPort()).catch((error) => {
+        showError(error && error.message ? error.message : '无法准备 OBS 推流地址');
+      });
+    }
+  });
 
   bindQualitySegmentGroup(elements.qualityCodecOptions, (value) => {
     qualitySettings.codecPreference = value === 'h265' ? 'h265' : 'h264';
@@ -1665,6 +1992,55 @@ function bindQualitySettingsUi() {
     elements.qualityBitrate.addEventListener('change', syncBitrate);
     elements.qualityBitrate.addEventListener('blur', syncBitrate);
   }
+
+  if (elements.qualityObsCustomPortEnabled) {
+    elements.qualityObsCustomPortEnabled.addEventListener('change', () => {
+      const enabled = Boolean(elements.qualityObsCustomPortEnabled.checked);
+      setObsIngestCustomPortEnabled(enabled);
+      renderQualitySettingsUi();
+      prepareObsIngestPreview(true, getEffectiveObsIngestPort()).catch((error) => {
+        showError(error && error.message ? error.message : '无法准备 OBS 推流地址');
+      });
+    });
+  }
+
+  if (elements.qualityObsPort) {
+    const syncObsPortFromInput = () => {
+      try {
+        commitObsIngestPortInput();
+        renderQualitySettingsUi();
+      } catch (error) {
+        showError(error && error.message ? error.message : 'OBS 端口无效');
+      }
+    };
+    elements.qualityObsPort.addEventListener('change', syncObsPortFromInput);
+    elements.qualityObsPort.addEventListener('blur', syncObsPortFromInput);
+    elements.qualityObsPort.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') {
+        return;
+      }
+      event.preventDefault();
+      if (elements.btnSaveObsPort) {
+        elements.btnSaveObsPort.click();
+      } else {
+        syncObsPortFromInput();
+      }
+    });
+  }
+
+  if (elements.btnSaveObsPort) {
+    elements.btnSaveObsPort.addEventListener('click', () => {
+      try {
+        const port = commitObsIngestPortInput();
+        renderQualitySettingsUi();
+        prepareObsIngestPreview(true, port).catch((error) => {
+          showError(error && error.message ? error.message : '无法保存 OBS 推流地址');
+        });
+      } catch (error) {
+        showError(error && error.message ? error.message : 'OBS 端口无效');
+      }
+    });
+  }
 }
 
 async function openQualityModal() {
@@ -1672,9 +2048,22 @@ async function openQualityModal() {
   renderQualitySettingsUi();
   elements.qualityModal.classList.remove('hidden');
   refreshQualityCapabilities().catch(() => {});
+  if (getSelectedHostBackend() === 'obs-ingest') {
+    prepareObsIngestPreview(false, getEffectiveObsIngestPort()).catch(() => {});
+  }
 }
 
 async function confirmQualitySelection() {
+  if (getSelectedHostBackend() === 'obs-ingest') {
+    const port = isObsIngestCustomPortEnabled()
+      ? commitObsIngestPortInput()
+      : DEFAULT_OBS_INGEST_PORT;
+    await copyObsIngestUrl();
+    elements.qualityModal.classList.add('hidden');
+    await prepareObsIngestPreview(false, port);
+    await startScreenShareWithObsIngest({ port });
+    return;
+  }
   elements.qualityModal.classList.add('hidden');
   await showSourceSelection();
 }
@@ -1815,7 +2204,7 @@ elements.sourceAudioEnabled.addEventListener('change', updateSourceAudioUi);
 elements.btnConfirmQuality.addEventListener('click', () => {
   confirmQualitySelection().catch((error) => {
     console.error('Failed to confirm quality selection:', error);
-    showError(error && error.message ? error.message : '无法继续打开采集源列表');
+    showError(error && error.message ? error.message : '无法开始共享');
   });
 });
 
@@ -2807,6 +3196,10 @@ async function startScreenShareWithAudio(source, audioPid) {
   return requireNativeAuthorityOverride('startScreenShareWithAudio', startScreenShareWithAudio)(source, audioPid);
 }
 
+async function startScreenShareWithObsIngest(options = {}) {
+  return requireNativeAuthorityOverride('startScreenShareWithObsIngest', startScreenShareWithObsIngest)(options);
+}
+
 async function startScreenShare() {
   await openQualityModal();
 }
@@ -2883,7 +3276,7 @@ function showError(message) {
 // Native mainline only
 
 // 版本检查和自动更新
-let currentVersion = '1.5.9'; // 默认版本（Electron环境会动态获取）
+let currentVersion = '1.6.1'; // 默认版本（Electron环境会动态获取）
 
 // 初始化版本号（从 Electron app 获取）
 async function initVersion() {
