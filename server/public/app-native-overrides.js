@@ -39,6 +39,12 @@
   const viewerFullscreenButton = document.getElementById('btn-viewer-fullscreen');
   const viewerVolumeInput = document.getElementById('viewer-volume');
   const viewerVolumeValue = document.getElementById('viewer-volume-value');
+  const viewerFullscreenUnderbar = document.getElementById('viewer-fullscreen-underbar');
+  const viewerFullscreenVolumeControl = document.getElementById('viewer-fullscreen-volume-control');
+  const viewerFullscreenMuteButton = document.getElementById('btn-viewer-mute-fullscreen');
+  const viewerFullscreenExitButton = document.getElementById('btn-viewer-exit-fullscreen');
+  const viewerFullscreenVolumeInput = document.getElementById('viewer-volume-fullscreen');
+  const viewerFullscreenVolumeValue = document.getElementById('viewer-volume-fullscreen-value');
 
   const nativePeerHandles = new Map();
   const nativePeerSignalBacklog = new Map();
@@ -52,6 +58,7 @@
   let nativeHostStatsIntervalId = null;
   let mediaEngineStarted = false;
   let mediaEngineStartPromise = null;
+  let nativeUiReadyPromise = null;
   let hostPreviewSurfaceAttached = false;
   let viewerVolumeSynced = false;
   let embeddedSurfaceSyncRafId = 0;
@@ -60,6 +67,7 @@
   let embeddedSurfaceTrackingRafId = 0;
   let wheelDrivenSyncRafId = 0;
   let wheelDrivenSyncFramesRemaining = 0;
+  const embeddedSurfaceTrackingIntervalMs = 180;
   let currentWindowBounds = null;
   let hostPreviewRequested = true;
   let hostSourceFramesSample = null;
@@ -69,6 +77,17 @@
   let viewerRenderedFramesSample = null;
   let viewerFramesSampleAtMs = 0;
   let hostFramesSampleAtMs = 0;
+  let stopScreenShareInFlight = false;
+  let hostWaitingWindowRestore = false;
+  let nativeHostEffectiveCodec = 'h264';
+  let viewerFullscreenControlsHideTimerId = 0;
+  let viewerFullscreenCursorPollTimerId = 0;
+  let viewerFullscreenVolumePopoverHideTimerId = 0;
+  let viewerFullscreenVolumeDragging = false;
+  let lastViewerCursorPoint = null;
+  let lastNonZeroViewerVolume = 100;
+  const recoverableSurfaceSyncWarnings = new Map();
+  const recoverableNativeWarnings = new Map();
 
   function isDebugModeEnabled() {
     if (typeof window.__vdsIsDebugModeEnabled === 'function') {
@@ -86,7 +105,7 @@
   }
 
   function shouldShowDebugLogs() {
-    return shouldShowDebugLogsFor('misc');
+    return shouldShowDebugLogsFor('misc', 'renderer');
   }
 
   function isBlockingModalVisible() {
@@ -97,14 +116,14 @@
     return verboseNativeLogs;
   }
 
-  function shouldShowDebugLogsFor(category = 'misc') {
+  function shouldShowDebugLogsFor(category = 'misc', channel = 'renderer') {
     if (verboseNativeLogs) {
       return true;
     }
 
     if (typeof window.__vdsShouldDebugLog === 'function') {
       try {
-        return Boolean(window.__vdsShouldDebugLog(category));
+        return Boolean(window.__vdsShouldDebugLog(category, channel));
       } catch (_error) {
         return false;
       }
@@ -226,14 +245,14 @@
   }
 
   function logNativeDebug(category, ...args) {
-    if (!shouldShowDebugLogsFor(category)) {
+    if (!shouldShowDebugLogsFor(category, 'renderer')) {
       return;
     }
     console.log(...args);
   }
 
   function logNativeStep(scope, payload, category = getNativeDebugCategoryFromScope(scope)) {
-    if (!shouldShowDebugLogsFor(category)) {
+    if (!shouldShowDebugLogsFor(category, 'nativeSteps')) {
       return;
     }
     const normalized = summarizeNativeLogValue(payload);
@@ -241,6 +260,377 @@
       console.log(`[media-engine step] ${scope} ${JSON.stringify(normalized)}`);
     } catch (_error) {
       console.log(`[media-engine step] ${scope}`, normalized || null);
+    }
+  }
+
+  function logRecoverableSurfaceSyncWarning(surfaceId, error) {
+    const message = error && error.message ? error.message : String(error);
+    const now = Date.now();
+    const lastLoggedAt = recoverableSurfaceSyncWarnings.get(surfaceId) || 0;
+    if (!shouldShowDebugLogsFor('video', 'nativeSteps') && now - lastLoggedAt < 5000) {
+      return;
+    }
+    recoverableSurfaceSyncWarnings.set(surfaceId, now);
+    if (shouldShowDebugLogsFor('video', 'nativeSteps')) {
+      logNativeStep('updateSurface:recoverable-error', { surfaceId, message }, 'video');
+      return;
+    }
+    console.warn('[media-engine] surface sync failed:', surfaceId, message);
+  }
+
+  function clearRecoverableSurfaceSyncWarning(surfaceId) {
+    if (!surfaceId) {
+      return;
+    }
+    recoverableSurfaceSyncWarnings.delete(surfaceId);
+  }
+
+  function logRecoverableNativeWarning(scope, error, {
+    key = scope,
+    category = 'video',
+    channel = 'nativeSteps',
+    intervalMs = 5000,
+    fallbackLabel = '[media-engine]'
+  } = {}) {
+    const message = error && error.message ? error.message : String(error);
+    const now = Date.now();
+    const lastLoggedAt = recoverableNativeWarnings.get(key) || 0;
+    if (!shouldShowDebugLogsFor(category, channel) && now - lastLoggedAt < intervalMs) {
+      return;
+    }
+    recoverableNativeWarnings.set(key, now);
+    if (shouldShowDebugLogsFor(category, channel)) {
+      logNativeStep(scope, { key, message }, category);
+      return;
+    }
+    console.warn(fallbackLabel, message);
+  }
+
+  function waitForNextPaint() {
+    return new Promise((resolve) => {
+      window.requestAnimationFrame(() => window.requestAnimationFrame(resolve));
+    });
+  }
+
+  function isViewerFullscreenMode() {
+    return document.body.classList.contains('native-embedded-fullscreen') &&
+      document.body.getAttribute('data-app-view') === 'viewer';
+  }
+
+  function shouldReserveViewerFullscreenUnderbarSpace() {
+    return isViewerFullscreenMode() && (
+      document.body.classList.contains('viewer-fullscreen-controls-visible') ||
+      (viewerFullscreenUnderbar && viewerFullscreenUnderbar.matches(':hover'))
+    );
+  }
+
+  function isViewerFullscreenVolumePopoverPinned() {
+    return Boolean(
+      viewerFullscreenVolumeDragging ||
+      (viewerFullscreenVolumeControl && viewerFullscreenVolumeControl.matches(':hover'))
+    );
+  }
+
+  function isViewerFullscreenUnderbarPinned() {
+    return Boolean(
+      (viewerFullscreenUnderbar && viewerFullscreenUnderbar.matches(':hover')) ||
+      isViewerFullscreenVolumePopoverPinned()
+    );
+  }
+
+  function clearViewerFullscreenVolumePopoverHideTimer() {
+    if (viewerFullscreenVolumePopoverHideTimerId) {
+      window.clearTimeout(viewerFullscreenVolumePopoverHideTimerId);
+      viewerFullscreenVolumePopoverHideTimerId = 0;
+    }
+  }
+
+  function setViewerFullscreenVolumePopoverOpen(open) {
+    if (!viewerFullscreenVolumeControl) {
+      return;
+    }
+    if (open) {
+      viewerFullscreenVolumeControl.classList.add('is-open');
+      clearViewerFullscreenVolumePopoverHideTimer();
+      return;
+    }
+    viewerFullscreenVolumeControl.classList.remove('is-open');
+    clearViewerFullscreenVolumePopoverHideTimer();
+  }
+
+  function scheduleViewerFullscreenVolumePopoverHide(delayMs = 900) {
+    if (!viewerFullscreenVolumeControl) {
+      return;
+    }
+    clearViewerFullscreenVolumePopoverHideTimer();
+    viewerFullscreenVolumePopoverHideTimerId = window.setTimeout(() => {
+      viewerFullscreenVolumePopoverHideTimerId = 0;
+      if (isViewerFullscreenVolumePopoverPinned()) {
+        scheduleViewerFullscreenVolumePopoverHide(600);
+        return;
+      }
+      setViewerFullscreenVolumePopoverOpen(false);
+    }, delayMs);
+  }
+
+  function syncViewerFullscreenUnderbarState() {
+    const active = isViewerFullscreenMode();
+    if (viewerFullscreenUnderbar) {
+      viewerFullscreenUnderbar.setAttribute('aria-hidden', active ? 'false' : 'true');
+    }
+    if (!active) {
+      document.body.classList.remove('viewer-fullscreen-controls-visible');
+      setViewerFullscreenVolumePopoverOpen(false);
+      if (viewerFullscreenControlsHideTimerId) {
+        window.clearTimeout(viewerFullscreenControlsHideTimerId);
+        viewerFullscreenControlsHideTimerId = 0;
+      }
+      stopViewerFullscreenCursorPolling();
+    }
+  }
+
+  function isCursorInsideCurrentWindow(point) {
+    if (!point || !currentWindowBounds) {
+      return false;
+    }
+    const x = Number(point.x);
+    const y = Number(point.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      return false;
+    }
+    return x >= currentWindowBounds.x &&
+      y >= currentWindowBounds.y &&
+      x < currentWindowBounds.x + currentWindowBounds.width &&
+      y < currentWindowBounds.y + currentWindowBounds.height;
+  }
+
+  function stopViewerFullscreenCursorPolling() {
+    if (viewerFullscreenCursorPollTimerId) {
+      window.clearInterval(viewerFullscreenCursorPollTimerId);
+      viewerFullscreenCursorPollTimerId = 0;
+    }
+    lastViewerCursorPoint = null;
+  }
+
+  function startViewerFullscreenCursorPolling() {
+    if (
+      viewerFullscreenCursorPollTimerId ||
+      !electronApi ||
+      typeof electronApi.getCursorScreenPoint !== 'function'
+    ) {
+      return;
+    }
+
+    viewerFullscreenCursorPollTimerId = window.setInterval(async () => {
+      if (!isViewerFullscreenMode()) {
+        stopViewerFullscreenCursorPolling();
+        return;
+      }
+
+      try {
+        const point = await electronApi.getCursorScreenPoint();
+        const normalizedPoint = {
+          x: Number(point && point.x) || 0,
+          y: Number(point && point.y) || 0
+        };
+
+        if (!isCursorInsideCurrentWindow(normalizedPoint)) {
+          lastViewerCursorPoint = normalizedPoint;
+          return;
+        }
+
+        const moved =
+          !lastViewerCursorPoint ||
+          Math.abs(normalizedPoint.x - lastViewerCursorPoint.x) >= 2 ||
+          Math.abs(normalizedPoint.y - lastViewerCursorPoint.y) >= 2;
+
+        lastViewerCursorPoint = normalizedPoint;
+        if (moved) {
+          showViewerFullscreenControls();
+        }
+      } catch (_error) {
+        // Ignore cursor polling failures; controls can still be shown by direct hover when visible.
+      }
+    }, 120);
+  }
+
+  function scheduleViewerFullscreenControlsHide(delayMs = 2200) {
+    if (!isViewerFullscreenMode()) {
+      return;
+    }
+    if (viewerFullscreenControlsHideTimerId) {
+      window.clearTimeout(viewerFullscreenControlsHideTimerId);
+    }
+    viewerFullscreenControlsHideTimerId = window.setTimeout(() => {
+      viewerFullscreenControlsHideTimerId = 0;
+      if (!isViewerFullscreenMode()) {
+        return;
+      }
+      if (isViewerFullscreenVolumePopoverPinned()) {
+        scheduleViewerFullscreenVolumePopoverHide(800);
+        scheduleViewerFullscreenControlsHide(900);
+        return;
+      }
+      if (isViewerFullscreenUnderbarPinned()) {
+        scheduleViewerFullscreenControlsHide(1200);
+        return;
+      }
+      setViewerFullscreenVolumePopoverOpen(false);
+      document.body.classList.remove('viewer-fullscreen-controls-visible');
+      forceEmbeddedSurfaceResync();
+    }, delayMs);
+  }
+
+  function showViewerFullscreenControls() {
+    if (!isViewerFullscreenMode()) {
+      return;
+    }
+    document.body.classList.add('viewer-fullscreen-controls-visible');
+    startViewerFullscreenCursorPolling();
+    forceEmbeddedSurfaceResync();
+    scheduleViewerFullscreenControlsHide();
+  }
+
+  function applyViewerVolumeUi(volume) {
+    const normalizedVolume = Math.max(0, Math.min(100, Number(volume) || 0));
+    if (normalizedVolume > 0) {
+      lastNonZeroViewerVolume = normalizedVolume;
+    }
+
+    if (viewerVolumeInput) {
+      viewerVolumeInput.value = String(normalizedVolume);
+    }
+    if (viewerVolumeValue) {
+      viewerVolumeValue.textContent = `${normalizedVolume}%`;
+    }
+    if (viewerFullscreenVolumeInput) {
+      viewerFullscreenVolumeInput.value = String(normalizedVolume);
+    }
+    if (viewerFullscreenVolumeValue) {
+      viewerFullscreenVolumeValue.textContent = `${normalizedVolume}%`;
+    }
+    if (viewerFullscreenMuteButton) {
+      const volumeState = normalizedVolume <= 0 ? 'muted' : (normalizedVolume < 45 ? 'low' : 'high');
+      viewerFullscreenMuteButton.dataset.volumeState = volumeState;
+      viewerFullscreenMuteButton.setAttribute('aria-pressed', normalizedVolume <= 0 ? 'true' : 'false');
+      viewerFullscreenMuteButton.setAttribute('aria-label', normalizedVolume <= 0 ? '取消静音' : '静音');
+    }
+  }
+
+  async function setViewerVolumeValue(nextValue) {
+    const normalizedVolume = Math.max(0, Math.min(100, Number(nextValue) || 0));
+    applyViewerVolumeUi(normalizedVolume);
+    await mediaEngine.setViewerVolume(normalizedVolume / 100);
+  }
+
+  async function toggleViewerMute() {
+    const currentVolume = Math.max(0, Math.min(100, Number(viewerVolumeInput && viewerVolumeInput.value) || 0));
+    const nextVolume = currentVolume <= 0 ? Math.max(1, lastNonZeroViewerVolume || 100) : 0;
+    await setViewerVolumeValue(nextVolume);
+    showViewerFullscreenControls();
+  }
+
+  async function exitViewerFullscreen() {
+    if (!electronApi || typeof electronApi.isFullscreen !== 'function') {
+      return;
+    }
+    const isFullscreen = await electronApi.isFullscreen();
+    if (!isFullscreen) {
+      return;
+    }
+    const nextState = await electronApi.setFullscreen(false);
+    updateFullscreenUi(nextState);
+  }
+
+  async function waitForHostUiReady() {
+    if (!hostVideoContainer) {
+      return;
+    }
+    await waitForNextPaint();
+    hostVideoContainer.getBoundingClientRect();
+    await waitForNextPaint();
+  }
+
+  function setHostStopUiState(stopping) {
+    if (elements.btnStopShare) {
+      elements.btnStopShare.disabled = Boolean(stopping);
+    }
+    if (elements.btnStartShare) {
+      elements.btnStartShare.disabled = Boolean(stopping);
+    }
+    if (stopping && elements.hostStatus) {
+      elements.hostStatus.textContent = '正在结束原生直播...';
+    }
+  }
+
+  function syncHostWaitingWindowRestoreUi(waiting, restoredText = '原生分享已恢复') {
+    hostWaitingWindowRestore = Boolean(waiting);
+    if (!elements.hostStatus) {
+      return;
+    }
+
+    if (hostWaitingWindowRestore) {
+      elements.hostStatus.textContent = '等待窗口恢复...';
+      elements.hostStatus.classList.add('waiting');
+      return;
+    }
+
+    elements.hostStatus.textContent = restoredText;
+    elements.hostStatus.classList.remove('waiting');
+  }
+
+  function resetHostUiAfterFailedStart() {
+    nativeHostSessionRunning = false;
+    hostWaitingWindowRestore = false;
+    hostPreviewSurfaceAttached = false;
+    stopNativeHostStatsPolling();
+    resetHostFpsIndicators();
+    updateHostEncoderDetail(null);
+    hideLegacyVideoElements();
+    hostPreviewRequested = !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
+    if (hostVideoContainer) {
+      hostVideoContainer.classList.toggle('hidden', !hostPreviewRequested);
+    }
+    if (elements.btnStartShare) {
+      elements.btnStartShare.classList.remove('hidden');
+      elements.btnStartShare.disabled = false;
+    }
+    if (elements.btnStopShare) {
+      elements.btnStopShare.classList.add('hidden');
+      elements.btnStopShare.disabled = false;
+    }
+    if (elements.hostStatus) {
+      elements.hostStatus.textContent = '准备就绪';
+      elements.hostStatus.classList.remove('waiting');
+    }
+  }
+
+  function isRecoverableHostPreviewAttachError(error) {
+    const message = error && error.message ? error.message : String(error);
+    return message.includes('media-engine-attach-surface') ||
+      message.includes('attachSurface') ||
+      message.includes('media-agent-exited');
+  }
+
+  async function cleanupAfterFailedHostStart() {
+    hostPreviewSurfaceAttached = false;
+    attachedEmbeddedSurfaces.delete(HOST_PREVIEW_SURFACE_ID);
+    clearRecoverableSurfaceSyncWarning(HOST_PREVIEW_SURFACE_ID);
+    stopEmbeddedSurfaceTrackingLoop();
+    await Promise.all([
+      typeof mediaEngine.stopAudioSession === 'function'
+        ? mediaEngine.stopAudioSession({}).catch(() => {})
+        : Promise.resolve(null),
+      typeof mediaEngine.stopHostSession === 'function'
+        ? mediaEngine.stopHostSession({}).catch(() => {})
+        : Promise.resolve(null)
+    ]);
+    resetHostUiAfterFailedStart();
+  }
+
+  async function ensureNativeUiReady() {
+    if (nativeUiReadyPromise) {
+      await nativeUiReadyPromise;
     }
   }
 
@@ -323,11 +713,24 @@
       return;
     }
 
+    const eventName = String(event.event || '').toLowerCase();
+    const stateName = String(event && event.params && event.params.state ? event.params.state : '').toLowerCase();
     const debugCategory = getNativeDebugCategoryFromEvent(event);
+    const isHighFrequencySurfaceEvent =
+      eventName === 'media-state' &&
+      (
+        stateName === 'surface-updated' ||
+        stateName === 'surface-attached' ||
+        stateName === 'surface-detached'
+      );
 
-    if (shouldShowDebugLogsFor(debugCategory)) {
+    if (isHighFrequencySurfaceEvent && !isVerboseMediaLoggingEnabled()) {
+      return;
+    }
+
+    if (shouldShowDebugLogsFor(debugCategory, 'nativeEvents')) {
       console.log('Native media engine event:', event.event, event.params || null);
-    } else if (event.event === 'warning') {
+    } else if (eventName === 'warning') {
       console.warn('Native media engine event:', event.event, event.params || null);
     }
   }
@@ -486,8 +889,20 @@
     const clippedTop = Math.max(0, Math.min(viewportHeight, rect.top));
     const clippedRight = Math.max(0, Math.min(viewportWidth, rect.right));
     const clippedBottom = Math.max(0, Math.min(viewportHeight, rect.bottom));
+    let reservedBottom = 0;
+    if (
+      element === remoteVideoContainer &&
+      shouldReserveViewerFullscreenUnderbarSpace() &&
+      viewerFullscreenUnderbar
+    ) {
+      const underbarRect = viewerFullscreenUnderbar.getBoundingClientRect();
+      if (underbarRect && Number.isFinite(underbarRect.height) && underbarRect.height > 0) {
+        reservedBottom = Math.max(58, Math.round(underbarRect.height + 10));
+      }
+    }
+    const adjustedClippedBottom = Math.max(clippedTop, clippedBottom - reservedBottom);
     const cssWidth = Math.max(0, Math.round(clippedRight - clippedLeft));
-    const cssHeight = Math.max(0, Math.round(clippedBottom - clippedTop));
+    const cssHeight = Math.max(0, Math.round(adjustedClippedBottom - clippedTop));
     const visible =
       cssWidth > 1 &&
       cssHeight > 1 &&
@@ -514,7 +929,8 @@
         logNativeStep('buildSurfaceLayout:detached', {
           elementId: element.id || '',
           width: cssWidth,
-          height: cssHeight
+          height: cssHeight,
+          reservedBottom
         });
       }
       return layout;
@@ -554,7 +970,8 @@
           left: clippedLeft,
           top: clippedTop,
           width: cssWidth,
-          height: cssHeight
+          height: cssHeight,
+          reservedBottom
         },
         viewport: {
           width: viewportWidth,
@@ -611,7 +1028,24 @@
         element: describeSurfaceElement(entry.element)
       });
     }
-    const result = await mediaEngine.updateSurface(payload);
+    let result = null;
+    try {
+      result = await mediaEngine.updateSurface(payload);
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      if (message.includes('Surface is not attached')) {
+        attachedEmbeddedSurfaces.delete(surfaceId);
+        clearRecoverableSurfaceSyncWarning(surfaceId);
+        if (attachedEmbeddedSurfaces.size === 0) {
+          stopEmbeddedSurfaceTrackingLoop();
+        }
+        if (shouldShowDebugLogsFor('video', 'nativeSteps')) {
+          logNativeStep('updateSurface:detached-skip', { surfaceId, message }, 'video');
+        }
+        return null;
+      }
+      throw error;
+    }
     entry.lastLayoutKey = layoutKey;
     if (shouldShowDebugLogsFor('video')) {
       logNativeStep('updateSurface:result', {
@@ -626,7 +1060,7 @@
     const jobs = [];
     attachedEmbeddedSurfaces.forEach((_entry, surfaceId) => {
       jobs.push(syncEmbeddedSurface(surfaceId).catch((error) => {
-        console.warn('[media-engine] surface sync failed:', surfaceId, error);
+        logRecoverableSurfaceSyncWarning(surfaceId, error);
       }));
     });
     await Promise.all(jobs);
@@ -650,7 +1084,9 @@
       try {
         await syncAllEmbeddedSurfaces();
       } catch (error) {
-        console.warn('[media-engine] syncAllEmbeddedSurfaces failed:', error);
+        if (shouldShowDebugLogsFor('video', 'nativeSteps')) {
+          console.warn('[media-engine] syncAllEmbeddedSurfaces failed:', error);
+        }
       } finally {
         embeddedSurfaceSyncInFlight = false;
         if (embeddedSurfaceSyncPending) {
@@ -732,9 +1168,16 @@
     window.setTimeout(runPass, 180);
   }
 
+  function forceEmbeddedSurfaceResyncBurst() {
+    forceEmbeddedSurfaceResync();
+    window.setTimeout(forceEmbeddedSurfaceResync, 40);
+    window.setTimeout(forceEmbeddedSurfaceResync, 120);
+    window.setTimeout(forceEmbeddedSurfaceResync, 260);
+  }
+
   function stopEmbeddedSurfaceTrackingLoop() {
     if (embeddedSurfaceTrackingRafId) {
-      window.cancelAnimationFrame(embeddedSurfaceTrackingRafId);
+      window.clearTimeout(embeddedSurfaceTrackingRafId);
       embeddedSurfaceTrackingRafId = 0;
     }
   }
@@ -750,10 +1193,10 @@
         return;
       }
       scheduleEmbeddedSurfaceSync();
-      embeddedSurfaceTrackingRafId = window.requestAnimationFrame(tick);
+      embeddedSurfaceTrackingRafId = window.setTimeout(tick, embeddedSurfaceTrackingIntervalMs);
     };
 
-    embeddedSurfaceTrackingRafId = window.requestAnimationFrame(tick);
+    embeddedSurfaceTrackingRafId = window.setTimeout(tick, embeddedSurfaceTrackingIntervalMs);
   }
 
   function hideLegacyVideoElements() {
@@ -847,11 +1290,38 @@
 
     if (normalized.startsWith('window:')) {
       const parts = normalized.split(':');
+      const isExclusiveFullscreenSource =
+        sourceObject && sourceObject.state === 'exclusive-fullscreen';
+      if (isExclusiveFullscreenSource) {
+        const sourceDisplayId =
+          sourceObject && sourceObject.nativeMonitorIndex != null && String(sourceObject.nativeMonitorIndex).trim()
+            ? String(sourceObject.nativeMonitorIndex).trim()
+            : (
+              sourceObject && sourceObject.displayId != null && String(sourceObject.displayId).trim()
+                ? String(sourceObject.displayId).trim()
+                : '0'
+            );
+        return {
+          captureTargetId: normalized,
+          sourceId: normalized,
+          captureKind: 'display',
+          captureState: 'display',
+          displayId: sourceDisplayId,
+          captureHwnd: sourceObject && sourceObject.hwnd != null
+            ? String(sourceObject.hwnd).trim()
+            : (parts[1] || ''),
+          captureTitle: sourceObject && sourceObject.title ? String(sourceObject.title) : '',
+          ...sharedConfig
+        };
+      }
       return {
         captureTargetId: normalized,
         sourceId: normalized,
         captureKind: 'window',
-        captureState: 'normal',
+        captureState:
+          sourceObject && sourceObject.state === 'minimized'
+            ? 'minimized'
+            : 'normal',
         captureHwnd: sourceObject && sourceObject.hwnd != null
           ? String(sourceObject.hwnd).trim()
           : (parts[1] || ''),
@@ -906,6 +1376,7 @@
       element: describeSurfaceElement(element)
     });
     const result = await mediaEngine.attachSurface(payload);
+    clearRecoverableSurfaceSyncWarning(surfaceId);
     attachedEmbeddedSurfaces.set(surfaceId, { target, element, lastLayoutKey: layoutKey });
     startEmbeddedSurfaceTrackingLoop();
     logNativeStep('attachSurface:result', {
@@ -918,6 +1389,7 @@
 
   async function detachEmbeddedSurface(surfaceId) {
     attachedEmbeddedSurfaces.delete(surfaceId);
+    clearRecoverableSurfaceSyncWarning(surfaceId);
     if (attachedEmbeddedSurfaces.size === 0) {
       stopEmbeddedSurfaceTrackingLoop();
     }
@@ -1227,6 +1699,14 @@
       return;
     }
 
+    if (params.state === 'surface-detached' && params.surface) {
+      attachedEmbeddedSurfaces.delete(params.surface);
+      clearRecoverableSurfaceSyncWarning(params.surface);
+      if (attachedEmbeddedSurfaces.size === 0) {
+        stopEmbeddedSurfaceTrackingLoop();
+      }
+    }
+
     if (params.state === 'host-session-started') {
       nativeHostSessionRunning = true;
       if (typeof qualitySettings === 'object' && qualitySettings) {
@@ -1235,13 +1715,18 @@
           normalizeNativeVideoCodec(params.requestedCodec, qualitySettings.codecPreference || 'h264')
         );
         qualitySettings.codecPreference = effectiveCodec;
+        nativeHostEffectiveCodec = effectiveCodec;
       }
       lockCodecUiToNativeH264();
+      if (params.capturePlan && params.capturePlan.captureState === 'minimized') {
+        syncHostWaitingWindowRestoreUi(true);
+      }
       return;
     }
 
     if (params.state === 'host-session-stopped') {
       nativeHostSessionRunning = false;
+      hostWaitingWindowRestore = false;
     }
   }
 
@@ -1289,13 +1774,31 @@
       throw new Error('renderer-peer-path-disabled-for-native-authority');
     }
 
-    await ensureNativePeerConnectionReady(peerId, pc);
+    // Clear only stale queued offers from earlier attempts before the current
+    // native peer has a chance to emit its fresh local description.
     dropQueuedNativePeerSignals(peerId, (entry) => entry && entry.type === 'offer');
+    await ensureNativePeerConnectionReady(peerId, pc);
     const attachResult = await attachNativePeerMediaSources(peerId, pc);
     if (attachResult && attachResult.peerTransport && attachResult.peerTransport.videoTrackConfigured !== true) {
       throw new Error(`native-peer-video-track-not-configured:${peerId}`);
     }
-    const signal = await waitForNativeMediaOffer(peerId);
+
+    let signal = null;
+    if (
+      pc.localDescription &&
+      pc.localDescription.type === 'offer' &&
+      isMediaOfferSignal({ type: 'offer', sdp: pc.localDescription })
+    ) {
+      signal = {
+        peerId,
+        targetId: peerId,
+        type: 'offer',
+        sdp: pc.localDescription
+      };
+    } else {
+      signal = await waitForNativeMediaOffer(peerId);
+    }
+
     updateNativePeerSignalState(peerId, signal);
 
     sendMessage({
@@ -1545,8 +2048,16 @@
 
       updateHostEncoderDetail(hostPipeline);
       updateHostFpsIndicators(sourceFrames, captureFrames, sentFrames);
+      if (hostPlan && hostPlan.captureState === 'minimized') {
+        syncHostWaitingWindowRestoreUi(true);
+      } else if (hostWaitingWindowRestore) {
+        syncHostWaitingWindowRestoreUi(
+          false,
+          currentRoomId ? '原生分享已恢复' : `正在共享（原生，${String(nativeHostEffectiveCodec || 'h264').toUpperCase()}）`
+        );
+      }
 
-      if (shouldShowDebugLogsFor('video')) {
+      if (shouldShowDebugLogsFor('video', 'periodicStats')) {
         console.log(
           '[media-engine native-host-stats]',
           `reason=${reason}`,
@@ -1561,6 +2072,7 @@
           `avgReadbackUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceTotalReadbackUs) ? peer.mediaBinding.avgSourceTotalReadbackUs : 0}`,
           `surfaceRunning=${Boolean(surface && surface.running)}`,
           `surfaceFramesRendered=${surface && Number.isFinite(surface.decodedFramesRendered) ? surface.decodedFramesRendered : 0}`,
+          `surfaceFrameStddevMs=${surface && typeof surface.frameIntervalStddevMs === 'number' ? surface.frameIntervalStddevMs.toFixed(3) : '0.000'}`,
           `surfaceReason=${surface && surface.reason ? surface.reason : 'n/a'}`,
           `peer=${peer && peer.peerId ? peer.peerId : 'n/a'}`,
           `videoConfigured=${Boolean(peer && peer.peerTransport && peer.peerTransport.videoTrackConfigured)}`,
@@ -1572,7 +2084,12 @@
 
       return stats;
     } catch (error) {
-      console.warn('[media-engine native-host-stats] failed:', error);
+      logRecoverableNativeWarning('native-host-stats:failed', error, {
+        key: 'native-host-stats',
+        category: 'video',
+        channel: 'periodicStats',
+        fallbackLabel: '[media-engine native-host-stats] failed:'
+      });
       return null;
     }
   }
@@ -1611,7 +2128,7 @@
         surface && surface.decodedFramesRendered ? surface.decodedFramesRendered : 0
       );
       updateViewerFpsIndicator(peer.peerTransport.remoteVideoFramesReceived || 0, renderedFrames);
-      if (shouldShowDebugLogsFor('video')) {
+      if (shouldShowDebugLogsFor('video', 'periodicStats')) {
         console.log(
           '[media-engine native-peer-stats]',
           `reason=${reason}`,
@@ -1620,6 +2137,7 @@
           `decoderReady=${Boolean(peer.peerTransport.decoderReady)}`,
           `framesReceived=${peer.peerTransport.remoteVideoFramesReceived || 0}`,
           `framesRendered=${peer.peerTransport.decodedFramesRendered || 0}`,
+          `surfaceFrameStddevMs=${surface && typeof surface.frameIntervalStddevMs === 'number' ? surface.frameIntervalStddevMs.toFixed(3) : '0.000'}`,
           `queuedVideo=${peer.receiverRuntime && peer.receiverRuntime.queuedVideoUnits ? peer.receiverRuntime.queuedVideoUnits : 0}`,
           `queuedAudio=${peer.receiverRuntime && peer.receiverRuntime.queuedAudioBlocks ? peer.receiverRuntime.queuedAudioBlocks : 0}`,
           `submittedVideo=${peer.receiverRuntime && peer.receiverRuntime.submittedVideoUnits ? peer.receiverRuntime.submittedVideoUnits : 0}`,
@@ -1633,6 +2151,25 @@
           `surfaceReason=${surface && surface.reason ? surface.reason : 'n/a'}`,
           `surfaceError=${surface && surface.lastError ? surface.lastError : ''}`
         );
+        const relayPeers = peers.filter((entry) => entry && entry.role === 'relay-downstream');
+        relayPeers.forEach((relayPeer) => {
+          const relayRuntime = relayPeer.relaySubscriberRuntime || null;
+          console.log(
+            '[media-engine native-relay-stats]',
+            `reason=${reason}`,
+            `peer=${relayPeer.peerId || 'n/a'}`,
+            `transportState=${relayPeer.peerTransport && relayPeer.peerTransport.connectionState ? relayPeer.peerTransport.connectionState : 'n/a'}`,
+            `videoTrackOpen=${Boolean(relayPeer.peerTransport && relayPeer.peerTransport.videoTrackOpen)}`,
+            `audioTrackOpen=${Boolean(relayPeer.peerTransport && relayPeer.peerTransport.audioTrackOpen)}`,
+            `videoFramesSent=${relayPeer.peerTransport && Number.isFinite(relayPeer.peerTransport.videoFramesSent) ? relayPeer.peerTransport.videoFramesSent : 0}`,
+            `audioFramesSent=${relayPeer.peerTransport && Number.isFinite(relayPeer.peerTransport.audioFramesSent) ? relayPeer.peerTransport.audioFramesSent : 0}`,
+            `pendingBootstrap=${Boolean(relayRuntime && relayRuntime.pendingVideoBootstrap)}`,
+            `bootstrapSnapshotSent=${Boolean(relayRuntime && relayRuntime.bootstrapSnapshotSent)}`,
+            `relayFramesSent=${relayRuntime && Number.isFinite(relayRuntime.framesSent) ? relayRuntime.framesSent : 0}`,
+            `relayReason=${relayRuntime && relayRuntime.reason ? relayRuntime.reason : 'n/a'}`,
+            `relayError=${relayRuntime && relayRuntime.lastError ? relayRuntime.lastError : ''}`
+          );
+        });
       }
 
       if (renderedFrames > 0 || peer.peerTransport.mediaPlaneReady) {
@@ -1644,7 +2181,12 @@
         if (!viewerVolumeSynced) {
           viewerVolumeSynced = true;
           refreshViewerVolumeUi().catch((error) => {
-            console.warn('[media-engine] delayed getViewerVolume failed:', error);
+            logRecoverableNativeWarning('viewer-volume:refresh-failed', error, {
+              key: 'viewer-volume-refresh',
+              category: 'audio',
+              channel: 'nativeSteps',
+              fallbackLabel: '[media-engine] delayed getViewerVolume failed:'
+            });
           });
         }
         if (!viewerReadySent && currentRoomId && Number.isInteger(myChainPosition) && myChainPosition >= 0) {
@@ -1660,7 +2202,12 @@
 
       return stats;
     } catch (error) {
-      console.warn('[media-engine native-peer-stats] failed:', error);
+      logRecoverableNativeWarning('native-peer-stats:failed', error, {
+        key: 'native-peer-stats',
+        category: 'video',
+        channel: 'periodicStats',
+        fallbackLabel: '[media-engine native-peer-stats] failed:'
+      });
       return null;
     }
   }
@@ -1693,77 +2240,102 @@
       throw new Error('native-host-session-disabled');
     }
 
+    await ensureNativeUiReady();
     const parsedSource = parseCaptureSource(sourceId);
     logNativeStep('startHostSession:source', {
       sourceId,
       parsedSource
     });
     await ensureMediaEngineStarted();
+    await waitForHostUiReady();
     lockCodecUiToNativeH264();
+    const preferredPreview = !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
+    let allowPreviewForAttempt = nativeHostPreviewEnabled && preferredPreview;
+    let previewFallbackNoticeShown = false;
 
-    const session = await mediaEngine.startHostSession(parsedSource);
-    logNativeDebug('video', '[media-engine] host session result:', JSON.stringify(session));
-    if (!session || session.running !== true) {
-      throw new Error(session && session.reason ? session.reason : 'native-host-session-start-failed');
-    }
-    if (!session.capturePlan || session.capturePlan.ready !== true || session.capturePlan.validated !== true) {
-      await mediaEngine.stopHostSession({}).catch(() => {});
-      const captureReason =
-        (session && session.capturePlan && (session.capturePlan.lastError || session.capturePlan.validationReason || session.capturePlan.reason)) ||
-        'native-host-capture-plan-not-ready';
-      throw new Error(captureReason);
-    }
-    if (!session.pipeline || session.pipeline.ready !== true || session.pipeline.validated !== true) {
-      await mediaEngine.stopHostSession({}).catch(() => {});
-      const pipelineReason =
-        (session && session.pipeline && (session.pipeline.lastError || session.pipeline.validationReason || session.pipeline.reason)) ||
-        'native-host-pipeline-not-ready';
-      throw new Error(pipelineReason);
-    }
-
-    const requestedCodec = normalizeNativeVideoCodec(
-      session && session.requestedCodec,
-      normalizeNativeVideoCodec(parsedSource.requestedCodec, 'h264')
-    );
-    const effectiveCodec = normalizeNativeVideoCodec(
-      session && (session.effectiveCodec || session.codec),
-      requestedCodec
-    );
-
-    if (typeof qualitySettings === 'object' && qualitySettings) {
-      qualitySettings.codecPreference = effectiveCodec;
-    }
-    lockCodecUiToNativeH264();
-
-    nativeHostSessionRunning = true;
-    localStream = null;
-    hostPreviewRequested = !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
-    hideLegacyVideoElements();
-    if (hostVideoContainer) {
-      hostVideoContainer.classList.toggle('hidden', !hostPreviewRequested);
-    }
-    startNativeHostStatsPolling();
-
-    elements.btnStartShare.classList.add('hidden');
-    elements.btnStopShare.classList.remove('hidden');
-    elements.hostStatus.textContent = `正在共享（原生，${effectiveCodec.toUpperCase()}）`;
-    elements.hostStatus.classList.remove('waiting');
-    updateHostEncoderDetail(session && session.pipeline ? session.pipeline : null);
-
-    if (nativeHostPreviewEnabled && hostPreviewRequested) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        await attachNativeHostPreviewSurface();
+        const session = await mediaEngine.startHostSession(parsedSource);
+        logNativeDebug('video', '[media-engine] host session result:', JSON.stringify(session));
+        if (!session || session.running !== true) {
+          throw new Error(session && session.reason ? session.reason : 'native-host-session-start-failed');
+        }
+        if (!session.capturePlan || session.capturePlan.ready !== true || session.capturePlan.validated !== true) {
+          await mediaEngine.stopHostSession({}).catch(() => {});
+          const captureReason =
+            (session && session.capturePlan && (session.capturePlan.lastError || session.capturePlan.validationReason || session.capturePlan.reason)) ||
+            'native-host-capture-plan-not-ready';
+          throw new Error(captureReason);
+        }
+        if (!session.pipeline || session.pipeline.ready !== true || session.pipeline.validated !== true) {
+          await mediaEngine.stopHostSession({}).catch(() => {});
+          const pipelineReason =
+            (session && session.pipeline && (session.pipeline.lastError || session.pipeline.validationReason || session.pipeline.reason)) ||
+            'native-host-pipeline-not-ready';
+          throw new Error(pipelineReason);
+        }
+
+        const requestedCodec = normalizeNativeVideoCodec(
+          session && session.requestedCodec,
+          normalizeNativeVideoCodec(parsedSource.requestedCodec, 'h264')
+        );
+        const effectiveCodec = normalizeNativeVideoCodec(
+          session && (session.effectiveCodec || session.codec),
+          requestedCodec
+        );
+        nativeHostEffectiveCodec = effectiveCodec;
+
+        if (typeof qualitySettings === 'object' && qualitySettings) {
+          qualitySettings.codecPreference = effectiveCodec;
+        }
+        lockCodecUiToNativeH264();
+
+        nativeHostSessionRunning = true;
+        localStream = null;
+        hostPreviewRequested = allowPreviewForAttempt;
+        hideLegacyVideoElements();
+        if (hostVideoContainer) {
+          hostVideoContainer.classList.toggle('hidden', !hostPreviewRequested);
+        }
+        startNativeHostStatsPolling();
+
+        elements.btnStartShare.classList.add('hidden');
+        elements.btnStopShare.classList.remove('hidden');
+        syncHostWaitingWindowRestoreUi(
+          session && session.capturePlan && session.capturePlan.captureState === 'minimized',
+          `正在共享（原生，${effectiveCodec.toUpperCase()}）`
+        );
+        updateHostEncoderDetail(session && session.pipeline ? session.pipeline : null);
+
+        if (allowPreviewForAttempt) {
+          await waitForHostUiReady();
+          await attachNativeHostPreviewSurface();
+        }
+
+        if (!allowPreviewForAttempt && preferredPreview && !previewFallbackNoticeShown) {
+          previewFallbackNoticeShown = true;
+          showError('原生预览暂不可用，已自动改为无预览开播');
+        }
+
+        sendMessage({
+          type: 'create-room',
+          clientId
+        });
+        return;
       } catch (error) {
-        nativeHostSessionRunning = false;
-        await mediaEngine.stopHostSession({}).catch(() => {});
+        await cleanupAfterFailedHostStart();
+        if (attempt === 0 && allowPreviewForAttempt && isRecoverableHostPreviewAttachError(error)) {
+          logNativeStep('startHostSession:retry-without-preview', {
+            message: error && error.message ? error.message : String(error),
+            sourceId
+          }, 'video');
+          allowPreviewForAttempt = false;
+          await ensureMediaEngineStarted();
+          continue;
+        }
         throw error;
       }
     }
-
-    sendMessage({
-      type: 'create-room',
-      clientId
-    });
   }
 
   async function startScreenShareWithAudio(sourceId, audioPid) {
@@ -1786,52 +2358,75 @@
   }
 
   async function stopScreenShare() {
-    stopNativeHostStatsPolling();
-    stopNativeViewerStatsPolling();
-    await detachNativeHostPreviewSurface().catch(() => {});
-
-    const peerIds = Array.from(nativePeerHandles.keys());
-    for (const peerId of peerIds) {
-      await closeNativePeerConnectionImpl(peerId, { clearRetryState: true });
+    if (stopScreenShareInFlight) {
+      return;
     }
 
-    if (typeof mediaEngine.stopAudioSession === 'function') {
-      await mediaEngine.stopAudioSession({}).catch(() => {});
-    }
-    if (typeof mediaEngine.stopHostSession === 'function') {
-      await mediaEngine.stopHostSession({}).catch(() => {});
-    }
+    stopScreenShareInFlight = true;
+    setHostStopUiState(true);
+    logNativeStep('stopScreenShare:begin', {
+      peerCount: nativePeerHandles.size,
+      hasRoom: Boolean(currentRoomId),
+      sessionRole
+    }, 'video');
 
-    nativeHostSessionRunning = false;
+    try {
+      stopNativeHostStatsPolling();
+      stopNativeViewerStatsPolling();
+      await detachNativeHostPreviewSurface().catch(() => {});
+      logNativeStep('stopScreenShare:preview-detached', {}, 'video');
 
-    if (currentRoomId && sessionRole === 'host') {
-      sendMessage({
-        type: 'leave-room',
-        roomId: currentRoomId,
-        clientId
-      }, { queueIfDisconnected: false });
-    }
+      const peerIds = Array.from(nativePeerHandles.keys());
+      await Promise.all(peerIds.map((peerId) => closeNativePeerConnectionImpl(peerId, { clearRetryState: true })));
+      logNativeStep('stopScreenShare:peers-closed', { peerCount: peerIds.length }, 'video');
 
-    sessionRole = null;
-    currentRoomId = null;
-    hostId = null;
-    upstreamPeerId = null;
-    relayStream = null;
-    upstreamConnected = false;
-    viewerReadySent = false;
-    videoStarted = false;
+      await Promise.all([
+        typeof mediaEngine.stopAudioSession === 'function'
+          ? mediaEngine.stopAudioSession({}).catch(() => {})
+          : Promise.resolve(null),
+        typeof mediaEngine.stopHostSession === 'function'
+          ? mediaEngine.stopHostSession({}).catch(() => {})
+          : Promise.resolve(null)
+      ]);
+      logNativeStep('stopScreenShare:sessions-stopped', {}, 'video');
 
-    elements.roomInfo.classList.add('hidden');
-    elements.viewerCount.textContent = '0';
-    elements.btnStartShare.classList.remove('hidden');
-    elements.btnStopShare.classList.add('hidden');
-    elements.hostStatus.textContent = '准备就绪';
-    updateHostEncoderDetail(null);
-    resetHostFpsIndicators();
-    hideLegacyVideoElements();
-    hostPreviewRequested = !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
-    if (hostVideoContainer) {
-      hostVideoContainer.classList.toggle('hidden', !hostPreviewRequested);
+      nativeHostSessionRunning = false;
+      hostWaitingWindowRestore = false;
+
+      if (currentRoomId && sessionRole === 'host') {
+        sendMessage({
+          type: 'leave-room',
+          roomId: currentRoomId,
+          clientId
+        }, { queueIfDisconnected: false });
+        logNativeStep('stopScreenShare:leave-room-sent', { roomId: currentRoomId }, 'connection');
+      }
+
+      sessionRole = null;
+      currentRoomId = null;
+      hostId = null;
+      upstreamPeerId = null;
+      relayStream = null;
+      upstreamConnected = false;
+      viewerReadySent = false;
+      videoStarted = false;
+
+      elements.roomInfo.classList.add('hidden');
+      elements.viewerCount.textContent = '0';
+      elements.btnStartShare.classList.remove('hidden');
+      elements.btnStopShare.classList.add('hidden');
+      elements.hostStatus.textContent = '准备就绪';
+      elements.hostStatus.classList.remove('waiting');
+      updateHostEncoderDetail(null);
+      resetHostFpsIndicators();
+      hideLegacyVideoElements();
+      hostPreviewRequested = !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
+      if (hostVideoContainer) {
+        hostVideoContainer.classList.toggle('hidden', !hostPreviewRequested);
+      }
+    } finally {
+      stopScreenShareInFlight = false;
+      setHostStopUiState(false);
     }
   }
 
@@ -2087,7 +2682,11 @@
         elements.roomInfo.classList.remove('hidden');
         elements.btnStartShare.classList.add('hidden');
         elements.btnStopShare.classList.remove('hidden');
-        elements.hostStatus.textContent = '原生分享已就绪';
+        if (hostWaitingWindowRestore) {
+          syncHostWaitingWindowRestoreUi(true);
+        } else {
+          elements.hostStatus.textContent = '原生分享已就绪';
+        }
         return;
 
       case 'room-joined':
@@ -2107,6 +2706,9 @@
         elements.viewerRoomId.textContent = data.roomId;
         elements.btnLeave.classList.remove('hidden');
         elements.chainPosition.textContent = String(data.chainPosition + 1);
+        if (typeof window.__vdsRenderViewerPlaybackPrefsUi === 'function') {
+          window.__vdsRenderViewerPlaybackPrefsUi();
+        }
         setViewerConnectionState('等待原生上游连接...');
         return;
 
@@ -2120,7 +2722,11 @@
           elements.viewerCount.textContent = String(data.viewerCount || 0);
           elements.btnStartShare.classList.add('hidden');
           elements.btnStopShare.classList.remove('hidden');
-          elements.hostStatus.textContent = '原生分享已恢复';
+          if (hostWaitingWindowRestore) {
+            syncHostWaitingWindowRestoreUi(true);
+          } else {
+            elements.hostStatus.textContent = '原生分享已恢复';
+          }
           return;
         }
 
@@ -2136,6 +2742,9 @@
         elements.viewerRoomId.textContent = data.roomId;
         elements.btnLeave.classList.remove('hidden');
         elements.chainPosition.textContent = String(myChainPosition + 1);
+        if (typeof window.__vdsRenderViewerPlaybackPrefsUi === 'function') {
+          window.__vdsRenderViewerPlaybackPrefsUi();
+        }
         if (!upstreamConnected) {
           setViewerConnectionState('正在恢复原生上游连接...');
         } else if (elements.connectionStatus) {
@@ -2205,6 +2814,10 @@
 
   function updateFullscreenUi(isFullscreen) {
     document.body.classList.toggle('native-embedded-fullscreen', Boolean(isFullscreen));
+    syncViewerFullscreenUnderbarState();
+    if (Boolean(isFullscreen) && document.body.getAttribute('data-app-view') === 'viewer') {
+      showViewerFullscreenControls();
+    }
     forceEmbeddedSurfaceResync();
   }
 
@@ -2240,23 +2853,26 @@
       const volume = Math.round(
         Math.max(0, Math.min(1, Number(result && result.volume))) * 100
       );
-      viewerVolumeInput.value = String(volume);
-      viewerVolumeValue.textContent = `${volume}%`;
+      applyViewerVolumeUi(volume);
     } catch (error) {
       const message = error && error.message ? error.message : String(error);
       if (message.includes('No active render audio session was found')) {
-        viewerVolumeInput.value = '100';
-        viewerVolumeValue.textContent = '100%';
+        applyViewerVolumeUi(100);
         return;
       }
-      console.warn('[media-engine] getViewerVolume failed:', error);
+      logRecoverableNativeWarning('viewer-volume:get-failed', error, {
+        key: 'viewer-volume-get',
+        category: 'audio',
+        channel: 'nativeSteps',
+        fallbackLabel: '[media-engine] getViewerVolume failed:'
+      });
     }
   }
 
   async function handleViewerVolumeInput(event) {
     const nextValue = Math.max(0, Math.min(100, Number(event.target.value) || 0));
-    viewerVolumeValue.textContent = `${nextValue}%`;
-    await mediaEngine.setViewerVolume(nextValue / 100);
+    await setViewerVolumeValue(nextValue);
+    showViewerFullscreenControls();
   }
 
   async function initializeNativeUi() {
@@ -2278,8 +2894,100 @@
     }
     if (viewerVolumeInput) {
       viewerVolumeInput.addEventListener('input', handleViewerVolumeInput);
-      viewerVolumeInput.value = '100';
-      viewerVolumeValue.textContent = '100%';
+    }
+    if (viewerFullscreenVolumeInput) {
+      viewerFullscreenVolumeInput.addEventListener('input', handleViewerVolumeInput);
+      viewerFullscreenVolumeInput.addEventListener('pointerdown', () => {
+        viewerFullscreenVolumeDragging = true;
+        setViewerFullscreenVolumePopoverOpen(true);
+        showViewerFullscreenControls();
+      });
+      viewerFullscreenVolumeInput.addEventListener('pointerup', () => {
+        viewerFullscreenVolumeDragging = false;
+        if (document.activeElement === viewerFullscreenVolumeInput) {
+          viewerFullscreenVolumeInput.blur();
+        }
+        scheduleViewerFullscreenVolumePopoverHide(1000);
+        scheduleViewerFullscreenControlsHide(1400);
+      });
+      viewerFullscreenVolumeInput.addEventListener('change', () => {
+        viewerFullscreenVolumeDragging = false;
+        if (document.activeElement === viewerFullscreenVolumeInput) {
+          viewerFullscreenVolumeInput.blur();
+        }
+        scheduleViewerFullscreenVolumePopoverHide(900);
+        scheduleViewerFullscreenControlsHide(1300);
+      });
+      viewerFullscreenVolumeInput.addEventListener('blur', () => {
+        viewerFullscreenVolumeDragging = false;
+      });
+    }
+    applyViewerVolumeUi(100);
+    if (viewerFullscreenVolumeControl) {
+      viewerFullscreenVolumeControl.addEventListener('mouseenter', () => {
+        setViewerFullscreenVolumePopoverOpen(true);
+        showViewerFullscreenControls();
+      });
+      viewerFullscreenVolumeControl.addEventListener('mouseleave', () => {
+        scheduleViewerFullscreenVolumePopoverHide(320);
+        scheduleViewerFullscreenControlsHide(900);
+      });
+      viewerFullscreenVolumeControl.addEventListener('focusin', () => {
+        setViewerFullscreenVolumePopoverOpen(true);
+        showViewerFullscreenControls();
+      });
+      viewerFullscreenVolumeControl.addEventListener('focusout', () => {
+        window.setTimeout(() => {
+          if (!isViewerFullscreenVolumePopoverPinned()) {
+            scheduleViewerFullscreenVolumePopoverHide(180);
+            scheduleViewerFullscreenControlsHide(900);
+          }
+        }, 0);
+      });
+    }
+    if (viewerFullscreenMuteButton) {
+      viewerFullscreenMuteButton.addEventListener('click', () => {
+        toggleViewerMute().catch((error) => {
+          logRecoverableNativeWarning('viewer-volume:mute-toggle-failed', error, {
+            key: 'viewer-volume-mute-toggle',
+            category: 'audio',
+            channel: 'nativeSteps',
+            fallbackLabel: '[media-engine] mute toggle failed:'
+          });
+        });
+      });
+    }
+    if (viewerFullscreenExitButton) {
+      viewerFullscreenExitButton.addEventListener('click', () => {
+        exitViewerFullscreen().catch((error) => {
+          logRecoverableNativeWarning('viewer-fullscreen:exit-failed', error, {
+            key: 'viewer-fullscreen-exit',
+            category: 'video',
+            channel: 'nativeSteps',
+            fallbackLabel: '[media-engine] viewer fullscreen exit failed:'
+          });
+        });
+      });
+    }
+    if (remoteVideoContainer) {
+      const showControls = () => {
+        showViewerFullscreenControls();
+      };
+      remoteVideoContainer.addEventListener('mousemove', showControls);
+      remoteVideoContainer.addEventListener('mouseenter', showControls);
+      remoteVideoContainer.addEventListener('touchstart', showControls, { passive: true });
+    }
+    if (viewerFullscreenUnderbar) {
+      viewerFullscreenUnderbar.addEventListener('mouseenter', () => {
+        showViewerFullscreenControls();
+      });
+      viewerFullscreenUnderbar.addEventListener('mouseleave', () => {
+        scheduleViewerFullscreenVolumePopoverHide(220);
+        scheduleViewerFullscreenControlsHide(900);
+      });
+      viewerFullscreenUnderbar.addEventListener('focusin', () => {
+        showViewerFullscreenControls();
+      });
     }
 
     if (elements.btnStopShare) {
@@ -2303,7 +3011,12 @@
 
     window.addEventListener('keydown', (event) => {
       handleFullscreenEscapeKey(event).catch((error) => {
-        console.warn('[media-engine] fullscreen escape failed:', error);
+        logRecoverableNativeWarning('fullscreen-escape:failed', error, {
+          key: 'fullscreen-escape',
+          category: 'video',
+          channel: 'nativeSteps',
+          fallbackLabel: '[media-engine] fullscreen escape failed:'
+        });
       });
     }, true);
 
@@ -2318,6 +3031,14 @@
     if (typeof electronApi.onWindowBoundsChange === 'function') {
       electronApi.onWindowBoundsChange((bounds) => {
         currentWindowBounds = bounds || null;
+        forceEmbeddedSurfaceResyncBurst();
+      });
+    }
+    if (typeof electronApi.onMaximizedChange === 'function') {
+      electronApi.onMaximizedChange(() => {
+        refreshCurrentWindowBounds().finally(() => {
+          forceEmbeddedSurfaceResyncBurst();
+        });
       });
     }
 
@@ -2378,7 +3099,9 @@
   window.handleMessage = handleMessage;
   window.setViewerConnectionState = setViewerConnectionState;
 
-  initializeNativeUi().catch((error) => {
+  nativeUiReadyPromise = initializeNativeUi();
+
+  nativeUiReadyPromise.catch((error) => {
     console.error('[media-engine] native override init failed:', error);
     showError(`Native init failed: ${error && error.message ? error.message : String(error)}`);
   });

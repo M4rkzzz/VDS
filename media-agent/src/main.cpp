@@ -49,6 +49,7 @@ extern "C" {
 #include "native_video_surface.h"
 #include "peer_transport.h"
 #include "wasapi_backend.h"
+#include "win32_placeholder_frame.h"
 #include "wgc_capture.h"
 
 namespace fs = std::filesystem;
@@ -84,6 +85,57 @@ constexpr std::size_t kPeerAvSyncAudioBacklogTrimTargetBlocks = 12;
 constexpr std::uint64_t kPeerAvSyncCatchupLatencyStepUs = 4000;
 constexpr std::uint64_t kPeerAvSyncAudioDispatchStarveUs = 40000;
 
+#ifdef _WIN32
+enum class WindowCaptureAvailability {
+  normal,
+  minimized,
+  unavailable
+};
+
+HWND parse_runtime_window_handle(const std::string& value) {
+  std::string trimmed = value;
+  trimmed.erase(trimmed.begin(), std::find_if(trimmed.begin(), trimmed.end(), [](unsigned char ch) {
+    return !std::isspace(ch);
+  }));
+  trimmed.erase(std::find_if(trimmed.rbegin(), trimmed.rend(), [](unsigned char ch) {
+    return !std::isspace(ch);
+  }).base(), trimmed.end());
+  if (trimmed.empty()) {
+    return nullptr;
+  }
+
+  try {
+    std::size_t parsed_length = 0;
+    const auto numeric = static_cast<std::uintptr_t>(std::stoull(trimmed, &parsed_length, 0));
+    if (parsed_length != trimmed.size()) {
+      return nullptr;
+    }
+    return reinterpret_cast<HWND>(numeric);
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+WindowCaptureAvailability query_window_capture_availability(const std::string& window_handle) {
+  const HWND hwnd = parse_runtime_window_handle(window_handle);
+  if (!hwnd || !IsWindow(hwnd)) {
+    return WindowCaptureAvailability::unavailable;
+  }
+  if (IsIconic(hwnd)) {
+    return WindowCaptureAvailability::minimized;
+  }
+  return WindowCaptureAvailability::normal;
+}
+
+std::vector<std::uint8_t> build_window_restore_placeholder_frame_bgra(int width, int height) {
+  return build_placeholder_frame_bgra(
+    width,
+    height,
+    L"\u7b49\u5f85\u623f\u4e3b\u7a97\u53e3\u6062\u590d"
+  );
+}
+#endif
+
 struct PeerState {
   struct PeerVideoSenderRuntime {
     bool launch_attempted = false;
@@ -99,6 +151,8 @@ struct PeerState {
     unsigned long long bytes_sent = 0;
     unsigned long long next_frame_timestamp_us = 0;
     unsigned long long frame_interval_us = 16666;
+    long long next_frame_send_deadline_steady_us = -1;
+    long long last_frame_sent_at_steady_us = -1;
     long long started_at_unix_ms = 0;
     long long updated_at_unix_ms = 0;
     long long stopped_at_unix_ms = 0;
@@ -112,6 +166,7 @@ struct PeerState {
     std::vector<std::uint8_t> cached_video_decoder_config_au;
     std::vector<std::uint8_t> cached_video_random_access_au;
     bool pending_video_bootstrap = true;
+    std::atomic<bool> soft_refresh_requested { false };
     std::atomic<bool> stop_requested { false };
 #ifdef _WIN32
     HANDLE process_handle = nullptr;
@@ -152,6 +207,9 @@ struct PeerState {
     bool av_sync_thread_started = false;
     bool av_sync_anchor_initialized = false;
     bool av_sync_stop_requested = false;
+    bool closing = false;
+    bool local_playback_enabled = false;
+    bool passthrough_playback_enabled = false;
     unsigned long process_id = 0;
     unsigned long long remote_frames_received = 0;
     unsigned long long remote_bytes_received = 0;
@@ -162,6 +220,7 @@ struct PeerState {
     unsigned long long dispatched_audio_blocks = 0;
     unsigned long long dropped_video_units = 0;
     unsigned long long dropped_audio_blocks = 0;
+    double frame_interval_stddev_ms = 0.0;
     long long last_remote_frame_at_unix_ms = -1;
     long long last_decoded_frame_at_unix_ms = -1;
     long long last_start_attempt_at_unix_ms = 0;
@@ -401,6 +460,7 @@ struct SurfaceAttachmentState {
   bool decoder_ready = false;
   unsigned int restart_count = 0;
   unsigned long long decoded_frames_rendered = 0;
+  double frame_interval_stddev_ms = 0.0;
   long long last_start_attempt_at_unix_ms = 0;
   long long last_start_success_at_unix_ms = 0;
   long long last_stop_at_unix_ms = 0;
@@ -449,6 +509,8 @@ struct HostCaptureArtifactProbe {
 };
 
 struct AgentRuntimeState {
+  std::string viewer_playback_mode = "synced";
+  unsigned int viewer_audio_delay_ms = 0;
   bool host_session_running = false;
   std::string host_capture_target_id;
   std::string host_requested_codec = "h264";
@@ -463,6 +525,9 @@ struct AgentRuntimeState {
   std::string host_capture_hwnd;
   std::string host_capture_display_id;
   std::string host_capture_source_id;
+  bool host_window_restore_placeholder_active = false;
+  bool host_video_sender_refresh_requested = false;
+  std::string host_video_sender_refresh_reason;
   int host_width = 1920;
   int host_height = 1080;
   int host_frame_rate = 60;
@@ -479,11 +544,16 @@ struct AgentRuntimeState {
   HostCaptureProcessState host_capture_process;
   HostCaptureArtifactProbe host_capture_artifact;
   struct ViewerAudioPlaybackRuntime {
+    struct QueuedPcmBlock {
+      std::vector<std::int16_t> pcm;
+      std::int64_t release_at_steady_us = 0;
+    };
     bool running = false;
     bool ready = false;
     bool stop_requested = false;
     bool thread_started = false;
     bool playback_primed = false;
+    bool passthrough_mode = false;
     unsigned long long audio_packets_received = 0;
     unsigned long long audio_bytes_received = 0;
     unsigned long long pcm_frames_queued = 0;
@@ -491,6 +561,7 @@ struct AgentRuntimeState {
     unsigned long long buffered_pcm_frames = 0;
     unsigned int target_buffer_frames = kViewerAudioStartupBufferFrames;
     unsigned int channel_count = kViewerAudioChannelCount;
+    unsigned int passthrough_audio_delay_ms = 0;
     float software_volume = 1.0f;
     std::string implementation = "native-waveout-opus-playback";
     std::string reason = "viewer-audio-idle";
@@ -498,7 +569,7 @@ struct AgentRuntimeState {
     std::mutex mutex;
     std::condition_variable cv;
     std::thread worker;
-    std::deque<std::vector<std::int16_t>> pcm_queue;
+    std::deque<QueuedPcmBlock> pcm_queue;
 #ifdef _WIN32
     HWAVEOUT wave_out = nullptr;
 #endif
@@ -527,23 +598,41 @@ struct RelaySubscriberState {
   std::weak_ptr<PeerTransportSession> session;
   bool audio_enabled = false;
   bool pending_video_bootstrap = true;
+  bool bootstrap_snapshot_sent = false;
   unsigned long long frames_sent = 0;
   unsigned long long bytes_sent = 0;
+  std::uint64_t last_video_timestamp_us = 0;
+  long long next_video_send_deadline_steady_us = -1;
   std::string reason = "relay-subscriber-idle";
   std::string last_error;
   long long updated_at_unix_ms = 0;
 };
 
 struct RelayUpstreamVideoBootstrapState {
+  struct CachedAccessUnit {
+    std::vector<std::uint8_t> bytes;
+    std::uint64_t timestamp_us = 0;
+  };
   std::string codec_path = "h264";
   std::vector<std::uint8_t> decoder_config_au;
   std::vector<std::uint8_t> random_access_au;
+  std::vector<CachedAccessUnit> gop_access_units;
+};
+
+struct QueuedRelayVideoDispatch {
+  std::string upstream_peer_id;
+  std::string codec;
+  std::vector<std::vector<std::uint8_t>> access_units;
+  std::uint32_t rtp_timestamp = 0;
 };
 
 struct RelayDispatchState {
   std::mutex mutex;
+  std::condition_variable video_cv;
   std::map<std::string, std::vector<RelaySubscriberState>> subscribers_by_upstream_peer;
   std::map<std::string, RelayUpstreamVideoBootstrapState> video_bootstrap_by_upstream_peer;
+  std::deque<QueuedRelayVideoDispatch> pending_video_dispatches;
+  bool video_worker_started = false;
 };
 
 struct RelayDispatchTarget {
@@ -557,6 +646,9 @@ RelayDispatchState& relay_dispatch_state() {
   static RelayDispatchState state;
   return state;
 }
+
+constexpr std::size_t kMaxQueuedRelayVideoDispatches = 512;
+constexpr std::size_t kMaxRelayBootstrapGopAccessUnits = 96;
 
 std::string normalize_video_codec(const std::string& codec, const std::string& fallback = "h264");
 bool video_access_unit_has_decoder_config_nal(const std::string& codec, const std::vector<std::uint8_t>& access_unit);
@@ -573,12 +665,33 @@ std::int64_t current_time_micros_steady() {
   ).count();
 }
 
+bool sleep_until_steady_us(std::int64_t target_us, const std::atomic<bool>* stop_flag = nullptr) {
+  while (true) {
+    if (stop_flag && stop_flag->load()) {
+      return false;
+    }
+
+    const std::int64_t now_us = current_time_micros_steady();
+    if (target_us <= now_us) {
+      return true;
+    }
+
+    const std::int64_t remaining_us = target_us - now_us;
+    const auto sleep_for = std::chrono::microseconds(std::min<std::int64_t>(
+      remaining_us,
+      static_cast<std::int64_t>(kPeerAvSyncMaxSleepChunkUs)
+    ));
+    std::this_thread::sleep_for(sleep_for);
+  }
+}
+
 std::uint64_t rtp_timestamp_to_us(std::uint32_t timestamp, std::uint64_t clock_rate) {
   if (clock_rate == 0) {
     return 0;
   }
   return (static_cast<std::uint64_t>(timestamp) * 1000000ull) / clock_rate;
 }
+
 
 std::string json_escape(const std::string& value) {
   std::ostringstream escaped;
@@ -663,6 +776,11 @@ long long current_time_millis() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
     std::chrono::system_clock::now().time_since_epoch()
   ).count();
+}
+
+void emit_breadcrumb(const std::string& step) {
+  std::cerr << "[media-agent breadcrumb] t=" << current_time_millis()
+            << " step=" << step << std::endl;
 }
 
 std::uint8_t linear16_to_ulaw_sample(std::int16_t sample) {
@@ -1249,6 +1367,7 @@ void viewer_audio_playback_worker(AgentRuntimeState::ViewerAudioPlaybackRuntime*
   std::vector<WAVEHDR*> in_flight_headers;
   while (true) {
     std::vector<std::int16_t> pcm_block;
+    std::int64_t release_at_steady_us = 0;
     float volume = 1.0f;
     {
       std::unique_lock<std::mutex> lock(runtime->mutex);
@@ -1258,6 +1377,9 @@ void viewer_audio_playback_worker(AgentRuntimeState::ViewerAudioPlaybackRuntime*
         }
         if (runtime->pcm_queue.empty()) {
           return false;
+        }
+        if (runtime->passthrough_mode) {
+          return runtime->pcm_queue.front().release_at_steady_us <= current_time_micros_steady();
         }
         if (runtime->playback_primed) {
           return true;
@@ -1273,7 +1395,20 @@ void viewer_audio_playback_worker(AgentRuntimeState::ViewerAudioPlaybackRuntime*
         continue;
       }
 
-      if (!runtime->playback_primed) {
+      if (runtime->passthrough_mode) {
+        release_at_steady_us = runtime->pcm_queue.front().release_at_steady_us;
+        const std::int64_t now_steady_us = current_time_micros_steady();
+        if (!runtime->stop_requested && release_at_steady_us > now_steady_us) {
+          runtime->reason = "viewer-audio-delay-waiting";
+          continue;
+        }
+        if (!runtime->playback_primed) {
+          runtime->playback_primed = true;
+          runtime->reason = "viewer-audio-running";
+        }
+      }
+
+      if (!runtime->passthrough_mode && !runtime->playback_primed) {
         if (runtime->buffered_pcm_frames < runtime->target_buffer_frames) {
           runtime->reason = "viewer-audio-buffering";
           continue;
@@ -1282,7 +1417,7 @@ void viewer_audio_playback_worker(AgentRuntimeState::ViewerAudioPlaybackRuntime*
         runtime->reason = "viewer-audio-running";
       }
 
-      pcm_block = std::move(runtime->pcm_queue.front());
+      pcm_block = std::move(runtime->pcm_queue.front().pcm);
       runtime->pcm_queue.pop_front();
       const unsigned int pcm_block_frames = pcm_sample_count_to_frames(pcm_block.size(), runtime->channel_count);
       runtime->buffered_pcm_frames = runtime->buffered_pcm_frames > pcm_block_frames
@@ -1403,14 +1538,22 @@ void queue_viewer_audio_pcm_block(
   ensure_viewer_audio_playback_runtime(runtime);
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
-  runtime.audio_packets_received += 1;
-  runtime.audio_bytes_received += pcm_block.size() * sizeof(std::int16_t);
-  runtime.pcm_frames_queued += pcm_sample_count_to_frames(pcm_block.size(), runtime.channel_count);
-  runtime.buffered_pcm_frames += pcm_sample_count_to_frames(pcm_block.size(), runtime.channel_count);
-    runtime.reason = runtime.playback_primed ? "viewer-audio-queued" : "viewer-audio-buffering";
-    runtime.pcm_queue.push_back(std::move(pcm_block));
+    AgentRuntimeState::ViewerAudioPlaybackRuntime::QueuedPcmBlock queued_block;
+    queued_block.release_at_steady_us = runtime.passthrough_mode
+      ? (current_time_micros_steady() + static_cast<std::int64_t>(runtime.passthrough_audio_delay_ms) * 1000)
+      : 0;
+    queued_block.pcm = std::move(pcm_block);
+
+    runtime.audio_packets_received += 1;
+    runtime.audio_bytes_received += queued_block.pcm.size() * sizeof(std::int16_t);
+    runtime.pcm_frames_queued += pcm_sample_count_to_frames(queued_block.pcm.size(), runtime.channel_count);
+    runtime.buffered_pcm_frames += pcm_sample_count_to_frames(queued_block.pcm.size(), runtime.channel_count);
+    runtime.reason = runtime.passthrough_mode
+      ? "viewer-audio-passthrough-queued"
+      : (runtime.playback_primed ? "viewer-audio-queued" : "viewer-audio-buffering");
+    runtime.pcm_queue.push_back(std::move(queued_block));
     while (!runtime.pcm_queue.empty() && runtime.buffered_pcm_frames > kViewerAudioMaxBufferedFrames) {
-      const unsigned int front_frames = pcm_sample_count_to_frames(runtime.pcm_queue.front().size(), runtime.channel_count);
+      const unsigned int front_frames = pcm_sample_count_to_frames(runtime.pcm_queue.front().pcm.size(), runtime.channel_count);
       runtime.buffered_pcm_frames = runtime.buffered_pcm_frames > front_frames
         ? runtime.buffered_pcm_frames - front_frames
         : 0;
@@ -1446,6 +1589,9 @@ void register_relay_subscriber(
       subscriber.session = session;
       subscriber.audio_enabled = audio_enabled;
       subscriber.pending_video_bootstrap = true;
+      subscriber.bootstrap_snapshot_sent = false;
+      subscriber.last_video_timestamp_us = 0;
+      subscriber.next_video_send_deadline_steady_us = -1;
       subscriber.reason = "relay-subscriber-registered";
       subscriber.last_error.clear();
       subscriber.updated_at_unix_ms = current_time_millis();
@@ -1459,6 +1605,9 @@ void register_relay_subscriber(
   subscriber.session = session;
   subscriber.audio_enabled = audio_enabled;
   subscriber.pending_video_bootstrap = true;
+  subscriber.bootstrap_snapshot_sent = false;
+  subscriber.last_video_timestamp_us = 0;
+  subscriber.next_video_send_deadline_steady_us = -1;
   subscriber.reason = "relay-subscriber-registered";
   subscriber.updated_at_unix_ms = current_time_millis();
   subscribers.push_back(std::move(subscriber));
@@ -1482,7 +1631,6 @@ void unregister_relay_subscriber(const std::string& peer_id) {
       subscribers.end()
     );
     if (subscribers.empty()) {
-      state.video_bootstrap_by_upstream_peer.erase(upstream_it->first);
       upstream_it = state.subscribers_by_upstream_peer.erase(upstream_it);
       continue;
     }
@@ -1490,10 +1638,21 @@ void unregister_relay_subscriber(const std::string& peer_id) {
   }
 }
 
+void clear_relay_upstream_bootstrap_state(const std::string& upstream_peer_id) {
+  if (upstream_peer_id.empty()) {
+    return;
+  }
+
+  auto& state = relay_dispatch_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.video_bootstrap_by_upstream_peer.erase(upstream_peer_id);
+}
+
 void cache_relay_video_bootstrap_access_unit(
   const std::string& upstream_peer_id,
   const std::string& codec,
-  const std::vector<std::uint8_t>& access_unit) {
+  const std::vector<std::uint8_t>& access_unit,
+  std::uint64_t timestamp_us) {
   if (upstream_peer_id.empty() || access_unit.empty()) {
     return;
   }
@@ -1506,11 +1665,13 @@ void cache_relay_video_bootstrap_access_unit(
     bootstrap.codec_path = normalized_codec;
     bootstrap.decoder_config_au.clear();
     bootstrap.random_access_au.clear();
+    bootstrap.gop_access_units.clear();
 
     auto subscribers_it = state.subscribers_by_upstream_peer.find(upstream_peer_id);
     if (subscribers_it != state.subscribers_by_upstream_peer.end()) {
       for (auto& subscriber : subscribers_it->second) {
         subscriber.pending_video_bootstrap = true;
+        subscriber.bootstrap_snapshot_sent = false;
       }
     }
   }
@@ -1520,13 +1681,25 @@ void cache_relay_video_bootstrap_access_unit(
   }
   if (video_access_unit_has_random_access_nal(bootstrap.codec_path, access_unit)) {
     bootstrap.random_access_au = access_unit;
+    bootstrap.gop_access_units.clear();
+  }
+  if (!bootstrap.random_access_au.empty()) {
+    RelayUpstreamVideoBootstrapState::CachedAccessUnit cached;
+    cached.bytes = access_unit;
+    cached.timestamp_us = timestamp_us;
+    bootstrap.gop_access_units.push_back(std::move(cached));
+    while (bootstrap.gop_access_units.size() > kMaxRelayBootstrapGopAccessUnits) {
+      bootstrap.gop_access_units.erase(bootstrap.gop_access_units.begin());
+    }
   }
 }
 
 bool collect_relay_video_bootstrap_access_units(
   const std::string& upstream_peer_id,
   const std::string& peer_id,
-  std::vector<std::vector<std::uint8_t>>* out_access_units) {
+  const std::vector<std::vector<std::uint8_t>>& current_access_units,
+  std::uint64_t current_timestamp_us,
+  std::vector<RelayUpstreamVideoBootstrapState::CachedAccessUnit>* out_access_units) {
   if (!out_access_units || upstream_peer_id.empty() || peer_id.empty()) {
     return false;
   }
@@ -1561,17 +1734,81 @@ bool collect_relay_video_bootstrap_access_units(
     return false;
   }
 
-  if (!bootstrap_it->second.decoder_config_au.empty()) {
-    out_access_units->push_back(bootstrap_it->second.decoder_config_au);
+  if (!matched_subscriber->bootstrap_snapshot_sent) {
+    if (!bootstrap_it->second.gop_access_units.empty()) {
+      const std::uint64_t bootstrap_timestamp_us =
+        bootstrap_it->second.gop_access_units.front().timestamp_us > 0
+          ? bootstrap_it->second.gop_access_units.front().timestamp_us
+          : current_timestamp_us;
+      if (!bootstrap_it->second.decoder_config_au.empty()) {
+        RelayUpstreamVideoBootstrapState::CachedAccessUnit config_unit;
+        config_unit.bytes = bootstrap_it->second.decoder_config_au;
+        config_unit.timestamp_us = bootstrap_timestamp_us;
+        out_access_units->push_back(std::move(config_unit));
+      }
+      for (const auto& cached_unit : bootstrap_it->second.gop_access_units) {
+        if (!out_access_units->empty() && out_access_units->back().bytes == cached_unit.bytes) {
+          continue;
+        }
+        out_access_units->push_back(cached_unit);
+      }
+      if (!out_access_units->empty()) {
+        matched_subscriber->bootstrap_snapshot_sent = true;
+        matched_subscriber->pending_video_bootstrap = false;
+        return true;
+      }
+    }
+
+    if (!bootstrap_it->second.decoder_config_au.empty()) {
+      RelayUpstreamVideoBootstrapState::CachedAccessUnit config_unit;
+      config_unit.bytes = bootstrap_it->second.decoder_config_au;
+      config_unit.timestamp_us = current_timestamp_us;
+      out_access_units->push_back(std::move(config_unit));
+    }
+    if (!bootstrap_it->second.random_access_au.empty() &&
+        (out_access_units->empty() || out_access_units->back().bytes != bootstrap_it->second.random_access_au)) {
+      RelayUpstreamVideoBootstrapState::CachedAccessUnit random_access_unit;
+      random_access_unit.bytes = bootstrap_it->second.random_access_au;
+      random_access_unit.timestamp_us = current_timestamp_us;
+      out_access_units->push_back(std::move(random_access_unit));
+    }
+    if (!out_access_units->empty()) {
+      matched_subscriber->bootstrap_snapshot_sent = true;
+      return true;
+    }
   }
-  if (!bootstrap_it->second.random_access_au.empty() &&
-      bootstrap_it->second.random_access_au != bootstrap_it->second.decoder_config_au) {
-    out_access_units->push_back(bootstrap_it->second.random_access_au);
+
+  auto random_access_it = std::find_if(
+    current_access_units.begin(),
+    current_access_units.end(),
+    [&](const std::vector<std::uint8_t>& access_unit) {
+      return video_access_unit_has_random_access_nal(bootstrap_it->second.codec_path, access_unit);
+    }
+  );
+  if (random_access_it == current_access_units.end()) {
+    return false;
+  }
+
+  if (!bootstrap_it->second.decoder_config_au.empty()) {
+    RelayUpstreamVideoBootstrapState::CachedAccessUnit config_unit;
+    config_unit.bytes = bootstrap_it->second.decoder_config_au;
+    config_unit.timestamp_us = current_timestamp_us;
+    out_access_units->push_back(std::move(config_unit));
+  }
+  for (auto it = random_access_it; it != current_access_units.end(); ++it) {
+    if (!out_access_units->empty() && out_access_units->back().bytes == *it) {
+      continue;
+    }
+    RelayUpstreamVideoBootstrapState::CachedAccessUnit unit;
+    unit.bytes = *it;
+    unit.timestamp_us = current_timestamp_us;
+    out_access_units->push_back(std::move(unit));
   }
   if (out_access_units->empty()) {
     return false;
   }
 
+  matched_subscriber->bootstrap_snapshot_sent = true;
   matched_subscriber->pending_video_bootstrap = false;
   return true;
 }
@@ -1667,7 +1904,7 @@ void update_relay_subscriber_runtime(
   }
 }
 
-void fanout_relay_video_units(
+void fanout_relay_video_units_now(
   const std::string& upstream_peer_id,
   const std::string& codec,
   const std::vector<std::vector<std::uint8_t>>& access_units,
@@ -1676,8 +1913,9 @@ void fanout_relay_video_units(
     return;
   }
 
+  const std::uint64_t timestamp_us = rtp_timestamp_to_us(rtp_timestamp, kPeerAvSyncVideoClockRate);
   for (const auto& access_unit : access_units) {
-    cache_relay_video_bootstrap_access_unit(upstream_peer_id, codec, access_unit);
+    cache_relay_video_bootstrap_access_unit(upstream_peer_id, codec, access_unit, timestamp_us);
   }
 
   const auto targets = collect_relay_dispatch_targets(upstream_peer_id);
@@ -1685,7 +1923,6 @@ void fanout_relay_video_units(
     return;
   }
 
-  const std::uint64_t timestamp_us = rtp_timestamp_to_us(rtp_timestamp, kPeerAvSyncVideoClockRate);
   for (const auto& target : targets) {
     const PeerTransportSnapshot snapshot = get_peer_transport_snapshot(target.session);
     if (!snapshot.remote_description_set || snapshot.connection_state != "connected") {
@@ -1715,16 +1952,43 @@ void fanout_relay_video_units(
     std::string send_error;
     unsigned long long sent_frames = 0;
     unsigned long long sent_bytes = 0;
-    std::vector<std::vector<std::uint8_t>> units_to_send;
-    collect_relay_video_bootstrap_access_units(upstream_peer_id, target.peer_id, &units_to_send);
-    units_to_send.insert(units_to_send.end(), access_units.begin(), access_units.end());
+    std::vector<RelayUpstreamVideoBootstrapState::CachedAccessUnit> units_to_send;
+    const bool using_bootstrap =
+      collect_relay_video_bootstrap_access_units(
+        upstream_peer_id,
+        target.peer_id,
+        access_units,
+        timestamp_us,
+        &units_to_send
+      );
+    if (!using_bootstrap) {
+      RelaySubscriberState relay_state;
+      if (query_relay_subscriber_state(target.peer_id, &relay_state) && relay_state.pending_video_bootstrap) {
+        update_relay_subscriber_runtime(
+          upstream_peer_id,
+          target.peer_id,
+          "relay-waiting-for-random-access",
+          "",
+          0,
+          0
+        );
+        continue;
+      }
+      for (const auto& access_unit : access_units) {
+        RelayUpstreamVideoBootstrapState::CachedAccessUnit live_unit;
+        live_unit.bytes = access_unit;
+        live_unit.timestamp_us = timestamp_us;
+        units_to_send.push_back(std::move(live_unit));
+      }
+    }
     for (const auto& access_unit : units_to_send) {
-      if (!send_peer_transport_video_frame(target.session, access_unit, codec, timestamp_us, &send_error)) {
+      const std::uint64_t unit_timestamp_us = access_unit.timestamp_us > 0 ? access_unit.timestamp_us : timestamp_us;
+      if (!send_peer_transport_video_frame(target.session, access_unit.bytes, codec, unit_timestamp_us, &send_error)) {
         send_failed = true;
         break;
       }
       sent_frames += 1;
-      sent_bytes += static_cast<unsigned long long>(access_unit.size());
+      sent_bytes += static_cast<unsigned long long>(access_unit.bytes.size());
     }
 
     if (send_failed) {
@@ -1747,6 +2011,64 @@ void fanout_relay_video_units(
       );
     }
   }
+}
+
+void ensure_relay_video_dispatch_worker_running() {
+  auto& state = relay_dispatch_state();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  if (state.video_worker_started) {
+    return;
+  }
+
+  state.video_worker_started = true;
+  std::thread([]() {
+    auto& worker_state = relay_dispatch_state();
+    while (true) {
+      QueuedRelayVideoDispatch task;
+      {
+        std::unique_lock<std::mutex> lock(worker_state.mutex);
+        worker_state.video_cv.wait(lock, [&]() {
+          return !worker_state.pending_video_dispatches.empty();
+        });
+        task = std::move(worker_state.pending_video_dispatches.front());
+        worker_state.pending_video_dispatches.pop_front();
+      }
+
+      fanout_relay_video_units_now(
+        task.upstream_peer_id,
+        task.codec,
+        task.access_units,
+        task.rtp_timestamp
+      );
+    }
+  }).detach();
+}
+
+void fanout_relay_video_units(
+  const std::string& upstream_peer_id,
+  const std::string& codec,
+  const std::vector<std::vector<std::uint8_t>>& access_units,
+  std::uint32_t rtp_timestamp) {
+  if (upstream_peer_id.empty() || access_units.empty()) {
+    return;
+  }
+
+  ensure_relay_video_dispatch_worker_running();
+
+  auto& state = relay_dispatch_state();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    QueuedRelayVideoDispatch task;
+    task.upstream_peer_id = upstream_peer_id;
+    task.codec = codec;
+    task.access_units = access_units;
+    task.rtp_timestamp = rtp_timestamp;
+    state.pending_video_dispatches.push_back(std::move(task));
+    while (state.pending_video_dispatches.size() > kMaxQueuedRelayVideoDispatches) {
+      state.pending_video_dispatches.pop_front();
+    }
+  }
+  state.video_cv.notify_one();
 }
 
 void fanout_relay_audio_frame(
@@ -1837,6 +2159,7 @@ void ensure_peer_av_sync_anchor_locked(
 
 void retune_peer_av_sync_latency_locked(PeerState::PeerVideoReceiverRuntime& runtime, long long lateness_us) {
   runtime.av_sync_last_video_lateness_us = lateness_us;
+  const long long previous_target_latency_us = runtime.av_sync_target_latency_us;
   long long delta_us = 0;
   if (lateness_us > static_cast<long long>(kPeerAvSyncLateToleranceUs)) {
     const long long available_raise =
@@ -1857,6 +2180,9 @@ void retune_peer_av_sync_latency_locked(PeerState::PeerVideoReceiverRuntime& run
   }
 
   runtime.av_sync_target_latency_us += delta_us;
+  if (runtime.av_sync_anchor_initialized) {
+    runtime.av_sync_anchor_local_us += (runtime.av_sync_target_latency_us - previous_target_latency_us);
+  }
 }
 
 void peer_av_sync_worker(
@@ -1881,11 +2207,13 @@ void peer_av_sync_worker(
     {
       std::unique_lock<std::mutex> lock(runtime->mutex);
       runtime->av_sync_running = true;
-      runtime->av_sync_cv.wait_for(lock, std::chrono::milliseconds(10), [&]() {
-        return runtime->av_sync_stop_requested ||
-          !runtime->scheduled_audio_queue.empty() ||
-          !runtime->scheduled_video_queue.empty();
-      });
+      if (runtime->scheduled_audio_queue.empty() && runtime->scheduled_video_queue.empty()) {
+        runtime->av_sync_cv.wait(lock, [&]() {
+          return runtime->av_sync_stop_requested ||
+            !runtime->scheduled_audio_queue.empty() ||
+            !runtime->scheduled_video_queue.empty();
+        });
+      }
       runtime->av_sync_last_scheduler_wake_at_unix_ms = current_time_millis();
 
       if (runtime->av_sync_stop_requested &&
@@ -1910,8 +2238,15 @@ void peer_av_sync_worker(
         runtime->reason = "peer-av-sync-audio-trimmed";
       }
 
-      const auto compute_dispatch_time = [&](std::int64_t local_arrival_us) -> std::int64_t {
-        return local_arrival_us + runtime->av_sync_target_latency_us;
+      const auto compute_dispatch_time = [&](
+        std::uint64_t remote_timestamp_us,
+        std::int64_t local_arrival_us) -> std::int64_t {
+        if (remote_timestamp_us == 0) {
+          return local_arrival_us + runtime->av_sync_target_latency_us;
+        }
+        ensure_peer_av_sync_anchor_locked(*runtime, now_us, remote_timestamp_us);
+        return runtime->av_sync_anchor_local_us +
+          (static_cast<long long>(remote_timestamp_us) - runtime->av_sync_anchor_remote_us);
       };
 
       const bool surface_ready = runtime->surface && runtime->surface_attached;
@@ -1922,12 +2257,16 @@ void peer_av_sync_worker(
 
       std::int64_t next_audio_target_us = std::numeric_limits<std::int64_t>::max();
       if (!runtime->scheduled_audio_queue.empty()) {
-        next_audio_target_us = compute_dispatch_time(runtime->scheduled_audio_queue.front().local_arrival_us);
+        next_audio_target_us = compute_dispatch_time(
+          runtime->scheduled_audio_queue.front().remote_timestamp_us,
+          runtime->scheduled_audio_queue.front().local_arrival_us);
       }
 
       std::int64_t next_video_target_us = std::numeric_limits<std::int64_t>::max();
       if (!runtime->scheduled_video_queue.empty()) {
-        next_video_target_us = compute_dispatch_time(runtime->scheduled_video_queue.front().local_arrival_us);
+        next_video_target_us = compute_dispatch_time(
+          runtime->scheduled_video_queue.front().remote_timestamp_us,
+          runtime->scheduled_video_queue.front().local_arrival_us);
       }
 
       const auto choose_next_dispatch = [&]() {
@@ -1961,10 +2300,14 @@ void peer_av_sync_worker(
         );
         runtime->av_sync_target_latency_us -= catchup_step_us;
         if (!runtime->scheduled_audio_queue.empty()) {
-          next_audio_target_us = compute_dispatch_time(runtime->scheduled_audio_queue.front().local_arrival_us);
+          next_audio_target_us = compute_dispatch_time(
+            runtime->scheduled_audio_queue.front().remote_timestamp_us,
+            runtime->scheduled_audio_queue.front().local_arrival_us);
         }
         if (!runtime->scheduled_video_queue.empty()) {
-          next_video_target_us = compute_dispatch_time(runtime->scheduled_video_queue.front().local_arrival_us);
+          next_video_target_us = compute_dispatch_time(
+            runtime->scheduled_video_queue.front().remote_timestamp_us,
+            runtime->scheduled_video_queue.front().local_arrival_us);
         }
         choose_next_dispatch();
         wait_us = dispatch_target_local_us - now_us;
@@ -1990,11 +2333,12 @@ void peer_av_sync_worker(
       }
 
       if (wait_us > 2000) {
-        lock.unlock();
-        std::this_thread::sleep_for(std::chrono::microseconds(std::min<std::int64_t>(
-          wait_us,
-          static_cast<std::int64_t>(kPeerAvSyncMaxSleepChunkUs)
-        )));
+        runtime->reason = "peer-av-sync-waiting";
+        const auto wake_time = std::chrono::steady_clock::time_point(
+          std::chrono::microseconds(std::max<std::int64_t>(0, dispatch_target_local_us))
+        );
+        runtime->av_sync_cv.wait_until(lock, wake_time);
+        runtime->av_sync_last_scheduler_wake_at_unix_ms = current_time_millis();
         continue;
       }
 
@@ -2056,13 +2400,26 @@ void ensure_peer_av_sync_runtime(
   PeerState::PeerVideoReceiverRuntime& runtime,
   AgentRuntimeState::ViewerAudioPlaybackRuntime& audio_runtime) {
   std::lock_guard<std::mutex> lock(runtime.mutex);
-  if (runtime.av_sync_thread_started) {
+  if (runtime.closing || runtime.av_sync_thread_started) {
     return;
   }
   runtime.av_sync_stop_requested = false;
   runtime.av_sync_running = true;
   runtime.av_sync_thread_started = true;
   runtime.av_sync_thread = std::thread(peer_av_sync_worker, &runtime, &audio_runtime);
+}
+
+void begin_close_peer_video_receiver_runtime(PeerState::PeerVideoReceiverRuntime& runtime) {
+  std::lock_guard<std::mutex> lock(runtime.mutex);
+  runtime.closing = true;
+  runtime.av_sync_stop_requested = true;
+  runtime.pending_video_annexb_bytes.clear();
+  runtime.startup_video_decoder_config_au.clear();
+  runtime.scheduled_audio_queue.clear();
+  runtime.scheduled_video_queue.clear();
+  runtime.av_sync_anchor_initialized = false;
+  runtime.reason = "peer-closing";
+  runtime.av_sync_cv.notify_all();
 }
 
 void stop_peer_av_sync_runtime(PeerState::PeerVideoReceiverRuntime& runtime, bool clear_pending) {
@@ -2101,10 +2458,22 @@ void consume_remote_peer_audio_frame(
   if (!runtime_ptr) {
     return;
   }
+  bool local_playback_enabled = false;
+  {
+    std::lock_guard<std::mutex> lock(runtime_ptr->mutex);
+    if (runtime_ptr->closing) {
+      return;
+    }
+    local_playback_enabled = runtime_ptr->local_playback_enabled;
+  }
   std::string lowered_codec = codec;
   std::transform(lowered_codec.begin(), lowered_codec.end(), lowered_codec.begin(), [](unsigned char ch) {
     return static_cast<char>(std::tolower(ch));
   });
+  fanout_relay_audio_frame(peer_id, frame, lowered_codec, rtp_timestamp);
+  if (!local_playback_enabled) {
+    return;
+  }
   if (lowered_codec != "pcmu" && lowered_codec != "opus") {
     std::lock_guard<std::mutex> lock(audio_runtime.mutex);
     audio_runtime.last_error = "viewer-audio-unsupported-codec:" + codec;
@@ -2125,13 +2494,31 @@ void consume_remote_peer_audio_frame(
     return;
   }
 
+  bool passthrough_enabled = false;
+  {
+    std::lock_guard<std::mutex> lock(runtime_ptr->mutex);
+    if (runtime_ptr->closing) {
+      return;
+    }
+    if (runtime_ptr->startup_waiting_for_random_access) {
+      runtime_ptr->dropped_audio_blocks += 1;
+      runtime_ptr->reason = "peer-av-sync-audio-waiting-for-random-access";
+      return;
+    }
+    passthrough_enabled = runtime_ptr->passthrough_playback_enabled;
+    if (passthrough_enabled) {
+      runtime_ptr->dispatched_audio_blocks += 1;
+      runtime_ptr->reason = "peer-audio-passthrough-dispatched";
+      runtime_ptr->av_sync_last_audio_lateness_us = 0;
+    }
+  }
+  if (passthrough_enabled) {
+    queue_viewer_audio_pcm_block(audio_runtime, std::move(pcm));
+    return;
+  }
   ensure_peer_av_sync_runtime(*runtime_ptr, audio_runtime);
-  fanout_relay_audio_frame(peer_id, frame, lowered_codec, rtp_timestamp);
-
   std::lock_guard<std::mutex> lock(runtime_ptr->mutex);
-  if (runtime_ptr->startup_waiting_for_random_access) {
-    runtime_ptr->dropped_audio_blocks += 1;
-    runtime_ptr->reason = "peer-av-sync-audio-waiting-for-random-access";
+  if (runtime_ptr->closing) {
     return;
   }
   PeerState::PeerVideoReceiverRuntime::ScheduledAudioBlock block;
@@ -2682,6 +3069,8 @@ bool start_peer_video_sender(
   std::string* error);
 void refresh_peer_media_binding(PeerState& peer);
 bool stop_peer_video_sender(PeerState& peer, const std::string& reason, std::string* error);
+bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, std::string* error, bool force_restart = false);
+void perform_host_video_sender_soft_refresh(AgentRuntimeState& state);
 bool configure_host_audio_sender(AgentRuntimeState& state, PeerState& peer, std::string* error);
 void clear_host_audio_sender(PeerState& peer);
 void refresh_host_audio_senders(AgentRuntimeState& state);
@@ -3004,8 +3393,14 @@ void close_surface_attachment_handles(SurfaceAttachmentState& state) {
 }
 
 void close_peer_video_receiver_handles(PeerState::PeerVideoReceiverRuntime& runtime) {
+  begin_close_peer_video_receiver_runtime(runtime);
   stop_peer_av_sync_runtime(runtime, true);
   reset_peer_audio_decoder_runtime(runtime);
+  std::lock_guard<std::mutex> lock(runtime.mutex);
+  runtime.running = false;
+  runtime.decoder_ready = false;
+  runtime.surface_attached = false;
+  runtime.process_id = 0;
 }
 
 void refresh_peer_video_receiver_runtime(PeerState::PeerVideoReceiverRuntime& runtime) {
@@ -3027,6 +3422,7 @@ void refresh_peer_video_receiver_runtime(PeerState::PeerVideoReceiverRuntime& ru
   runtime.decoder_ready = snapshot.decoder_ready;
   runtime.process_id = snapshot.process_id;
   runtime.decoded_frames_rendered = snapshot.decoded_frames_rendered;
+  runtime.frame_interval_stddev_ms = snapshot.frame_interval_stddev_ms;
   runtime.last_decoded_frame_at_unix_ms = snapshot.last_decoded_frame_at_unix_ms;
   runtime.codec_path = snapshot.codec_path;
   runtime.preview_surface_backend = snapshot.preview_surface_backend;
@@ -3057,6 +3453,7 @@ bool start_peer_video_surface_attachment(
     codec_path = runtime.codec_path.empty() ? "h264" : runtime.codec_path;
     runtime.window_title = window_title;
     runtime.command_line.clear();
+    runtime.closing = false;
     runtime.pending_video_annexb_bytes.clear();
     runtime.startup_video_decoder_config_au.clear();
     runtime.startup_waiting_for_random_access = true;
@@ -3169,6 +3566,7 @@ void refresh_surface_attachment_state(SurfaceAttachmentState& state) {
     state.waiting_for_artifact = snapshot.waiting_for_artifact;
     state.decoder_ready = snapshot.decoder_ready;
     state.decoded_frames_rendered = snapshot.decoded_frames_rendered;
+    state.frame_interval_stddev_ms = snapshot.frame_interval_stddev_ms;
     state.last_decoded_frame_at_unix_ms = snapshot.last_decoded_frame_at_unix_ms;
     state.process_id = snapshot.process_id;
     state.preview_surface_backend = snapshot.preview_surface_backend;
@@ -3193,6 +3591,7 @@ void refresh_surface_attachment_state(SurfaceAttachmentState& state) {
     state.waiting_for_artifact = snapshot.waiting_for_artifact;
     state.decoder_ready = snapshot.decoder_ready;
     state.decoded_frames_rendered = snapshot.decoded_frames_rendered;
+    state.frame_interval_stddev_ms = 0.0;
     state.last_decoded_frame_at_unix_ms = snapshot.last_decoded_frame_at_unix_ms;
     state.process_id = snapshot.process_id;
     state.preview_surface_backend = snapshot.preview_surface_backend;
@@ -3249,6 +3648,7 @@ void sync_surface_attachment_from_peer_runtime(
   state.waiting_for_artifact = false;
   state.decoder_ready = runtime->decoder_ready;
   state.decoded_frames_rendered = runtime->decoded_frames_rendered;
+  state.frame_interval_stddev_ms = runtime->frame_interval_stddev_ms;
   state.last_decoded_frame_at_unix_ms = runtime->last_decoded_frame_at_unix_ms;
   state.process_id = runtime->process_id;
   state.last_exit_code = runtime->last_exit_code;
@@ -3282,6 +3682,7 @@ SurfaceAttachmentState start_surface_attachment(
   state.decoder_backend = "none";
   state.decoder_ready = false;
   state.decoded_frames_rendered = 0;
+  state.frame_interval_stddev_ms = 0.0;
   state.last_decoded_frame_at_unix_ms = -1;
   state.codec_path = host_capture_artifact.video_codec.empty() ? "h264" : to_lower_copy(host_capture_artifact.video_codec);
   state.implementation = host_capture_plan.capture_backend == "wgc"
@@ -3310,6 +3711,7 @@ SurfaceAttachmentState start_surface_attachment(
     config.target_kind = host_capture_plan.capture_kind == "display" ? "display" : "window";
     config.display_id = host_capture_plan.capture_display_id.empty() ? "0" : host_capture_plan.capture_display_id;
     config.window_handle = host_capture_plan.capture_handle;
+    config.capture_state = host_capture_plan.capture_state;
     config.layout = state.surface_layout;
 
     std::string preview_error;
@@ -4285,6 +4687,7 @@ std::string viewer_audio_playback_json(AgentRuntimeState::ViewerAudioPlaybackRun
     << ",\"ready\":" << (runtime.ready ? "true" : "false")
     << ",\"threadStarted\":" << (runtime.thread_started ? "true" : "false")
     << ",\"playbackPrimed\":" << (runtime.playback_primed ? "true" : "false")
+    << ",\"passthroughMode\":" << (runtime.passthrough_mode ? "true" : "false")
     << ",\"queueDepth\":" << runtime.pcm_queue.size()
     << ",\"audioPacketsReceived\":" << runtime.audio_packets_received
     << ",\"audioBytesReceived\":" << runtime.audio_bytes_received
@@ -4293,6 +4696,7 @@ std::string viewer_audio_playback_json(AgentRuntimeState::ViewerAudioPlaybackRun
     << ",\"bufferedPcmFrames\":" << runtime.buffered_pcm_frames
     << ",\"targetBufferFrames\":" << runtime.target_buffer_frames
     << ",\"targetBufferMs\":" << ((runtime.target_buffer_frames * 1000u) / kViewerAudioSampleRate)
+    << ",\"audioDelayMs\":" << runtime.passthrough_audio_delay_ms
     << ",\"softwareVolume\":" << runtime.software_volume
     << ",\"implementation\":\"" << json_escape(runtime.implementation) << "\""
     << ",\"reason\":\"" << json_escape(runtime.reason) << "\""
@@ -4578,6 +4982,197 @@ bool is_h265_video_encoder(const std::string& encoder) {
 int normalize_host_output_dimension(int value, int fallback) {
   return value > 0 ? value : fallback;
 }
+
+#ifdef _WIN32
+struct DisplayDimensionLookupContext {
+  int target_index = 0;
+  int current_index = 0;
+  RECT bounds {};
+  std::wstring device_name;
+  bool found = false;
+};
+
+BOOL CALLBACK enum_display_dimension_proc(HMONITOR monitor, HDC, LPRECT, LPARAM context_value) {
+  auto* context = reinterpret_cast<DisplayDimensionLookupContext*>(context_value);
+  if (!context || context->found) {
+    return TRUE;
+  }
+
+  if (context->current_index == context->target_index) {
+    MONITORINFOEXW monitor_info {};
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (GetMonitorInfoW(monitor, &monitor_info)) {
+      context->bounds = monitor_info.rcMonitor;
+      context->device_name = monitor_info.szDevice;
+      context->found = true;
+    }
+    return FALSE;
+  }
+
+  context->current_index += 1;
+  return TRUE;
+}
+
+bool resolve_wgc_display_dimensions(const std::string& display_id, int* width, int* height, std::string* error) {
+  if (!width || !height) {
+    if (error) {
+      *error = "wgc-display-dimension-output-missing";
+    }
+    return false;
+  }
+
+  char* parse_end = nullptr;
+  const unsigned long monitor_index = std::strtoul(display_id.c_str(), &parse_end, 10);
+  if (!parse_end || *parse_end != '\0') {
+    if (error) {
+      *error = "wgc-display-id-must-be-a-numeric-monitor-index";
+    }
+    return false;
+  }
+
+  DisplayDimensionLookupContext context;
+  context.target_index = static_cast<int>(monitor_index);
+  EnumDisplayMonitors(nullptr, nullptr, &enum_display_dimension_proc, reinterpret_cast<LPARAM>(&context));
+  if (!context.found) {
+    if (error) {
+      *error = "wgc-display-monitor-not-found";
+    }
+    return false;
+  }
+
+  DEVMODEW display_mode {};
+  display_mode.dmSize = sizeof(display_mode);
+  if (!context.device_name.empty() &&
+      EnumDisplaySettingsW(context.device_name.c_str(), ENUM_CURRENT_SETTINGS, &display_mode) &&
+      display_mode.dmPelsWidth > 0 &&
+      display_mode.dmPelsHeight > 0) {
+    *width = static_cast<int>(display_mode.dmPelsWidth);
+    *height = static_cast<int>(display_mode.dmPelsHeight);
+  } else {
+    *width = std::max(0, static_cast<int>(context.bounds.right - context.bounds.left));
+    *height = std::max(0, static_cast<int>(context.bounds.bottom - context.bounds.top));
+  }
+
+  if (*width <= 0 || *height <= 0) {
+    if (error) {
+      *error = "wgc-display-monitor-bounds-empty";
+    }
+    return false;
+  }
+
+  return true;
+}
+
+UINT get_window_dpi_or_default(HWND hwnd) {
+  using GetDpiForWindowFn = UINT (WINAPI*)(HWND);
+  static const auto get_dpi_for_window = reinterpret_cast<GetDpiForWindowFn>(
+    GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow")
+  );
+  if (!get_dpi_for_window || !hwnd) {
+    return 96;
+  }
+
+  const UINT dpi = get_dpi_for_window(hwnd);
+  return dpi == 0 ? 96 : dpi;
+}
+
+bool get_window_capture_rect(HWND hwnd, RECT* rect) {
+  if (!hwnd || !rect || !IsWindow(hwnd)) {
+    return false;
+  }
+
+  if (IsIconic(hwnd)) {
+    WINDOWPLACEMENT placement {};
+    placement.length = sizeof(placement);
+    if (GetWindowPlacement(hwnd, &placement)) {
+      const RECT normal_rect = placement.rcNormalPosition;
+      if (normal_rect.right > normal_rect.left &&
+          normal_rect.bottom > normal_rect.top) {
+        *rect = normal_rect;
+        return true;
+      }
+    }
+  }
+
+  using DwmGetWindowAttributeFn = HRESULT (WINAPI*)(HWND, DWORD, PVOID, DWORD);
+  static const auto dwm_get_window_attribute = reinterpret_cast<DwmGetWindowAttributeFn>(
+    []() -> FARPROC {
+      HMODULE module = LoadLibraryW(L"dwmapi.dll");
+      return module ? GetProcAddress(module, "DwmGetWindowAttribute") : nullptr;
+    }()
+  );
+
+  constexpr DWORD kDwmwaExtendedFrameBounds = 9;
+  if (dwm_get_window_attribute) {
+    RECT extended_rect {};
+    if (SUCCEEDED(dwm_get_window_attribute(
+          hwnd,
+          kDwmwaExtendedFrameBounds,
+          &extended_rect,
+          static_cast<DWORD>(sizeof(extended_rect)))) &&
+        extended_rect.right > extended_rect.left &&
+        extended_rect.bottom > extended_rect.top) {
+      *rect = extended_rect;
+      return true;
+    }
+  }
+
+  RECT window_rect {};
+  if (GetWindowRect(hwnd, &window_rect) &&
+      window_rect.right > window_rect.left &&
+      window_rect.bottom > window_rect.top) {
+    *rect = window_rect;
+    return true;
+  }
+
+  return false;
+}
+
+bool resolve_wgc_window_dimensions(const std::string& capture_handle, int* width, int* height, std::string* error) {
+  if (!width || !height) {
+    if (error) {
+      *error = "wgc-window-dimension-output-missing";
+    }
+    return false;
+  }
+
+  char* parse_end = nullptr;
+  const unsigned long long hwnd_value = std::strtoull(capture_handle.c_str(), &parse_end, 10);
+  if (!parse_end || *parse_end != '\0' || hwnd_value == 0) {
+    if (error) {
+      *error = "wgc-window-handle-invalid";
+    }
+    return false;
+  }
+
+  HWND hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(hwnd_value));
+  if (!IsWindow(hwnd)) {
+    if (error) {
+      *error = "wgc-window-handle-not-found";
+    }
+    return false;
+  }
+
+  RECT capture_rect {};
+  if (!get_window_capture_rect(hwnd, &capture_rect)) {
+    if (error) {
+      *error = format_windows_error(GetLastError());
+    }
+    return false;
+  }
+
+  *width = std::max(0, static_cast<int>(capture_rect.right - capture_rect.left));
+  *height = std::max(0, static_cast<int>(capture_rect.bottom - capture_rect.top));
+  if (*width <= 0 || *height <= 0) {
+    if (error) {
+      *error = "wgc-window-capture-rect-empty";
+    }
+    return false;
+  }
+
+  return true;
+}
+#endif
 
 std::string infer_video_encoder_backend(const std::string& encoder) {
   const std::string lowered = to_lower_copy(trim_copy(encoder));
@@ -5112,44 +5707,58 @@ HostCapturePlan validate_host_capture_plan(const FfmpegProbeResult& ffmpeg, Host
   }
 
   if (plan.capture_backend == "wgc") {
-    const WgcFrameSourceConfig config = build_wgc_frame_source_config(plan);
-    std::string create_error;
-    std::shared_ptr<WgcFrameSource> source = create_wgc_frame_source(config, &create_error);
-    if (!source) {
+    emit_breadcrumb(
+      "validateHostCapturePlan:wgc:before-resolve-dimensions target=" + plan.input_target +
+      " codec=" + plan.codec_path +
+      " size=" + std::to_string(plan.width) + "x" + std::to_string(plan.height) +
+      " fps=" + std::to_string(plan.frame_rate));
+#ifdef _WIN32
+    const bool is_display_like =
+      plan.capture_kind == "display" ||
+      plan.capture_state == "display" ||
+      plan.input_target.rfind("wgc-display:", 0) == 0;
+    int resolved_width = 0;
+    int resolved_height = 0;
+    std::string resolve_error;
+    const bool resolved = is_display_like
+      ? resolve_wgc_display_dimensions(
+          plan.capture_display_id.empty() ? "0" : plan.capture_display_id,
+          &resolved_width,
+          &resolved_height,
+          &resolve_error)
+      : resolve_wgc_window_dimensions(plan.capture_handle, &resolved_width, &resolved_height, &resolve_error);
+    if (!resolved) {
       plan.validated = false;
-      plan.validation_reason = "wgc-capture-self-test-failed";
-      plan.last_error = create_error.empty() ? "Failed to create the WGC display frame source." : create_error;
+      plan.validation_reason = "wgc-capture-dimensions-unavailable";
+      plan.last_error = resolve_error.empty()
+        ? "WGC capture validation could not resolve input dimensions."
+        : resolve_error;
+      emit_breadcrumb(
+        "validateHostCapturePlan:wgc:resolve-dimensions-failed reason=" +
+        plan.validation_reason + " error=" + plan.last_error);
       return plan;
     }
 
-    WgcFrameCpuBuffer frame;
-    std::string frame_error;
-    if (!source->wait_for_frame_bgra(1500, &frame, &frame_error)) {
-      source->close();
-      plan.validated = false;
-      plan.validation_reason = "wgc-capture-self-test-failed";
-      plan.last_error = frame_error.empty() ? "WGC capture self-test failed to acquire a frame from the selected display." : frame_error;
-      return plan;
-    }
-
-    source->close();
-    plan.input_width = frame.width;
-    plan.input_height = frame.height;
-    plan.validated = frame.width > 0 && frame.height > 0;
-    plan.validation_reason = plan.validated
-      ? "wgc-capture-self-test-passed"
-      : "wgc-capture-self-test-returned-empty-frame";
-    if (!plan.validated) {
-      plan.last_error = "WGC capture self-test returned an empty frame.";
-      return plan;
-    }
+    plan.input_width = resolved_width;
+    plan.input_height = resolved_height;
+    plan.validated = true;
+    plan.validation_reason = "wgc-capture-dimensions-resolved";
     plan.command_preview =
-      (config.target_kind == "window"
-        ? "wgc-window:" + config.window_handle
-        : "wgc-display:" + config.display_id) +
+      (is_display_like
+        ? "wgc-display:" + (plan.capture_display_id.empty() ? "0" : plan.capture_display_id)
+        : "wgc-window:" + plan.capture_handle) +
       " -> ffmpeg-stdin";
     plan.last_error.clear();
+    emit_breadcrumb(
+      "validateHostCapturePlan:wgc:after-resolve-dimensions size=" +
+      std::to_string(plan.input_width) + "x" + std::to_string(plan.input_height));
     return plan;
+#else
+    plan.validated = false;
+    plan.validation_reason = "wgc-capture-validation-unsupported";
+    plan.last_error = "WGC capture validation requires Windows.";
+    return plan;
+#endif
   }
 
   plan.validated = false;
@@ -5271,6 +5880,35 @@ HostCaptureProcessState start_host_capture_process(
 }
 
 void refresh_host_capture_runtime(AgentRuntimeState& state) {
+#ifdef _WIN32
+  if (state.host_session_running &&
+      state.host_window_restore_placeholder_active &&
+      state.host_capture_plan.capture_backend == "wgc" &&
+      to_lower_copy(state.host_capture_plan.capture_kind) == "window" &&
+      !state.host_capture_plan.capture_handle.empty()) {
+    const WindowCaptureAvailability availability =
+      query_window_capture_availability(state.host_capture_plan.capture_handle);
+    if (availability == WindowCaptureAvailability::minimized) {
+      state.host_capture_state = "minimized";
+      state.host_capture_plan.capture_state = "minimized";
+      state.host_capture_plan.reason = "minimized-window-wgc-capture-planned";
+      state.host_capture_plan.last_error.clear();
+    } else if (availability == WindowCaptureAvailability::normal) {
+      state.host_capture_state = "normal";
+      state.host_capture_plan.capture_state = "normal";
+      state.host_window_restore_placeholder_active = false;
+      if (state.host_capture_plan.reason == "minimized-window-wgc-capture-planned" ||
+          state.host_capture_plan.reason == "window-capture-target-unavailable") {
+        state.host_capture_plan.reason = "window-wgc-capture-planned";
+      }
+      state.host_capture_plan.last_error.clear();
+      state.host_capture_plan = validate_host_capture_plan(state.ffmpeg, state.host_capture_plan);
+    } else {
+      state.host_capture_plan.reason = "window-capture-target-unavailable";
+      state.host_capture_plan.last_error = "Selected window is no longer available.";
+    }
+  }
+#endif
   refresh_host_capture_process_state(state.host_capture_process);
   state.host_capture_artifact = probe_host_capture_artifact(
     state.ffmpeg,
@@ -5318,6 +5956,54 @@ void refresh_host_capture_runtime(AgentRuntimeState& state) {
       state.host_capture_artifact,
       surface
     );
+  }
+}
+
+void perform_host_video_sender_soft_refresh(AgentRuntimeState& state) {
+  if (!state.host_session_running) {
+    return;
+  }
+
+  bool attempted = false;
+  bool all_succeeded = true;
+  for (auto& entry : state.peers) {
+    PeerState& peer = entry.second;
+    if (peer.role != "host-downstream" || !peer.transport_session) {
+      continue;
+    }
+    if (!peer.media_binding.runtime || !peer.media_binding.runtime->soft_refresh_requested.load()) {
+      continue;
+    }
+
+    attempted = true;
+    state.host_capture_plan = validate_host_capture_plan(state.ffmpeg, state.host_capture_plan);
+    if (!state.host_capture_plan.ready || !state.host_capture_plan.validated) {
+      all_succeeded = false;
+      peer.media_binding.reason = "peer-media-soft-refresh-waiting-for-valid-plan";
+      peer.media_binding.last_error = state.host_capture_plan.last_error;
+      peer.media_binding.updated_at_unix_ms = current_time_millis();
+      continue;
+    }
+    std::string refresh_error;
+    if (!attach_host_video_media_binding(state, peer, &refresh_error, true)) {
+      peer.media_binding.attached = false;
+      peer.media_binding.sender_configured = false;
+      peer.media_binding.active = false;
+      peer.media_binding.reason = "peer-media-soft-refresh-failed";
+      peer.media_binding.last_error = refresh_error;
+      peer.media_binding.updated_at_unix_ms = current_time_millis();
+      all_succeeded = false;
+      emit_breadcrumb(
+        std::string("hostVideoSenderRefresh:failed peer=") + peer.peer_id +
+        " error=" + refresh_error);
+    } else {
+      emit_breadcrumb(std::string("hostVideoSenderRefresh:done peer=") + peer.peer_id);
+    }
+  }
+
+  if (!attempted || all_succeeded) {
+    state.host_video_sender_refresh_requested = false;
+    state.host_video_sender_refresh_reason.clear();
   }
 }
 
@@ -5384,7 +6070,12 @@ void refresh_peer_transport_runtime(AgentRuntimeState& state) {
   }
 }
 
-bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, std::string* error) {
+bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, std::string* error, bool force_restart) {
+  emit_breadcrumb(
+    std::string("attachHostVideoMediaBinding:start peer=") + peer.peer_id +
+    " codec=" + normalize_video_codec(state.host_codec) +
+    " forceRestart=" + (force_restart ? "true" : "false") +
+    " sessionRunning=" + (state.host_session_running ? "true" : "false"));
   if (!peer.transport_session) {
     if (error) {
       *error = "peer-transport-session-missing";
@@ -5413,10 +6104,8 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
   config.frame_rate = state.host_frame_rate;
   config.bitrate_kbps = state.host_bitrate_kbps;
 
-  const bool already_attached =
+  const bool config_matches_current =
     peer.media_binding.attached &&
-    peer.media_binding.runtime &&
-    peer.transport.video_track_configured &&
     peer.media_binding.kind == "video" &&
     peer.media_binding.source == config.source &&
     peer.media_binding.codec == config.codec &&
@@ -5424,6 +6113,13 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
     peer.media_binding.height == config.height &&
     peer.media_binding.frame_rate == config.frame_rate &&
     peer.media_binding.bitrate_kbps == config.bitrate_kbps;
+
+  const bool already_attached =
+    !force_restart &&
+    peer.media_binding.attached &&
+    peer.media_binding.runtime &&
+    peer.transport.video_track_configured &&
+    config_matches_current;
 
   if (already_attached) {
     peer.transport = get_peer_transport_snapshot(peer.transport_session);
@@ -5441,6 +6137,11 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
     return true;
   }
 
+  const bool restart_sender_only =
+    force_restart &&
+    config_matches_current &&
+    peer.transport.video_track_configured;
+
   if (peer.media_binding.runtime) {
     std::string stop_error;
     if (!stop_peer_video_sender(peer, "peer-media-reconfigure", &stop_error)) {
@@ -5452,11 +6153,16 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
   }
 
   std::string attach_error;
-  if (!configure_peer_transport_video_sender(peer.transport_session, config, &attach_error)) {
-    if (error) {
-      *error = attach_error;
+  if (!restart_sender_only) {
+    if (!configure_peer_transport_video_sender(peer.transport_session, config, &attach_error)) {
+      if (error) {
+        *error = attach_error;
+      }
+      return false;
     }
-    return false;
+    emit_breadcrumb(std::string("attachHostVideoMediaBinding:after-configure-transport peer=") + peer.peer_id);
+  } else {
+    emit_breadcrumb(std::string("attachHostVideoMediaBinding:restarting-sender-only peer=") + peer.peer_id);
   }
 
   peer.transport = get_peer_transport_snapshot(peer.transport_session);
@@ -5491,12 +6197,16 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
     }
     return false;
   }
+  emit_breadcrumb(std::string("attachHostVideoMediaBinding:after-start-sender peer=") + peer.peer_id);
 
-  if (state.audio_session.capture_active && state.audio_session.ready) {
+  if ((!force_restart || !peer.transport.audio_track_configured) &&
+      state.audio_session.capture_active &&
+      state.audio_session.ready) {
     configure_host_audio_sender(state, peer, nullptr);
   }
 
   peer.media_binding.reason = "peer-media-attached";
+  emit_breadcrumb(std::string("attachHostVideoMediaBinding:done peer=") + peer.peer_id);
   return true;
 }
 
@@ -5595,19 +6305,51 @@ bool attach_relay_video_media_binding(
   video_config.stream_id = "vds-relay-stream";
   video_config.track_id = peer.peer_id + "-video";
   video_config.source = source;
-  video_config.width = 1920;
-  video_config.height = 1080;
-  video_config.frame_rate = 30;
-  video_config.bitrate_kbps = 10000;
+  video_config.width = upstream_peer.media_binding.width > 0 ? upstream_peer.media_binding.width : 1920;
+  video_config.height = upstream_peer.media_binding.height > 0 ? upstream_peer.media_binding.height : 1080;
+  video_config.frame_rate = upstream_peer.media_binding.frame_rate > 0 ? upstream_peer.media_binding.frame_rate : 60;
+  video_config.bitrate_kbps =
+    upstream_peer.media_binding.bitrate_kbps > 0 ? upstream_peer.media_binding.bitrate_kbps : 10000;
+
+  const std::string upstream_audio_codec = to_lower_copy(upstream_peer.transport.audio_codec);
+  const bool audio_enabled =
+    upstream_peer.transport.audio_receiver_configured &&
+    (upstream_audio_codec == "opus" || upstream_audio_codec == "pcmu");
+
+  const bool already_attached =
+    peer.media_binding.attached &&
+    peer.transport.video_track_configured &&
+    peer.media_binding.kind == "video" &&
+    peer.media_binding.source == source &&
+    peer.media_binding.codec == video_config.codec &&
+    peer.media_binding.width == video_config.width &&
+    peer.media_binding.height == video_config.height &&
+    peer.media_binding.frame_rate == video_config.frame_rate &&
+    peer.media_binding.bitrate_kbps == video_config.bitrate_kbps &&
+    peer.transport.audio_track_configured == audio_enabled;
+
+  if (already_attached) {
+    register_relay_subscriber(upstream_peer_id, peer.peer_id, peer.transport_session, audio_enabled);
+    peer.transport = get_peer_transport_snapshot(peer.transport_session);
+    peer.media_binding.sender_configured = peer.transport.video_track_configured;
+    peer.media_binding.active = peer.transport.video_track_open;
+    peer.media_binding.video_encoder_backend = "relay-copy";
+    peer.media_binding.implementation = "peer-transport-relay-track";
+    peer.media_binding.reason = peer.transport.video_track_open
+      ? "relay-media-attached"
+      : "relay-video-sender-waiting-for-video-track-open";
+    peer.media_binding.updated_at_unix_ms = current_time_millis();
+    if (error) {
+      error->clear();
+    }
+    return true;
+  }
 
   if (!configure_peer_transport_video_sender(peer.transport_session, video_config, error)) {
     return false;
   }
 
-  bool audio_enabled = false;
-  const std::string upstream_audio_codec = to_lower_copy(upstream_peer.transport.audio_codec);
-  if (upstream_peer.transport.audio_receiver_configured &&
-      (upstream_audio_codec == "opus" || upstream_audio_codec == "pcmu")) {
+  if (audio_enabled) {
     PeerAudioTrackConfig audio_config;
     audio_config.enabled = true;
     audio_config.codec = upstream_audio_codec;
@@ -5623,7 +6365,6 @@ bool attach_relay_video_media_binding(
       clear_peer_transport_video_sender(peer.transport_session, nullptr);
       return false;
     }
-    audio_enabled = true;
   } else {
     clear_peer_transport_audio_sender(peer.transport_session, nullptr);
   }
@@ -5730,6 +6471,40 @@ bool detach_peer_media_binding(PeerState& peer, std::string* error) {
   peer.media_binding.process_id = 0;
   peer.media_binding.updated_at_unix_ms = current_time_millis();
   peer.media_binding.detached_at_unix_ms = peer.media_binding.updated_at_unix_ms;
+  return true;
+}
+
+bool prepare_peer_media_binding_for_transport_close(PeerState& peer, std::string* error) {
+  emit_breadcrumb(
+    std::string("preparePeerMediaBinding:start peer=") +
+    peer.peer_id +
+    " role=" + peer.role +
+    " attached=" + (peer.media_binding.attached ? "true" : "false")
+  );
+  unregister_relay_subscriber(peer.peer_id);
+  unregister_host_audio_transport_session(peer.transport_session);
+
+  std::string stop_error;
+  if (!stop_peer_video_sender(peer, "peer-closing", &stop_error)) {
+    if (error) {
+      *error = stop_error;
+    }
+    return false;
+  }
+
+  peer.media_binding.attached = false;
+  peer.media_binding.sender_configured = false;
+  peer.media_binding.active = false;
+  peer.media_binding.reason = "peer-closing";
+  peer.media_binding.last_error.clear();
+  peer.media_binding.command_line.clear();
+  peer.media_binding.process_id = 0;
+  peer.media_binding.updated_at_unix_ms = current_time_millis();
+  peer.media_binding.detached_at_unix_ms = peer.media_binding.updated_at_unix_ms;
+  emit_breadcrumb(std::string("preparePeerMediaBinding:done peer=") + peer.peer_id);
+  if (error) {
+    error->clear();
+  }
   return true;
 }
 
@@ -6186,6 +6961,10 @@ bool start_peer_video_sender(
   const HostCapturePlan& plan,
   PeerState& peer,
   std::string* error) {
+  emit_breadcrumb(
+    std::string("startPeerVideoSender:start peer=") + peer.peer_id +
+    " codec=" + normalize_video_codec(plan.codec_path, normalize_video_codec(pipeline.requested_video_codec)) +
+    " backend=" + plan.capture_backend);
   if (!peer.transport_session) {
     if (error) {
       *error = "peer-transport-session-missing";
@@ -6200,6 +6979,7 @@ bool start_peer_video_sender(
     }
     return false;
   }
+  emit_breadcrumb(std::string("startPeerVideoSender:after-build-command peer=") + peer.peer_id);
 
   auto runtime = std::make_shared<PeerState::PeerVideoSenderRuntime>();
   runtime->launch_attempted = true;
@@ -6211,17 +6991,15 @@ bool start_peer_video_sender(
   runtime->next_frame_timestamp_us = 0;
   runtime->source_backend = plan.capture_backend;
 
-  std::shared_ptr<WgcFrameSource> wgc_source;
-  if (plan.capture_backend == "wgc") {
-    std::string source_error;
-    wgc_source = create_wgc_frame_source(build_wgc_frame_source_config(plan), &source_error);
-    if (!wgc_source) {
-      if (error) {
-        *error = source_error.empty() ? "failed to create wgc frame source for peer video sender" : source_error;
-      }
-      return false;
-    }
-  }
+  const bool use_wgc_source = plan.capture_backend == "wgc";
+  const WgcFrameSourceConfig wgc_source_config = build_wgc_frame_source_config(plan);
+  const bool use_window_restore_placeholder =
+    use_wgc_source &&
+    wgc_source_config.target_kind == "window" &&
+    plan.capture_state == "minimized" &&
+    !wgc_source_config.window_handle.empty();
+  const int source_frame_width = std::max(1, plan.input_width);
+  const int source_frame_height = std::max(1, plan.input_height);
 
   SECURITY_ATTRIBUTES security_attributes{};
   security_attributes.nLength = sizeof(security_attributes);
@@ -6231,12 +7009,11 @@ bool start_peer_video_sender(
   HANDLE stdin_write = nullptr;
   HANDLE stdout_read = nullptr;
   HANDLE stdout_write = nullptr;
-  if (wgc_source) {
+  if (use_wgc_source) {
     if (!CreatePipe(&stdin_read, &stdin_write, &security_attributes, 0)) {
       if (error) {
         *error = format_windows_error(GetLastError());
       }
-      wgc_source->close();
       return false;
     }
     SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0);
@@ -6251,9 +7028,6 @@ bool start_peer_video_sender(
     }
     if (error) {
       *error = format_windows_error(GetLastError());
-    }
-    if (wgc_source) {
-      wgc_source->close();
     }
     return false;
   }
@@ -6281,9 +7055,6 @@ bool start_peer_video_sender(
     if (error) {
       *error = format_windows_error(GetLastError());
     }
-    if (wgc_source) {
-      wgc_source->close();
-    }
     return false;
   }
 
@@ -6308,9 +7079,6 @@ bool start_peer_video_sender(
     CloseHandle(stdout_write);
     if (error) {
       *error = "failed to convert peer video sender command line to UTF-16";
-    }
-    if (wgc_source) {
-      wgc_source->close();
     }
     return false;
   }
@@ -6345,9 +7113,6 @@ bool start_peer_video_sender(
     if (error) {
       *error = format_windows_error(GetLastError());
     }
-    if (wgc_source) {
-      wgc_source->close();
-    }
     return false;
   }
 
@@ -6360,31 +7125,251 @@ bool start_peer_video_sender(
   runtime->started_at_unix_ms = current_time_millis();
   runtime->updated_at_unix_ms = runtime->started_at_unix_ms;
   runtime->reason = "peer-video-sender-running";
+  emit_breadcrumb(
+    std::string("startPeerVideoSender:after-create-process peer=") + peer.peer_id +
+    " pid=" + std::to_string(runtime->process_id));
 
-  if (wgc_source && runtime->stdin_write_handle) {
-    runtime->source_thread = std::thread([runtime, wgc_source]() {
+  if (use_wgc_source && runtime->stdin_write_handle) {
+    struct SourceStartState {
+      std::mutex mutex;
+      std::condition_variable condition;
+      bool complete = false;
+      bool success = false;
+      std::string error;
+    };
+
+    auto source_start_state = std::make_shared<SourceStartState>();
+    HANDLE stdin_write_handle = runtime->stdin_write_handle;
+    const std::string source_peer_id = peer.peer_id;
+    runtime->source_thread = std::thread([
+      runtime,
+      wgc_source_config,
+      source_start_state,
+      stdin_write_handle,
+      source_peer_id,
+      use_window_restore_placeholder,
+      source_frame_width,
+      source_frame_height
+    ]() {
+      emit_breadcrumb(std::string("startPeerVideoSender:source-thread-begin peer=") + source_peer_id);
+
+      auto finish_start = [&](bool success, const std::string& error_message) {
+        std::lock_guard<std::mutex> lock(source_start_state->mutex);
+        if (source_start_state->complete) {
+          return;
+        }
+        source_start_state->complete = true;
+        source_start_state->success = success;
+        source_start_state->error = error_message;
+        source_start_state->condition.notify_all();
+      };
+
+      const auto update_runtime_state = [&](const std::string& reason, const std::string& last_error, bool running) {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        runtime->reason = reason;
+        runtime->last_error = last_error;
+        runtime->running = running;
+        runtime->updated_at_unix_ms = current_time_millis();
+      };
+
+      const auto write_bgra_frame = [&](const std::vector<std::uint8_t>& bytes) -> bool {
+        std::size_t total_written = 0;
+        while (total_written < bytes.size() && !runtime->stop_requested.load()) {
+          DWORD chunk_written = 0;
+          const DWORD chunk_size = static_cast<DWORD>(std::min<std::size_t>(bytes.size() - total_written, 1u << 20));
+          const BOOL wrote = WriteFile(
+            stdin_write_handle,
+            bytes.data() + total_written,
+            chunk_size,
+            &chunk_written,
+            nullptr
+          );
+          if (!wrote || chunk_written == 0) {
+            update_runtime_state("peer-video-source-write-failed", format_windows_error(GetLastError()), false);
+            return false;
+          }
+          total_written += static_cast<std::size_t>(chunk_written);
+        }
+        return !runtime->stop_requested.load();
+      };
+
+      const auto wait_for_next_placeholder_deadline = [&](std::int64_t* deadline_us) -> bool {
+        const std::int64_t now_us = current_time_micros_steady();
+        if (*deadline_us <= 0) {
+          *deadline_us = now_us;
+        }
+        const bool slept = sleep_until_steady_us(*deadline_us, &runtime->stop_requested);
+        *deadline_us += static_cast<std::int64_t>(runtime->frame_interval_us);
+        return slept;
+      };
+
+      const auto try_create_wgc_source = [&]() -> std::shared_ptr<WgcFrameSource> {
+        std::string source_error;
+        emit_breadcrumb(std::string("startPeerVideoSender:source-before-create peer=") + source_peer_id);
+        std::shared_ptr<WgcFrameSource> created = create_wgc_frame_source(wgc_source_config, &source_error);
+        emit_breadcrumb(
+          std::string("startPeerVideoSender:source-after-create peer=") + source_peer_id +
+          " ok=" + (created ? "true" : "false"));
+        if (!created) {
+          update_runtime_state(
+            "peer-video-source-start-failed",
+            source_error.empty() ? "failed to create wgc frame source for peer video sender" : source_error,
+            false
+          );
+        }
+        return created;
+      };
+
+      std::shared_ptr<WgcFrameSource> wgc_source;
+      bool placeholder_mode_active = use_window_restore_placeholder;
+      bool refresh_pending = false;
+      std::int64_t next_placeholder_deadline_us = -1;
+      const int placeholder_width = std::max(1, source_frame_width);
+      const int placeholder_height = std::max(1, source_frame_height);
+      std::vector<std::uint8_t> placeholder_frame;
+      const auto ensure_placeholder_frame = [&]() -> const std::vector<std::uint8_t>& {
+        if (placeholder_frame.empty()) {
+          placeholder_frame = build_window_restore_placeholder_frame_bgra(
+            placeholder_width,
+            placeholder_height
+          );
+        }
+        return placeholder_frame;
+      };
       const std::uint64_t min_frame_interval_100ns =
         std::max<std::uint64_t>(1, runtime->frame_interval_us) * 10;
       std::uint64_t next_source_timestamp_100ns = 0;
       auto next_source_time = std::chrono::steady_clock::time_point {};
       const auto source_frame_interval = std::chrono::microseconds(runtime->frame_interval_us);
 
+      if (use_window_restore_placeholder) {
+#ifdef _WIN32
+        const WindowCaptureAvailability availability =
+          query_window_capture_availability(wgc_source_config.window_handle);
+        if (availability == WindowCaptureAvailability::minimized) {
+          finish_start(true, "");
+          update_runtime_state("peer-video-sender-waiting-for-window-restore", "", true);
+        } else if (availability == WindowCaptureAvailability::unavailable) {
+          const std::string missing_target_error = "Selected window is no longer available for capture.";
+          finish_start(false, missing_target_error);
+          update_runtime_state("peer-video-source-target-unavailable", missing_target_error, false);
+          return;
+        }
+#endif
+      }
+
+      if (!source_start_state->complete) {
+        wgc_source = try_create_wgc_source();
+        if (!wgc_source) {
+          finish_start(false, runtime->last_error.empty()
+            ? "failed to create wgc frame source for peer video sender"
+            : runtime->last_error);
+          return;
+        }
+        finish_start(true, "");
+      }
+
       while (!runtime->stop_requested.load()) {
+        if (refresh_pending) {
+          sleep_until_steady_us(
+            current_time_micros_steady() + 100000,
+            &runtime->stop_requested
+          );
+          continue;
+        }
+        if (placeholder_mode_active) {
+#ifdef _WIN32
+          const WindowCaptureAvailability availability =
+            query_window_capture_availability(wgc_source_config.window_handle);
+          if (availability == WindowCaptureAvailability::unavailable) {
+            update_runtime_state(
+              "peer-video-source-target-unavailable",
+              "Selected window is no longer available for capture.",
+              false
+            );
+            break;
+          }
+          if (availability == WindowCaptureAvailability::minimized) {
+            if (wgc_source) {
+              wgc_source->close();
+              wgc_source.reset();
+            }
+            update_runtime_state("peer-video-sender-waiting-for-window-restore", "", true);
+            if (!wait_for_next_placeholder_deadline(&next_placeholder_deadline_us)) {
+              break;
+            }
+            const auto& current_placeholder_frame = ensure_placeholder_frame();
+            if (!current_placeholder_frame.empty()) {
+              {
+                std::lock_guard<std::mutex> lock(runtime->mutex);
+                runtime->source_frames_captured += 1;
+                runtime->source_bytes_captured += static_cast<unsigned long long>(current_placeholder_frame.size());
+                runtime->updated_at_unix_ms = current_time_millis();
+              }
+              if (!write_bgra_frame(current_placeholder_frame)) {
+                break;
+              }
+            }
+            continue;
+          }
+          if (availability == WindowCaptureAvailability::normal) {
+            runtime->soft_refresh_requested.store(true);
+            update_runtime_state("peer-video-sender-refresh-pending", "", false);
+            refresh_pending = true;
+            continue;
+          }
+#endif
+        }
+
+        if (!wgc_source) {
+          wgc_source = try_create_wgc_source();
+          if (!wgc_source) {
+            if (placeholder_mode_active) {
+              sleep_until_steady_us(
+                current_time_micros_steady() + 250000,
+                &runtime->stop_requested
+              );
+              continue;
+            }
+            break;
+          }
+          next_placeholder_deadline_us = -1;
+          next_source_timestamp_100ns = 0;
+          next_source_time = std::chrono::steady_clock::time_point {};
+          placeholder_mode_active = false;
+        }
+
         WgcFrameCpuBuffer frame;
         std::string frame_error;
         if (!wgc_source->wait_for_frame_bgra(250, &frame, &frame_error)) {
           if (runtime->stop_requested.load()) {
             break;
           }
-          if (frame_error == "wgc-frame-timeout") {
+          if (frame_error == "wgc-frame-timeout" || frame_error == "wgc-frame-pool-recreated") {
             continue;
           }
-          std::lock_guard<std::mutex> lock(runtime->mutex);
-          runtime->last_error = frame_error;
-          runtime->reason = "peer-video-source-frame-failed";
-          runtime->running = false;
-          runtime->updated_at_unix_ms = current_time_millis();
+          update_runtime_state("peer-video-source-frame-failed", frame_error, false);
           break;
+        }
+
+        const bool frame_geometry_changed =
+          frame.width != source_frame_width ||
+          frame.height != source_frame_height ||
+          frame.stride != (source_frame_width * 4);
+        if (!placeholder_mode_active && frame_geometry_changed) {
+          emit_breadcrumb(
+            std::string("startPeerVideoSender:geometry-change-refresh peer=") + source_peer_id +
+            " old=" + std::to_string(source_frame_width) + "x" + std::to_string(source_frame_height) +
+            " new=" + std::to_string(frame.width) + "x" + std::to_string(frame.height) +
+            " stride=" + std::to_string(frame.stride));
+          runtime->soft_refresh_requested.store(true);
+          update_runtime_state("peer-video-sender-refresh-pending", "", false);
+          if (wgc_source) {
+            wgc_source->close();
+            wgc_source.reset();
+          }
+          refresh_pending = true;
+          continue;
         }
 
         {
@@ -6421,38 +7406,49 @@ bool start_peer_video_sender(
           } while (next_source_time <= now);
         }
 
-        std::size_t total_written = 0;
-        while (total_written < frame.bgra.size() && !runtime->stop_requested.load()) {
-          DWORD chunk_written = 0;
-          const DWORD chunk_size = static_cast<DWORD>(std::min<std::size_t>(frame.bgra.size() - total_written, 1u << 20));
-          const BOOL wrote = WriteFile(
-            runtime->stdin_write_handle,
-            frame.bgra.data() + total_written,
-            chunk_size,
-            &chunk_written,
-            nullptr
-          );
-          if (!wrote || chunk_written == 0) {
-            if (!runtime->stop_requested.load()) {
-              std::lock_guard<std::mutex> lock(runtime->mutex);
-              runtime->last_error = format_windows_error(GetLastError());
-              runtime->reason = "peer-video-source-write-failed";
-              runtime->running = false;
-              runtime->updated_at_unix_ms = current_time_millis();
-            }
-            total_written = frame.bgra.size();
-            break;
-          }
-          total_written += static_cast<std::size_t>(chunk_written);
+        if (!write_bgra_frame(frame.bgra)) {
+          break;
         }
+        update_runtime_state("peer-video-sender-running", "", true);
       }
 
-      if (runtime->stdin_write_handle) {
-        CloseHandle(runtime->stdin_write_handle);
-        runtime->stdin_write_handle = nullptr;
+      if (stdin_write_handle) {
+        CloseHandle(stdin_write_handle);
+        if (runtime->stdin_write_handle == stdin_write_handle) {
+          runtime->stdin_write_handle = nullptr;
+        }
       }
-      wgc_source->close();
+      if (wgc_source) {
+        wgc_source->close();
+      }
     });
+
+    {
+      std::unique_lock<std::mutex> lock(source_start_state->mutex);
+      source_start_state->condition.wait(lock, [&source_start_state]() {
+        return source_start_state->complete;
+      });
+      if (!source_start_state->success) {
+        runtime->stop_requested.store(true);
+        if (runtime->stdin_write_handle) {
+          CloseHandle(runtime->stdin_write_handle);
+          runtime->stdin_write_handle = nullptr;
+        }
+        if (runtime->process_handle) {
+          TerminateProcess(runtime->process_handle, 0);
+          WaitForSingleObject(runtime->process_handle, 2000);
+        }
+        if (runtime->source_thread.joinable()) {
+          runtime->source_thread.join();
+        }
+        close_peer_video_sender_handles(*runtime);
+        if (error) {
+          *error = source_start_state->error;
+        }
+        return false;
+      }
+    }
+    emit_breadcrumb(std::string("startPeerVideoSender:source-ready peer=") + peer.peer_id);
   }
 
   const std::shared_ptr<PeerTransportSession> transport_session = peer.transport_session;
@@ -6475,11 +7471,38 @@ bool start_peer_video_sender(
     const auto send_video_access_unit = [&runtime, &transport_session, &codec_path](
       const std::vector<std::uint8_t>& access_unit,
       std::string* error) -> bool {
+      std::int64_t target_send_us = -1;
+      std::int64_t now_us = current_time_micros_steady();
+      {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        if (runtime->next_frame_send_deadline_steady_us <= 0) {
+          runtime->next_frame_send_deadline_steady_us = now_us;
+        } else {
+          runtime->next_frame_send_deadline_steady_us += static_cast<std::int64_t>(runtime->frame_interval_us);
+          if (runtime->next_frame_send_deadline_steady_us < now_us) {
+            runtime->next_frame_send_deadline_steady_us = now_us;
+          }
+        }
+        target_send_us = runtime->next_frame_send_deadline_steady_us;
+      }
+
+      if (target_send_us > 0 && !sleep_until_steady_us(target_send_us, &runtime->stop_requested)) {
+        if (error) {
+          *error = "peer-video-sender-stopped";
+        }
+        return false;
+      }
+
+      now_us = current_time_micros_steady();
       std::uint64_t timestamp_us = 0;
       {
         std::lock_guard<std::mutex> lock(runtime->mutex);
+        if (runtime->last_frame_sent_at_steady_us > 0 && now_us > runtime->last_frame_sent_at_steady_us) {
+          runtime->next_frame_timestamp_us += static_cast<unsigned long long>(
+            std::min<std::int64_t>(now_us - runtime->last_frame_sent_at_steady_us, 1000000)
+          );
+        }
         timestamp_us = runtime->next_frame_timestamp_us;
-        runtime->next_frame_timestamp_us += runtime->frame_interval_us;
       }
 
       if (!send_peer_transport_video_frame(transport_session, access_unit, codec_path, timestamp_us, error)) {
@@ -6487,6 +7510,7 @@ bool start_peer_video_sender(
       }
 
       std::lock_guard<std::mutex> lock(runtime->mutex);
+      runtime->last_frame_sent_at_steady_us = now_us;
       runtime->frames_sent += 1;
       runtime->bytes_sent += static_cast<unsigned long long>(access_unit.size());
       runtime->reason = "peer-video-sender-running";
@@ -6709,6 +7733,7 @@ bool start_peer_video_sender(
   peer.media_binding.avg_source_total_readback_us = 0;
   peer.media_binding.frames_sent = 0;
   peer.media_binding.bytes_sent = 0;
+  emit_breadcrumb(std::string("startPeerVideoSender:done peer=") + peer.peer_id);
   return true;
 }
 
@@ -6785,6 +7810,12 @@ void refresh_peer_media_binding(PeerState& peer) {
 }
 
 bool stop_peer_video_sender(PeerState& peer, const std::string& reason, std::string* error) {
+  emit_breadcrumb(
+    std::string("stopPeerVideoSender:start peer=") +
+    peer.peer_id +
+    " reason=" + reason +
+    " hasRuntime=" + (peer.media_binding.runtime ? "true" : "false")
+  );
   if (!peer.media_binding.runtime) {
     peer.media_binding.process_id = 0;
     peer.media_binding.source_frames_captured = 0;
@@ -6796,6 +7827,7 @@ bool stop_peer_video_sender(PeerState& peer, const std::string& reason, std::str
     peer.media_binding.active = false;
     peer.media_binding.reason = reason;
     peer.media_binding.updated_at_unix_ms = current_time_millis();
+    emit_breadcrumb(std::string("stopPeerVideoSender:done-no-runtime peer=") + peer.peer_id);
     return true;
   }
 
@@ -6808,11 +7840,6 @@ bool stop_peer_video_sender(PeerState& peer, const std::string& reason, std::str
   }
 
   runtime->stop_requested.store(true);
-
-  if (runtime->stdin_write_handle) {
-    CloseHandle(runtime->stdin_write_handle);
-    runtime->stdin_write_handle = nullptr;
-  }
 
   if (runtime->process_handle) {
     TerminateProcess(runtime->process_handle, 0);
@@ -6840,6 +7867,7 @@ bool stop_peer_video_sender(PeerState& peer, const std::string& reason, std::str
   peer.media_binding.updated_at_unix_ms = current_time_millis();
   peer.media_binding.detached_at_unix_ms = peer.media_binding.updated_at_unix_ms;
   peer.media_binding.runtime.reset();
+  emit_breadcrumb(std::string("stopPeerVideoSender:done peer=") + peer.peer_id);
   if (error) {
     error->clear();
   }
@@ -6879,6 +7907,41 @@ bool submit_scheduled_video_unit_to_surface(
   if (!surface) {
     if (warning_message) {
       *warning_message = "peer-video-surface-missing";
+    }
+    return false;
+  }
+
+  const NativeVideoSurfaceSnapshot snapshot = surface->snapshot();
+  if (snapshot.reason == "native-decoder-send-failed" ||
+      snapshot.reason == "native-decoder-receive-failed" ||
+      snapshot.reason == "native-decoder-transfer-failed") {
+    {
+      std::lock_guard<std::mutex> lock(runtime.mutex);
+      runtime.running = false;
+      runtime.decoder_ready = false;
+      runtime.pending_video_annexb_bytes.clear();
+      runtime.startup_video_decoder_config_au.clear();
+      runtime.startup_waiting_for_random_access = true;
+      runtime.scheduled_video_queue.clear();
+      runtime.scheduled_audio_queue.clear();
+      runtime.av_sync_anchor_initialized = false;
+      runtime.reason = "peer-video-surface-decoder-recovering";
+      runtime.last_error = snapshot.last_error;
+    }
+
+    std::string restart_error;
+    if (!restart_peer_video_surface_attachment(runtime, &restart_error)) {
+      if (warning_message) {
+        *warning_message = restart_error.empty() ? snapshot.last_error : restart_error;
+      }
+      return false;
+    }
+
+    refresh_peer_video_receiver_runtime(runtime);
+    if (warning_message) {
+      *warning_message = snapshot.last_error.empty()
+        ? "peer-video-surface-decoder-restarted"
+        : snapshot.last_error;
     }
     return false;
   }
@@ -6954,13 +8017,23 @@ void consume_remote_peer_video_frame(
   if (!runtime_ptr) {
     return;
   }
+  {
+    std::lock_guard<std::mutex> lock(runtime_ptr->mutex);
+    if (runtime_ptr->closing) {
+      return;
+    }
+  }
 
   auto& runtime = *runtime_ptr;
   std::string codec_path;
   std::vector<std::vector<std::uint8_t>> decode_units;
+  std::vector<std::vector<std::uint8_t>> relay_decode_units;
 
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
+    if (runtime.closing) {
+      return;
+    }
     runtime.codec_path = normalize_video_codec(codec);
     runtime.remote_frames_received += 1;
     runtime.remote_bytes_received += static_cast<unsigned long long>(frame.size());
@@ -6985,12 +8058,16 @@ void consume_remote_peer_video_frame(
       decode_units.push_back(frame);
     }
   }
+  relay_decode_units = decode_units;
 
   if (codec_path == "h264" || codec_path == "h265") {
     std::vector<std::vector<std::uint8_t>> startup_units;
     bool waiting_for_random_access = false;
     {
       std::lock_guard<std::mutex> lock(runtime.mutex);
+      if (runtime.closing) {
+        return;
+      }
       if (runtime.startup_waiting_for_random_access) {
         for (const auto& decode_unit : decode_units) {
           if (video_access_unit_has_decoder_config_nal(codec_path, decode_unit)) {
@@ -7029,6 +8106,7 @@ void consume_remote_peer_video_frame(
     }
 
     if (waiting_for_random_access) {
+      fanout_relay_video_units(peer_id, codec_path, relay_decode_units, rtp_timestamp);
       refresh_peer_video_receiver_runtime(runtime);
       update_peer_decoder_state_from_runtime(runtime_ptr, transport_session);
       return;
@@ -7039,10 +8117,60 @@ void consume_remote_peer_video_frame(
     }
   }
 
-  ensure_peer_av_sync_runtime(runtime, g_agent_runtime_for_audio->viewer_audio_playback);
-  fanout_relay_video_units(peer_id, codec_path, decode_units, rtp_timestamp);
+  fanout_relay_video_units(peer_id, codec_path, relay_decode_units, rtp_timestamp);
+  bool local_playback_enabled = false;
+  bool passthrough_enabled = false;
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
+    if (runtime.closing) {
+      return;
+    }
+    local_playback_enabled = runtime.local_playback_enabled;
+    passthrough_enabled = runtime.passthrough_playback_enabled;
+  }
+
+  if (!local_playback_enabled) {
+    refresh_peer_video_receiver_runtime(runtime);
+    update_peer_decoder_state_from_runtime(runtime_ptr, transport_session);
+    return;
+  }
+
+  if (passthrough_enabled) {
+    for (const auto& decode_unit : decode_units) {
+      std::string warning_message;
+      const bool submitted = submit_scheduled_video_unit_to_surface(
+        peer_id,
+        runtime,
+        decode_unit,
+        codec_path,
+        &warning_message
+      );
+      std::lock_guard<std::mutex> lock(runtime.mutex);
+      runtime.scheduled_video_units += 1;
+      if (submitted) {
+        runtime.submitted_video_units += 1;
+        runtime.av_sync_last_video_lateness_us = 0;
+        runtime.reason = "peer-video-passthrough-submitted";
+      } else {
+        runtime.dropped_video_units += 1;
+        runtime.reason = "peer-video-passthrough-dropped";
+        if (!warning_message.empty()) {
+          runtime.last_error = warning_message;
+        }
+      }
+    }
+    refresh_peer_video_receiver_runtime(runtime);
+    update_peer_decoder_state_from_runtime(runtime_ptr, transport_session);
+    (void)peer_id;
+    return;
+  }
+
+  ensure_peer_av_sync_runtime(runtime, g_agent_runtime_for_audio->viewer_audio_playback);
+  {
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    if (runtime.closing) {
+      return;
+    }
     for (const auto& decode_unit : decode_units) {
       PeerState::PeerVideoReceiverRuntime::ScheduledVideoUnit unit;
       unit.remote_timestamp_us = rtp_timestamp_to_us(rtp_timestamp, kPeerAvSyncVideoClockRate);
@@ -7053,7 +8181,7 @@ void consume_remote_peer_video_frame(
       runtime.scheduled_video_units += 1;
     }
     while (runtime.scheduled_video_queue.size() > kPeerAvSyncMaxQueuedVideoUnits) {
-      runtime.scheduled_video_queue.pop_back();
+      runtime.scheduled_video_queue.pop_front();
       runtime.dropped_video_units += 1;
       runtime.reason = "peer-av-sync-video-overflow";
     }
@@ -7361,6 +8489,29 @@ std::string peer_video_receiver_runtime_json(const std::shared_ptr<PeerState::Pe
   return payload.str();
 }
 
+std::string relay_subscriber_runtime_json(const std::string& peer_id) {
+  RelaySubscriberState relay_state;
+  if (!query_relay_subscriber_state(peer_id, &relay_state)) {
+    return "null";
+  }
+
+  std::ostringstream payload;
+  payload
+    << "{\"upstreamPeerId\":\"" << json_escape(relay_state.upstream_peer_id) << "\""
+    << ",\"audioEnabled\":" << (relay_state.audio_enabled ? "true" : "false")
+    << ",\"pendingVideoBootstrap\":" << (relay_state.pending_video_bootstrap ? "true" : "false")
+    << ",\"bootstrapSnapshotSent\":" << (relay_state.bootstrap_snapshot_sent ? "true" : "false")
+    << ",\"framesSent\":" << relay_state.frames_sent
+    << ",\"bytesSent\":" << relay_state.bytes_sent
+    << ",\"lastVideoTimestampUs\":" << relay_state.last_video_timestamp_us
+    << ",\"reason\":\"" << json_escape(relay_state.reason) << "\""
+    << ",\"lastError\":\"" << json_escape(relay_state.last_error) << "\""
+    << ",\"updatedAtMs\":";
+  append_nullable_int64(payload, relay_state.updated_at_unix_ms);
+  payload << "}";
+  return payload.str();
+}
+
 std::string build_peer_state_json(const PeerState& peer, const std::string& state) {
   std::ostringstream payload;
   payload
@@ -7373,6 +8524,7 @@ std::string build_peer_state_json(const PeerState& peer, const std::string& stat
     << ",\"mediaBinding\":" << peer_media_binding_json(peer.media_binding)
     << ",\"peerTransport\":" << peer_transport_snapshot_json(peer.transport)
     << ",\"receiverRuntime\":" << peer_video_receiver_runtime_json(peer.receiver_runtime)
+    << ",\"relaySubscriberRuntime\":" << relay_subscriber_runtime_json(peer.peer_id)
     << "}";
   return payload.str();
 }
@@ -7432,6 +8584,7 @@ std::string surface_attachment_json(SurfaceAttachmentState& state) {
     << ",\"decoderReady\":" << (state.decoder_ready ? "true" : "false")
     << ",\"restartCount\":" << state.restart_count
     << ",\"decodedFramesRendered\":" << state.decoded_frames_rendered
+    << ",\"frameIntervalStddevMs\":" << state.frame_interval_stddev_ms
     << ",\"avgCopyResourceUs\":" << (has_live_preview_snapshot ? live_preview_snapshot.avg_copy_resource_us : 0)
     << ",\"avgMapUs\":" << (has_live_preview_snapshot ? live_preview_snapshot.avg_map_us : 0)
     << ",\"avgMemcpyUs\":" << (has_live_preview_snapshot ? live_preview_snapshot.avg_memcpy_us : 0)
@@ -7532,6 +8685,7 @@ std::string build_stats_json(AgentRuntimeState& state) {
       << ",\"mediaBinding\":" << peer_media_binding_json(peer.media_binding)
       << ",\"peerTransport\":" << peer_transport_snapshot_json(peer.transport)
       << ",\"receiverRuntime\":" << peer_video_receiver_runtime_json(peer.receiver_runtime)
+      << ",\"relaySubscriberRuntime\":" << relay_subscriber_runtime_json(peer.peer_id)
       << "}";
   }
 
@@ -7605,6 +8759,8 @@ int main(int argc, char* argv[]) {
       runtime_state.audio_session = build_audio_session_state(get_wasapi_process_loopback_session_status());
       refresh_host_capture_runtime(runtime_state);
       refresh_peer_transport_runtime(runtime_state);
+      perform_host_video_sender_soft_refresh(runtime_state);
+      refresh_peer_transport_runtime(runtime_state);
       write_json_line(build_result_payload(id, build_status_json(runtime_state)));
       continue;
     }
@@ -7612,6 +8768,8 @@ int main(int argc, char* argv[]) {
     if (method == "getCapabilities") {
       runtime_state.audio_session = build_audio_session_state(get_wasapi_process_loopback_session_status());
       refresh_host_capture_runtime(runtime_state);
+      refresh_peer_transport_runtime(runtime_state);
+      perform_host_video_sender_soft_refresh(runtime_state);
       refresh_peer_transport_runtime(runtime_state);
       write_json_line(build_result_payload(id, capabilities_json(runtime_state)));
       continue;
@@ -7686,7 +8844,9 @@ int main(int argc, char* argv[]) {
     }
 
     if (method == "startHostSession") {
+      emit_breadcrumb("startHostSession:begin");
       stop_all_surface_attachments(runtime_state, "host-session-restart");
+      emit_breadcrumb("startHostSession:after-stop-all-surfaces");
       stop_host_capture_process(
         runtime_state.host_capture_process,
         runtime_state.host_pipeline,
@@ -7694,6 +8854,7 @@ int main(int argc, char* argv[]) {
         runtime_state.host_capture_artifact,
         "host-session-restart"
       );
+      emit_breadcrumb("startHostSession:after-stop-host-capture-process");
       runtime_state.host_session_running = true;
       runtime_state.host_capture_target_id = extract_string_value(line, "captureTargetId");
       runtime_state.host_capture_source_id = extract_string_value(line, "sourceId");
@@ -7702,6 +8863,9 @@ int main(int argc, char* argv[]) {
       runtime_state.host_capture_title = extract_string_value(line, "captureTitle");
       runtime_state.host_capture_hwnd = extract_string_value(line, "captureHwnd");
       runtime_state.host_capture_display_id = extract_string_value(line, "displayId");
+      runtime_state.host_window_restore_placeholder_active = false;
+      runtime_state.host_video_sender_refresh_requested = false;
+      runtime_state.host_video_sender_refresh_reason.clear();
       runtime_state.host_requested_codec = normalize_video_codec(
         extract_string_value(line, "requestedCodec"),
         normalize_video_codec(extract_string_value(line, "codec"))
@@ -7730,6 +8894,9 @@ int main(int argc, char* argv[]) {
       if (runtime_state.host_capture_state.empty()) {
         runtime_state.host_capture_state = runtime_state.host_capture_kind == "display" ? "display" : "normal";
       }
+      runtime_state.host_window_restore_placeholder_active =
+        runtime_state.host_capture_kind == "window" &&
+        runtime_state.host_capture_state == "minimized";
       if (runtime_state.host_codec.empty()) {
         runtime_state.host_codec = "h264";
       }
@@ -7737,6 +8904,13 @@ int main(int argc, char* argv[]) {
         runtime_state.host_requested_codec = runtime_state.host_codec;
       }
       runtime_state.host_capture_process = build_host_capture_process_state();
+      emit_breadcrumb(
+        std::string("startHostSession:config-applied target=") +
+        runtime_state.host_capture_target_id +
+        " codec=" + runtime_state.host_codec +
+        " size=" + std::to_string(runtime_state.host_width) + "x" + std::to_string(runtime_state.host_height) +
+        " fps=" + std::to_string(runtime_state.host_frame_rate)
+      );
       runtime_state.host_pipeline = select_and_validate_host_pipeline(
         runtime_state.ffmpeg,
         runtime_state.host_codec,
@@ -7745,6 +8919,7 @@ int main(int argc, char* argv[]) {
         runtime_state.host_encoder_preset,
         runtime_state.host_encoder_tune
       );
+      emit_breadcrumb("startHostSession:after-select-pipeline");
       runtime_state.host_capture_plan = build_host_capture_plan(
         runtime_state.ffmpeg,
         runtime_state.wgc_capture_backend,
@@ -7760,15 +8935,20 @@ int main(int argc, char* argv[]) {
         runtime_state.host_frame_rate,
         runtime_state.host_bitrate_kbps
       );
+      emit_breadcrumb("startHostSession:after-build-capture-plan");
       runtime_state.host_capture_plan = validate_host_capture_plan(runtime_state.ffmpeg, runtime_state.host_capture_plan);
+      emit_breadcrumb("startHostSession:after-validate-capture-plan");
       runtime_state.host_capture_process = start_host_capture_process(
         runtime_state.ffmpeg,
         runtime_state.host_pipeline,
         runtime_state.host_capture_plan,
         runtime_state.host_capture_process
       );
+      emit_breadcrumb("startHostSession:after-start-host-capture-process");
       refresh_host_capture_runtime(runtime_state);
+      emit_breadcrumb("startHostSession:after-refresh-host-capture-runtime");
       restart_host_capture_surface_attachments(runtime_state);
+      emit_breadcrumb("startHostSession:after-restart-surface-attachments");
       for (auto& entry : runtime_state.peers) {
         PeerState& peer = entry.second;
         if (peer.role != "host-downstream") {
@@ -7797,6 +8977,7 @@ int main(int argc, char* argv[]) {
           emit_event("peer-state", build_peer_state_json(peer, "media-source-attached"));
         }
       }
+      emit_breadcrumb("startHostSession:before-result");
 
       emit_event(
         "media-state",
@@ -7836,7 +9017,9 @@ int main(int argc, char* argv[]) {
     }
 
     if (method == "stopHostSession") {
+      emit_breadcrumb("stopHostSession:begin");
       stop_all_surface_attachments(runtime_state, "host-session-stopped");
+      emit_breadcrumb("stopHostSession:after-stop-all-surfaces");
       for (auto& entry : runtime_state.peers) {
         PeerState& peer = entry.second;
         if (peer.role == "host-downstream") {
@@ -7845,9 +9028,20 @@ int main(int argc, char* argv[]) {
             peer.media_binding.reason = "peer-media-detach-failed";
             peer.media_binding.last_error = detach_error;
             peer.media_binding.updated_at_unix_ms = current_time_millis();
+          } else if (peer.initiator && peer.transport_session) {
+            std::string negotiate_error;
+            if (!ensure_peer_transport_local_description(peer.transport_session, &negotiate_error)) {
+              peer.transport = get_peer_transport_snapshot(peer.transport_session);
+              peer.transport.last_error = negotiate_error;
+              peer.transport.reason = "peer-local-description-failed";
+              peer.media_binding.reason = "peer-local-description-failed";
+              peer.media_binding.last_error = negotiate_error;
+              peer.media_binding.updated_at_unix_ms = current_time_millis();
+            }
           }
         }
       }
+      emit_breadcrumb("stopHostSession:after-detach-host-downstream-peers");
       stop_host_capture_process(
         runtime_state.host_capture_process,
         runtime_state.host_pipeline,
@@ -7855,12 +9049,16 @@ int main(int argc, char* argv[]) {
         runtime_state.host_capture_artifact,
         "host-session-stopped"
       );
+      emit_breadcrumb("stopHostSession:after-stop-host-capture-process");
       runtime_state.host_session_running = false;
       runtime_state.host_capture_target_id.clear();
       runtime_state.host_capture_source_id.clear();
       runtime_state.host_capture_title.clear();
       runtime_state.host_capture_hwnd.clear();
       runtime_state.host_capture_display_id.clear();
+      runtime_state.host_window_restore_placeholder_active = false;
+      runtime_state.host_video_sender_refresh_requested = false;
+      runtime_state.host_video_sender_refresh_reason.clear();
       runtime_state.host_requested_codec = "h264";
       runtime_state.host_codec = "h264";
       runtime_state.host_hardware_acceleration = true;
@@ -7896,6 +9094,7 @@ int main(int argc, char* argv[]) {
         runtime_state.host_bitrate_kbps
       );
       runtime_state.host_capture_plan = validate_host_capture_plan(runtime_state.ffmpeg, runtime_state.host_capture_plan);
+      emit_breadcrumb("stopHostSession:before-result");
       emit_event(
         "media-state",
         std::string("{\"state\":\"host-session-stopped\",\"captureProcess\":") +
@@ -7912,6 +9111,10 @@ int main(int argc, char* argv[]) {
       peer.peer_id = extract_string_value(line, "peerId");
       peer.role = extract_string_value(line, "role");
       peer.initiator = extract_bool_value(line, "initiator");
+      emit_breadcrumb(
+        std::string("createPeer:begin peer=") + peer.peer_id +
+        " role=" + peer.role +
+        " initiator=" + (peer.initiator ? "true" : "false"));
       if (peer.peer_id.empty()) {
         write_json_line(build_error_payload(id, "BAD_REQUEST", "peerId is required"));
         continue;
@@ -7922,10 +9125,14 @@ int main(int argc, char* argv[]) {
       peer.transport.reason = runtime_state.peer_transport_backend.reason;
       peer.receiver_runtime = std::make_shared<PeerState::PeerVideoReceiverRuntime>();
       peer.receiver_runtime->peer_id = peer.peer_id;
+      peer.receiver_runtime->local_playback_enabled = peer.role == "viewer-upstream";
+      peer.receiver_runtime->passthrough_playback_enabled =
+        peer.receiver_runtime->local_playback_enabled &&
+        runtime_state.viewer_playback_mode == "passthrough";
 
       if (runtime_state.peer_transport_backend.transport_ready) {
         auto receiver_runtime = peer.receiver_runtime;
-        auto transport_session_holder = std::make_shared<std::shared_ptr<PeerTransportSession>>();
+        auto transport_session_holder = std::make_shared<std::weak_ptr<PeerTransportSession>>();
         PeerTransportCallbacks callbacks;
         callbacks.on_local_description = [peer_id = peer.peer_id](const std::string& type, const std::string& sdp) {
           emit_event(
@@ -7972,7 +9179,14 @@ int main(int argc, char* argv[]) {
           receiver_runtime,
           transport_session_holder
         ](const std::vector<std::uint8_t>& frame, const std::string& codec, std::uint32_t rtp_timestamp) {
-          consume_remote_peer_video_frame(peer_id, receiver_runtime, *transport_session_holder, frame, codec, rtp_timestamp);
+          consume_remote_peer_video_frame(
+            peer_id,
+            receiver_runtime,
+            transport_session_holder->lock(),
+            frame,
+            codec,
+            rtp_timestamp
+          );
         };
         callbacks.on_remote_audio_frame = [
           &runtime_state,
@@ -7987,6 +9201,7 @@ int main(int argc, char* argv[]) {
         *transport_session_holder = peer.transport_session;
         if (peer.transport_session) {
           peer.transport = get_peer_transport_snapshot(peer.transport_session);
+          emit_breadcrumb(std::string("createPeer:after-create-transport peer=") + peer.peer_id);
         } else {
           peer.transport.transport_ready = false;
           peer.transport.reason = "peer-create-failed";
@@ -8009,7 +9224,7 @@ int main(int argc, char* argv[]) {
       const bool should_negotiate_immediately =
         peer.transport_session &&
         peer.initiator &&
-        peer.role != "host-downstream";
+        (peer.role != "host-downstream" || peer.media_binding.attached);
 
       if (should_negotiate_immediately) {
         std::string negotiate_error;
@@ -8035,12 +9250,14 @@ int main(int argc, char* argv[]) {
             "\",\"message\":\"" + json_escape(peer.transport.last_error) + "\"}"
         );
       }
+      emit_breadcrumb(std::string("createPeer:before-result peer=") + peer.peer_id);
       write_json_line(build_result_payload(id, build_peer_result_json(runtime_state.peers[peer.peer_id])));
       continue;
     }
 
     if (method == "closePeer") {
       const std::string peer_id = extract_string_value(line, "peerId");
+      emit_breadcrumb(std::string("closePeer:begin peer=") + peer_id);
       auto it = runtime_state.peers.find(peer_id);
       if (it != runtime_state.peers.end()) {
         for (auto surface_it = runtime_state.attached_surfaces.begin(); surface_it != runtime_state.attached_surfaces.end();) {
@@ -8055,17 +9272,31 @@ int main(int argc, char* argv[]) {
           }
           ++surface_it;
         }
+        emit_breadcrumb(std::string("closePeer:after-stop-surfaces peer=") + peer_id);
 
         std::string detach_error;
-        if (!detach_peer_media_binding(it->second, &detach_error)) {
-          it->second.media_binding.reason = "peer-media-detach-failed";
+        if (!prepare_peer_media_binding_for_transport_close(it->second, &detach_error)) {
+          it->second.media_binding.reason = "peer-media-close-prepare-failed";
           it->second.media_binding.last_error = detach_error;
         }
+        emit_breadcrumb(std::string("closePeer:after-prepare-media-binding peer=") + peer_id);
+        if (it->second.receiver_runtime) {
+          begin_close_peer_video_receiver_runtime(*it->second.receiver_runtime);
+        }
+        emit_breadcrumb(std::string("closePeer:after-begin-close-receiver-runtime peer=") + peer_id);
+        close_peer_transport_session(it->second.transport_session);
+        emit_breadcrumb(std::string("closePeer:after-close-transport-session peer=") + peer_id);
         if (it->second.receiver_runtime) {
           close_peer_video_receiver_handles(*it->second.receiver_runtime);
         }
-        stop_viewer_audio_playback_runtime(runtime_state.viewer_audio_playback);
-        close_peer_transport_session(it->second.transport_session);
+        emit_breadcrumb(std::string("closePeer:after-close-receiver-handles peer=") + peer_id);
+        if (it->second.role == "viewer-upstream") {
+          clear_relay_upstream_bootstrap_state(peer_id);
+        }
+        if (it->second.role == "viewer-upstream") {
+          stop_viewer_audio_playback_runtime(runtime_state.viewer_audio_playback);
+        }
+        emit_breadcrumb(std::string("closePeer:after-stop-viewer-audio peer=") + peer_id);
         it->second.transport.closed = true;
         it->second.transport.data_channel_open = false;
         it->second.transport.connection_state = "closed";
@@ -8075,6 +9306,7 @@ int main(int argc, char* argv[]) {
         it->second.transport.updated_at_unix_ms = current_time_millis();
         emit_event("peer-state", build_peer_state_json(it->second, "closed"));
         runtime_state.peers.erase(it);
+        emit_breadcrumb(std::string("closePeer:after-erase peer=") + peer_id);
       }
 
       write_json_line(
@@ -8165,6 +9397,9 @@ int main(int argc, char* argv[]) {
     if (method == "attachPeerMediaSource") {
       const std::string peer_id = extract_string_value(line, "peerId");
       const std::string source = extract_string_value(line, "source");
+      emit_breadcrumb(
+        std::string("attachPeerMediaSource:begin peer=") + peer_id +
+        " source=" + source);
       auto it = runtime_state.peers.find(peer_id);
       if (it == runtime_state.peers.end()) {
         write_json_line(build_error_payload(id, "PEER_NOT_FOUND", "Peer has not been created"));
@@ -8185,6 +9420,16 @@ int main(int argc, char* argv[]) {
         continue;
       }
 
+      const bool was_attached = it->second.media_binding.attached;
+      const bool had_video_track_configured = it->second.transport.video_track_configured;
+      const bool had_audio_track_configured = it->second.transport.audio_track_configured;
+      const std::string previous_source = it->second.media_binding.source;
+      const std::string previous_codec = it->second.media_binding.codec;
+      const int previous_width = it->second.media_binding.width;
+      const int previous_height = it->second.media_binding.height;
+      const int previous_frame_rate = it->second.media_binding.frame_rate;
+      const int previous_bitrate_kbps = it->second.media_binding.bitrate_kbps;
+
       std::string attach_error;
       const bool attach_ok = is_peer_video_media_source(source)
         ? attach_relay_video_media_binding(runtime_state, it->second, source, &attach_error)
@@ -8200,8 +9445,20 @@ int main(int argc, char* argv[]) {
         continue;
       }
 
+      const bool attachment_requires_negotiation =
+        !was_attached ||
+        previous_source != it->second.media_binding.source ||
+        previous_codec != it->second.media_binding.codec ||
+        previous_width != it->second.media_binding.width ||
+        previous_height != it->second.media_binding.height ||
+        previous_frame_rate != it->second.media_binding.frame_rate ||
+        previous_bitrate_kbps != it->second.media_binding.bitrate_kbps ||
+        had_video_track_configured != it->second.transport.video_track_configured ||
+        had_audio_track_configured != it->second.transport.audio_track_configured;
+
       if (it->second.transport_session &&
-          (it->second.initiator || is_peer_video_media_source(source))) {
+          (it->second.initiator || is_peer_video_media_source(source)) &&
+          attachment_requires_negotiation) {
         std::string negotiate_error;
         if (!ensure_peer_transport_local_description(it->second.transport_session, &negotiate_error)) {
           it->second.transport = get_peer_transport_snapshot(it->second.transport_session);
@@ -8217,6 +9474,7 @@ int main(int argc, char* argv[]) {
 
       refresh_peer_transport_runtime(runtime_state);
       emit_event("peer-state", build_peer_state_json(it->second, "media-source-attached"));
+      emit_breadcrumb(std::string("attachPeerMediaSource:before-result peer=") + peer_id);
       write_json_line(build_result_payload(id, build_peer_result_json(it->second)));
       continue;
     }
@@ -8236,6 +9494,18 @@ int main(int argc, char* argv[]) {
         it->second.media_binding.updated_at_unix_ms = current_time_millis();
         write_json_line(build_error_payload(id, "MEDIA_SOURCE_DETACH_FAILED", detach_error));
         continue;
+      }
+
+      if (it->second.initiator && it->second.transport_session) {
+        std::string negotiate_error;
+        if (!ensure_peer_transport_local_description(it->second.transport_session, &negotiate_error)) {
+          it->second.transport = get_peer_transport_snapshot(it->second.transport_session);
+          it->second.transport.last_error = negotiate_error;
+          it->second.transport.reason = "peer-local-description-failed";
+          it->second.media_binding.reason = "peer-local-description-failed";
+          it->second.media_binding.last_error = negotiate_error;
+          it->second.media_binding.updated_at_unix_ms = current_time_millis();
+        }
       }
 
       refresh_peer_transport_runtime(runtime_state);
@@ -8276,6 +9546,12 @@ int main(int argc, char* argv[]) {
 
         if (!peer_it->second.receiver_runtime) {
           peer_it->second.receiver_runtime = std::make_shared<PeerState::PeerVideoReceiverRuntime>();
+          peer_it->second.receiver_runtime->peer_id = peer_id;
+          peer_it->second.receiver_runtime->local_playback_enabled =
+            peer_it->second.role == "viewer-upstream";
+          peer_it->second.receiver_runtime->passthrough_playback_enabled =
+            peer_it->second.receiver_runtime->local_playback_enabled &&
+            runtime_state.viewer_playback_mode == "passthrough";
         }
 
         attachment.peer_id = peer_id;
@@ -8387,6 +9663,54 @@ int main(int argc, char* argv[]) {
       continue;
     }
 
+    if (method == "setViewerPlaybackMode") {
+      const std::string requested_mode = to_lower_copy(extract_string_value(line, "mode"));
+      const std::string normalized_mode = requested_mode == "passthrough" ? "passthrough" : "synced";
+      runtime_state.viewer_playback_mode = normalized_mode;
+      {
+        std::lock_guard<std::mutex> lock(runtime_state.viewer_audio_playback.mutex);
+        runtime_state.viewer_audio_playback.passthrough_mode = normalized_mode == "passthrough";
+        runtime_state.viewer_audio_playback.target_buffer_frames =
+          normalized_mode == "passthrough" ? 0u : kViewerAudioStartupBufferFrames;
+        runtime_state.viewer_audio_playback.playback_primed = false;
+        runtime_state.viewer_audio_playback.reason =
+          normalized_mode == "passthrough" ? "viewer-audio-passthrough-ready" : "viewer-audio-buffering";
+        runtime_state.viewer_audio_playback.cv.notify_all();
+      }
+      for (auto& entry : runtime_state.peers) {
+        if (!entry.second.receiver_runtime) {
+          continue;
+        }
+        std::lock_guard<std::mutex> lock(entry.second.receiver_runtime->mutex);
+        entry.second.receiver_runtime->passthrough_playback_enabled =
+          entry.second.receiver_runtime->local_playback_enabled &&
+          normalized_mode == "passthrough";
+      }
+      std::ostringstream payload;
+      payload
+        << "{\"mode\":\"" << json_escape(normalized_mode) << "\""
+        << ",\"implementation\":\"viewer-playback-mode\"}";
+      write_json_line(build_result_payload(id, payload.str()));
+      continue;
+    }
+
+    if (method == "setViewerAudioDelay") {
+      const int requested_delay_ms = extract_int_value(line, "delayMs", 0);
+      const unsigned int normalized_delay_ms = static_cast<unsigned int>(std::max(0, std::min(300, requested_delay_ms)));
+      runtime_state.viewer_audio_delay_ms = normalized_delay_ms;
+      {
+        std::lock_guard<std::mutex> lock(runtime_state.viewer_audio_playback.mutex);
+        runtime_state.viewer_audio_playback.passthrough_audio_delay_ms = normalized_delay_ms;
+        runtime_state.viewer_audio_playback.cv.notify_all();
+      }
+      std::ostringstream payload;
+      payload
+        << "{\"delayMs\":" << normalized_delay_ms
+        << ",\"implementation\":\"viewer-audio-delay\"}";
+      write_json_line(build_result_payload(id, payload.str()));
+      continue;
+    }
+
     if (method == "getViewerVolume") {
       const int pid = extract_int_value(line, "pid", 0);
       {
@@ -8474,6 +9798,8 @@ int main(int argc, char* argv[]) {
     if (method == "getStats") {
       runtime_state.audio_session = build_audio_session_state(get_wasapi_process_loopback_session_status());
       refresh_host_capture_runtime(runtime_state);
+      refresh_peer_transport_runtime(runtime_state);
+      perform_host_video_sender_soft_refresh(runtime_state);
       refresh_peer_transport_runtime(runtime_state);
       write_json_line(build_result_payload(id, build_stats_json(runtime_state)));
       continue;

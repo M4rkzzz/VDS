@@ -1,9 +1,11 @@
 #include "native_live_preview.h"
 
 #include "wgc_capture.h"
+#include "win32_placeholder_frame.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -12,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <limits>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -33,6 +36,17 @@ namespace {
 long long current_time_millis() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
     std::chrono::system_clock::now().time_since_epoch()
+  ).count();
+}
+
+void emit_live_preview_breadcrumb(const std::string& step) {
+  std::cerr << "[media-agent breadcrumb] t=" << current_time_millis()
+            << " step=nativeLivePreview:" << step << std::endl;
+}
+
+long long current_time_micros_steady() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()
   ).count();
 }
 
@@ -199,6 +213,99 @@ bool should_use_overlay_popup(const NativeEmbeddedSurfaceLayout& layout) {
   return layout.embedded;
 }
 
+enum class WindowCaptureAvailability {
+  normal,
+  minimized,
+  unavailable
+};
+
+WindowCaptureAvailability query_window_capture_availability(const std::string& window_handle) {
+  const HWND hwnd = parse_window_handle(window_handle);
+  if (!hwnd || !IsWindow(hwnd)) {
+    return WindowCaptureAvailability::unavailable;
+  }
+  if (IsIconic(hwnd)) {
+    return WindowCaptureAvailability::minimized;
+  }
+  return WindowCaptureAvailability::normal;
+}
+
+bool get_window_capture_rect(HWND hwnd, RECT* rect) {
+  if (!hwnd || !rect || !IsWindow(hwnd)) {
+    return false;
+  }
+
+  if (IsIconic(hwnd)) {
+    WINDOWPLACEMENT placement {};
+    placement.length = sizeof(placement);
+    if (GetWindowPlacement(hwnd, &placement)) {
+      const RECT normal_rect = placement.rcNormalPosition;
+      if (normal_rect.right > normal_rect.left &&
+          normal_rect.bottom > normal_rect.top) {
+        *rect = normal_rect;
+        return true;
+      }
+    }
+  }
+
+  using DwmGetWindowAttributeFn = HRESULT (WINAPI*)(HWND, DWORD, PVOID, DWORD);
+  static const auto dwm_get_window_attribute = reinterpret_cast<DwmGetWindowAttributeFn>(
+    []() -> FARPROC {
+      HMODULE module = LoadLibraryW(L"dwmapi.dll");
+      return module ? GetProcAddress(module, "DwmGetWindowAttribute") : nullptr;
+    }()
+  );
+
+  constexpr DWORD kDwmwaExtendedFrameBounds = 9;
+  if (dwm_get_window_attribute) {
+    RECT extended_rect {};
+    if (SUCCEEDED(dwm_get_window_attribute(
+          hwnd,
+          kDwmwaExtendedFrameBounds,
+          &extended_rect,
+          static_cast<DWORD>(sizeof(extended_rect)))) &&
+        extended_rect.right > extended_rect.left &&
+        extended_rect.bottom > extended_rect.top) {
+      *rect = extended_rect;
+      return true;
+    }
+  }
+
+  RECT window_rect {};
+  if (GetWindowRect(hwnd, &window_rect) &&
+      window_rect.right > window_rect.left &&
+      window_rect.bottom > window_rect.top) {
+    *rect = window_rect;
+    return true;
+  }
+
+  return false;
+}
+
+bool resolve_placeholder_window_dimensions(
+  const std::string& window_handle,
+  int* width,
+  int* height
+) {
+  if (!width || !height) {
+    return false;
+  }
+
+  const HWND hwnd = parse_window_handle(window_handle);
+  if (!hwnd || !IsWindow(hwnd)) {
+    return false;
+  }
+
+  RECT capture_rect {};
+  if (!get_window_capture_rect(hwnd, &capture_rect)) {
+    return false;
+  }
+
+  *width = std::max(0, static_cast<int>(capture_rect.right - capture_rect.left));
+  *height = std::max(0, static_cast<int>(capture_rect.bottom - capture_rect.top));
+  return *width > 0 && *height > 0;
+}
+
 void activate_owner_window_for_popup(HWND hwnd) {
   if (!hwnd || !IsWindow(hwnd)) {
     return;
@@ -212,14 +319,44 @@ void activate_owner_window_for_popup(HWND hwnd) {
     return;
   }
 
-  if (IsIconic(owner)) {
-    ShowWindow(owner, SW_RESTORE);
-  } else {
-    ShowWindow(owner, SW_SHOW);
+  HWND root_owner = GetAncestor(owner, GA_ROOTOWNER);
+  if (root_owner && IsWindow(root_owner)) {
+    owner = root_owner;
   }
+
+  const DWORD current_thread_id = GetCurrentThreadId();
+  const DWORD owner_thread_id = GetWindowThreadProcessId(owner, nullptr);
+  HWND foreground_window = GetForegroundWindow();
+  const DWORD foreground_thread_id = foreground_window
+    ? GetWindowThreadProcessId(foreground_window, nullptr)
+    : 0;
+  const bool attached_owner_thread =
+    owner_thread_id != 0 &&
+    owner_thread_id != current_thread_id &&
+    AttachThreadInput(current_thread_id, owner_thread_id, TRUE) != FALSE;
+  const bool attached_foreground_thread =
+    foreground_thread_id != 0 &&
+    foreground_thread_id != current_thread_id &&
+    foreground_thread_id != owner_thread_id &&
+    AttachThreadInput(current_thread_id, foreground_thread_id, TRUE) != FALSE;
+
+  if (IsIconic(owner)) {
+    ShowWindowAsync(owner, SW_RESTORE);
+  } else {
+    ShowWindowAsync(owner, SW_SHOW);
+  }
+  SetWindowPos(owner, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
   BringWindowToTop(owner);
-  SetActiveWindow(owner);
   SetForegroundWindow(owner);
+  SetActiveWindow(owner);
+  SetFocus(owner);
+
+  if (attached_foreground_thread) {
+    AttachThreadInput(current_thread_id, foreground_thread_id, FALSE);
+  }
+  if (attached_owner_thread) {
+    AttachThreadInput(current_thread_id, owner_thread_id, FALSE);
+  }
 }
 
 bool is_embedded_content_window_class(const std::string& class_name) {
@@ -598,19 +735,12 @@ class NativeLivePreview::Impl {
         }
         return;
       }
-      stop_requested_ = true;
+      stop_requested_.store(true, std::memory_order_release);
       if (!reason.empty()) {
         stop_reason_ = reason;
       }
       worker_to_join = std::move(worker_);
     }
-
-#ifdef _WIN32
-    const HWND local_window = window_handle_.load();
-    if (local_window) {
-      PostMessageW(local_window, WM_CLOSE, 0, 0);
-    }
-#endif
 
     if (worker_to_join.joinable()) {
       worker_to_join.join();
@@ -620,6 +750,7 @@ class NativeLivePreview::Impl {
  private:
 #ifdef _WIN32
   static constexpr UINT kRefreshOwnerMoveHookMessage = WM_APP + 1;
+  static constexpr UINT kPresentFrameMessage = WM_APP + 2;
 
   struct OverlayAnchorState {
     HWND owner_window = nullptr;
@@ -652,16 +783,12 @@ class NativeLivePreview::Impl {
       case WM_NCHITTEST:
         return HTTRANSPARENT;
       case WM_MOUSEACTIVATE:
-        activate_owner_window_for_popup(hwnd);
         return MA_NOACTIVATE;
-      case WM_LBUTTONDOWN:
-      case WM_MBUTTONDOWN:
-      case WM_RBUTTONDOWN:
-      case WM_XBUTTONDOWN:
-        activate_owner_window_for_popup(hwnd);
-        return 0;
       case kRefreshOwnerMoveHookMessage:
         self->refresh_owner_move_hook();
+        return 0;
+      case kPresentFrameMessage:
+        self->flush_pending_present();
         return 0;
       case WM_PAINT:
         self->paint();
@@ -680,27 +807,34 @@ class NativeLivePreview::Impl {
 
   void thread_main() {
 #ifdef _WIN32
+    emit_live_preview_breadcrumb("thread-main-begin");
     {
       std::lock_guard<std::mutex> lock(mutex_);
       snapshot_.process_id = static_cast<unsigned long>(GetCurrentProcessId());
     }
 
     if (!register_window_class()) {
+      emit_live_preview_breadcrumb("window-class-registration-failed");
       fail_start("native-live-preview-window-class-registration-failed");
       return;
     }
+    emit_live_preview_breadcrumb("window-class-ready");
 
     if (!create_window()) {
+      emit_live_preview_breadcrumb("create-window-failed");
       return;
     }
+    emit_live_preview_breadcrumb("create-window-succeeded");
 
     capture_worker_ = std::thread([this]() { capture_loop(); });
+    emit_live_preview_breadcrumb("capture-worker-launched");
     {
       std::unique_lock<std::mutex> lock(mutex_);
       capture_started_condition_.wait(lock, [this]() {
         return capture_start_complete_;
       });
       if (!capture_start_succeeded_) {
+        emit_live_preview_breadcrumb("capture-source-create-failed");
         start_error_ = capture_start_error_.empty()
           ? "native-live-preview-source-create-failed"
           : capture_start_error_;
@@ -717,6 +851,7 @@ class NativeLivePreview::Impl {
         start_complete_ = true;
         start_succeeded_ = true;
         started_condition_.notify_all();
+        emit_live_preview_breadcrumb("startup-ready");
       }
     }
 
@@ -730,14 +865,24 @@ class NativeLivePreview::Impl {
 
     bool should_stop = false;
     while (!should_stop) {
-      pump_messages(&should_stop);
-      if (should_stop || stop_requested_) {
+      pump_pending_messages(&should_stop);
+      if (should_stop || stop_requested_.load(std::memory_order_acquire)) {
         break;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+      const DWORD wait_result = MsgWaitForMultipleObjectsEx(
+        0,
+        nullptr,
+        16,
+        QS_ALLINPUT,
+        MWMO_INPUTAVAILABLE
+      );
+      if (wait_result == WAIT_OBJECT_0) {
+        pump_pending_messages(&should_stop);
+      }
     }
 
-    stop_requested_ = true;
+    stop_requested_.store(true, std::memory_order_release);
     if (capture_worker_.joinable()) {
       capture_worker_.join();
     }
@@ -757,32 +902,143 @@ class NativeLivePreview::Impl {
   }
 
   void capture_loop() {
+    emit_live_preview_breadcrumb("capture-loop-begin");
     WgcFrameSourceConfig source_config;
     source_config.target_kind = config_.target_kind;
     source_config.display_id = config_.display_id.empty() ? "0" : config_.display_id;
     source_config.window_handle = config_.window_handle;
+    const bool use_window_restore_placeholder =
+      source_config.target_kind == "window" &&
+      config_.capture_state == "minimized" &&
+      !source_config.window_handle.empty();
+    const int placeholder_width = std::max(640, config_.layout.width > 0 ? config_.layout.width : 1280);
+    const int placeholder_height = std::max(360, config_.layout.height > 0 ? config_.layout.height : 720);
+    std::vector<std::uint8_t> placeholder_bgra;
+    const auto ensure_placeholder_bgra = [&]() -> const std::vector<std::uint8_t>& {
+      if (placeholder_bgra.empty()) {
+        placeholder_bgra = build_placeholder_frame_bgra(
+          placeholder_width,
+          placeholder_height,
+          L"\u7b49\u5f85\u623f\u4e3b\u7a97\u53e3\u6062\u590d"
+        );
+      }
+      return placeholder_bgra;
+    };
 
-    std::string source_error;
-    source_ = create_wgc_frame_source(source_config, &source_error);
-    {
+    const auto finalize_capture_start = [&](bool success, const std::string& error_message) {
       std::lock_guard<std::mutex> lock(mutex_);
+      if (capture_start_complete_) {
+        return;
+      }
       capture_start_complete_ = true;
-      capture_start_succeeded_ = static_cast<bool>(source_);
-      capture_start_error_ = source_error.empty() ? "native-live-preview-source-create-failed" : source_error;
+      capture_start_succeeded_ = success;
+      capture_start_error_ = error_message;
       capture_started_condition_.notify_all();
-    }
-    if (!source_) {
-      return;
+    };
+
+    const auto try_create_source = [&]() -> std::shared_ptr<WgcFrameSource> {
+      std::string source_error;
+      emit_live_preview_breadcrumb(
+        "source-create-begin target=" + source_config.target_kind +
+        (source_config.window_handle.empty() ? "" : " hwnd=" + source_config.window_handle) +
+        (source_config.display_id.empty() ? "" : " display=" + source_config.display_id));
+      std::shared_ptr<WgcFrameSource> created = create_wgc_frame_source(source_config, &source_error);
+      if (!created) {
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          snapshot_.reason = "live-preview-source-create-failed";
+          snapshot_.last_error = source_error.empty() ? "native-live-preview-source-create-failed" : source_error;
+          snapshot_.decoder_ready = false;
+        }
+      }
+      return created;
+    };
+
+    if (use_window_restore_placeholder) {
+      const WindowCaptureAvailability availability =
+        query_window_capture_availability(source_config.window_handle);
+      if (availability == WindowCaptureAvailability::minimized) {
+        finalize_capture_start(true, "");
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          snapshot_.reason = "live-preview-waiting-for-window-restore";
+          snapshot_.last_error.clear();
+          snapshot_.decoder_ready = true;
+        }
+      } else if (availability == WindowCaptureAvailability::unavailable) {
+        const std::string missing_target_error = "Selected window is no longer available for capture.";
+        finalize_capture_start(false, missing_target_error);
+        emit_live_preview_breadcrumb("source-create-failed error=" + missing_target_error);
+        return;
+      }
     }
 
-    while (!stop_requested_) {
+    if (!capture_start_complete_) {
+      source_ = try_create_source();
+      finalize_capture_start(
+        static_cast<bool>(source_),
+        source_ ? "" : snapshot_.last_error
+      );
+      if (!source_) {
+        emit_live_preview_breadcrumb("source-create-failed error=" + capture_start_error_);
+        return;
+      }
+      emit_live_preview_breadcrumb("source-create-succeeded");
+    }
+
+    bool placeholder_mode_active = use_window_restore_placeholder;
+    while (!stop_requested_.load(std::memory_order_acquire)) {
+      if (placeholder_mode_active) {
+        const WindowCaptureAvailability availability =
+          query_window_capture_availability(source_config.window_handle);
+        if (availability == WindowCaptureAvailability::unavailable) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          snapshot_.reason = "live-preview-target-unavailable";
+          snapshot_.last_error = "Selected window is no longer available for capture.";
+          snapshot_.decoder_ready = false;
+          break;
+        }
+        if (availability == WindowCaptureAvailability::minimized) {
+          if (source_) {
+            source_->close();
+            source_.reset();
+          }
+          {
+            std::lock_guard<std::mutex> lock(mutex_);
+            snapshot_.reason = "live-preview-waiting-for-window-restore";
+            snapshot_.last_error.clear();
+            snapshot_.decoder_ready = true;
+          }
+          const auto& current_placeholder_bgra = ensure_placeholder_bgra();
+          if (!current_placeholder_bgra.empty()) {
+            WgcFrameCpuBuffer placeholder_frame;
+            placeholder_frame.width = placeholder_width;
+            placeholder_frame.height = placeholder_height;
+            placeholder_frame.bgra = current_placeholder_bgra;
+            present_frame(placeholder_frame);
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(120));
+          continue;
+        }
+      }
+
+      if (!source_) {
+        source_ = try_create_source();
+        if (!source_) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+          continue;
+        }
+        emit_live_preview_breadcrumb("source-create-succeeded");
+        placeholder_mode_active = false;
+      }
+
       WgcFrameCpuBuffer frame;
       std::string frame_error;
       if (!source_->wait_for_frame_bgra(250, &frame, &frame_error)) {
-        if (stop_requested_) {
+        if (stop_requested_.load(std::memory_order_acquire)) {
           break;
         }
-        if (frame_error == "wgc-frame-timeout") {
+        if (frame_error == "wgc-frame-timeout" || frame_error == "wgc-frame-pool-recreated") {
           continue;
         }
         {
@@ -791,13 +1047,20 @@ class NativeLivePreview::Impl {
           snapshot_.last_error = frame_error;
           snapshot_.decoder_ready = false;
         }
+        if (source_) {
+          source_->close();
+          source_.reset();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         continue;
       }
       present_frame(frame);
     }
 
-    source_->close();
-    source_.reset();
+    if (source_) {
+      source_->close();
+      source_.reset();
+    }
   }
 
   void fail_start(const std::string& error_message) {
@@ -892,54 +1155,10 @@ class NativeLivePreview::Impl {
   }
 
   void refresh_owner_move_hook() {
-    NativeEmbeddedSurfaceLayout layout;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      layout = config_.layout;
-    }
-
-    if (!layout.embedded || !should_use_overlay_popup(layout)) {
-      unregister_owner_move_hook();
-      return;
-    }
-
-    const HWND owner_window = parse_window_handle(layout.parent_window_handle);
-    if (!owner_window || !IsWindow(owner_window)) {
-      unregister_owner_move_hook();
-      return;
-    }
-
-    if (owner_move_hook_ && owner_move_hook_owner_ == owner_window) {
-      return;
-    }
-
+    // Host live preview already receives explicit updateSurface calls from the
+    // renderer on move/resize/maximize. Avoid the extra WinEvent owner hook to
+    // keep the popup attach path minimal and deterministic.
     unregister_owner_move_hook();
-
-    DWORD owner_process_id = 0;
-    const DWORD owner_thread_id = GetWindowThreadProcessId(owner_window, &owner_process_id);
-    if (!owner_thread_id) {
-      return;
-    }
-
-    owner_move_hook_ = SetWinEventHook(
-      EVENT_OBJECT_LOCATIONCHANGE,
-      EVENT_OBJECT_LOCATIONCHANGE,
-      nullptr,
-      &Impl::owner_move_hook_proc,
-      owner_process_id,
-      owner_thread_id,
-      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
-    );
-    if (!owner_move_hook_) {
-      owner_move_hook_owner_ = nullptr;
-      return;
-    }
-
-    owner_move_hook_owner_ = owner_window;
-    {
-      std::lock_guard<std::mutex> registry_lock(owner_move_hook_registry_mutex_);
-      owner_move_hook_registry_[owner_move_hook_] = this;
-    }
   }
 
   void sync_overlay_popup_to_owner(HWND owner_window) {
@@ -1051,14 +1270,12 @@ class NativeLivePreview::Impl {
 
     window_handle_.store(hwnd);
     if (embedded && overlay_popup) {
-      refresh_overlay_anchor(owner_window, config_.layout);
       if (config_.layout.visible) {
         SetWindowPos(hwnd, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW | SWP_NOACTIVATE);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
       } else {
         ShowWindow(hwnd, SW_HIDE);
       }
-      refresh_owner_move_hook();
     } else {
       ShowWindow(hwnd, embedded && config_.layout.visible ? SW_SHOWNA : SW_SHOW);
       if (embedded && !config_.layout.visible) {
@@ -1127,8 +1344,6 @@ class NativeLivePreview::Impl {
 
     if (overlay_popup) {
       SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(parent_window));
-      refresh_overlay_anchor(parent_window, layout);
-      PostMessageW(hwnd, kRefreshOwnerMoveHookMessage, 0, 0);
     } else if (GetParent(hwnd) != parent_window) {
       SetParent(hwnd, parent_window);
     }
@@ -1212,7 +1427,7 @@ class NativeLivePreview::Impl {
     return true;
   }
 
-  void pump_messages(bool* should_stop) {
+  void pump_pending_messages(bool* should_stop) {
     MSG msg{};
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) {
@@ -1222,6 +1437,15 @@ class NativeLivePreview::Impl {
       TranslateMessage(&msg);
       DispatchMessageW(&msg);
     }
+  }
+
+  void flush_pending_present() {
+    repaint_pending_.store(false, std::memory_order_release);
+    const HWND hwnd = window_handle_.load();
+    if (!hwnd || !IsWindow(hwnd)) {
+      return;
+    }
+    InvalidateRect(hwnd, nullptr, FALSE);
   }
 
   void paint() {
@@ -1313,11 +1537,24 @@ class NativeLivePreview::Impl {
       return;
     }
 
+    const long long now_steady_us = current_time_micros_steady();
     {
       std::lock_guard<std::mutex> lock(mutex_);
       frame_width_ = frame.width;
       frame_height_ = frame.height;
       bgra_buffer_ = frame.bgra;
+      if (last_frame_present_at_steady_us_ > 0 && now_steady_us > last_frame_present_at_steady_us_) {
+        const double interval_us = static_cast<double>(now_steady_us - last_frame_present_at_steady_us_);
+        frame_interval_sample_count_ += 1;
+        const double delta = interval_us - frame_interval_mean_us_;
+        frame_interval_mean_us_ += delta / static_cast<double>(frame_interval_sample_count_);
+        const double delta2 = interval_us - frame_interval_mean_us_;
+        frame_interval_m2_us_ += delta * delta2;
+        snapshot_.frame_interval_stddev_ms = frame_interval_sample_count_ > 1
+          ? std::sqrt(frame_interval_m2_us_ / static_cast<double>(frame_interval_sample_count_ - 1)) / 1000.0
+          : 0.0;
+      }
+      last_frame_present_at_steady_us_ = now_steady_us;
       snapshot_.decoded_frames_rendered += 1;
       if (snapshot_.decoded_frames_rendered > 0) {
         const std::uint64_t rendered = snapshot_.decoded_frames_rendered;
@@ -1334,12 +1571,19 @@ class NativeLivePreview::Impl {
       snapshot_.decoder_ready = true;
       snapshot_.reason = "live-preview-frame-rendered";
       snapshot_.last_error.clear();
+      if (snapshot_.decoded_frames_rendered == 1) {
+        emit_live_preview_breadcrumb(
+          "first-frame-rendered size=" +
+          std::to_string(frame.width) + "x" + std::to_string(frame.height));
+      }
     }
 
 #ifdef _WIN32
     const HWND hwnd = window_handle_.load();
-    if (hwnd) {
-      InvalidateRect(hwnd, nullptr, FALSE);
+    if (hwnd && IsWindow(hwnd)) {
+      if (!repaint_pending_.exchange(true, std::memory_order_acq_rel)) {
+        PostMessageW(hwnd, kPresentFrameMessage, 0, 0);
+      }
     }
 #endif
   }
@@ -1350,7 +1594,7 @@ class NativeLivePreview::Impl {
   std::condition_variable capture_started_condition_;
   std::thread worker_;
   std::thread capture_worker_;
-  bool stop_requested_ = false;
+  std::atomic<bool> stop_requested_ { false };
   bool start_complete_ = false;
   bool start_succeeded_ = false;
   std::string start_error_;
@@ -1363,9 +1607,14 @@ class NativeLivePreview::Impl {
   int frame_width_ = 0;
   int frame_height_ = 0;
   std::vector<std::uint8_t> bgra_buffer_;
+  long long last_frame_present_at_steady_us_ = -1;
+  std::uint64_t frame_interval_sample_count_ = 0;
+  double frame_interval_mean_us_ = 0.0;
+  double frame_interval_m2_us_ = 0.0;
 
 #ifdef _WIN32
   std::atomic<HWND> window_handle_ { nullptr };
+  std::atomic<bool> repaint_pending_ { false };
   OverlayAnchorState overlay_anchor_{};
   HWINEVENTHOOK owner_move_hook_ = nullptr;
   HWND owner_move_hook_owner_ = nullptr;

@@ -35,6 +35,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setDebugMode: (enabled) => ipcRenderer.send('renderer-debug-mode-changed', Boolean(enabled)),
   isMaximized: () => ipcRenderer.invoke('window-is-maximized'),
   getWindowBounds: () => ipcRenderer.invoke('window-get-bounds'),
+  getCursorScreenPoint: () => ipcRenderer.invoke('window-get-cursor-screen-point'),
   setFullscreen: (enabled) => ipcRenderer.invoke('window-set-fullscreen', enabled),
   isFullscreen: () => ipcRenderer.invoke('window-is-fullscreen'),
   showNotification: (title, body) => {
@@ -62,6 +63,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     attachSurface: (options) => ipcRenderer.invoke('media-engine-attach-surface', options),
     updateSurface: (options) => ipcRenderer.invoke('media-engine-update-surface', options),
     detachSurface: (options) => ipcRenderer.invoke('media-engine-detach-surface', options),
+    setViewerPlaybackMode: (options) => ipcRenderer.invoke('media-engine-set-viewer-playback-mode', options),
+    setViewerAudioDelay: (options) => ipcRenderer.invoke('media-engine-set-viewer-audio-delay', options),
     setViewerVolume: (volume) => ipcRenderer.invoke('media-engine-set-viewer-volume', volume),
     getViewerVolume: () => ipcRenderer.invoke('media-engine-get-viewer-volume'),
     getCapabilities: () => ipcRenderer.invoke('media-engine-get-capabilities'),

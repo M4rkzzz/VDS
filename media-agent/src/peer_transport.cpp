@@ -332,23 +332,26 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       inbound_audio_rtcp_session.reset();
     }
 
-    if (local_video_track) {
-      local_video_track->close();
-    }
-    if (local_audio_track) {
-      local_audio_track->close();
-    }
-    if (local_inbound_video_track) {
-      local_inbound_video_track->close();
-    }
-    if (local_inbound_audio_track) {
-      local_inbound_audio_track->close();
+    if (local_data_channel) {
+      local_data_channel->close();
     }
     if (local_pc) {
       local_pc->resetCallbacks();
+      local_pc->close();
+    } else {
+      if (local_video_track) {
+        local_video_track->close();
+      }
+      if (local_audio_track) {
+        local_audio_track->close();
+      }
+      if (local_inbound_video_track) {
+        local_inbound_video_track->close();
+      }
+      if (local_inbound_audio_track) {
+        local_inbound_audio_track->close();
+      }
     }
-
-    (void)local_data_channel;
   }
 
   PeerTransportSnapshot get_snapshot() {
@@ -684,6 +687,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
 
       std::lock_guard<std::mutex> lock(self->mutex);
+      if (self->closed) {
+        return;
+      }
       self->snapshot.remote_video_track_attached = true;
       if (self->snapshot.remote_track_count < 1) {
         self->snapshot.remote_track_count = 1;
@@ -699,6 +705,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
 
       std::lock_guard<std::mutex> lock(self->mutex);
+      if (self->closed) {
+        return;
+      }
       self->snapshot.remote_video_track_attached = false;
       self->snapshot.updated_at_unix_ms = current_time_millis();
       self->snapshot.media_plane_ready = self->snapshot.decoder_ready && self->snapshot.decoded_frames_rendered > 0;
@@ -719,6 +728,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       std::uint32_t timestamp = info.timestamp;
       {
         std::lock_guard<std::mutex> lock(self->mutex);
+        if (self->closed) {
+          return;
+        }
         self->snapshot.remote_video_track_attached = true;
         if (self->snapshot.remote_track_count < 1) {
           self->snapshot.remote_track_count = 1;
@@ -751,6 +763,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
 
       std::lock_guard<std::mutex> lock(self->mutex);
+      if (self->closed) {
+        return;
+      }
       self->snapshot.remote_audio_track_attached = true;
       self->snapshot.reason = "remote-audio-track-open";
       self->snapshot.updated_at_unix_ms = current_time_millis();
@@ -762,6 +777,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
 
       std::lock_guard<std::mutex> lock(self->mutex);
+      if (self->closed) {
+        return;
+      }
       self->snapshot.remote_audio_track_attached = false;
       self->snapshot.updated_at_unix_ms = current_time_millis();
     });
@@ -781,6 +799,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       std::uint32_t timestamp = info.timestamp;
       {
         std::lock_guard<std::mutex> lock(self->mutex);
+        if (self->closed) {
+          return;
+        }
         self->snapshot.remote_audio_track_attached = true;
         self->snapshot.remote_audio_frames_received += 1;
         self->snapshot.remote_audio_bytes_received += static_cast<std::uint64_t>(frame.size());
@@ -963,6 +984,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       PeerTransportSnapshot snapshot_copy;
       {
         std::lock_guard<std::mutex> lock(self->mutex);
+        if (self->closed) {
+          return;
+        }
         self->snapshot.local_description_created = true;
         self->snapshot.local_description_type = to_description_type_string(description.type());
         self->snapshot.reason = "local-description-created";
@@ -988,6 +1012,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       std::string candidate_mid;
       {
         std::lock_guard<std::mutex> lock(self->mutex);
+        if (self->closed) {
+          return;
+        }
         self->snapshot.local_candidate_count += 1;
         self->snapshot.reason = "local-candidate-gathered";
         self->refresh_from_peer_connection_locked();
@@ -1008,6 +1035,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       PeerTransportSnapshot snapshot_copy;
       {
         std::lock_guard<std::mutex> lock(self->mutex);
+        if (self->closed) {
+          return;
+        }
         self->snapshot.connection_state = to_connection_state_string(state);
         self->snapshot.reason = self->snapshot.connection_state;
         self->refresh_from_peer_connection_locked();
@@ -1026,6 +1056,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
 
       std::lock_guard<std::mutex> lock(self->mutex);
+      if (self->closed) {
+        return;
+      }
       self->snapshot.ice_state = to_ice_state_string(state);
       self->snapshot.updated_at_unix_ms = current_time_millis();
     });
@@ -1037,6 +1070,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
 
       std::lock_guard<std::mutex> lock(self->mutex);
+      if (self->closed) {
+        return;
+      }
       self->snapshot.gathering_state = to_gathering_state_string(state);
       self->snapshot.updated_at_unix_ms = current_time_millis();
     });
@@ -1048,6 +1084,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
 
       std::lock_guard<std::mutex> lock(self->mutex);
+      if (self->closed) {
+        return;
+      }
       self->snapshot.signaling_state = to_signaling_state_string(state);
       self->snapshot.updated_at_unix_ms = current_time_millis();
     });
@@ -1060,6 +1099,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
       {
         std::lock_guard<std::mutex> lock(self->mutex);
+        if (self->closed) {
+          return;
+        }
         self->data_channel = data_channel_value;
         self->snapshot.data_channel_requested = true;
         self->snapshot.data_channel_label = data_channel_value ? data_channel_value->label() : "vds-control";
@@ -1087,6 +1129,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
       {
         std::lock_guard<std::mutex> lock(self->mutex);
+        if (self->closed) {
+          return;
+        }
         self->snapshot.remote_track_count += 1;
         if (track) {
           if (track_type == "audio") {
@@ -1136,6 +1181,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       PeerTransportSnapshot snapshot_copy;
       {
         std::lock_guard<std::mutex> lock(self->mutex);
+        if (self->closed) {
+          return;
+        }
         self->snapshot.data_channel_open = true;
         self->snapshot.reason = "data-channel-open";
         self->refresh_from_peer_connection_locked();
@@ -1156,6 +1204,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       PeerTransportSnapshot snapshot_copy;
       {
         std::lock_guard<std::mutex> lock(self->mutex);
+        if (self->closed) {
+          return;
+        }
         self->snapshot.data_channel_open = false;
         self->snapshot.reason = "data-channel-closed";
         self->refresh_from_peer_connection_locked();

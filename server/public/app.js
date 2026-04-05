@@ -17,6 +17,7 @@ const wsBaseUrl = toWebSocketUrl(serverBaseUrl);
 const clientId = runtimeConfig.clientId || ('client_' + Math.random().toString(36).substring(2, 11));
 const DEBUG_MODE_STORAGE_KEY = 'vds-debug-mode';
 const DEBUG_CONFIG_STORAGE_KEY = 'vds-debug-config';
+const VIEWER_PLAYBACK_PREFS_STORAGE_KEY = 'vds-viewer-playback-prefs';
 const DEBUG_CATEGORY_DEFINITIONS = Object.freeze({
   connection: {
     label: '连接',
@@ -39,8 +40,134 @@ const DEBUG_CATEGORY_DEFINITIONS = Object.freeze({
     description: '启动、能力探测、版本信息与其它诊断'
   }
 });
+const DEBUG_CHANNEL_DEFINITIONS = Object.freeze({
+  renderer: {
+    label: '渲染日志',
+    description: 'app.js 常规调试输出'
+  },
+  nativeEvents: {
+    label: '原生事件',
+    description: 'media-state、peer-state、signal 事件摘要'
+  },
+  nativeSteps: {
+    label: '原生步骤',
+    description: 'attach/createPeer/setRemoteDescription 等 step 明细'
+  },
+  periodicStats: {
+    label: '周期统计',
+    description: 'host/viewer 周期 stats 与抖动指标'
+  },
+  mainProcess: {
+    label: '主进程桥接',
+    description: 'IPC 调用、surface enrich、主进程媒体桥'
+  },
+  agentBreadcrumbs: {
+    label: 'Agent Breadcrumb',
+    description: 'native agent stderr breadcrumb 轨迹'
+  },
+  agentStderr: {
+    label: 'Agent STDERR',
+    description: 'native agent 原始 stderr 输出'
+  }
+});
+const DEBUG_PRESET_DEFINITIONS = Object.freeze({
+  quiet: {
+    label: '静默',
+    description: '关闭所有调试输出',
+    config: {
+      categories: {
+        connection: false,
+        video: false,
+        audio: false,
+        update: false,
+        misc: false
+      },
+      channels: {
+        renderer: false,
+        nativeEvents: false,
+        nativeSteps: false,
+        periodicStats: false,
+        mainProcess: false,
+        agentBreadcrumbs: false,
+        agentStderr: false
+      }
+    }
+  },
+  diagnose: {
+    label: '排障',
+    description: '推荐日常排障，默认不开高频日志',
+    config: {
+      categories: {
+        connection: true,
+        video: true,
+        audio: true,
+        update: true,
+        misc: true
+      },
+      channels: {
+        renderer: true,
+        nativeEvents: true,
+        nativeSteps: false,
+        periodicStats: false,
+        mainProcess: true,
+        agentBreadcrumbs: false,
+        agentStderr: false
+      }
+    }
+  },
+  traceVideo: {
+    label: '视频追踪',
+    description: '重点看视频链路，开启 step 和周期统计',
+    config: {
+      categories: {
+        connection: true,
+        video: true,
+        audio: false,
+        update: false,
+        misc: false
+      },
+      channels: {
+        renderer: true,
+        nativeEvents: true,
+        nativeSteps: true,
+        periodicStats: true,
+        mainProcess: true,
+        agentBreadcrumbs: true,
+        agentStderr: false
+      }
+    }
+  },
+  verbose: {
+    label: '全开',
+    description: '最大化日志，适合短时间深挖问题',
+    config: {
+      categories: {
+        connection: true,
+        video: true,
+        audio: true,
+        update: true,
+        misc: true
+      },
+      channels: {
+        renderer: true,
+        nativeEvents: true,
+        nativeSteps: true,
+        periodicStats: true,
+        mainProcess: true,
+        agentBreadcrumbs: true,
+        agentStderr: true
+      }
+    }
+  }
+});
 const DEBUG_CATEGORY_KEYS = Object.keys(DEBUG_CATEGORY_DEFINITIONS);
+const DEBUG_CHANNEL_KEYS = Object.keys(DEBUG_CHANNEL_DEFINITIONS);
 let debugConfig = readDebugConfig();
+
+const VIEWER_PLAYBACK_MODES = Object.freeze({
+  SYNCED: 'synced',
+  PASSTHROUGH: 'passthrough'
+});
 
 // WebSocket连接
 let ws = null;
@@ -62,6 +189,8 @@ let currentRoomId = null;
 let localStream = null;
 let myChainPosition = -1; // 观众在链中的位置
 let hostId = null; // Host的clientId
+
+let viewerPlaybackPrefs = readViewerPlaybackPrefs();
 
 // 音频捕获全局变量（用于资源清理）
 
@@ -130,6 +259,7 @@ let updateStatusUnsubscribe = null;
 let updateLogUnsubscribe = null;
 let updateCheckStarted = false;
 let updateModalAutoHideTimer = null;
+let updateInstallTimer = null;
 let updateLogPath = '';
 const updateLogEntries = [];
 const UPDATE_LOG_ENTRY_LIMIT = 40;
@@ -174,21 +304,54 @@ function readDebugModeFlag() {
 }
 
 function buildDefaultDebugConfig(enabled = false) {
-  return DEBUG_CATEGORY_KEYS.reduce((config, key) => {
-    config[key] = Boolean(enabled);
-    return config;
-  }, {});
+  return {
+    categories: DEBUG_CATEGORY_KEYS.reduce((config, key) => {
+      config[key] = Boolean(enabled);
+      return config;
+    }, {}),
+    channels: DEBUG_CHANNEL_KEYS.reduce((config, key) => {
+      config[key] = Boolean(enabled);
+      return config;
+    }, {})
+  };
 }
 
 function normalizeDebugConfig(config, fallbackEnabled = false) {
+  if (typeof config === 'boolean') {
+    return buildDefaultDebugConfig(config);
+  }
+
   const normalized = buildDefaultDebugConfig(fallbackEnabled);
   if (!config || typeof config !== 'object') {
     return normalized;
   }
 
+  const hasStructuredCategories = Boolean(config.categories && typeof config.categories === 'object');
+  const hasStructuredChannels = Boolean(config.channels && typeof config.channels === 'object');
+
+  if (!hasStructuredCategories && !hasStructuredChannels) {
+    for (const key of DEBUG_CATEGORY_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(config, key)) {
+        normalized.categories[key] = Boolean(config[key]);
+      }
+    }
+
+    const legacyEnabled = DEBUG_CATEGORY_KEYS.some((key) => normalized.categories[key]);
+    normalized.channels.renderer = legacyEnabled;
+    normalized.channels.nativeEvents = legacyEnabled;
+    normalized.channels.mainProcess = legacyEnabled;
+    return normalized;
+  }
+
   for (const key of DEBUG_CATEGORY_KEYS) {
-    if (Object.prototype.hasOwnProperty.call(config, key)) {
-      normalized[key] = Boolean(config[key]);
+    if (hasStructuredCategories && Object.prototype.hasOwnProperty.call(config.categories, key)) {
+      normalized.categories[key] = Boolean(config.categories[key]);
+    }
+  }
+
+  for (const key of DEBUG_CHANNEL_KEYS) {
+    if (hasStructuredChannels && Object.prototype.hasOwnProperty.call(config.channels, key)) {
+      normalized.channels[key] = Boolean(config.channels[key]);
     }
   }
 
@@ -209,7 +372,14 @@ function readDebugConfig() {
 }
 
 function isAnyDebugEnabled(config = debugConfig) {
-  return DEBUG_CATEGORY_KEYS.some((key) => Boolean(config[key]));
+  return DEBUG_CATEGORY_KEYS.some((key) => Boolean(config.categories && config.categories[key])) ||
+    DEBUG_CHANNEL_KEYS.some((key) => Boolean(config.channels && config.channels[key]));
+}
+
+function isAnyDebugPathEnabled(config = debugConfig) {
+  return DEBUG_CATEGORY_KEYS.some((category) => (
+    DEBUG_CHANNEL_KEYS.some((channel) => isDebugLogEnabled(category, channel, config))
+  ));
 }
 
 function persistDebugConfig(config) {
@@ -222,16 +392,19 @@ function persistDebugConfig(config) {
 }
 
 function syncDebugUi() {
-  const debugEnabled = isAnyDebugEnabled();
+  const debugEnabled = isAnyDebugPathEnabled();
   document.body.classList.toggle('debug-mode-enabled', debugEnabled);
 
   if (elements && elements.btnDebugToggle) {
-    const enabledLabels = DEBUG_CATEGORY_KEYS
-      .filter((key) => debugConfig[key])
+    const enabledCategories = DEBUG_CATEGORY_KEYS
+      .filter((key) => debugConfig.categories[key])
       .map((key) => DEBUG_CATEGORY_DEFINITIONS[key].label);
+    const enabledChannels = DEBUG_CHANNEL_KEYS
+      .filter((key) => debugConfig.channels[key])
+      .map((key) => DEBUG_CHANNEL_DEFINITIONS[key].label);
     elements.btnDebugToggle.classList.toggle('active', debugEnabled);
-    elements.btnDebugToggle.title = enabledLabels.length > 0
-      ? `已开启调试：${enabledLabels.join('、')}`
+    elements.btnDebugToggle.title = debugEnabled
+      ? `已开启：${enabledCategories.join('、') || '无类别'} / ${enabledChannels.join('、') || '无通道'}`
       : '打开调试菜单';
     if (elements.debugMenu) {
       elements.btnDebugToggle.setAttribute(
@@ -242,10 +415,32 @@ function syncDebugUi() {
   }
 
   if (elements && elements.debugMenu) {
-    const checkboxes = elements.debugMenu.querySelectorAll('[data-debug-category]');
+    const checkboxes = elements.debugMenu.querySelectorAll('[data-debug-category], [data-debug-channel]');
     checkboxes.forEach((input) => {
-      const key = input.getAttribute('data-debug-category');
-      input.checked = Boolean(key && debugConfig[key]);
+      const category = input.getAttribute('data-debug-category');
+      const channel = input.getAttribute('data-debug-channel');
+      if (category) {
+        input.checked = Boolean(debugConfig.categories[category]);
+      } else if (channel) {
+        input.checked = Boolean(debugConfig.channels[channel]);
+      }
+    });
+
+    const summary = elements.debugMenu.querySelector('[data-debug-summary]');
+    if (summary) {
+      const categoryCount = DEBUG_CATEGORY_KEYS.filter((key) => debugConfig.categories[key]).length;
+      const channelCount = DEBUG_CHANNEL_KEYS.filter((key) => debugConfig.channels[key]).length;
+      summary.textContent = isAnyDebugPathEnabled()
+        ? `已启用 ${categoryCount} 个类别 / ${channelCount} 个通道`
+        : '当前为静默模式';
+    }
+
+    const presetButtons = elements.debugMenu.querySelectorAll('[data-debug-preset]');
+    presetButtons.forEach((button) => {
+      const presetKey = button.getAttribute('data-debug-preset');
+      const preset = presetKey ? DEBUG_PRESET_DEFINITIONS[presetKey] : null;
+      const active = preset ? isSameDebugConfig(debugConfig, normalizeDebugConfig(preset.config, false)) : false;
+      button.classList.toggle('active', active);
     });
   }
 }
@@ -267,14 +462,39 @@ function propagateDebugConfig(config) {
 }
 
 function isDebugModeEnabled() {
-  return isAnyDebugEnabled();
+  return isAnyDebugPathEnabled();
 }
 
 function isDebugCategoryEnabled(category = 'misc') {
   if (!Object.prototype.hasOwnProperty.call(DEBUG_CATEGORY_DEFINITIONS, category)) {
     return false;
   }
-  return Boolean(debugConfig[category]);
+  return Boolean(debugConfig.categories[category]);
+}
+
+function isDebugChannelEnabled(channel = 'renderer') {
+  if (!Object.prototype.hasOwnProperty.call(DEBUG_CHANNEL_DEFINITIONS, channel)) {
+    return false;
+  }
+  return Boolean(debugConfig.channels[channel]);
+}
+
+function isDebugLogEnabled(category = 'misc', channel = 'renderer', config = debugConfig) {
+  if (!Object.prototype.hasOwnProperty.call(DEBUG_CATEGORY_DEFINITIONS, category)) {
+    return false;
+  }
+  if (!Object.prototype.hasOwnProperty.call(DEBUG_CHANNEL_DEFINITIONS, channel)) {
+    return false;
+  }
+
+  return Boolean(config.categories && config.categories[category]) &&
+    Boolean(config.channels && config.channels[channel]);
+}
+
+function isSameDebugConfig(left, right) {
+  const normalizedLeft = normalizeDebugConfig(left, false);
+  const normalizedRight = normalizeDebugConfig(right, false);
+  return JSON.stringify(normalizedLeft) === JSON.stringify(normalizedRight);
 }
 
 function setDebugConfig(nextConfig, options = {}) {
@@ -289,14 +509,147 @@ function setDebugConfig(nextConfig, options = {}) {
   syncDebugUi();
 }
 
+function readViewerPlaybackPrefs() {
+  const fallback = {
+    mode: VIEWER_PLAYBACK_MODES.SYNCED,
+    audioDelayMs: 0
+  };
+  try {
+    const raw = window.localStorage.getItem(VIEWER_PLAYBACK_PREFS_STORAGE_KEY);
+    if (!raw) {
+      return fallback;
+    }
+    return normalizeViewerPlaybackPrefs(JSON.parse(raw));
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function normalizeViewerPlaybackPrefs(nextPrefs) {
+  const normalizedMode =
+    nextPrefs && nextPrefs.mode === VIEWER_PLAYBACK_MODES.PASSTHROUGH
+      ? VIEWER_PLAYBACK_MODES.PASSTHROUGH
+      : VIEWER_PLAYBACK_MODES.SYNCED;
+  const numericDelay = Number(nextPrefs && nextPrefs.audioDelayMs);
+  const normalizedDelay = Math.max(0, Math.min(300, Number.isFinite(numericDelay) ? Math.round(numericDelay) : 0));
+  return {
+    mode: normalizedMode,
+    audioDelayMs: normalizedDelay
+  };
+}
+
+function persistViewerPlaybackPrefs() {
+  try {
+    window.localStorage.setItem(VIEWER_PLAYBACK_PREFS_STORAGE_KEY, JSON.stringify(viewerPlaybackPrefs));
+  } catch (_error) {
+    // Ignore storage failures.
+  }
+}
+
+function isViewerPlaybackPassthroughMode() {
+  return viewerPlaybackPrefs.mode === VIEWER_PLAYBACK_MODES.PASSTHROUGH;
+}
+
+function isViewerJoinLocked() {
+  return sessionRole === 'viewer' && Boolean(currentRoomId);
+}
+
+function renderViewerPlaybackPrefsUi() {
+  const passthrough = isViewerPlaybackPassthroughMode();
+  const locked = isViewerJoinLocked();
+
+  if (elements.viewerPlaybackModeToggle) {
+    elements.viewerPlaybackModeToggle.checked = passthrough;
+    elements.viewerPlaybackModeToggle.disabled = locked;
+  }
+  if (elements.viewerAudioDelayControl) {
+    elements.viewerAudioDelayControl.classList.toggle('hidden', !passthrough);
+  }
+  if (elements.viewerAudioDelayInput) {
+    elements.viewerAudioDelayInput.value = String(viewerPlaybackPrefs.audioDelayMs);
+    elements.viewerAudioDelayInput.disabled = locked && !passthrough;
+  }
+  if (elements.viewerAudioDelayDecrease) {
+    elements.viewerAudioDelayDecrease.disabled = locked && !passthrough;
+  }
+  if (elements.viewerAudioDelayIncrease) {
+    elements.viewerAudioDelayIncrease.disabled = locked && !passthrough;
+  }
+}
+
+function setViewerPlaybackMode(mode) {
+  viewerPlaybackPrefs = normalizeViewerPlaybackPrefs({
+    ...viewerPlaybackPrefs,
+    mode
+  });
+  persistViewerPlaybackPrefs();
+  renderViewerPlaybackPrefsUi();
+}
+
+async function applyNativeViewerPlaybackPrefs({ includeMode = false } = {}) {
+  if (!window.isElectron || !window.electronAPI || !window.electronAPI.mediaEngine) {
+    return;
+  }
+  const mediaEngine = window.electronAPI.mediaEngine;
+  if (includeMode && typeof mediaEngine.setViewerPlaybackMode === 'function') {
+    await mediaEngine.setViewerPlaybackMode({
+      mode: viewerPlaybackPrefs.mode
+    });
+  }
+  if (typeof mediaEngine.setViewerAudioDelay === 'function') {
+    await mediaEngine.setViewerAudioDelay({
+      delayMs: viewerPlaybackPrefs.audioDelayMs
+    });
+  }
+}
+
+function setViewerAudioDelayMs(nextDelayMs, { applyNative = false } = {}) {
+  viewerPlaybackPrefs = normalizeViewerPlaybackPrefs({
+    ...viewerPlaybackPrefs,
+    audioDelayMs: nextDelayMs
+  });
+  persistViewerPlaybackPrefs();
+  renderViewerPlaybackPrefsUi();
+  if (applyNative && sessionRole === 'viewer' && currentRoomId && isViewerPlaybackPassthroughMode()) {
+    applyNativeViewerPlaybackPrefs({ includeMode: false }).catch((error) => {
+      console.warn('[media-engine] setViewerAudioDelay failed:', error);
+    });
+  }
+}
+
 function setDebugCategoryEnabled(category, enabled) {
   if (!Object.prototype.hasOwnProperty.call(DEBUG_CATEGORY_DEFINITIONS, category)) {
     return;
   }
   setDebugConfig({
     ...debugConfig,
-    [category]: Boolean(enabled)
+    categories: {
+      ...debugConfig.categories,
+      [category]: Boolean(enabled)
+    }
   });
+}
+
+function setDebugChannelEnabled(channel, enabled) {
+  if (!Object.prototype.hasOwnProperty.call(DEBUG_CHANNEL_DEFINITIONS, channel)) {
+    return;
+  }
+  setDebugConfig({
+    ...debugConfig,
+    channels: {
+      ...debugConfig.channels,
+      [channel]: Boolean(enabled)
+    }
+  });
+}
+
+function applyDebugPreset(presetKey) {
+  const preset = DEBUG_PRESET_DEFINITIONS[presetKey];
+  if (!preset) {
+    return;
+  }
+
+  setDebugConfig(normalizeDebugConfig(preset.config, false));
 }
 
 function debugLog(category, ...args) {
@@ -306,7 +659,7 @@ function debugLog(category, ...args) {
     resolvedArgs = [category, ...args];
     resolvedCategory = 'misc';
   }
-  if (!isDebugCategoryEnabled(resolvedCategory)) {
+  if (!isDebugLogEnabled(resolvedCategory, 'renderer')) {
     return;
   }
   console.log(...resolvedArgs);
@@ -314,8 +667,11 @@ function debugLog(category, ...args) {
 
 window.__vdsIsDebugModeEnabled = isDebugModeEnabled;
 window.__vdsDebugCategoryDefinitions = DEBUG_CATEGORY_DEFINITIONS;
-window.__vdsShouldDebugLog = (category = 'misc') => isDebugCategoryEnabled(category);
-window.__vdsGetDebugConfig = () => ({ ...debugConfig });
+window.__vdsDebugChannelDefinitions = DEBUG_CHANNEL_DEFINITIONS;
+window.__vdsShouldDebugLog = (category = 'misc', channel = 'renderer') => isDebugLogEnabled(category, channel);
+window.__vdsGetDebugConfig = () => JSON.parse(JSON.stringify(debugConfig));
+window.__vdsGetViewerPlaybackPrefs = () => ({ ...viewerPlaybackPrefs });
+window.__vdsRenderViewerPlaybackPrefsUi = renderViewerPlaybackPrefsUi;
 window.__vdsSetDebugConfigState = (config) => {
   debugConfig = normalizeDebugConfig(config, false);
   syncDebugUi();
@@ -685,6 +1041,11 @@ const elements = {
   viewerCount: document.getElementById('viewer-count'),
   viewerRoomId: document.getElementById('viewer-room-id'),
   viewerStatus: document.getElementById('viewer-status'),
+  viewerPlaybackModeToggle: document.getElementById('viewer-playback-mode-toggle'),
+  viewerAudioDelayControl: document.getElementById('viewer-audio-delay-control'),
+  viewerAudioDelayInput: document.getElementById('viewer-audio-delay-input'),
+  viewerAudioDelayDecrease: document.getElementById('viewer-audio-delay-decrease'),
+  viewerAudioDelayIncrease: document.getElementById('viewer-audio-delay-increase'),
   connectionStatus: document.getElementById('connection-status'),
   chainPosition: document.getElementById('chain-position'),
   viewerReceiveFps: document.getElementById('viewer-receive-fps'),
@@ -707,7 +1068,6 @@ const elements = {
   btnRefreshSources: document.getElementById('btn-refresh-sources'),
   sourceAudioEnabled: document.getElementById('source-audio-enabled'),
   sourceAudioSummary: document.getElementById('source-audio-summary'),
-  btnChangeSourceAudio: document.getElementById('btn-change-source-audio'),
   sourceAudioProcessList: document.getElementById('source-audio-process-list'),
   // 画质设置弹窗
   qualityModal: document.getElementById('quality-modal'),
@@ -1330,7 +1690,13 @@ function renderDebugMenu() {
     return;
   }
 
-  const items = DEBUG_CATEGORY_KEYS.map((key) => {
+  const presetItems = Object.entries(DEBUG_PRESET_DEFINITIONS).map(([key, definition]) => `
+    <button class="debug-menu-preset" type="button" data-debug-preset="${key}" title="${definition.description}">
+      ${definition.label}
+    </button>
+  `).join('');
+
+  const categoryItems = DEBUG_CATEGORY_KEYS.map((key) => {
     const definition = DEBUG_CATEGORY_DEFINITIONS[key];
     return `
       <label class="debug-menu-item">
@@ -1343,12 +1709,42 @@ function renderDebugMenu() {
     `;
   }).join('');
 
+  const channelItems = DEBUG_CHANNEL_KEYS.map((key) => {
+    const definition = DEBUG_CHANNEL_DEFINITIONS[key];
+    return `
+      <label class="debug-menu-item">
+        <span class="debug-menu-item-main">
+          <input type="checkbox" data-debug-channel="${key}">
+          <span class="debug-menu-item-label">${definition.label}</span>
+        </span>
+        <span class="debug-menu-item-description">${definition.description}</span>
+      </label>
+    `;
+  }).join('');
+
   elements.debugMenu.innerHTML = `
     <div class="debug-menu-header">
-      <span class="debug-menu-title">调试日志</span>
-      <span class="debug-menu-subtitle">按链路分类启用前端诊断输出</span>
+      <span class="debug-menu-title">调试控制台</span>
+      <span class="debug-menu-subtitle">按类别和日志通道组合控制，默认建议保持静默或使用排障预设。</span>
     </div>
-    <div class="debug-menu-body">${items}</div>
+    <div class="debug-menu-summary" data-debug-summary>当前为静默模式</div>
+    <div class="debug-menu-section">
+      <span class="debug-menu-section-title">预设</span>
+      <div class="debug-menu-presets">${presetItems}</div>
+    </div>
+    <div class="debug-menu-section">
+      <span class="debug-menu-section-title">类别</span>
+      <div class="debug-menu-body">${categoryItems}</div>
+    </div>
+    <div class="debug-menu-section">
+      <span class="debug-menu-section-title">通道</span>
+      <div class="debug-menu-body">${channelItems}</div>
+    </div>
+    <div class="debug-menu-footer">
+      <button class="debug-menu-action" type="button" data-debug-preset="quiet">全部关闭</button>
+      <button class="debug-menu-action" type="button" data-debug-preset="diagnose">推荐排障</button>
+      <button class="debug-menu-action" type="button" data-debug-preset="verbose">全部开启</button>
+    </div>
   `;
 }
 
@@ -1360,6 +1756,7 @@ if (!window.isElectron) {
 renderDebugMenu();
 bindQualitySettingsUi();
 renderQualitySettingsUi();
+renderViewerPlaybackPrefsUi();
 
 prewarmWorkspacePanels().catch(() => {});
 
@@ -1373,6 +1770,38 @@ elements.btnLeave.addEventListener('click', leaveRoom);
 elements.btnBack.addEventListener('click', goBack);
 elements.btnBackViewer.addEventListener('click', goBackViewer);
 elements.btnCopyRoom.addEventListener('click', copyRoomId);
+if (elements.viewerPlaybackModeToggle) {
+  elements.viewerPlaybackModeToggle.addEventListener('change', (event) => {
+    if (isViewerJoinLocked()) {
+      renderViewerPlaybackPrefsUi();
+      return;
+    }
+    setViewerPlaybackMode(
+      event.target.checked ? VIEWER_PLAYBACK_MODES.PASSTHROUGH : VIEWER_PLAYBACK_MODES.SYNCED
+    );
+  });
+}
+if (elements.viewerAudioDelayInput) {
+  elements.viewerAudioDelayInput.addEventListener('input', (event) => {
+    setViewerAudioDelayMs(event.target.value, {
+      applyNative: true
+    });
+  });
+}
+if (elements.viewerAudioDelayDecrease) {
+  elements.viewerAudioDelayDecrease.addEventListener('click', () => {
+    setViewerAudioDelayMs(viewerPlaybackPrefs.audioDelayMs - 10, {
+      applyNative: true
+    });
+  });
+}
+if (elements.viewerAudioDelayIncrease) {
+  elements.viewerAudioDelayIncrease.addEventListener('click', () => {
+    setViewerAudioDelayMs(viewerPlaybackPrefs.audioDelayMs + 10, {
+      applyNative: true
+    });
+  });
+}
 
 // 屏幕源选择弹窗事件
 elements.btnConfirmSource.addEventListener('click', confirmSourceAndShare);
@@ -1381,7 +1810,6 @@ elements.btnRefreshSources.addEventListener('click', refreshSources);
 
 // 音频进程选择弹窗事件
 elements.sourceAudioEnabled.addEventListener('change', updateSourceAudioUi);
-elements.btnChangeSourceAudio.addEventListener('click', cycleSelectedSourceAudioCandidate);
 
 // 画质设置弹窗事件
 elements.btnConfirmQuality.addEventListener('click', () => {
@@ -1396,6 +1824,7 @@ elements.btnCancelQuality.addEventListener('click', cancelQualitySelection);
 // 标题栏按钮事件
 elements.btnCloseUpdate.addEventListener('click', hideUpdateModal);
 elements.btnInstallUpdate.addEventListener('click', () => {
+  clearScheduledUpdateInstall();
   hideUpdateModal();
   if (window.electronAPI && window.electronAPI.quitAndInstall) {
     window.electronAPI.quitAndInstall();
@@ -1436,10 +1865,26 @@ if (elements.debugMenu) {
       return;
     }
     const category = input.getAttribute('data-debug-category');
-    if (!category) {
+    const channel = input.getAttribute('data-debug-channel');
+    if (category) {
+      setDebugCategoryEnabled(category, input.checked);
       return;
     }
-    setDebugCategoryEnabled(category, input.checked);
+    if (channel) {
+      setDebugChannelEnabled(channel, input.checked);
+    }
+  });
+
+  elements.debugMenu.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+
+    const presetKey = target.getAttribute('data-debug-preset');
+    if (presetKey) {
+      applyDebugPreset(presetKey);
+    }
   });
 }
 
@@ -1575,6 +2020,15 @@ function connectWebSocket() {
         wsReconnectTimer = null;
       }
       if (resumeOnNextConnect && currentRoomId && sessionRole) {
+        removePendingMessages((entry) => {
+          if (!entry || typeof entry !== 'object') {
+            return false;
+          }
+
+          return entry.type === 'join-room' ||
+            entry.type === 'create-room' ||
+            entry.type === 'resume-session';
+        });
         sendRawMessage({
           type: 'resume-session',
           roomId: currentRoomId,
@@ -1690,6 +2144,18 @@ function sendRawMessage(data) {
   }
 }
 
+function removePendingMessages(predicate) {
+  if (typeof predicate !== 'function' || pendingMessages.length === 0) {
+    return;
+  }
+
+  for (let index = pendingMessages.length - 1; index >= 0; index -= 1) {
+    if (predicate(pendingMessages[index])) {
+      pendingMessages.splice(index, 1);
+    }
+  }
+}
+
 function flushPendingMessages() {
   while (pendingMessages.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
     sendRawMessage(pendingMessages.shift());
@@ -1784,6 +2250,23 @@ function clearUpdateModalAutoHide() {
   }
 }
 
+function clearScheduledUpdateInstall() {
+  if (updateInstallTimer) {
+    clearTimeout(updateInstallTimer);
+    updateInstallTimer = null;
+  }
+}
+
+function scheduleSilentUpdateInstall(delayMs = 5000) {
+  clearScheduledUpdateInstall();
+  updateInstallTimer = setTimeout(() => {
+    updateInstallTimer = null;
+    if (window.electronAPI && window.electronAPI.quitAndInstall) {
+      window.electronAPI.quitAndInstall();
+    }
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
 function scheduleUpdateModalAutoHide(delayMs = 1800) {
   clearUpdateModalAutoHide();
   updateModalAutoHideTimer = setTimeout(() => {
@@ -1794,6 +2277,7 @@ function scheduleUpdateModalAutoHide(delayMs = 1800) {
 
 function hideUpdateModal() {
   clearUpdateModalAutoHide();
+  clearScheduledUpdateInstall();
   elements.updateModal.classList.add('hidden');
 }
 
@@ -1886,6 +2370,7 @@ function renderUpdateModal(options = {}) {
 
 function applyUpdateStatus(status) {
   clearUpdateModalAutoHide();
+  clearScheduledUpdateInstall();
 
   const activeVersion = status.currentVersion || currentVersion;
   const targetVersion = status.version || activeVersion;
@@ -1946,17 +2431,17 @@ function applyUpdateStatus(status) {
   if (status.status === 'downloaded') {
     renderUpdateModal({
       title: `更新已下载：v${targetVersion}`,
-      step: '下载完成，可以开始安装。',
+      step: '下载完成，正在安装。',
       detail: buildUpdateDiagnosticDetail(`当前版本：v${activeVersion}\n待安装版本：v${targetVersion}`),
       showProgress: true,
       progressPercent: 100,
       speedText: '下载完成',
       transferredText: '100%',
-      timeText: '点击“立即安装”后将重启并应用更新',
-      showCloseButton: true,
-      closeLabel: '稍后',
-      showInstallButton: true
+      timeText: '即将自动重启并静默安装更新',
+      showCloseButton: false,
+      showInstallButton: false
     });
+    scheduleSilentUpdateInstall(1200);
     return;
   }
 
@@ -2071,9 +2556,12 @@ function getSelectedCaptureSource() {
       id: sourceId,
       sourceId,
       title: selectedItem.dataset.name || '',
+      name: selectedItem.dataset.name || '',
       displayId: selectedItem.dataset.displayId || null,
       nativeMonitorIndex: selectedItem.dataset.nativeMonitorIndex || null,
-      hwnd: selectedItem.dataset.hwnd || null
+      hwnd: selectedItem.dataset.hwnd || null,
+      state: selectedItem.dataset.state || 'normal',
+      isMinimized: selectedItem.dataset.isMinimized === 'true'
     };
   }
 
@@ -2083,16 +2571,35 @@ function updateSourceAudioUi() {
   const selectedIndex = Math.max(0, Number(selectedItem && selectedItem.dataset.audioIndex) || 0);
   const selectedCandidate = candidates[selectedIndex] || null;
   const audioEnabled = Boolean(elements.sourceAudioEnabled && elements.sourceAudioEnabled.checked);
+  const shouldShowCandidateList = audioEnabled && candidates.length > 1;
 
   if (elements.sourceAudioProcessList) {
     elements.sourceAudioProcessList.innerHTML = '';
-    candidates.forEach((candidate, index) => {
-      const row = document.createElement('div');
-      row.className = `source-audio-process-item${index === selectedIndex ? ' selected' : ''}`;
-      row.textContent = `${candidate.processName || 'PID'} (${candidate.pid || 'n/a'})`;
-      elements.sourceAudioProcessList.appendChild(row);
-    });
-    elements.sourceAudioProcessList.classList.toggle('hidden', candidates.length === 0);
+    if (shouldShowCandidateList) {
+      candidates.forEach((candidate, index) => {
+        const row = document.createElement('div');
+        row.className = `source-audio-process-item${index === selectedIndex ? ' selected' : ''}`;
+        row.textContent = `${candidate.processName || 'PID'} (${candidate.pid || 'n/a'})`;
+        row.tabIndex = 0;
+        row.addEventListener('click', () => {
+          if (!selectedItem) {
+            return;
+          }
+          selectedItem.dataset.audioIndex = String(index);
+          updateSourceAudioUi();
+          debugLog('audio', '[source-audio] selected candidate:', candidate.processName || candidate.pid || 'n/a');
+        });
+        row.addEventListener('keydown', (event) => {
+          if (!event || (event.key !== 'Enter' && event.key !== ' ')) {
+            return;
+          }
+          event.preventDefault();
+          row.click();
+        });
+        elements.sourceAudioProcessList.appendChild(row);
+      });
+    }
+    elements.sourceAudioProcessList.classList.toggle('hidden', !shouldShowCandidateList);
   }
 
   if (!elements.sourceAudioSummary) {
@@ -2109,24 +2616,12 @@ function updateSourceAudioUi() {
     return;
   }
 
+  if (shouldShowCandidateList) {
+    elements.sourceAudioSummary.textContent = `检测到 ${candidates.length} 个音频进程，请手动选择`;
+    return;
+  }
+
   elements.sourceAudioSummary.textContent = `当前音频目标: ${selectedCandidate.processName || 'PID'} (${selectedCandidate.pid})`;
-}
-
-function cycleSelectedSourceAudioCandidate() {
-  const selectedItem = getSelectedSourceItem();
-  if (!selectedItem) {
-    return;
-  }
-
-  const candidates = parseSelectedSourceAudioCandidates(selectedItem);
-  if (candidates.length <= 1) {
-    updateSourceAudioUi();
-    return;
-  }
-
-  const currentIndex = Math.max(0, Number(selectedItem.dataset.audioIndex) || 0);
-  selectedItem.dataset.audioIndex = String((currentIndex + 1) % candidates.length);
-  updateSourceAudioUi();
 }
 
 function showSourceModal(sources) {
@@ -2140,10 +2635,12 @@ function showSourceModal(sources) {
     const item = document.createElement('div');
     item.className = 'source-item';
     item.dataset.id = source.id;
-    item.dataset.name = source.name;
+    item.dataset.name = source.title || source.name || '';
     item.dataset.displayId = source.displayId != null ? String(source.displayId) : '';
     item.dataset.nativeMonitorIndex = source.nativeMonitorIndex != null ? String(source.nativeMonitorIndex) : '';
     item.dataset.hwnd = source.hwnd != null ? String(source.hwnd) : '';
+    item.dataset.state = source.state || 'normal';
+    item.dataset.isMinimized = source.isMinimized ? 'true' : 'false';
     item.dataset.audioCandidates = JSON.stringify(Array.isArray(source.audioCandidates) ? source.audioCandidates : []);
     item.dataset.audioIndex = '0';
     item.__captureSource = source;
@@ -2157,8 +2654,22 @@ function showSourceModal(sources) {
 
     // 名称
     const name = document.createElement('p');
-    name.textContent = source.name;
+    name.className = 'source-item-title';
+    name.textContent = source.title || source.name || '';
     item.appendChild(name);
+
+    const subtitle = document.createElement('p');
+    subtitle.className = 'source-item-subtitle';
+    subtitle.textContent = buildCaptureSourceSubtitle(source);
+    item.appendChild(subtitle);
+
+    const status = buildCaptureSourceStatus(source);
+    if (status) {
+      const statusText = document.createElement('p');
+      statusText.className = 'source-item-status';
+      statusText.textContent = status;
+      item.appendChild(statusText);
+    }
 
     // 点击选择
     item.addEventListener('click', () => {
@@ -2182,6 +2693,43 @@ function showSourceModal(sources) {
   }
   updateSourceAudioUi();
   modal.classList.remove('hidden');
+}
+
+function buildCaptureSourceSubtitle(source) {
+  const parts = [];
+  const kindLabel = source && source.kind === 'display' ? '显示器' : '窗口';
+  parts.push(kindLabel);
+
+  if (source && source.kind === 'display') {
+    const displayIndex = Number(source.nativeMonitorIndex);
+    if (Number.isFinite(displayIndex) && displayIndex >= 0) {
+      parts.push(`屏幕 ${displayIndex + 1}`);
+    } else if (source.displayId != null && String(source.displayId).trim()) {
+      parts.push(`显示器 ${source.displayId}`);
+    }
+  } else {
+    const label = source && source.appName
+      ? String(source.appName)
+      : (source && source.title ? String(source.title) : '');
+    if (label) {
+      parts.push(label);
+    }
+  }
+
+  return parts.join(' · ');
+}
+
+function buildCaptureSourceStatus(source) {
+  if (!source) {
+    return '';
+  }
+  if (source.state === 'minimized') {
+    return '已最小化';
+  }
+  if (source.state === 'exclusive-fullscreen') {
+    return '独占全屏';
+  }
+  return '';
 }
 
 // 确认选择并开始共享
@@ -2264,11 +2812,19 @@ async function startScreenShare() {
 }
 
 // Viewer: 加入房间
-function joinRoom() {
+async function joinRoom() {
   const roomId = elements.roomIdInput.value.toUpperCase().trim();
   if (!roomId) {
     showError('请输入房间号');
     return;
+  }
+
+  try {
+    await applyNativeViewerPlaybackPrefs({
+      includeMode: true
+    });
+  } catch (error) {
+    console.warn('[media-engine] apply viewer playback prefs before join failed:', error);
   }
 
   currentRoomId = roomId;
@@ -2276,8 +2832,11 @@ function joinRoom() {
   sendMessage({
     type: 'join-room',
     roomId: roomId,
-    clientId: clientId
+    clientId: clientId,
+    viewerPlaybackMode: viewerPlaybackPrefs.mode,
+    viewerAudioDelayMs: viewerPlaybackPrefs.audioDelayMs
   });
+  renderViewerPlaybackPrefsUi();
 }
 
 // Viewer: 离开房间
@@ -2324,7 +2883,7 @@ function showError(message) {
 // Native mainline only
 
 // 版本检查和自动更新
-let currentVersion = '1.5.7'; // 默认版本（Electron环境会动态获取）
+let currentVersion = '1.5.9'; // 默认版本（Electron环境会动态获取）
 
 // 初始化版本号（从 Electron app 获取）
 async function initVersion() {
@@ -2401,7 +2960,51 @@ async function checkForUpdates() {
 }
 
 async function stopScreenShare() {
-  return requireNativeAuthorityOverride('stopScreenShare', stopScreenShare)();
+  const override = getNativeAuthorityOverride('stopScreenShare', stopScreenShare);
+  if (override) {
+    return override();
+  }
+
+  if (window.isElectron && window.electronAPI && window.electronAPI.mediaEngine) {
+    try {
+      const mediaEngine = window.electronAPI.mediaEngine;
+      await Promise.all([
+        typeof mediaEngine.stopAudioSession === 'function'
+          ? mediaEngine.stopAudioSession({}).catch(() => {})
+          : Promise.resolve(null),
+        typeof mediaEngine.stopHostSession === 'function'
+          ? mediaEngine.stopHostSession({}).catch(() => {})
+          : Promise.resolve(null)
+      ]);
+    } catch (_error) {
+      // Best-effort native cleanup when overrides were not installed successfully.
+    }
+  }
+
+  if (currentRoomId && sessionRole === 'host') {
+    sendMessage({
+      type: 'leave-room',
+      roomId: currentRoomId,
+      clientId
+    }, { queueIfDisconnected: false });
+  }
+
+  currentRoomId = null;
+  sessionRole = null;
+  hostId = null;
+  upstreamPeerId = null;
+  relayPc = null;
+  relayStream = null;
+  localStream = null;
+  upstreamConnected = false;
+  viewerReadySent = false;
+  videoStarted = false;
+  elements.roomInfo.classList.add('hidden');
+  elements.viewerCount.textContent = '0';
+  elements.btnStartShare.classList.remove('hidden');
+  elements.btnStopShare.classList.add('hidden');
+  elements.hostStatus.textContent = '准备就绪';
+  elements.hostStatus.classList.remove('waiting');
 }
 
 async function resetViewerState() {
@@ -2430,6 +3033,7 @@ async function resetViewerState() {
   if (elements.viewerRenderFps) {
     elements.viewerRenderFps.textContent = '-';
   }
+  renderViewerPlaybackPrefsUi();
 }
 
 async function handleMessage(data) {

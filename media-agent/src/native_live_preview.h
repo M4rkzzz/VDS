@@ -12,6 +12,7 @@ struct NativeLivePreviewConfig {
   std::string target_kind = "display";
   std::string display_id = "0";
   std::string window_handle;
+  std::string capture_state = "normal";
   NativeEmbeddedSurfaceLayout layout;
 };
 
@@ -26,6 +27,7 @@ struct NativeLivePreviewSnapshot {
   std::uint64_t avg_map_us = 0;
   std::uint64_t avg_memcpy_us = 0;
   std::uint64_t avg_total_readback_us = 0;
+  double frame_interval_stddev_ms = 0.0;
   std::int64_t last_decoded_frame_at_unix_ms = -1;
   unsigned long process_id = 0;
   std::string preview_surface_backend = "native-win32-gdi";

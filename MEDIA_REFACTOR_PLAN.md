@@ -2,7 +2,7 @@
 
 ## 1. 目的
 
-这份文档记录仓库在 `1.5.7` 时点的真实媒体架构、真实边界、真实验证结果、真实未解问题，以及接下来明确的执行方向。  
+这份文档记录仓库在 `1.6.0` 时点的真实媒体架构、真实边界、真实验证结果、真实未解问题，以及接下来明确的执行方向。  
 它同时承担三种职责：
 
 - 真相文档：说明当前代码真实在做什么
@@ -62,8 +62,8 @@
 
 ### 3.1 版本与产物
 
-- 桌面端版本：`1.5.7`
-- 服务端版本：`1.5.7`
+- 桌面端版本：`1.6.0`
+- 服务端版本：`1.6.0`
 - 构建方式：`electron-builder + nsis`
 - 更新源：`generic provider`
 - 更新目录：`server/updates/`
@@ -128,12 +128,16 @@
 - WGC session 现已显式设置：
   - `IsCursorCaptureEnabled(...)`
   - `IsBorderRequired(false)`
+- WGC 在目标窗口运行中发生尺寸变化时，`FramePool` 现已按 `frame.ContentSize()` 触发 `Recreate(...)`
+- `host preview` 和下游 sender 都已把 `wgc-frame-pool-recreated` 视为正常过渡帧，而不是致命错误
+- “开播时目标窗口已最小化”现已走启动期 placeholder，窗口恢复后通过 video sender soft refresh 切回真实流与音频
 
 当前已验证的结论：
 
 - 不开 preview 时仍出现的 `56-57fps` 上限，不是 preview 造成
 - 纯本地、无 Electron、无 sender、仅 `display capture + native preview` 的 smoke 在补上 `MinUpdateInterval(1ms)` 后，`10s` 内达到约 `194fps`
 - 这说明此前的 `56-57fps` 主要不是编码器、网络、viewer 或 CPU readback 自身上限，而是 WGC 在当前系统上的默认更新间隔问题
+- 这也说明“窗口缩放后 host preview 和 viewer 同时花屏”的问题不在 viewer 布局层，而在更上游的 WGC frame-pool 尺寸变化处理
 
 ### 4.2 Viewer
 
@@ -176,6 +180,16 @@
 
 - H.264 / H.265 decoder config / random access bootstrap 缓存
 - 新下游接入时先发 bootstrap，再发正常视频 AU
+
+需要明确补充一个当前未收口事实：
+
+- `viewer-upstream` 开启“音视频直通”后，`host -> v1` 单跳通常可稳定播放
+- 但 `host -> v1 -> v2` 的第二跳 relay 当前仍不稳定
+- 真实表现不是单一一种，而是几种回归形态来回出现：
+  - `v2` 有声音无画面
+  - `v2` 前几秒像慢速播放，随后卡住
+  - `v2` 初始收到大量视频帧，随后接收速率掉到极低
+- 当前最强怀疑是：relay 视频 sender 仍然没有完全从本地 viewer 播放策略里解耦出来
 
 ## 5. 接收侧同步与启动逻辑
 
@@ -225,6 +239,37 @@
 
 - 中间 relay 节点退出后，下游要自动接回
 - 下游恢复必须自动协商，不依赖用户重新点加入
+
+### 5.5 当前未收口的 relay regression
+
+截至这次文档更新，最需要如实同步的问题不是单跳接收，而是：
+
+- `viewer-upstream` 切到 `passthrough` 后，第二跳 relay 视频输出仍然不稳
+
+最近这轮真实观察到的现象：
+
+- `v1` 通常有声音、有画面，`native-peer-stats` 也能持续增长
+- `v2` 的问题集中在视频，不稳定形态包括：
+  - `framesReceived` 一开始冲很高，但 `framesRendered` 明显追不上
+  - `framesReceived` 前期增长后几乎停住
+  - 只有声音没有画面
+  - 先慢速播放再卡死
+- 当前最强怀疑是：问题不只是“解码器缺关键帧”这么简单，而是 relay sender 的起播、bootstrap、以及和本地 viewer 启动门控之间仍存在耦合
+
+最近已经试过、但没有最终收口的方向：
+
+- relay 视频从同步 fanout 改成异步队列
+- relay bootstrap 改成“完整 GOP 回放”
+- relay bootstrap 改成“只发 snapshot 再等下一次随机接入点”
+- relay bootstrap 限制历史长度
+- 删除 relay video 的应用级 pacing
+- 在 `consume_remote_peer_video_frame(...)` 里提前复制 `relay_decode_units`，避免被本地 startup gate 直接挡住
+
+这些尝试说明：
+
+- 代码里确实存在可疑耦合点
+- 但当前分支还没有把 `passthrough local playback` 和 `relay downstream sender` 真正彻底拆干净
+- 因此不能把“relay 问题已经定位并修复”写成事实
 
 ## 6. 质量设置现状
 
@@ -320,7 +365,6 @@
 
 - 单跳 native host -> viewer 基本建连
 - 接收侧启动与 steady-state 调度回归
-- relay 链路的 codec-aware bootstrap 修复后继续推进
 - WGC 高帧率瓶颈已定位并打穿：
   - 不加 `MinUpdateInterval` 时，本地 preview 稳定卡在约 `56-57fps`
   - 加上 `MinUpdateInterval(1ms)` 后，纯本地 `display capture + native preview` smoke `10s` 内达到约 `194fps`
@@ -329,8 +373,33 @@
 
 - “通过测试”不等于“已经千锤不烂”
 - 当前最该继续做的是 soak、重连、断链恢复、三端长时间播放
+- `host -> v1 -> v2` 在 `v1` 开启“音视频直通”后的 relay 视频链路，目前不能写成“已通过”
 
-### 8.4 popup 正式方案验收项
+### 8.4 当前调试与 smoke 能力的真实边界
+
+当前仓库虽然有：
+
+- `npm run dev:dual:native`
+- `npm run dev:triple:native`
+
+但这些脚本本质上只是：
+
+- 拉起本地 server
+- 拉起多实例 Electron 窗口
+
+它们还不是“全自动可回归 smoke harness”。当前仓库里没有一套现成脚本，能在不人工点 UI 的情况下自动完成：
+
+- host 建房
+- viewer 1 加入
+- viewer 2 加入
+- 自动收集并对比三端 relay 统计
+
+因此接手时必须面对一个现实：
+
+- 当前三端 relay 复现主要还是依赖人工操作 + 日志观察
+- 不要把 `dev:triple:native` 误当成已经成型的自动化回归体系
+
+### 8.5 popup 正式方案验收项
 
 popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 
@@ -416,7 +485,9 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 - native host preview 可用
 - native viewer surface 可用
 - fullscreen 覆盖任务栏已修
+- Windows fullscreen 已切到窗口化全屏实现
 - 调试日志前后端联动已收口
+- 与当前 6 类 native reliability 问题直接相关的高频诊断日志，默认都已收口到详细调试开关
 - PowerShell 正常运行时不再默认刷屏
 - 质量设置与 native 参数贯通
 - `H.265` 已进入主链路并可在 UI 中选择
@@ -424,9 +495,22 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 - 音频主链路从 `PCMU` 升级为 `Opus`
 - relay 从 browser stream 转发切到 native encoded fanout
 - relay 的 codec-aware bootstrap 已补
+- relay 新下游起播已改为优先回放缓存 GOP，并在 bootstrap 成功后切回 steady-state
+- `viewer-left` 已补上游通知，`v2` 重连不再依赖残留旧下游 peer 被动超时
+- 关闭 `relay-downstream` 时不再误停 `viewer-upstream` 的原生音频运行时
 - 差分更新 installer cache seed 已补
 - WGC 高帧率问题已定位到 `GraphicsCaptureSession.MinUpdateInterval`
 - WGC session 已显式设置 `MinUpdateInterval(1ms)` / `IsCursorCaptureEnabled(...)` / `IsBorderRequired(false)`
+- 运行中窗口 resize 导致的 `host preview + viewer` 同时花屏问题已定位到 WGC frame-pool 未随 `ContentSize` 变化重建，并已补上 `Recreate(...)`
+- Host 停止直播已改为先更新 UI、再并行回收 native 资源
+- Host 首次开播已增加 readiness gate；preview surface attach 失败时会自动降级为无预览重试
+- Windows 独占全屏目标已补 Win32 synthetic capture target fallback
+- “开播即最小化窗口”现已支持启动期占位画面；窗口恢复后通过 video sender soft refresh 接回真实视频与音频
+- 手动音频选择已改成列表点击选中，不再只靠“更改音频进程”循环切换
+- 画面源选择弹窗已补精简副标题，以及滚动时常驻的刷新 / 确认 / 取消控件
+- Viewer fullscreen 已补播放器式 underbar 基础形态，并接入原生音量控制
+- 非 fullscreen 模式下 maximize / restore 引发的 viewer native surface 定位错误已修
+- Viewer 非 fullscreen 舞台背景与容器比例已经收紧，播放区外的空白区已改为项目当前深灰舞台风格
 
 ## 11. 当前未完成项
 
@@ -434,10 +518,14 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 
 - 接收侧 A/V 调度还需继续 soak
 - relay 长链稳健性还需继续验证
+- `viewer-upstream passthrough -> relay-downstream` 视频链路仍有明显 regression，当前没有收口
 - popup overlay 虽已选定为正式路线，但仍需把正式验收项全部打磨完成
+- host preview 的 `native_live_preview` popup attach 仍存在偶发失败，当前正在继续收窄 owner hook / layout / attach 时序问题
+- viewer fullscreen underbar 当前已基本可用，但交互细节仍在打磨，不能写成最终完成
 - `H.265` 虽已进入主链路，但双端 / 三端 / 晚加入 / 重连 / 长时间 soak 还需继续验证
 - WGC 黄框虽然已有代码级关闭开关，但跨机器、跨系统、跨打包形态的最终验证还未完成
 - 差分更新成功率还没有达到目标状态
+- 三端 smoke 还缺真正自动化 harness，当前排障效率受人工点击和人工抄日志限制
 
 ## 12. 下一阶段顺序
 
@@ -453,6 +541,7 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 
 目标：
 
+- 先收口 `v1 passthrough + v2 relay` 当前 regression，再谈更长 soak
 - 继续压缩单次建连失败率
 - 继续提高首帧成功率和启动平滑度
 - 继续观察 `queuedVideo / queuedAudio / dropped* / submitted* / dispatched*`
@@ -491,18 +580,42 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 
 ## 14. 本次文档更新结论
 
-截至 `1.5.7` 当前仓库状态，最准确的总结是：
+截至 `1.6.0` 当前仓库状态，最准确的总结是：
 
 - native authority 已经是唯一主链路
 - `H.264 / H.265 + Opus + native relay fanout` 已经落地
 - 更新、UI、调试、fullscreen、质量设置都已跟这条主链路对齐
 - popup overlay 已经被确定为正式打磨路线
+- Windows fullscreen 已切成窗口化全屏，任务栏覆盖和 maximize / restore viewer surface 错位问题都已收口
+- 观看端 fullscreen underbar 已经进入“可用并继续打磨”的状态，而不是还没有形态
 - Win11 24H2 下 WGC 高帧率瓶颈已经定位到 `GraphicsCaptureSession.MinUpdateInterval`
+- WGC 运行中尺寸变化现在已经会触发 frame-pool 重建，`host preview` 和 `viewer` 不再共用一条会稳定产出坏帧的旧采集路径
+- “开播即最小化窗口”当前已经能通过启动期 placeholder + 恢复 soft refresh 接回真实视频与音频
+- 当前最大的未收口问题已经明确收缩到：`viewer-upstream passthrough` 打开后，`host -> v1 -> v2` 的 relay 视频第二跳仍不稳定
 - 当前最大的工程重点顺序已经明确：
-  - 先验证并稳住 `H.265` 与高帧率正式链路
+  - 先收口 `v1 passthrough + v2 relay` 当前 regression
+  - 再验证并稳住 `H.265` 与高帧率正式链路
   - 再完善全链路稳健性
   - 最后持续打磨代码和效率
 
 ## 15. 给下一个 Agent 的交接说明
 
-如果你是接手这个项目的下一个 agent，不要先发散找“是不是还要保留旧浏览器链路”，也不要先去碰 child embed。当前主线已经明确：native authority 是唯一媒体主链路，popup overlay 是正式打磨路线，接下来优先级是 `H.265 / 高帧率正式链路验证 -> 全链路稳健性 -> 代码打磨`。先读本文，再看 [app-native-overrides.js](/d:/project/videosharing/server/public/app-native-overrides.js)、[main.js](/d:/project/videosharing/desktop/main.js)、[main.cpp](/d:/project/videosharing/media-agent/src/main.cpp) 这三个入口文件，确认当前 host、viewer、relay、update 的真实行为；然后优先用 `npm run dev:dual:native` 和 `npm run dev:triple:native` 复现实况。处理连接问题时，先看 `native-peer-stats` 里的 `queuedVideo / queuedAudio / submittedVideo / dispatchedAudio / dropped* / receiverReason`，不要凭感觉加新阈值；处理高帧率问题时，优先确认 `GraphicsCaptureSession.MinUpdateInterval` 是否生效，再看 host / viewer FPS 指标，不要重新回到猜编码器或猜 WebRTC 的路径。处理更新问题时，先区分“服务端产物不一致”和“客户端本地 installer 基底不匹配”，不要一上来就怀疑 blockmap 生成。任何改动都要坚持 fail-fast、边界单一、不要静默 fallback 到旧 authority。
+如果你是接手这个项目的下一个 agent，不要先发散找“是不是还要保留旧浏览器链路”，也不要先去碰 child embed。当前主线已经明确：native authority 是唯一媒体主链路，popup overlay 是正式打磨路线，但眼前第一优先级已经不是抽象架构，而是收口一个非常具体的 regression：`viewer-upstream` 开启“音视频直通”后，`host -> v1 -> v2` 的第二跳 relay 视频仍不稳定。先读本文，再看 [app-native-overrides.js](/d:/project/videosharing/server/public/app-native-overrides.js)、[main.js](/d:/project/videosharing/desktop/main.js)、[main.cpp](/d:/project/videosharing/media-agent/src/main.cpp) 这三个入口文件，确认当前 host、viewer、relay、update 的真实行为；然后优先用 `npm run dev:dual:native` 和 `npm run dev:triple:native` 复现实况。
+
+最近一轮已经做过、但还不能写成“修好了”的尝试包括：
+
+- relay 视频异步 fanout
+- 多种 bootstrap 策略切换：完整 GOP、snapshot、等待 live random access、压缩 bootstrap 历史长度
+- 删除 relay video 应用级 pacing
+- 让 relay 在本地 viewer startup gate 之前就复制并发送 `relay_decode_units`
+- 增加 `relaySubscriberRuntime` 和前端 `[media-engine native-relay-stats]` 日志
+
+这些改动说明调试方向已经逼近真实问题，但也说明一件事：当前分支里有不少“为定位问题而做的实验性改动”，不要把它们当成已经验收通过的最终解。接手时先看日志，再决定保留还是回退，不要继续在未证实的假设上叠补丁。
+
+排查 relay regression 时，先盯这几组事实：
+
+- `v1` 是否稳定：看 `native-peer-stats` 里的 `framesReceived / framesRendered / dispatchedAudio`
+- `v2` 是否真没收到视频：看 `framesReceived`
+- `v2` 是收到后渲染跟不上，还是 sender 根本没送：结合 `[media-engine native-relay-stats]` 里的 `videoFramesSent / pendingBootstrap / bootstrapSnapshotSent / relayFramesSent / relayReason`
+
+处理连接问题时，先看 `native-peer-stats` 里的 `queuedVideo / queuedAudio / submittedVideo / dispatchedAudio / dropped* / receiverReason`，不要凭感觉加新阈值。处理 relay sender 问题时，先确认“是没发出去，还是发出去但下游起播/渲染追不上”，不要一上来就把锅甩给 FFmpeg、surface 或 ICE。处理高帧率问题时，优先确认 `GraphicsCaptureSession.MinUpdateInterval` 是否生效，再看 host / viewer FPS 指标，不要重新回到猜编码器或猜 WebRTC 的路径。处理更新问题时，先区分“服务端产物不一致”和“客户端本地 installer 基底不匹配”，不要一上来就怀疑 blockmap 生成。任何改动都要坚持 fail-fast、边界单一、不要静默 fallback 到旧 authority。

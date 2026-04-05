@@ -143,6 +143,27 @@
             <video id="remote-video" autoplay playsinline controls></video>
             <audio id="remote-audio" autoplay style="display:none"></audio>
             <p id="waiting-message">等待分享者开始共享...</p>
+            <div id="viewer-fullscreen-underbar" class="viewer-fullscreen-underbar" aria-hidden="true">
+              <div class="viewer-fullscreen-underbar-track">
+                <div class="viewer-fullscreen-underbar-actions">
+                  <div id="viewer-fullscreen-volume-control" class="viewer-fullscreen-volume-control">
+                    <div class="viewer-fullscreen-volume-popover" aria-hidden="true">
+                      <input id="viewer-volume-fullscreen" type="range" min="0" max="100" step="1" value="100" aria-label="全屏音量">
+                      <span id="viewer-volume-fullscreen-value">100%</span>
+                    </div>
+                    <button id="btn-viewer-mute-fullscreen" class="viewer-fullscreen-icon-button" type="button" aria-label="静音切换" aria-pressed="false">
+                      <svg id="viewer-fullscreen-volume-icon" class="viewer-fullscreen-icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path class="viewer-fullscreen-icon-speaker" d="M4 10h4.2L13 6.2v11.6L8.2 14H4z"></path>
+                        <path class="viewer-fullscreen-icon-wave viewer-fullscreen-icon-wave-low" d="M16.3 9.4a4.5 4.5 0 0 1 0 5.2"></path>
+                        <path class="viewer-fullscreen-icon-wave viewer-fullscreen-icon-wave-high" d="M18.8 6.8a8.4 8.4 0 0 1 0 10.4"></path>
+                        <path class="viewer-fullscreen-icon-mute" d="M15.5 8.5l5 7M20.5 8.5l-5 7"></path>
+                      </svg>
+                    </button>
+                  </div>
+                  <button id="btn-viewer-exit-fullscreen" class="viewer-fullscreen-action-button" type="button">取消全屏</button>
+                </div>
+              </div>
+            </div>
           </div>
         </section>
 
@@ -154,6 +175,13 @@
 
           <div id="join-form" class="workspace-card workspace-join-card workspace-block">
             <input type="text" id="room-id-input" placeholder="输入房间号" maxlength="6">
+            <div class="viewer-join-options">
+              <label class="quality-switch viewer-passthrough-switch" for="viewer-playback-mode-toggle">
+                <span class="viewer-passthrough-label">音视频直通</span>
+                <input id="viewer-playback-mode-toggle" type="checkbox">
+                <span class="quality-switch-track" aria-hidden="true"></span>
+              </label>
+            </div>
             <button id="btn-join" class="btn btn-primary">加入</button>
           </div>
 
@@ -174,6 +202,15 @@
 
           <div class="native-panel-toolbar native-panel-toolbar-viewer workspace-block">
             <button id="btn-viewer-fullscreen" class="btn btn-small btn-secondary" type="button">全屏播放</button>
+            <div id="viewer-audio-delay-control" class="viewer-audio-delay-control hidden" aria-label="直通音频延迟">
+              <span class="viewer-audio-delay-label">音频延迟</span>
+              <div class="quality-stepper viewer-audio-delay-stepper">
+                <button id="viewer-audio-delay-decrease" class="quality-stepper-btn" type="button" aria-label="减少音频延迟">-</button>
+                <input id="viewer-audio-delay-input" type="number" min="0" max="300" step="10" value="0" inputmode="numeric">
+                <span class="quality-stepper-unit">ms</span>
+                <button id="viewer-audio-delay-increase" class="quality-stepper-btn" type="button" aria-label="增加音频延迟">+</button>
+              </div>
+            </div>
             <label class="native-volume-control" for="viewer-volume">
               <span>音量</span>
               <input id="viewer-volume" type="range" min="0" max="100" step="1" value="100">
@@ -188,18 +225,20 @@
 
     <div id="source-modal" class="modal hidden">
       <div class="modal-content">
-        <h3>选择要分享的内容 <button id="btn-refresh-sources" class="btn-icon" title="刷新">↻</button></h3>
-        <div class="source-list" id="source-list"></div>
-        <div class="source-audio-panel">
-          <label class="checkbox-label source-audio-toggle">
-            <input type="checkbox" id="source-audio-enabled">
-            <span>共享进程音频</span>
-          </label>
-          <div id="source-audio-summary" class="source-audio-summary">当前目标没有匹配到可用的音频进程。</div>
-          <div class="source-audio-actions">
-            <button id="btn-change-source-audio" class="btn btn-secondary btn-small">更改音频进程</button>
+        <div class="source-modal-header">
+          <h3>选择要分享的内容</h3>
+          <button id="btn-refresh-sources" class="btn-icon" title="刷新">↻</button>
+        </div>
+        <div class="source-modal-body">
+          <div class="source-list" id="source-list"></div>
+          <div class="source-audio-panel">
+            <label class="checkbox-label source-audio-toggle">
+              <input type="checkbox" id="source-audio-enabled">
+              <span>共享进程音频</span>
+            </label>
+            <div id="source-audio-summary" class="source-audio-summary">当前目标没有匹配到可用的音频进程。</div>
+            <div id="source-audio-process-list" class="source-audio-process-list hidden"></div>
           </div>
-          <div id="source-audio-process-list" class="source-audio-process-list hidden"></div>
         </div>
         <div class="modal-buttons">
           <button id="btn-confirm-source" class="btn btn-primary">确认</button>

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.6.0
+
+- fixed WGC frame-pool recreation on live window resize so host preview and viewer no longer corrupt together
+- stabilized minimized-window startup restore with startup-only placeholder plus soft refresh audio/video recovery
+- polished viewer stage presentation and refreshed installer, blockmap, and update manifest for the new desktop version
+
+## 1.5.9
+
+- polished the source selection modal with simplified subtitles plus sticky refresh and confirm controls
+- refined viewer fullscreen underbar behavior and native surface layout handling around maximize and fullscreen flows
+- refreshed installer, blockmap, and update manifest for the new desktop version
+
+## 1.5.8
+
+- fixed relay bootstrap handoff and rejoin behavior for the `host -> v1 -> v2` native chain
+- tightened viewer disconnect handling and native surface cleanup during relay leave/reconnect flows
+- refreshed installer, blockmap, and update manifest for the new desktop version
+
 ## 1.5.7
 
 - release rollover for the latest native media stack and packaging outputs

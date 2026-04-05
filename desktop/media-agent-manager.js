@@ -93,14 +93,87 @@ class MediaAgentManager extends EventEmitter {
     const child = this.child;
     this.child = null;
     this.disposeLineReader();
-    child.kill();
     this.rejectAllPending(new Error('media-agent-stopped'));
+    await this.stopChildProcess(child);
     this.updateStatus({
       state: 'idle',
       running: false,
       reason: 'stopped'
     });
     return this.getStatus();
+  }
+
+  async stopChildProcess(child, timeoutMs = 5000) {
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      return;
+    }
+
+    child.__vdsExpectedExit = true;
+    child.__vdsExpectedExitReason = 'manager-stop';
+
+    await new Promise((resolve) => {
+      let settled = false;
+      let killTimer = null;
+      let forceTimer = null;
+
+      const cleanup = () => {
+        if (killTimer) {
+          clearTimeout(killTimer);
+          killTimer = null;
+        }
+        if (forceTimer) {
+          clearTimeout(forceTimer);
+          forceTimer = null;
+        }
+        child.removeListener('exit', onExit);
+      };
+
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve();
+      };
+
+      const onExit = () => {
+        finish();
+      };
+
+      child.once('exit', onExit);
+
+      try {
+        child.kill();
+      } catch (_error) {
+        finish();
+        return;
+      }
+
+      killTimer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+
+        if (process.platform === 'win32' && child.pid) {
+          spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+            stdio: 'ignore',
+            windowsHide: true
+          });
+        } else {
+          try {
+            child.kill('SIGKILL');
+          } catch (_error) {
+            finish();
+            return;
+          }
+        }
+
+        forceTimer = setTimeout(() => {
+          finish();
+        }, 1000);
+      }, timeoutMs);
+    });
   }
 
   async invoke(method, params = {}) {
@@ -312,15 +385,22 @@ class MediaAgentManager extends EventEmitter {
 
     child.once('exit', (code, signal) => {
       this.disposeLineReader();
-      const exitError = this.buildExitError(code, signal);
-      this.logger.error('[media-agent] process exited:', exitError.message);
-      this.rejectAllPending(exitError);
+      const expectedExit = Boolean(child.__vdsExpectedExit);
+      const exitReason = child.__vdsExpectedExitReason || 'process-exit';
+      if (expectedExit) {
+        this.rejectAllPending(new Error('media-agent-stopped'));
+        this.logger.log(`[media-agent] process exited as expected: code=${code ?? 'null'} signal=${signal ?? 'null'} reason=${exitReason}`);
+      } else {
+        const exitError = this.buildExitError(code, signal);
+        this.logger.error('[media-agent] process exited:', exitError.message);
+        this.rejectAllPending(exitError);
+      }
       this.child = null;
       this.updateStatus({
         state: 'stopped',
         available: true,
         running: false,
-        reason: 'process-exit',
+        reason: expectedExit ? exitReason : 'process-exit',
         binaryPath,
         exitCode: code,
         exitSignal: signal

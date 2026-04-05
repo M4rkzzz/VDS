@@ -2,6 +2,18 @@
 
 VDS is an Electron desktop client plus a Node.js signaling server for cascade screen sharing.
 
+## 1.6.0 Overview
+
+Version `1.6.0` focuses on making the native sharing path behave like a real production tool instead of a demo build.
+
+Highlights:
+
+- fixed WGC frame-pool recreation on live window resize so host preview and viewer no longer corrupt together
+- added startup-only minimized-window placeholder handling, then soft-refresh back into the real stream when the source window is restored
+- kept audio alive across minimized-window startup recovery instead of losing sound after video refresh
+- improved viewer stage presentation in windowed mode, including a tighter native-surface fit and darker stage treatment around the playback area
+- kept all detailed native diagnostics behind the existing debug gates so normal runs stay readable
+
 Current media path:
 
 - host capture: native `Windows Graphics Capture`

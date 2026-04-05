@@ -20,6 +20,7 @@ struct NativeVideoSurfaceSnapshot {
   bool running = false;
   bool decoder_ready = false;
   std::uint64_t decoded_frames_rendered = 0;
+  double frame_interval_stddev_ms = 0.0;
   std::int64_t last_decoded_frame_at_unix_ms = -1;
   unsigned long process_id = 0;
   unsigned long thread_id = 0;

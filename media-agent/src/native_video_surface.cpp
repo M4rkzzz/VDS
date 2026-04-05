@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -40,6 +41,12 @@ namespace {
 long long current_time_millis() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
     std::chrono::system_clock::now().time_since_epoch()
+  ).count();
+}
+
+long long current_time_micros_steady() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()
   ).count();
 }
 
@@ -266,14 +273,44 @@ void activate_owner_window_for_popup(HWND hwnd) {
     return;
   }
 
-  if (IsIconic(owner)) {
-    ShowWindow(owner, SW_RESTORE);
-  } else {
-    ShowWindow(owner, SW_SHOW);
+  HWND root_owner = GetAncestor(owner, GA_ROOTOWNER);
+  if (root_owner && IsWindow(root_owner)) {
+    owner = root_owner;
   }
+
+  const DWORD current_thread_id = GetCurrentThreadId();
+  const DWORD owner_thread_id = GetWindowThreadProcessId(owner, nullptr);
+  HWND foreground_window = GetForegroundWindow();
+  const DWORD foreground_thread_id = foreground_window
+    ? GetWindowThreadProcessId(foreground_window, nullptr)
+    : 0;
+  const bool attached_owner_thread =
+    owner_thread_id != 0 &&
+    owner_thread_id != current_thread_id &&
+    AttachThreadInput(current_thread_id, owner_thread_id, TRUE) != FALSE;
+  const bool attached_foreground_thread =
+    foreground_thread_id != 0 &&
+    foreground_thread_id != current_thread_id &&
+    foreground_thread_id != owner_thread_id &&
+    AttachThreadInput(current_thread_id, foreground_thread_id, TRUE) != FALSE;
+
+  if (IsIconic(owner)) {
+    ShowWindowAsync(owner, SW_RESTORE);
+  } else {
+    ShowWindowAsync(owner, SW_SHOW);
+  }
+  SetWindowPos(owner, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
   BringWindowToTop(owner);
-  SetActiveWindow(owner);
   SetForegroundWindow(owner);
+  SetActiveWindow(owner);
+  SetFocus(owner);
+
+  if (attached_foreground_thread) {
+    AttachThreadInput(current_thread_id, foreground_thread_id, FALSE);
+  }
+  if (attached_owner_thread) {
+    AttachThreadInput(current_thread_id, owner_thread_id, FALSE);
+  }
 }
 
 bool is_render_widget_window_class(const std::string& class_name) {
@@ -766,10 +803,10 @@ class NativeVideoSurface::Impl {
       case WM_ERASEBKGND:
         return 1;
       case WM_NCHITTEST:
-        return HTTRANSPARENT;
+        return HTCLIENT;
       case WM_MOUSEACTIVATE:
         activate_owner_window_for_popup(hwnd);
-        return MA_NOACTIVATE;
+        return MA_NOACTIVATEANDEAT;
       case WM_LBUTTONDOWN:
       case WM_MBUTTONDOWN:
       case WM_RBUTTONDOWN:
@@ -785,7 +822,6 @@ class NativeVideoSurface::Impl {
       case WM_SIZE:
       case WM_WINDOWPOSCHANGED:
         InvalidateRect(hwnd, nullptr, FALSE);
-        UpdateWindow(hwnd);
         return DefWindowProcW(hwnd, message, w_param, l_param);
       case WM_PAINT:
         self->paint();
@@ -1262,7 +1298,6 @@ class NativeVideoSurface::Impl {
     }
 
     InvalidateRect(hwnd, nullptr, FALSE);
-    UpdateWindow(hwnd);
     {
       std::lock_guard<std::mutex> lock(mutex_);
       snapshot_.surface_window_debug = describe_window_debug(
@@ -1287,34 +1322,33 @@ class NativeVideoSurface::Impl {
   void request_frame_drain() {
     const HWND hwnd = window_handle_.load();
     if (hwnd) {
-      PostMessageW(hwnd, kFrameAvailableMessage, 0, 0);
+      if (!frame_drain_pending_.exchange(true, std::memory_order_acq_rel)) {
+        PostMessageW(hwnd, kFrameAvailableMessage, 0, 0);
+      }
     }
   }
 
   void drain_queued_frames() {
-    EncodedFrame frame;
-    bool has_more_frames = false;
+    frame_drain_pending_.store(false, std::memory_order_release);
 
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (stop_requested_ || frame_queue_.empty()) {
-        return;
+    while (true) {
+      EncodedFrame frame;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stop_requested_ || frame_queue_.empty()) {
+          return;
+        }
+
+        frame = std::move(frame_queue_.front());
+        frame_queue_.pop_front();
       }
 
-      frame = std::move(frame_queue_.front());
-      frame_queue_.pop_front();
-      has_more_frames = !frame_queue_.empty();
-    }
-
-    if (!frame.bytes.empty()) {
-      if (!frame.codec.empty() && frame.codec != active_codec_) {
-        open_decoder(frame.codec);
+      if (!frame.bytes.empty()) {
+        if (!frame.codec.empty() && frame.codec != active_codec_) {
+          open_decoder(frame.codec);
+        }
+        decode_and_present(frame);
       }
-      decode_and_present(frame);
-    }
-
-    if (has_more_frames) {
-      request_frame_drain();
     }
   }
 
@@ -1637,14 +1671,14 @@ class NativeVideoSurface::Impl {
       return;
     }
 
-    std::vector<std::uint8_t> render_buffer(static_cast<std::size_t>(buffer_size), 0);
+    render_buffer_.resize(static_cast<std::size_t>(buffer_size));
 
     std::uint8_t* destination_data[4] = { nullptr, nullptr, nullptr, nullptr };
     int destination_linesize[4] = { 0, 0, 0, 0 };
     const int fill_result = av_image_fill_arrays(
       destination_data,
       destination_linesize,
-      render_buffer.data(),
+      render_buffer_.data(),
       AV_PIX_FMT_BGRA,
       frame->width,
       frame->height,
@@ -1687,6 +1721,7 @@ class NativeVideoSurface::Impl {
       destination_linesize
     );
 
+    const long long now_steady_us = current_time_micros_steady();
     {
       std::lock_guard<std::mutex> lock(mutex_);
       frame_width_ = frame->width;
@@ -1695,7 +1730,19 @@ class NativeVideoSurface::Impl {
         (frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0)
           ? frame->sample_aspect_ratio
           : codec_context_->sample_aspect_ratio;
-      bgra_buffer_.swap(render_buffer);
+      bgra_buffer_.swap(render_buffer_);
+      if (last_frame_present_at_steady_us_ > 0 && now_steady_us > last_frame_present_at_steady_us_) {
+        const double interval_us = static_cast<double>(now_steady_us - last_frame_present_at_steady_us_);
+        frame_interval_sample_count_ += 1;
+        const double delta = interval_us - frame_interval_mean_us_;
+        frame_interval_mean_us_ += delta / static_cast<double>(frame_interval_sample_count_);
+        const double delta2 = interval_us - frame_interval_mean_us_;
+        frame_interval_m2_us_ += delta * delta2;
+        snapshot_.frame_interval_stddev_ms = frame_interval_sample_count_ > 1
+          ? std::sqrt(frame_interval_m2_us_ / static_cast<double>(frame_interval_sample_count_ - 1)) / 1000.0
+          : 0.0;
+      }
+      last_frame_present_at_steady_us_ = now_steady_us;
       snapshot_.decoded_frames_rendered += 1;
       snapshot_.last_decoded_frame_at_unix_ms = current_time_millis();
       snapshot_.decoder_ready = true;
@@ -1727,6 +1774,7 @@ class NativeVideoSurface::Impl {
 
 #ifdef _WIN32
   std::atomic<HWND> window_handle_ { nullptr };
+  std::atomic<bool> frame_drain_pending_ { false };
   OverlayAnchorState overlay_anchor_{};
   HWINEVENTHOOK owner_move_hook_ = nullptr;
   HWND owner_move_hook_owner_ = nullptr;
@@ -1745,6 +1793,11 @@ class NativeVideoSurface::Impl {
   int frame_height_ = 0;
   AVRational frame_sample_aspect_ratio_ { 1, 1 };
   std::vector<std::uint8_t> bgra_buffer_;
+  std::vector<std::uint8_t> render_buffer_;
+  long long last_frame_present_at_steady_us_ = -1;
+  std::uint64_t frame_interval_sample_count_ = 0;
+  double frame_interval_mean_us_ = 0.0;
+  double frame_interval_m2_us_ = 0.0;
 };
 
 #ifdef _WIN32

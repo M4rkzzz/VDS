@@ -14,6 +14,7 @@ const ENABLE_NATIVE_HOST_PREVIEW_SURFACE = true;
 const ENABLE_NATIVE_PEER_TRANSPORT = true;
 const ENABLE_NATIVE_SURFACE_EMBEDDING = process.env.VDS_ENABLE_NATIVE_SURFACE_EMBEDDING !== '0';
 const DEBUG_CATEGORIES = ['connection', 'video', 'audio', 'update', 'misc'];
+const DEBUG_CHANNELS = ['renderer', 'nativeEvents', 'nativeSteps', 'periodicStats', 'mainProcess', 'agentBreadcrumbs', 'agentStderr'];
 
 let mainWindow = null;
 let tray = null;
@@ -31,14 +32,25 @@ let quitFinalizeTimer = null;
 let audioCapture = undefined;
 let audioCaptureLoadError = null;
 let audioBridgeAttached = false;
+let emulatedFullscreenState = {
+  active: false,
+  bounds: null,
+  maximized: false
+};
 
 configureProfilePaths();
 
 function buildDefaultRendererDebugConfig(enabled = false) {
-  return DEBUG_CATEGORIES.reduce((config, key) => {
-    config[key] = Boolean(enabled);
-    return config;
-  }, {});
+  return {
+    categories: DEBUG_CATEGORIES.reduce((config, key) => {
+      config[key] = Boolean(enabled);
+      return config;
+    }, {}),
+    channels: DEBUG_CHANNELS.reduce((config, key) => {
+      config[key] = Boolean(enabled);
+      return config;
+    }, {})
+  };
 }
 
 function normalizeRendererDebugConfig(config, fallbackEnabled = false) {
@@ -51,17 +63,42 @@ function normalizeRendererDebugConfig(config, fallbackEnabled = false) {
     return normalized;
   }
 
+  const hasStructuredCategories = Boolean(config.categories && typeof config.categories === 'object');
+  const hasStructuredChannels = Boolean(config.channels && typeof config.channels === 'object');
+
+  if (!hasStructuredCategories && !hasStructuredChannels) {
+    for (const key of DEBUG_CATEGORIES) {
+      if (Object.prototype.hasOwnProperty.call(config, key)) {
+        normalized.categories[key] = Boolean(config[key]);
+      }
+    }
+
+    const legacyEnabled = DEBUG_CATEGORIES.some((key) => normalized.categories[key]);
+    normalized.channels.renderer = legacyEnabled;
+    normalized.channels.nativeEvents = legacyEnabled;
+    normalized.channels.mainProcess = legacyEnabled;
+    return normalized;
+  }
+
   for (const key of DEBUG_CATEGORIES) {
-    if (Object.prototype.hasOwnProperty.call(config, key)) {
-      normalized[key] = Boolean(config[key]);
+    if (hasStructuredCategories && Object.prototype.hasOwnProperty.call(config.categories, key)) {
+      normalized.categories[key] = Boolean(config.categories[key]);
+    }
+  }
+
+  for (const key of DEBUG_CHANNELS) {
+    if (hasStructuredChannels && Object.prototype.hasOwnProperty.call(config.channels, key)) {
+      normalized.channels[key] = Boolean(config.channels[key]);
     }
   }
 
   return normalized;
 }
 
-function isRendererDebugEnabled(category = 'misc') {
-  return VERBOSE_MEDIA_LOGS || Boolean(rendererDebugConfig[category]);
+function isRendererDebugEnabled(category = 'misc', channel = 'renderer') {
+  return VERBOSE_MEDIA_LOGS ||
+    (Boolean(rendererDebugConfig.categories && rendererDebugConfig.categories[category]) &&
+      Boolean(rendererDebugConfig.channels && rendererDebugConfig.channels[channel]));
 }
 
 function getMediaEngineDebugCategory(method) {
@@ -83,6 +120,8 @@ function getMediaEngineDebugCategory(method) {
     case 'getAudioBackendStatus':
     case 'startAudioSession':
     case 'stopAudioSession':
+    case 'setViewerPlaybackMode':
+    case 'setViewerAudioDelay':
     case 'setViewerVolume':
     case 'getViewerVolume':
       return 'audio';
@@ -175,6 +214,8 @@ ipcMain.handle('media-engine-detach-peer-media-source', async (_event, options) 
 ipcMain.handle('media-engine-attach-surface', async (_event, options) => invokeMediaEngine('attachSurface', enrichEmbeddedSurfaceOptions(options || {})));
 ipcMain.handle('media-engine-update-surface', async (_event, options) => invokeMediaEngine('updateSurface', enrichEmbeddedSurfaceOptions(options || {})));
 ipcMain.handle('media-engine-detach-surface', async (_event, options) => invokeMediaEngine('detachSurface', options || {}));
+ipcMain.handle('media-engine-set-viewer-playback-mode', async (_event, options) => invokeMediaEngine('setViewerPlaybackMode', options || {}));
+ipcMain.handle('media-engine-set-viewer-audio-delay', async (_event, options) => invokeMediaEngine('setViewerAudioDelay', options || {}));
 ipcMain.handle('media-engine-set-viewer-volume', async (_event, volume) => invokeMediaEngine('setViewerVolume', {
   pid: getRendererProcessId(),
   volume
@@ -201,12 +242,19 @@ ipcMain.handle('window-get-bounds', () => {
   if (!mainWindow) {
     return null;
   }
-  return mainWindow.getBounds();
+  return getRendererWindowBounds();
+});
+ipcMain.handle('window-get-cursor-screen-point', () => {
+  const point = screen.getCursorScreenPoint();
+  return {
+    x: Number(point && point.x) || 0,
+    y: Number(point && point.y) || 0
+  };
 });
 ipcMain.handle('window-set-fullscreen', (_event, enabled) => {
   return applyWindowFullscreenState(enabled);
 });
-ipcMain.handle('window-is-fullscreen', () => Boolean(mainWindow && mainWindow.isFullScreen()));
+ipcMain.handle('window-is-fullscreen', () => isWindowFullscreenActive());
 
 ipcMain.on('window-minimize', () => {
   if (mainWindow) {
@@ -293,8 +341,8 @@ ipcMain.handle('download-update', async () => {
 ipcMain.handle('quit-and-install', () => {
   if (app.isPackaged) {
     const updater = getAutoUpdater();
-    writeUpdateLog('info', 'quitAndInstall requested by renderer.');
-    updater.quitAndInstall();
+    writeUpdateLog('info', 'quitAndInstall requested by renderer. mode=silent');
+    updater.quitAndInstall(true, true);
   }
 });
 
@@ -349,32 +397,48 @@ function createWindow() {
 
   mainWindow.on('maximize', () => {
     sendToRenderer('window-maximized-changed', true);
-    sendToRenderer('window-bounds-changed', mainWindow.getBounds());
+    sendToRenderer('window-bounds-changed', getRendererWindowBounds());
   });
 
   mainWindow.on('unmaximize', () => {
     sendToRenderer('window-maximized-changed', false);
-    sendToRenderer('window-bounds-changed', mainWindow.getBounds());
+    sendToRenderer('window-bounds-changed', getRendererWindowBounds());
   });
 
   mainWindow.on('enter-full-screen', () => {
     syncWindowFullscreenZOrder(true);
     sendToRenderer('window-fullscreen-changed', true);
-    sendToRenderer('window-bounds-changed', mainWindow.getBounds());
+    sendToRenderer('window-bounds-changed', getRendererWindowBounds());
   });
 
   mainWindow.on('leave-full-screen', () => {
     syncWindowFullscreenZOrder(false);
     sendToRenderer('window-fullscreen-changed', false);
-    sendToRenderer('window-bounds-changed', mainWindow.getBounds());
+    sendToRenderer('window-bounds-changed', getRendererWindowBounds());
   });
 
   mainWindow.on('move', () => {
-    sendToRenderer('window-bounds-changed', mainWindow.getBounds());
+    sendToRenderer('window-bounds-changed', getRendererWindowBounds());
   });
 
   mainWindow.on('resize', () => {
-    sendToRenderer('window-bounds-changed', mainWindow.getBounds());
+    sendToRenderer('window-bounds-changed', getRendererWindowBounds());
+  });
+
+  mainWindow.on('focus', () => {
+    syncWindowFullscreenZOrder(isWindowFullscreenActive());
+  });
+
+  mainWindow.on('blur', () => {
+    syncWindowFullscreenZOrder(isWindowFullscreenActive());
+  });
+
+  mainWindow.on('minimize', () => {
+    syncWindowFullscreenZOrder(false);
+  });
+
+  mainWindow.on('restore', () => {
+    syncWindowFullscreenZOrder(isWindowFullscreenActive());
   });
 
   mainWindow.on('closed', () => {
@@ -387,8 +451,16 @@ function syncWindowFullscreenZOrder(enabled) {
     return;
   }
 
-  if (enabled) {
-    mainWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+  const shouldElevate = Boolean(enabled) && mainWindow.isFocused() && !mainWindow.isMinimized();
+  logMainProcessDebug('video', '[fullscreen-zorder] sync:', {
+    enabled: Boolean(enabled),
+    focused: mainWindow.isFocused(),
+    minimized: mainWindow.isMinimized(),
+    elevate: shouldElevate
+  });
+
+  if (shouldElevate) {
+    mainWindow.setAlwaysOnTop(true, 'pop-up-menu');
     if (typeof mainWindow.moveTop === 'function') {
       mainWindow.moveTop();
     }
@@ -399,12 +471,92 @@ function syncWindowFullscreenZOrder(enabled) {
   mainWindow.setAlwaysOnTop(false);
 }
 
+function isWindowFullscreenActive() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return false;
+  }
+
+  if (process.platform === 'win32') {
+    return Boolean(emulatedFullscreenState.active);
+  }
+
+  return Boolean(mainWindow.isFullScreen());
+}
+
+function getRendererWindowBounds() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return null;
+  }
+
+  if (typeof mainWindow.getContentBounds === 'function') {
+    return mainWindow.getContentBounds();
+  }
+
+  return mainWindow.getBounds();
+}
+
 function applyWindowFullscreenState(enabled) {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return false;
   }
 
   const shouldEnable = Boolean(enabled);
+  if (process.platform === 'win32') {
+    if (shouldEnable === emulatedFullscreenState.active) {
+      syncWindowFullscreenZOrder(shouldEnable);
+      return emulatedFullscreenState.active;
+    }
+
+    if (shouldEnable) {
+      const display = screen.getDisplayMatching(mainWindow.getBounds());
+      const displayBounds = display && display.bounds ? display.bounds : screen.getPrimaryDisplay().bounds;
+      const targetBounds = {
+        x: Math.round(displayBounds.x - 1),
+        y: Math.round(displayBounds.y - 1),
+        width: Math.round(displayBounds.width + 2),
+        height: Math.round(displayBounds.height + 2)
+      };
+      const restoreBounds = mainWindow.isMaximized() && typeof mainWindow.getNormalBounds === 'function'
+        ? mainWindow.getNormalBounds()
+        : mainWindow.getBounds();
+
+      emulatedFullscreenState = {
+        active: true,
+        bounds: restoreBounds,
+        maximized: mainWindow.isMaximized()
+      };
+
+      if (mainWindow.isMaximized()) {
+        mainWindow.unmaximize();
+      }
+
+      mainWindow.setBounds(targetBounds, false);
+      syncWindowFullscreenZOrder(true);
+      sendToRenderer('window-fullscreen-changed', true);
+      sendToRenderer('window-bounds-changed', getRendererWindowBounds());
+      return true;
+    }
+
+    const restoreState = emulatedFullscreenState;
+    emulatedFullscreenState = {
+      active: false,
+      bounds: null,
+      maximized: false
+    };
+
+    if (restoreState.bounds) {
+      mainWindow.setBounds(restoreState.bounds, false);
+    }
+    if (restoreState.maximized) {
+      mainWindow.maximize();
+    }
+
+    syncWindowFullscreenZOrder(false);
+    sendToRenderer('window-fullscreen-changed', false);
+    sendToRenderer('window-bounds-changed', getRendererWindowBounds());
+    return false;
+  }
+
   if (shouldEnable) {
     syncWindowFullscreenZOrder(true);
   }
@@ -518,21 +670,35 @@ function requestAppQuit() {
     });
 }
 
-function shouldLogMediaDebug(category = 'misc') {
-  return VERBOSE_MEDIA_LOGS || isRendererDebugEnabled(category);
+function shouldLogMediaDebug(category = 'misc', channel = 'renderer') {
+  return VERBOSE_MEDIA_LOGS || isRendererDebugEnabled(category, channel);
 }
 
 function shouldLogMediaInvoke(method, category = 'misc') {
-  return shouldLogMediaDebug(category);
+  return shouldLogMediaDebug(category, 'mainProcess');
+}
+
+function logMainProcessDebug(category, ...args) {
+  if (!shouldLogMediaDebug(category, 'mainProcess')) {
+    return;
+  }
+  console.log(...args);
+}
+
+function logMainProcessWarning(category, ...args) {
+  if (!shouldLogMediaDebug(category, 'mainProcess')) {
+    return;
+  }
+  console.warn(...args);
 }
 
 function enrichEmbeddedSurfaceOptions(options) {
   const normalized = { ...(options || {}) };
-  if (shouldLogMediaDebug('video')) {
+  if (shouldLogMediaDebug('video', 'mainProcess')) {
     console.log('[media-engine surface] enrich input:', JSON.stringify(summarizeMediaEnginePayload(normalized)));
   }
   if (!normalized.embedded) {
-    if (shouldLogMediaDebug('video')) {
+    if (shouldLogMediaDebug('video', 'mainProcess')) {
       console.log('[media-engine surface] non-embedded surface request');
     }
     return normalized;
@@ -543,7 +709,7 @@ function enrichEmbeddedSurfaceOptions(options) {
     throw new Error('main-window-handle-unavailable');
   }
   normalized.parentWindowHandle = parentWindowHandle;
-  if (shouldLogMediaDebug('video')) {
+  if (shouldLogMediaDebug('video', 'mainProcess')) {
     console.log('[media-engine surface] enrich output:', JSON.stringify(summarizeMediaEnginePayload(normalized)));
   }
   return normalized;
@@ -631,7 +797,10 @@ async function listDesktopSources() {
     fetchWindowIcons: true
   });
 
-  return sortDesktopSources(rawSources.map(normalizeDesktopSource));
+  const normalizedSources = sortDesktopSources(rawSources.map(normalizeDesktopSource));
+  const syntheticSources = buildSyntheticFullscreenSources(normalizedSources);
+  const minimizedSources = buildSyntheticMinimizedSources(normalizedSources);
+  return sortDesktopSources(normalizedSources.concat(syntheticSources, minimizedSources));
 }
 
 async function listCaptureTargets() {
@@ -705,7 +874,7 @@ function getDisplayMetadataMap() {
 }
 
 function buildCaptureTarget(source, audioDiscovery, windowMetadata, displayMetadata) {
-  const sourceHandle = getDesktopWindowHandleFromSourceId(source.id);
+  const sourceHandle = source && source.hwnd ? String(source.hwnd) : getDesktopWindowHandleFromSourceId(source.id);
   const windowInfo = sourceHandle ? windowMetadata.get(String(sourceHandle)) : null;
   const pid = normalizePid(windowInfo && windowInfo.pid);
   const title = (windowInfo && windowInfo.title) || source.name;
@@ -715,10 +884,11 @@ function buildCaptureTarget(source, audioDiscovery, windowMetadata, displayMetad
   return {
     id: source.id,
     sourceId: source.id,
+    name: title,
     title,
     appName: deriveAppName(source, title),
     kind: source.kind === 'screen' ? 'display' : 'window',
-    state: getCaptureTargetState(source),
+    state: getCaptureTargetState(source, windowInfo),
     captureMode: source.captureMode,
     displayId: source.displayId || null,
     nativeMonitorIndex: displayInfo ? displayInfo.nativeMonitorIndex : null,
@@ -732,14 +902,15 @@ function buildCaptureTarget(source, audioDiscovery, windowMetadata, displayMetad
     hwnd: sourceHandle || null,
     thumbnail: source.thumbnail || null,
     icon: source.appIcon || null,
-    isSynthetic: false,
+    isSynthetic: Boolean(source && source.isSynthetic),
+    isMinimized: Boolean(windowInfo && windowInfo.isMinimized) || source.syntheticKind === 'minimized-window',
     audioSupported: audioDiscovery.supported,
     audioPermissionStatus: audioDiscovery.permissionStatus,
     audioCandidates,
     defaultAudioMode: audioCandidates.length > 0 ? 'process' : 'none',
     defaultAudioTargetId: audioCandidates.length > 0 ? audioCandidates[0].id : null,
     warnings: buildCaptureTargetWarnings(source, pid, audioCandidates, audioDiscovery),
-    discoveryProvider: 'electron'
+    discoveryProvider: source && source.isSynthetic ? 'win32-fallback' : 'electron'
   };
 }
 
@@ -839,7 +1010,16 @@ function deriveAppName(source, title) {
   return comparableTitle;
 }
 
-function getCaptureTargetState(source) {
+function getCaptureTargetState(source, windowInfo) {
+  if (source && source.syntheticKind === 'minimized-window') {
+    return 'minimized';
+  }
+  if (windowInfo && windowInfo.isMinimized) {
+    return 'minimized';
+  }
+  if (source && source.isSynthetic) {
+    return 'exclusive-fullscreen';
+  }
   if (source.kind === 'screen') {
     return 'display';
   }
@@ -899,10 +1079,167 @@ function getTopLevelWindowMetadataMap() {
       return true;
     }, 0);
   } catch (error) {
-    console.warn('Unable to build top-level window metadata map:', error);
+    logMainProcessWarning('video', 'Unable to build top-level window metadata map:', error);
   }
 
   return metadata;
+}
+
+function buildSyntheticFullscreenSources(existingSources) {
+  const api = getWin32WindowCaptureApi();
+  if (!api || typeof api.GetForegroundWindow !== 'function') {
+    return [];
+  }
+
+  try {
+    const hwnd = api.GetForegroundWindow();
+    if (!hwnd) {
+      return [];
+    }
+
+    const handleValue = getWindowHandleValue(api, hwnd);
+    if (!handleValue || hasDesktopSourceForWindowHandle(existingSources, handleValue)) {
+      return [];
+    }
+
+    const title = getWindowTitle(api, hwnd);
+    const pid = getWindowProcessId(api, hwnd);
+    const rect = getWindowRect(api, hwnd);
+    if (!title || !pid || pid === process.pid || !rect) {
+      return [];
+    }
+
+    if ((api.IsWindowVisible && !api.IsWindowVisible(hwnd)) || (api.IsIconic && api.IsIconic(hwnd))) {
+      return [];
+    }
+
+    const display = findDisplayForFullscreenRect(rect);
+    if (!display) {
+      return [];
+    }
+
+    const syntheticSource = {
+      id: `window:${handleValue}:synthetic`,
+      name: title,
+      kind: 'window',
+      displayId: String(display.id),
+      isSynthetic: true,
+      syntheticKind: 'exclusive-fullscreen',
+      captureMode: 'window',
+      appIcon: null,
+      thumbnail: null,
+      hwnd: String(handleValue)
+    };
+    logMainProcessDebug('video', '[capture-targets] synthesized exclusive fullscreen source:', syntheticSource);
+    return [syntheticSource];
+  } catch (error) {
+    logMainProcessWarning('video', 'Failed to synthesize exclusive fullscreen source:', error);
+    return [];
+  }
+}
+
+function buildSyntheticMinimizedSources(existingSources) {
+  const windowMetadata = getTopLevelWindowMetadataMap();
+  if (!windowMetadata || windowMetadata.size === 0) {
+    return [];
+  }
+
+  const syntheticSources = [];
+  for (const windowInfo of windowMetadata.values()) {
+    if (!windowInfo || !windowInfo.isMinimized) {
+      continue;
+    }
+
+    const handleValue = String(windowInfo.hwnd || '').trim();
+    const pid = normalizePid(windowInfo.pid);
+    const title = String(windowInfo.title || '').trim();
+    if (!handleValue || !pid || pid === process.pid || !title) {
+      continue;
+    }
+    if (hasDesktopSourceForWindowHandle(existingSources, handleValue)) {
+      continue;
+    }
+
+    syntheticSources.push({
+      id: `window:${handleValue}:minimized`,
+      name: title,
+      kind: 'window',
+      displayId: null,
+      isSynthetic: true,
+      syntheticKind: 'minimized-window',
+      captureMode: 'window',
+      appIcon: null,
+      thumbnail: null,
+      hwnd: handleValue
+    });
+  }
+
+  if (syntheticSources.length > 0) {
+    logMainProcessDebug('video', '[capture-targets] synthesized minimized window sources:', syntheticSources);
+  }
+  return syntheticSources;
+}
+
+function hasDesktopSourceForWindowHandle(sources, hwnd) {
+  const wanted = String(hwnd || '').trim();
+  if (!wanted) {
+    return false;
+  }
+
+  return Array.isArray(sources) && sources.some((source) => {
+    if (!source) {
+      return false;
+    }
+    if (source.hwnd && String(source.hwnd).trim() === wanted) {
+      return true;
+    }
+    return getDesktopWindowHandleFromSourceId(source.id) === wanted;
+  });
+}
+
+function getWindowRect(api, hwnd) {
+  try {
+    const rect = { left: 0, top: 0, right: 0, bottom: 0 };
+    if (!api.GetWindowRect(hwnd, rect)) {
+      return null;
+    }
+    return {
+      left: Number(rect.left) || 0,
+      top: Number(rect.top) || 0,
+      right: Number(rect.right) || 0,
+      bottom: Number(rect.bottom) || 0
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+function findDisplayForFullscreenRect(rect) {
+  if (!rect) {
+    return null;
+  }
+
+  const displays = screen.getAllDisplays();
+  for (const display of displays) {
+    const bounds = display && display.bounds ? display.bounds : null;
+    if (!bounds) {
+      continue;
+    }
+
+    const overlapWidth = Math.max(0, Math.min(rect.right, bounds.x + bounds.width) - Math.max(rect.left, bounds.x));
+    const overlapHeight = Math.max(0, Math.min(rect.bottom, bounds.y + bounds.height) - Math.max(rect.top, bounds.y));
+    const overlapArea = overlapWidth * overlapHeight;
+    const displayArea = Math.max(1, bounds.width * bounds.height);
+    const widthDelta = Math.abs((rect.right - rect.left) - bounds.width);
+    const heightDelta = Math.abs((rect.bottom - rect.top) - bounds.height);
+    const overlapRatio = overlapArea / displayArea;
+
+    if (overlapRatio >= 0.95 && widthDelta <= 8 && heightDelta <= 8) {
+      return display;
+    }
+  }
+
+  return null;
 }
 
 function getMediaAgentManager() {
@@ -910,12 +1247,19 @@ function getMediaAgentManager() {
     mediaAgentManager = new MediaAgentManager({
       logger: {
         log: (...args) => {
-          if (shouldLogMediaDebug('video')) {
+          if (shouldLogMediaDebug('video', 'agentStderr')) {
             console.log(...args);
           }
         },
         warn: (...args) => {
-          if (shouldLogMediaDebug('video')) {
+          const message = args.map((entry) => String(entry)).join(' ');
+          if (message.includes('[media-agent breadcrumb]')) {
+            if (shouldLogMediaDebug('video', 'agentBreadcrumbs')) {
+              console.warn(...args);
+            }
+            return;
+          }
+          if (shouldLogMediaDebug('video', 'agentStderr')) {
             console.warn(...args);
           }
         },
@@ -956,6 +1300,13 @@ async function invokeMediaEngine(method, params) {
     if (method === 'getViewerVolume' && message.includes('No active render audio session was found')) {
       throw error;
     }
+    if (method === 'stopAudioSession' && message.includes('media-agent-stopped')) {
+      logMainProcessDebug('audio', '[media-agent] stopAudioSession ignored because agent is already stopped');
+      return {
+        stopped: false,
+        implementation: 'media-agent-stopped'
+      };
+    }
     console.error(`[media-agent] ${method} failed:`, error);
     throw error;
   }
@@ -970,8 +1321,37 @@ async function invokeMediaEngineHostSessionBridge(method, params) {
   }
 
   try {
-    return await invokeMediaEngine(method, params);
+    const result = await invokeMediaEngine(method, params);
+    if (method === 'stopHostSession') {
+      const manager = getMediaAgentManager();
+      try {
+        await manager.stop();
+      } catch (restartStopError) {
+        console.warn('[media-agent bridge] stopHostSession agent shutdown failed:', restartStopError);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      try {
+        await manager.start();
+      } catch (restartStartError) {
+        console.warn('[media-agent bridge] stopHostSession agent restart failed:', restartStartError);
+      }
+    }
+    return result;
   } catch (error) {
+    if (method === 'stopHostSession') {
+      const manager = getMediaAgentManager();
+      try {
+        await manager.stop();
+      } catch (restartStopError) {
+        console.warn('[media-agent bridge] stopHostSession recovery shutdown failed:', restartStopError);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      try {
+        await manager.start();
+      } catch (restartStartError) {
+        console.warn('[media-agent bridge] stopHostSession recovery restart failed:', restartStartError);
+      }
+    }
     console.error(`[media-agent bridge] ${method} failed:`, error);
     throw error;
   }
@@ -1305,7 +1685,7 @@ function getWin32WindowCaptureApi() {
       IsIconic: user32.func('bool __stdcall IsIconic(HWND hWnd)')
     };
   } catch (error) {
-    console.warn('Win32 fullscreen source detection unavailable:', error);
+    logMainProcessWarning('video', 'Win32 fullscreen source detection unavailable:', error);
     win32WindowCaptureApi = null;
   }
 

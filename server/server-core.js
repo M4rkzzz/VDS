@@ -156,6 +156,31 @@ function startServer(options = {}) {
       return;
     }
 
+    const existingViewer = room.viewers.find((candidate) => candidate.clientId === clientId);
+    if (existingViewer) {
+      const rebindRequired = existingViewer.ws !== ws;
+      clearDisconnectTimer(existingViewer);
+      existingViewer.ws = ws;
+      attachSocketMetadata(ws, roomId, clientId, 'viewer');
+
+      if (rebindRequired) {
+        sendJson(ws, {
+          type: 'room-joined',
+          roomId,
+          clientId,
+          hostId: room.host.clientId,
+          upstreamPeerId: resolveViewerUpstreamId(room, existingViewer.chainPosition),
+          chainPosition: existingViewer.chainPosition,
+          isFirstViewer: existingViewer.chainPosition === 0
+        });
+
+        if (!existingViewer.mediaReady || !existingViewer.relayEstablished) {
+          requestViewerReconnect(room, existingViewer);
+        }
+      }
+      return;
+    }
+
     const chainPosition = room.viewers.length;
     const viewer = {
       clientId,
@@ -163,6 +188,7 @@ function startServer(options = {}) {
       chainPosition,
       mediaReady: false,
       relayEstablished: false,
+      connectRequestPending: false,
       disconnectTimer: null
     };
 
@@ -186,11 +212,7 @@ function startServer(options = {}) {
 
     const previousViewer = room.viewers[chainPosition - 1];
     if (previousViewer && previousViewer.mediaReady && isSocketOpen(previousViewer.ws)) {
-      sendJson(previousViewer.ws, {
-        type: 'connect-to-next',
-        nextViewerId: viewer.clientId,
-        nextViewerChainPosition: chainPosition
-      });
+      notifyViewerToConnectNext(room, previousViewer, viewer);
     }
   }
 
@@ -264,16 +286,17 @@ function startServer(options = {}) {
       return;
     }
 
+    if (viewer.mediaReady && viewer.relayEstablished) {
+      return;
+    }
+
     viewer.mediaReady = true;
     viewer.relayEstablished = true;
+    viewer.connectRequestPending = false;
 
     const nextViewer = room.viewers[data.chainPosition + 1];
     if (nextViewer && isSocketOpen(ws)) {
-      sendJson(ws, {
-        type: 'connect-to-next',
-        nextViewerId: nextViewer.clientId,
-        nextViewerChainPosition: nextViewer.chainPosition
-      });
+      notifyViewerToConnectNext(room, viewer, nextViewer);
     }
   }
 
@@ -387,16 +410,29 @@ function startServer(options = {}) {
       return;
     }
 
+    const upstreamViewer =
+      viewerIndex > 0 && viewerIndex - 1 < room.viewers.length
+        ? room.viewers[viewerIndex - 1]
+        : null;
     const [viewer] = room.viewers.splice(viewerIndex, 1);
     clearDisconnectTimer(viewer);
 
     const leftPosition = viewer.chainPosition;
     room.viewers.forEach((candidate, index) => {
       candidate.chainPosition = index;
+      candidate.connectRequestPending = false;
     });
 
     if (isSocketOpen(room.host.ws)) {
       sendJson(room.host.ws, {
+        type: 'viewer-left',
+        viewerId: clientId,
+        leftPosition
+      });
+    }
+
+    if (upstreamViewer && isSocketOpen(upstreamViewer.ws)) {
+      sendJson(upstreamViewer.ws, {
         type: 'viewer-left',
         viewerId: clientId,
         leftPosition
@@ -429,11 +465,7 @@ function startServer(options = {}) {
       const previousViewer = room.viewers[leftPosition - 1];
       const nextViewer = room.viewers[leftPosition];
       if (previousViewer && nextViewer && previousViewer.mediaReady && isSocketOpen(previousViewer.ws)) {
-        sendJson(previousViewer.ws, {
-          type: 'connect-to-next',
-          nextViewerId: nextViewer.clientId,
-          nextViewerChainPosition: nextViewer.chainPosition
-        });
+        notifyViewerToConnectNext(room, previousViewer, nextViewer);
       }
     }
   }
@@ -443,13 +475,18 @@ function notifyHostToConnectViewer(room, viewer, reconnect) {
     return;
   }
 
-    sendJson(room.host.ws, {
-      type: 'viewer-joined',
-      viewerId: viewer.clientId,
-      viewerChainPosition: viewer.chainPosition,
-      reconnect
-    });
+  if (viewer.connectRequestPending) {
+    return;
   }
+
+  viewer.connectRequestPending = true;
+  sendJson(room.host.ws, {
+    type: 'viewer-joined',
+    viewerId: viewer.clientId,
+    viewerChainPosition: viewer.chainPosition,
+    reconnect
+  });
+}
 
   server.listen(port, () => {
     console.log(`Server running on http://localhost:${port}`);
@@ -465,6 +502,7 @@ function requestViewerReconnect(room, viewer) {
 
   viewer.mediaReady = false;
   viewer.relayEstablished = false;
+  viewer.connectRequestPending = false;
 
   if (viewer.chainPosition === 0) {
     notifyHostToConnectViewer(room, viewer, true);
@@ -473,12 +511,25 @@ function requestViewerReconnect(room, viewer) {
 
   const previousViewer = room.viewers[viewer.chainPosition - 1];
   if (previousViewer && previousViewer.mediaReady && isSocketOpen(previousViewer.ws)) {
-    sendJson(previousViewer.ws, {
-      type: 'connect-to-next',
-      nextViewerId: viewer.clientId,
-      nextViewerChainPosition: viewer.chainPosition
-    });
+    notifyViewerToConnectNext(room, previousViewer, viewer);
   }
+}
+
+function notifyViewerToConnectNext(room, previousViewer, nextViewer) {
+  if (!room || !previousViewer || !nextViewer || !isSocketOpen(previousViewer.ws)) {
+    return;
+  }
+
+  if (nextViewer.mediaReady || nextViewer.relayEstablished || nextViewer.connectRequestPending) {
+    return;
+  }
+
+  nextViewer.connectRequestPending = true;
+  sendJson(previousViewer.ws, {
+    type: 'connect-to-next',
+    nextViewerId: nextViewer.clientId,
+    nextViewerChainPosition: nextViewer.chainPosition
+  });
 }
 
 function attachSocketMetadata(ws, roomId, clientId, role) {

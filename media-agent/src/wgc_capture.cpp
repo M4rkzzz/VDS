@@ -38,6 +38,13 @@ std::string to_lower_ascii(std::string value) {
 }
 
 #ifdef _WIN32
+struct FrameEventState {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool frame_arrived = false;
+  bool closed = false;
+};
+
 bool parse_unsigned_index(const std::string& value, unsigned int* parsed) {
   try {
     std::size_t consumed = 0;
@@ -301,7 +308,7 @@ class WgcFrameSource::Impl {
       return false;
     }
 
-    winrt::init_apartment(winrt::apartment_type::single_threaded);
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
     apartment_initialized_ = true;
 
     if (!create_d3d11_device(&device_, &context_, error)) {
@@ -341,14 +348,19 @@ class WgcFrameSource::Impl {
       2,
       item_.Size()
     );
-    frame_arrived_token_ = pool_.FrameArrived([this](
+    current_pool_size_ = item_.Size();
+    const auto event_state = frame_event_state_;
+    frame_arrived_token_ = pool_.FrameArrived([event_state](
       const winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool&,
       const winrt::Windows::Foundation::IInspectable&) {
       {
-        std::lock_guard<std::mutex> lock(frame_event_mutex_);
-        frame_arrived_ = true;
+        std::lock_guard<std::mutex> lock(event_state->mutex);
+        if (event_state->closed) {
+          return;
+        }
+        event_state->frame_arrived = true;
       }
-      frame_event_cv_.notify_one();
+      event_state->cv.notify_one();
     });
     session_ = pool_.CreateCaptureSession(item_);
     if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
@@ -394,32 +406,33 @@ class WgcFrameSource::Impl {
       return false;
     }
 
-    if (auto next_frame = pool_.TryGetNextFrame()) {
-      return copy_frame_to_cpu(next_frame, frame, error);
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame latest_frame{ nullptr };
+    if (try_get_latest_frame(&latest_frame)) {
+      return copy_frame_to_cpu(latest_frame, frame, error);
     }
 
+    const auto event_state = frame_event_state_;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, timeout_ms));
     while (std::chrono::steady_clock::now() < deadline) {
       {
-        std::unique_lock<std::mutex> lock(frame_event_mutex_);
-        const bool signaled = frame_event_cv_.wait_until(lock, deadline, [this]() {
-          return frame_arrived_ || closed_;
+        std::unique_lock<std::mutex> lock(event_state->mutex);
+        const bool signaled = event_state->cv.wait_until(lock, deadline, [event_state]() {
+          return event_state->frame_arrived || event_state->closed;
         });
         if (!signaled) {
           break;
         }
-        if (closed_) {
+        if (event_state->closed) {
           if (error) {
             *error = "wgc-source-closed";
           }
           return false;
         }
-        frame_arrived_ = false;
+        event_state->frame_arrived = false;
       }
 
-      auto next_frame = pool_.TryGetNextFrame();
-      if (next_frame) {
-        return copy_frame_to_cpu(next_frame, frame, error);
+      if (try_get_latest_frame(&latest_frame)) {
+        return copy_frame_to_cpu(latest_frame, frame, error);
       }
     }
 
@@ -439,16 +452,16 @@ class WgcFrameSource::Impl {
 
   void close() {
 #ifdef _WIN32
+    const auto event_state = frame_event_state_;
     {
-      std::lock_guard<std::mutex> lock(frame_event_mutex_);
-      closed_ = true;
-      frame_arrived_ = false;
+      std::lock_guard<std::mutex> lock(event_state->mutex);
+      if (event_state->closed) {
+        return;
+      }
+      event_state->closed = true;
+      event_state->frame_arrived = false;
     }
-    frame_event_cv_.notify_all();
-    if (session_) {
-      session_.Close();
-      session_ = nullptr;
-    }
+    event_state->cv.notify_all();
     if (pool_) {
       if (frame_arrived_token_.value != 0) {
         try {
@@ -457,8 +470,18 @@ class WgcFrameSource::Impl {
         }
         frame_arrived_token_ = {};
       }
+    }
+    if (session_) {
+      session_.Close();
+      session_ = nullptr;
+    }
+    if (pool_) {
       pool_.Close();
       pool_ = nullptr;
+    }
+    if (context_) {
+      context_->ClearState();
+      context_->Flush();
     }
     item_ = nullptr;
     winrt_device_ = nullptr;
@@ -474,11 +497,64 @@ class WgcFrameSource::Impl {
 
  private:
 #ifdef _WIN32
+  bool try_get_latest_frame(
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame* frame
+  ) {
+    if (!frame) {
+      return false;
+    }
+
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame latest{ nullptr };
+    bool found = false;
+    while (auto next_frame = pool_.TryGetNextFrame()) {
+      latest = next_frame;
+      found = true;
+    }
+
+    if (!found) {
+      return false;
+    }
+
+    *frame = latest;
+    return true;
+  }
+
   bool copy_frame_to_cpu(
     const winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame& frame,
     WgcFrameCpuBuffer* output,
     std::string* error
   ) {
+    const auto content_size = frame.ContentSize();
+    if (content_size.Width <= 0 || content_size.Height <= 0) {
+      if (error) {
+        *error = "wgc-frame-content-size-invalid";
+      }
+      return false;
+    }
+
+    if (content_size.Width != current_pool_size_.Width ||
+        content_size.Height != current_pool_size_.Height) {
+      try {
+        pool_.Recreate(
+          winrt_device_,
+          winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+          2,
+          content_size
+        );
+        current_pool_size_ = content_size;
+        staging_texture_ = nullptr;
+        std::memset(&staging_desc_, 0, sizeof(staging_desc_));
+        if (error) {
+          *error = "wgc-frame-pool-recreated";
+        }
+      } catch (...) {
+        if (error) {
+          *error = "wgc-frame-pool-recreate-failed";
+        }
+      }
+      return false;
+    }
+
     const auto total_start = std::chrono::steady_clock::now();
     const auto surface = frame.Surface();
     winrt::com_ptr<IInspectable> inspectable;
@@ -568,13 +644,11 @@ class WgcFrameSource::Impl {
   winrt::Windows::Graphics::Capture::GraphicsCaptureItem item_ { nullptr };
   winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool pool_ { nullptr };
   winrt::Windows::Graphics::Capture::GraphicsCaptureSession session_ { nullptr };
+  winrt::Windows::Graphics::SizeInt32 current_pool_size_ {};
   winrt::event_token frame_arrived_token_ {};
   winrt::com_ptr<ID3D11Texture2D> staging_texture_;
   D3D11_TEXTURE2D_DESC staging_desc_ {};
-  std::mutex frame_event_mutex_;
-  std::condition_variable frame_event_cv_;
-  bool frame_arrived_ = false;
-  bool closed_ = false;
+  std::shared_ptr<FrameEventState> frame_event_state_ = std::make_shared<FrameEventState>();
 #else
   WgcFrameSourceConfig config_;
 #endif
