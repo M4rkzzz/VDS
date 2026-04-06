@@ -2194,7 +2194,8 @@
     }
     sendMessage({
       type: 'create-room',
-      clientId
+      clientId,
+      publicListing: Boolean(qualitySettings && qualitySettings.publicRoomEnabled)
     });
   }
 
@@ -2529,7 +2530,8 @@
 
         sendMessage({
           type: 'create-room',
-          clientId
+          clientId,
+          publicListing: Boolean(qualitySettings && qualitySettings.publicRoomEnabled)
         });
         return;
       } catch (error) {
@@ -2950,6 +2952,21 @@
         elements.roomInfo.classList.remove('hidden');
         elements.btnStartShare.classList.add('hidden');
         elements.btnStopShare.classList.remove('hidden');
+        if (typeof window.__vdsCopyRoomIdToClipboard === 'function') {
+          window.__vdsCopyRoomIdToClipboard({
+            roomId: data.roomId,
+            successMessage: '房间号已自动复制',
+            showFailureToast: false
+          }).catch((error) => {
+            logNativeStep('room-created:auto-copy-room-id-failed', {
+              roomId: data.roomId,
+              message: error && error.message ? error.message : String(error)
+            }, 'connection');
+          });
+        }
+        if (typeof window.__vdsRenderHostPublicListingUi === 'function') {
+          window.__vdsRenderHostPublicListingUi();
+        }
         startNativeHostStatsPolling();
         if (hostWaitingWindowRestore) {
           syncHostWaitingWindowRestoreUi(true);
@@ -2971,6 +2988,9 @@
         viewerReadySent = false;
         videoStarted = false;
         upstreamConnected = false;
+        if (typeof window.__vdsHandleViewerJoinSucceeded === 'function') {
+          window.__vdsHandleViewerJoinSucceeded();
+        }
         elements.joinForm.classList.add('hidden');
         elements.viewerStatus.classList.remove('hidden');
         elements.viewerRoomId.textContent = data.roomId;
@@ -2994,6 +3014,9 @@
           elements.viewerCount.textContent = String(data.viewerCount || 0);
           elements.btnStartShare.classList.add('hidden');
           elements.btnStopShare.classList.remove('hidden');
+          if (typeof window.__vdsRenderHostPublicListingUi === 'function') {
+            window.__vdsRenderHostPublicListingUi();
+          }
           startNativeHostStatsPolling();
           if (hostWaitingWindowRestore) {
             syncHostWaitingWindowRestoreUi(true);
@@ -3011,6 +3034,9 @@
         hostId = data.hostId || hostId;
         upstreamPeerId = data.upstreamPeerId || hostId;
         myChainPosition = data.chainPosition;
+        if (typeof window.__vdsHandleViewerJoinSucceeded === 'function') {
+          window.__vdsHandleViewerJoinSucceeded();
+        }
         elements.joinForm.classList.add('hidden');
         elements.viewerStatus.classList.remove('hidden');
         elements.viewerRoomId.textContent = data.roomId;
@@ -3029,6 +3055,12 @@
 
       case 'error':
         obsRoomCreatePending = false;
+        if (typeof window.__vdsHandleViewerJoinError === 'function') {
+          const handled = await window.__vdsHandleViewerJoinError(data);
+          if (handled) {
+            return;
+          }
+        }
         showError(data.message);
         return;
 

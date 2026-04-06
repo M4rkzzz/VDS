@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, desktopCapturer, shell, screen } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, desktopCapturer, shell, screen, clipboard } = require('electron');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -170,6 +170,14 @@ ipcMain.handle('get-desktop-sources', async () => {
 });
 
 ipcMain.handle('get-app-version', () => app.getVersion());
+ipcMain.handle('clipboard-write-text', (_event, text) => {
+  const value = String(text || '');
+  if (!value) {
+    throw new Error('clipboard-text-empty');
+  }
+  clipboard.writeText(value);
+  return { ok: true };
+});
 ipcMain.handle('get-update-log-snapshot', () => ({
   path: getUpdateLogFilePath(),
   entries: updateLogEntries.slice()

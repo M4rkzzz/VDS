@@ -166,7 +166,6 @@ const DEBUG_CHANNEL_KEYS = Object.keys(DEBUG_CHANNEL_DEFINITIONS);
 let debugConfig = readDebugConfig();
 
 const VIEWER_PLAYBACK_MODES = Object.freeze({
-  SYNCED: 'synced',
   PASSTHROUGH: 'passthrough'
 });
 
@@ -194,6 +193,13 @@ let currentRoomId = null;
 let localStream = null;
 let myChainPosition = -1; // 观众在链中的位置
 let hostId = null; // Host的clientId
+let viewerJoinMode = 'lobby';
+let viewerJoinPending = false;
+let viewerPendingJoinSource = null;
+let publicRooms = [];
+let publicRoomsRefreshInFlight = false;
+let publicRoomsPollTimer = null;
+let publicRoomsLastError = '';
 
 let viewerPlaybackPrefs = readViewerPlaybackPrefs();
 const initialObsIngestPrefs = readObsIngestPrefs();
@@ -215,7 +221,8 @@ let qualitySettings = {
   hardwareAcceleration: true,
   hardwareEncoderPreference: 'auto',
   encoderPreset: 'balanced',
-  encoderTune: 'none'
+  encoderTune: 'none',
+  publicRoomEnabled: false
 };
 let qualityCapabilities = null;
 let qualityCapabilitiesPromise = null;
@@ -257,6 +264,7 @@ const QUALITY_TUNE_OPTIONS = [
   { value: 'zerolatency', label: 'zerolatency' }
 ];
 const QUALITY_HARDWARE_ENCODER_PATTERN = /(?:_amf|_mf|_qsv|_nvenc|videotoolbox|_d3d12va)/i;
+const PUBLIC_ROOMS_POLL_INTERVAL_MS = 500;
 
 
 // Native peer/session state
@@ -523,7 +531,7 @@ function setDebugConfig(nextConfig, options = {}) {
 
 function readViewerPlaybackPrefs() {
   const fallback = {
-    mode: VIEWER_PLAYBACK_MODES.SYNCED,
+    mode: VIEWER_PLAYBACK_MODES.PASSTHROUGH,
     audioDelayMs: 0
   };
   try {
@@ -538,10 +546,7 @@ function readViewerPlaybackPrefs() {
 }
 
 function normalizeViewerPlaybackPrefs(nextPrefs) {
-  const normalizedMode =
-    nextPrefs && nextPrefs.mode === VIEWER_PLAYBACK_MODES.PASSTHROUGH
-      ? VIEWER_PLAYBACK_MODES.PASSTHROUGH
-      : VIEWER_PLAYBACK_MODES.SYNCED;
+  const normalizedMode = VIEWER_PLAYBACK_MODES.PASSTHROUGH;
   const numericDelay = Number(nextPrefs && nextPrefs.audioDelayMs);
   const normalizedDelay = Math.max(0, Math.min(300, Number.isFinite(numericDelay) ? Math.round(numericDelay) : 0));
   return {
@@ -606,7 +611,7 @@ function persistObsIngestPrefs() {
 }
 
 function isViewerPlaybackPassthroughMode() {
-  return viewerPlaybackPrefs.mode === VIEWER_PLAYBACK_MODES.PASSTHROUGH;
+  return true;
 }
 
 function isViewerJoinLocked() {
@@ -614,32 +619,29 @@ function isViewerJoinLocked() {
 }
 
 function renderViewerPlaybackPrefsUi() {
-  const passthrough = isViewerPlaybackPassthroughMode();
-  const locked = isViewerJoinLocked();
-
   if (elements.viewerPlaybackModeToggle) {
-    elements.viewerPlaybackModeToggle.checked = passthrough;
-    elements.viewerPlaybackModeToggle.disabled = locked;
+    elements.viewerPlaybackModeToggle.checked = true;
+    elements.viewerPlaybackModeToggle.disabled = true;
   }
   if (elements.viewerAudioDelayControl) {
-    elements.viewerAudioDelayControl.classList.toggle('hidden', !passthrough);
+    elements.viewerAudioDelayControl.classList.remove('hidden');
   }
   if (elements.viewerAudioDelayInput) {
     elements.viewerAudioDelayInput.value = String(viewerPlaybackPrefs.audioDelayMs);
-    elements.viewerAudioDelayInput.disabled = locked && !passthrough;
+    elements.viewerAudioDelayInput.disabled = false;
   }
   if (elements.viewerAudioDelayDecrease) {
-    elements.viewerAudioDelayDecrease.disabled = locked && !passthrough;
+    elements.viewerAudioDelayDecrease.disabled = false;
   }
   if (elements.viewerAudioDelayIncrease) {
-    elements.viewerAudioDelayIncrease.disabled = locked && !passthrough;
+    elements.viewerAudioDelayIncrease.disabled = false;
   }
 }
 
 function setViewerPlaybackMode(mode) {
   viewerPlaybackPrefs = normalizeViewerPlaybackPrefs({
     ...viewerPlaybackPrefs,
-    mode
+    mode: VIEWER_PLAYBACK_MODES.PASSTHROUGH
   });
   persistViewerPlaybackPrefs();
   renderViewerPlaybackPrefsUi();
@@ -669,12 +671,224 @@ function setViewerAudioDelayMs(nextDelayMs, { applyNative = false } = {}) {
   });
   persistViewerPlaybackPrefs();
   renderViewerPlaybackPrefsUi();
-  if (applyNative && sessionRole === 'viewer' && currentRoomId && isViewerPlaybackPassthroughMode()) {
+  if (applyNative && sessionRole === 'viewer' && currentRoomId) {
     applyNativeViewerPlaybackPrefs({ includeMode: false }).catch((error) => {
       console.warn('[media-engine] setViewerAudioDelay failed:', error);
     });
   }
 }
+
+function normalizeViewerJoinMode(mode) {
+  return mode === 'direct' ? 'direct' : 'lobby';
+}
+
+function renderHostPublicListingUi() {
+  if (!elements.hostPublicRoomEnabled) {
+    return;
+  }
+  const isShareActive = Boolean(
+    elements.btnStartShare &&
+    elements.btnStartShare.classList.contains('hidden')
+  );
+  const isPublicRoom = Boolean(qualitySettings.publicRoomEnabled);
+
+  elements.hostPublicRoomEnabled.checked = isPublicRoom;
+  elements.hostPublicRoomEnabled.disabled = isShareActive;
+  if (elements.hostPublicRoomLabel) {
+    elements.hostPublicRoomLabel.classList.toggle('hidden', isShareActive);
+  }
+  const switchLabel = elements.hostPublicRoomEnabled.closest('.quality-switch');
+  if (switchLabel) {
+    switchLabel.classList.toggle('hidden', isShareActive);
+  }
+  if (elements.hostPublicRoomStatus) {
+    elements.hostPublicRoomStatus.textContent = isPublicRoom ? '当前为公开房间' : '当前为非公开房间';
+    elements.hostPublicRoomStatus.classList.toggle('hidden', !isShareActive);
+  }
+}
+
+function setViewerJoinPending(pending, { source = null } = {}) {
+  viewerJoinPending = Boolean(pending);
+  viewerPendingJoinSource = viewerJoinPending ? source : null;
+  renderViewerJoinUi();
+}
+
+function renderPublicRooms() {
+  if (!elements.viewerPublicRoomsStatus || !elements.viewerPublicRoomsList) {
+    return;
+  }
+
+  let statusText = '';
+  if (publicRoomsRefreshInFlight && publicRooms.length === 0) {
+    statusText = '正在获取公开房间...';
+  } else if (publicRoomsLastError) {
+    statusText = publicRoomsLastError;
+  } else if (publicRooms.length === 0) {
+    statusText = '当前没有公开房间';
+  } else {
+    statusText = `当前公开房间 ${publicRooms.length} 个`;
+  }
+  elements.viewerPublicRoomsStatus.textContent = statusText;
+
+  elements.viewerPublicRoomsList.textContent = '';
+  if (publicRooms.length === 0) {
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  publicRooms.forEach((room) => {
+    if (!room || !room.roomId) {
+      return;
+    }
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'viewer-public-room-button';
+    button.textContent = `${String(room.roomId).toUpperCase()}·人数${Math.max(0, Number(room.viewerCount) || 0)}`;
+    button.disabled = viewerJoinPending;
+    button.addEventListener('click', () => {
+      joinRoomById(room.roomId, { source: 'lobby' }).catch((error) => {
+        showError(error && error.message ? error.message : '无法加入该房间');
+      });
+    });
+    fragment.appendChild(button);
+  });
+  elements.viewerPublicRoomsList.appendChild(fragment);
+}
+
+function renderViewerJoinUi() {
+  const isLobby = normalizeViewerJoinMode(viewerJoinMode) === 'lobby';
+
+  if (elements.btnViewerJoinLobby) {
+    elements.btnViewerJoinLobby.classList.toggle('is-active', isLobby);
+    elements.btnViewerJoinLobby.disabled = viewerJoinPending;
+  }
+  if (elements.btnViewerJoinDirect) {
+    elements.btnViewerJoinDirect.classList.toggle('is-active', !isLobby);
+    elements.btnViewerJoinDirect.disabled = viewerJoinPending;
+  }
+  if (elements.btnRefreshPublicRooms) {
+    elements.btnRefreshPublicRooms.classList.toggle('hidden', !isLobby);
+    elements.btnRefreshPublicRooms.classList.toggle('is-refreshing', isLobby && publicRoomsRefreshInFlight);
+    elements.btnRefreshPublicRooms.disabled = viewerJoinPending || publicRoomsRefreshInFlight;
+  }
+  if (elements.viewerPublicRoomsPanel) {
+    elements.viewerPublicRoomsPanel.classList.toggle('hidden', !isLobby);
+  }
+  if (elements.viewerDirectJoinPanel) {
+    elements.viewerDirectJoinPanel.classList.toggle('hidden', isLobby);
+  }
+  if (elements.roomIdInput) {
+    elements.roomIdInput.disabled = viewerJoinPending;
+  }
+  if (elements.btnJoin) {
+    elements.btnJoin.disabled = viewerJoinPending;
+    elements.btnJoin.textContent = viewerJoinPending && viewerPendingJoinSource === 'direct' ? '加入中...' : '加入';
+  }
+
+  renderPublicRooms();
+}
+
+function shouldPollPublicRooms() {
+  return document.body.dataset.appView === 'viewer' &&
+    Boolean(elements.joinForm) &&
+    !elements.joinForm.classList.contains('hidden') &&
+    !Boolean(currentRoomId);
+}
+
+function stopPublicRoomsPolling() {
+  if (publicRoomsPollTimer) {
+    clearInterval(publicRoomsPollTimer);
+    publicRoomsPollTimer = null;
+  }
+}
+
+function updatePublicRoomsPollingState() {
+  if (!shouldPollPublicRooms()) {
+    stopPublicRoomsPolling();
+    return;
+  }
+
+  if (!publicRoomsPollTimer) {
+    publicRoomsPollTimer = setInterval(() => {
+      refreshPublicRooms().catch(() => {});
+    }, PUBLIC_ROOMS_POLL_INTERVAL_MS);
+  }
+}
+
+async function refreshPublicRooms({ manual = false, force = false } = {}) {
+  if (!force && publicRoomsRefreshInFlight) {
+    return publicRooms;
+  }
+
+  publicRoomsRefreshInFlight = true;
+  publicRoomsLastError = '';
+  renderViewerJoinUi();
+
+  try {
+    const response = await fetch(`${serverBaseUrl}/api/public-rooms`, {
+      cache: 'no-store'
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    publicRooms = Array.isArray(payload && payload.rooms)
+      ? payload.rooms
+        .map((room) => ({
+          roomId: String(room && room.roomId ? room.roomId : '').trim().toUpperCase(),
+          viewerCount: Math.max(0, Number(room && room.viewerCount) || 0)
+        }))
+        .filter((room) => room.roomId)
+      : [];
+  } catch (_error) {
+    publicRoomsLastError = '大厅列表暂不可用';
+    if (manual) {
+      showError('无法刷新公开房间列表');
+    }
+  } finally {
+    publicRoomsRefreshInFlight = false;
+    renderViewerJoinUi();
+  }
+
+  return publicRooms;
+}
+
+function setViewerJoinMode(mode) {
+  viewerJoinMode = normalizeViewerJoinMode(mode);
+  renderViewerJoinUi();
+  updatePublicRoomsPollingState();
+}
+
+async function handleViewerJoinFailure(message) {
+  const failedSource = viewerPendingJoinSource;
+  await resetViewerState();
+  if (failedSource === 'lobby') {
+    setViewerJoinMode('lobby');
+    await refreshPublicRooms({ force: true }).catch(() => {});
+  } else {
+    renderViewerJoinUi();
+  }
+  showError(message || '该房间已不存在');
+}
+
+window.__vdsHandleViewerJoinError = async (data) => {
+  if (!data || data.code !== 'room-not-found') {
+    return false;
+  }
+
+  const message = viewerPendingJoinSource === 'lobby'
+    ? '该房间已不存在'
+    : (data.message || '该房间已不存在');
+  await handleViewerJoinFailure(message);
+  return true;
+};
+
+window.__vdsRenderHostPublicListingUi = renderHostPublicListingUi;
+window.__vdsUpdatePublicRoomsPollingState = updatePublicRoomsPollingState;
+window.__vdsHandleViewerJoinSucceeded = () => {
+  setViewerJoinPending(false);
+  updatePublicRoomsPollingState();
+};
 
 function setDebugCategoryEnabled(category, enabled) {
   if (!Object.prototype.hasOwnProperty.call(DEBUG_CATEGORY_DEFINITIONS, category)) {
@@ -769,6 +983,7 @@ function toggleDebugMenu() {
 
 function setAppView(view) {
   document.body.dataset.appView = view;
+  updatePublicRoomsPollingState();
 }
 
 function setLandingFocus(focus = 'idle') {
@@ -1089,17 +1304,27 @@ const elements = {
   btnViewer: document.getElementById('btn-viewer'),
   btnStartShare: document.getElementById('btn-start-share'),
   btnStopShare: document.getElementById('btn-stop-share'),
+  hostPublicRoomLabel: document.getElementById('host-public-room-label'),
+  hostPublicRoomEnabled: document.getElementById('host-public-room-enabled'),
+  hostPublicRoomStatus: document.getElementById('host-public-room-status'),
   btnJoin: document.getElementById('btn-join'),
   btnLeave: document.getElementById('btn-leave'),
   btnBack: document.getElementById('btn-back'),
   btnBackViewer: document.getElementById('btn-back-viewer'),
   btnCopyRoom: document.getElementById('btn-copy-room'),
+  btnViewerJoinLobby: document.getElementById('btn-viewer-join-lobby'),
+  btnViewerJoinDirect: document.getElementById('btn-viewer-join-direct'),
+  btnRefreshPublicRooms: document.getElementById('btn-refresh-public-rooms'),
   roomInfo: document.getElementById('room-info'),
   roomIdDisplay: document.getElementById('room-id-display'),
   roomIdInput: document.getElementById('room-id-input'),
   viewerCount: document.getElementById('viewer-count'),
   viewerRoomId: document.getElementById('viewer-room-id'),
   viewerStatus: document.getElementById('viewer-status'),
+  viewerPublicRoomsPanel: document.getElementById('viewer-public-rooms-panel'),
+  viewerDirectJoinPanel: document.getElementById('viewer-direct-join-panel'),
+  viewerPublicRoomsStatus: document.getElementById('viewer-public-rooms-status'),
+  viewerPublicRoomsList: document.getElementById('viewer-public-rooms-list'),
   viewerPlaybackModeToggle: document.getElementById('viewer-playback-mode-toggle'),
   viewerAudioDelayControl: document.getElementById('viewer-audio-delay-control'),
   viewerAudioDelayInput: document.getElementById('viewer-audio-delay-input'),
@@ -1379,8 +1604,73 @@ async function copyObsIngestUrl() {
   if (!url) {
     throw new Error('OBS 推流地址尚未准备完成');
   }
-  await navigator.clipboard.writeText(url);
-  showError('OBS 推流地址已复制');
+  await copyTextToClipboard(url, {
+    successMessage: 'OBS 推流地址已复制',
+    failureMessage: '复制 OBS 推流地址失败'
+  });
+}
+
+async function writeTextToClipboard(text) {
+  const value = String(text || '');
+  if (!value) {
+    throw new Error('clipboard-text-empty');
+  }
+
+  if (
+    window.isElectron &&
+    window.electronAPI &&
+    typeof window.electronAPI.writeClipboardText === 'function'
+  ) {
+    await window.electronAPI.writeClipboardText(value);
+    return;
+  }
+
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = value;
+  textarea.setAttribute('readonly', 'readonly');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  textarea.style.pointerEvents = 'none';
+  textarea.style.left = '-9999px';
+  textarea.style.top = '0';
+
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+
+  try {
+    const copied = document.execCommand('copy');
+    if (!copied) {
+      throw new Error('clipboard-write-failed');
+    }
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
+async function copyTextToClipboard(text, {
+  successMessage = '',
+  failureMessage = '',
+  showSuccessToast = true,
+  showFailureToast = true
+} = {}) {
+  try {
+    await writeTextToClipboard(text);
+    if (showSuccessToast && successMessage) {
+      showError(successMessage);
+    }
+    return true;
+  } catch (error) {
+    if (showFailureToast && failureMessage) {
+      showError(failureMessage);
+    }
+    throw error;
+  }
 }
 
 function getRequestedCodecPreference() {
@@ -2146,6 +2436,8 @@ renderDebugMenu();
 bindQualitySettingsUi();
 renderQualitySettingsUi();
 renderViewerPlaybackPrefsUi();
+renderViewerJoinUi();
+renderHostPublicListingUi();
 
 prewarmWorkspacePanels().catch(() => {});
 
@@ -2155,21 +2447,34 @@ elements.btnViewer.addEventListener('click', () => showViewerPanel());
 elements.btnStartShare.addEventListener('click', startScreenShare);
 elements.btnStopShare.addEventListener('click', stopScreenShare);
 elements.btnJoin.addEventListener('click', joinRoom);
+if (elements.hostPublicRoomEnabled) {
+  elements.hostPublicRoomEnabled.addEventListener('change', (event) => {
+    qualitySettings.publicRoomEnabled = Boolean(event.target.checked);
+    renderHostPublicListingUi();
+  });
+}
+if (elements.btnViewerJoinLobby) {
+  elements.btnViewerJoinLobby.addEventListener('click', () => {
+    setViewerJoinMode('lobby');
+    refreshPublicRooms({ manual: true, force: true }).catch(() => {});
+  });
+}
+if (elements.btnViewerJoinDirect) {
+  elements.btnViewerJoinDirect.addEventListener('click', () => {
+    setViewerJoinMode('direct');
+  });
+}
+if (elements.btnRefreshPublicRooms) {
+  elements.btnRefreshPublicRooms.addEventListener('click', () => {
+    refreshPublicRooms({ manual: true, force: true }).catch(() => {});
+  });
+}
 elements.btnLeave.addEventListener('click', leaveRoom);
 elements.btnBack.addEventListener('click', goBack);
 elements.btnBackViewer.addEventListener('click', goBackViewer);
-elements.btnCopyRoom.addEventListener('click', copyRoomId);
-if (elements.viewerPlaybackModeToggle) {
-  elements.viewerPlaybackModeToggle.addEventListener('change', (event) => {
-    if (isViewerJoinLocked()) {
-      renderViewerPlaybackPrefsUi();
-      return;
-    }
-    setViewerPlaybackMode(
-      event.target.checked ? VIEWER_PLAYBACK_MODES.PASSTHROUGH : VIEWER_PLAYBACK_MODES.SYNCED
-    );
-  });
-}
+elements.btnCopyRoom.addEventListener('click', () => {
+  copyRoomId().catch(() => {});
+});
 if (elements.viewerAudioDelayInput) {
   elements.viewerAudioDelayInput.addEventListener('input', (event) => {
     setViewerAudioDelayMs(event.target.value, {
@@ -2330,6 +2635,7 @@ initializeStartupTasks().catch((error) => {
 async function showHostPanel() {
   await transitionToWorkspace('host');
   isHost = true;
+  renderHostPublicListingUi();
   elements.hostStatus.textContent = '正在连接...';
   elements.hostStatus.classList.add('waiting');
   try {
@@ -2343,6 +2649,10 @@ async function showHostPanel() {
 async function showViewerPanel() {
   await transitionToWorkspace('viewer');
   isHost = false;
+  setViewerJoinMode('lobby');
+  renderViewerJoinUi();
+  updatePublicRoomsPollingState();
+  refreshPublicRooms({ force: true }).catch(() => {});
   elements.connectionStatus.textContent = '正在连接...';
   try {
     await ensureRuntimeConnectionConfig();
@@ -3205,11 +3515,22 @@ async function startScreenShare() {
 }
 
 // Viewer: 加入房间
-async function joinRoom() {
-  const roomId = elements.roomIdInput.value.toUpperCase().trim();
-  if (!roomId) {
+async function joinRoomById(roomId, { source = 'direct' } = {}) {
+  const normalizedRoomId = String(roomId || '').toUpperCase().trim();
+  if (viewerJoinPending) {
+    return;
+  }
+  if (!normalizedRoomId) {
     showError('请输入房间号');
     return;
+  }
+
+  setViewerJoinPending(true, {
+    source
+  });
+
+  if (elements.roomIdInput && source !== 'direct') {
+    elements.roomIdInput.value = normalizedRoomId;
   }
 
   try {
@@ -3220,16 +3541,26 @@ async function joinRoom() {
     console.warn('[media-engine] apply viewer playback prefs before join failed:', error);
   }
 
-  currentRoomId = roomId;
+  currentRoomId = normalizedRoomId;
   sessionRole = 'viewer';
+  updatePublicRoomsPollingState();
   sendMessage({
     type: 'join-room',
-    roomId: roomId,
+    roomId: normalizedRoomId,
     clientId: clientId,
     viewerPlaybackMode: viewerPlaybackPrefs.mode,
     viewerAudioDelayMs: viewerPlaybackPrefs.audioDelayMs
   });
   renderViewerPlaybackPrefsUi();
+}
+
+async function joinRoom() {
+  const roomId = elements.roomIdInput.value.toUpperCase().trim();
+  if (!roomId) {
+    showError('请输入房间号');
+    return;
+  }
+  return joinRoomById(roomId, { source: 'direct' });
 }
 
 // Viewer: 离开房间
@@ -3258,11 +3589,30 @@ function updateViewerCount(viewerId, leftPosition) {
   countElement.textContent = count;
 }
 
-function copyRoomId() {
-  navigator.clipboard.writeText(currentRoomId).then(() => {
-    showError('Room ID copied');
+async function copyRoomId(options = {}) {
+  const roomId = String((options && options.roomId) || currentRoomId || '').trim();
+  if (!roomId) {
+    if (options.showFailureToast !== false) {
+      showError('当前没有房间号可复制');
+    }
+    return false;
+  }
+
+  await copyTextToClipboard(roomId, {
+    successMessage: Object.prototype.hasOwnProperty.call(options, 'successMessage')
+      ? options.successMessage
+      : '房间号已复制',
+    failureMessage: Object.prototype.hasOwnProperty.call(options, 'failureMessage')
+      ? options.failureMessage
+      : '复制房间号失败',
+    showSuccessToast: options.showSuccessToast !== false,
+    showFailureToast: options.showFailureToast !== false
   });
+
+  return true;
 }
+
+window.__vdsCopyRoomIdToClipboard = copyRoomId;
 
 // 显示错误
 function showError(message) {
@@ -3276,7 +3626,7 @@ function showError(message) {
 // Native mainline only
 
 // 版本检查和自动更新
-let currentVersion = '1.6.1'; // 默认版本（Electron环境会动态获取）
+let currentVersion = '1.6.2'; // 默认版本（Electron环境会动态获取）
 
 // 初始化版本号（从 Electron app 获取）
 async function initVersion() {
@@ -3398,6 +3748,7 @@ async function stopScreenShare() {
   elements.btnStopShare.classList.add('hidden');
   elements.hostStatus.textContent = '准备就绪';
   elements.hostStatus.classList.remove('waiting');
+  renderHostPublicListingUi();
 }
 
 async function resetViewerState() {
@@ -3411,6 +3762,7 @@ async function resetViewerState() {
   upstreamConnected = false;
   relayPc = null;
   relayStream = null;
+  setViewerJoinPending(false);
 
   await clearAllPeerConnections({ clearRetryState: true });
   elements.joinForm.classList.remove('hidden');
@@ -3427,6 +3779,8 @@ async function resetViewerState() {
     elements.viewerRenderFps.textContent = '-';
   }
   renderViewerPlaybackPrefsUi();
+  renderViewerJoinUi();
+  updatePublicRoomsPollingState();
 }
 
 async function handleMessage(data) {

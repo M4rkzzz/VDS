@@ -117,6 +117,14 @@
 
           <div class="workspace-card workspace-block workspace-action-card">
             <div class="workspace-action-row workspace-action-row-stacked">
+              <div class="host-public-room-row" aria-label="大厅公开">
+                <span id="host-public-room-label" class="host-public-room-label">公开房间至大厅</span>
+                <label class="quality-switch" for="host-public-room-enabled">
+                  <input type="checkbox" id="host-public-room-enabled">
+                  <span class="quality-switch-track" aria-hidden="true"></span>
+                </label>
+                <span id="host-public-room-status" class="host-public-room-status hidden" aria-live="polite"></span>
+              </div>
               <button id="btn-start-share" class="btn btn-primary">开始共享</button>
               <button id="btn-stop-share" class="btn btn-danger hidden">停止共享</button>
               <button id="btn-back" class="btn btn-small">返回</button>
@@ -174,15 +182,28 @@
           </div>
 
           <div id="join-form" class="workspace-card workspace-join-card workspace-block">
-            <input type="text" id="room-id-input" placeholder="输入房间号" maxlength="6">
-            <div class="viewer-join-options">
-              <label class="quality-switch viewer-passthrough-switch" for="viewer-playback-mode-toggle">
-                <span class="viewer-passthrough-label">音视频直通</span>
-                <input id="viewer-playback-mode-toggle" type="checkbox">
-                <span class="quality-switch-track" aria-hidden="true"></span>
-              </label>
+            <div class="viewer-join-tabs">
+              <div class="quality-segment-group quality-segment-group-wrap" aria-label="加入方式">
+                <button id="btn-viewer-join-lobby" class="quality-segment-btn" type="button">大厅</button>
+                <button id="btn-viewer-join-direct" class="quality-segment-btn" type="button">直连</button>
+              </div>
+              <button id="btn-refresh-public-rooms" class="btn btn-small btn-secondary viewer-lobby-refresh viewer-lobby-refresh-icon" type="button" aria-label="刷新公开房间列表" title="刷新公开房间列表">
+                <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20 12a8 8 0 1 1-2.34-5.66" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                  <path d="M20 4v6h-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
             </div>
-            <button id="btn-join" class="btn btn-primary">加入</button>
+
+            <div id="viewer-public-rooms-panel" class="viewer-join-panel">
+              <p id="viewer-public-rooms-status" class="viewer-public-rooms-status">正在获取公开房间...</p>
+              <div id="viewer-public-rooms-list" class="viewer-public-rooms-list"></div>
+            </div>
+
+            <div id="viewer-direct-join-panel" class="viewer-join-panel hidden">
+              <input type="text" id="room-id-input" placeholder="输入房间号" maxlength="6">
+              <button id="btn-join" class="btn btn-primary">加入</button>
+            </div>
           </div>
 
           <div id="viewer-status" class="workspace-card workspace-block hidden">

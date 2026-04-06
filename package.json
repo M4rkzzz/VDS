@@ -1,6 +1,6 @@
 {
   "name": "screenshare-relay",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "Multi-viewer screen sharing with cascade relay (蜈蚣法) - Electron Edition",
   "main": "desktop/main.js",
   "scripts": {

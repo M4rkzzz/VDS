@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.2
+
+- added a public-room lobby with `Lobby / Direct` join tabs, auto-refreshing room list polling, and manual refresh
+- added host-side public room exposure control plus live room visibility state in the host panel
+- auto-copy the room code on successful room creation, including OBS ingest room startup
+- kept viewer playback on the passthrough-only path with manual audio delay and removed the old synced path from the current mainline
+- refreshed installer, blockmap, update manifest, and server release outputs for the new desktop version
+
 ## 1.6.0
 
 - fixed WGC frame-pool recreation on live window resize so host preview and viewer no longer corrupt together

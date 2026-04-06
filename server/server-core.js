@@ -73,6 +73,12 @@ function startServer(options = {}) {
     });
   });
 
+  app.get('/api/public-rooms', (_req, res) => {
+    res.json({
+      rooms: buildPublicRoomSummaryList(rooms)
+    });
+  });
+
   wss.on('connection', (ws) => {
     console.log('New WebSocket connection');
 
@@ -122,6 +128,7 @@ function startServer(options = {}) {
     const roomId = generateRoomId();
     const room = {
       id: roomId,
+      publicListing: data.publicListing === true,
       host: {
         clientId: data.clientId,
         ws: ws,
@@ -137,7 +144,8 @@ function startServer(options = {}) {
     sendJson(ws, {
       type: 'room-created',
       roomId: roomId,
-      clientId: data.clientId
+      clientId: data.clientId,
+      publicListing: room.publicListing
     });
 
     console.log(`Room created: ${roomId} by ${data.clientId}`);
@@ -151,7 +159,7 @@ function startServer(options = {}) {
       sendJson(ws, {
         type: 'error',
         code: 'room-not-found',
-        message: 'Room not found'
+        message: '该房间已不存在'
       });
       return;
     }
@@ -536,6 +544,21 @@ function attachSocketMetadata(ws, roomId, clientId, role) {
   ws.roomId = roomId;
   ws.clientId = clientId;
   ws.role = role;
+}
+
+function buildPublicRoomSummaryList(rooms) {
+  if (!(rooms instanceof Map)) {
+    return [];
+  }
+
+  return Array.from(rooms.values())
+    .filter((room) => room && room.publicListing === true && isSocketOpen(room.host && room.host.ws))
+    .sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0))
+    .map((room) => ({
+      roomId: room.id,
+      viewerCount: Array.isArray(room.viewers) ? room.viewers.length : 0,
+      createdAt: Number(room.createdAt || 0)
+    }));
 }
 
 function buildIceServers() {

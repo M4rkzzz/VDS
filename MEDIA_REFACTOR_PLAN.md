@@ -2,7 +2,7 @@
 
 ## 1. 目的
 
-这份文档记录仓库在 `1.6.1` 时点的真实媒体架构、真实边界、真实验证结果、真实未解问题，以及接下来明确的执行方向。  
+这份文档记录仓库在 `1.6.2` 时点的真实媒体架构、真实边界、真实验证结果、真实未解问题，以及接下来明确的执行方向。  
 它同时承担三种职责：
 
 - 真相文档：说明当前代码真实在做什么
@@ -63,12 +63,12 @@
 
 ### 3.1 版本与产物
 
-- 桌面端版本：`1.6.1`
-- 服务端版本：`1.6.1`
+- 桌面端版本：`1.6.2`
+- 服务端版本：`1.6.2`
 - 构建方式：`electron-builder + nsis`
 - 更新源：`generic provider`
 - 更新目录：`server/updates/`
-- 当前已准备好的发布产物：`VDS-Setup-1.6.1.exe` + `latest.yml`
+- 当前已准备好的发布产物：`VDS-Setup-1.6.2.exe` + `latest.yml`
 
 ### 3.2 当前主入口
 
@@ -100,6 +100,8 @@
 - host 质量弹窗现在有 `原生推流 / OBS 推流` 两个选项卡
 - OBS 选项卡默认只显示一行本地 SRT 地址，默认端口是 `61080`
 - OBS 端口可通过“自定义推流地址”开关展开并持久化保存
+- host 开播前可选择“公开房间至大厅”，开播后该位置会切成当前公开状态文案
+- viewer 加入页已改成 `大厅 / 直连` 两个选项卡，默认进入大厅并轮询公开房间列表
 
 需要明确：
 
@@ -165,6 +167,9 @@
 - 画面输出到 native surface
 - 音频走 native 解码后播放
 - viewer 音量通过 native IPC 控制
+- viewer 播放当前只保留原始 `passthrough` 路线
+- viewer 不再提供 `synced / passthrough` 切换
+- viewer 当前只保留手动音频延迟，不再保留旧的接收侧 A/V sync 调度
 
 当前音频主链路：
 
@@ -203,7 +208,7 @@
 
 需要明确补充一个当前未收口事实：
 
-- `viewer-upstream` 开启“音视频直通”后，`host -> v1` 单跳通常可稳定播放
+- 当前 `viewer-upstream passthrough` 唯一路线下，`host -> v1` 单跳通常可稳定播放
 - 但 `host -> v1 -> v2` 的第二跳 relay 当前仍不稳定
 - 真实表现不是单一一种，而是几种回归形态来回出现：
   - `v2` 有声音无画面
@@ -211,39 +216,41 @@
   - `v2` 初始收到大量视频帧，随后接收速率掉到极低
 - 当前最强怀疑是：relay 视频 sender 仍然没有完全从本地 viewer 播放策略里解耦出来
 
-## 5. 接收侧同步与启动逻辑
+## 5. 接收侧启动逻辑与播放现状
 
-这是当前项目最敏感、也是最近改动最多的部分。
+这里需要明确写出现状，而不是保留已经下线的旧描述。
 
 ### 5.1 当前已落地的策略
 
 - H.264 启动期明确等待 `SPS/PPS + IDR`
 - 在拿到可用开播点前，不盲目把普通 `P/B` 帧丢进调度队列
-- 音频在视频 bootstrap 完成前直接丢弃，避免先建立错误的 A/V 锚
-- steady-state 不再用“随意切视频队列前端”的方式粗暴追赶
-- 当前 A/V 调度已经改为基于“本地接收时刻 + 目标延迟”排队，不再直接跨媒体比较各自 RTP 起始时间
+- 音频在视频 bootstrap 完成前直接丢弃，避免先播出没有对应画面的声音
+- viewer steady-state 当前只保留原来的直通播放
+- viewer 侧旧的 A/V sync worker、目标延迟调度和播放模式切换都已退出主路径
+- viewer 现在的唯一用户可调节项是手动音频延迟
 
 ### 5.2 当前真实结论
 
 最近这轮修改后的结论是：
 
-- 启动阶段全丢锁死的问题已经定位并修过
-- “视频先播十几帧后 freeze”的部分根因已经收缩到接收侧调度
-- 调度逻辑已经从“堵”转向“疏”，即：
-  - 视频 backlog 时优先调整目标延迟追赶
-  - 不再长期让视频无限抢占音频
+- 旧 `synced` 路线主观效果不如原始直通，已经从当前主线移除
+- 当前默认也是唯一路线：`passthrough local playback + manual audio delay`
+- 接收侧当前最重要的真实问题已经不再是“旧 A/V sync 参数怎么调”，而是：
+  - 直通本身的观感还要继续验证
+  - relay 第二跳的视频稳健性仍未收口
 
 ### 5.3 当前剩余风险
 
-接收侧现在已经能通过最新一轮本地测试，但仍然是当前第一优先级风险点：
+接收侧当前剩余风险仍然明确：
 
+- 直通播放虽然更符合当前主观体验，但还没有形成“永久不用再碰”的结论
 - 长时间 soak 还不够
-- 极端网络抖动下的追赶行为还需要继续观察
 - relay 第二跳、第三跳叠加后的接收稳定性仍需继续验证
+- 如果后续要重新做顺滑度优化，必须是新方案，不能回滚旧 `synced` / A/V sync 逻辑
 
 结论很明确：
 
-- 当前接收侧已经从“经常 freeze”推进到了“可工作、可继续细调”
+- 当前 viewer 播放已经先收缩到单一路线，减少了行为分叉
 - 但这里还不是“永久免维护”状态
 
 ### 5.4 当前验收目标
@@ -264,7 +271,7 @@
 
 截至这次文档更新，最需要如实同步的问题不是单跳接收，而是：
 
-- `viewer-upstream` 切到 `passthrough` 后，第二跳 relay 视频输出仍然不稳
+- 当前唯一的 `viewer-upstream passthrough` 路线下，第二跳 relay 视频输出仍然不稳
 
 最近这轮真实观察到的现象：
 
@@ -333,7 +340,7 @@ OBS 模式当前真实 UI：
 - 发布脚本：`npm run build:release`
 - 更新目录刷新脚本：`prepare-server-release`
 - `runtime/media-agent` 已通过 `extraResources` 打包，避免再被错误塞进 `app.asar`
-- `1.6.1` 已完成打包，并已把产物复制到 `server/updates/`
+- `1.6.2` 已完成打包，并已把产物复制到 `server/updates/`
 
 ### 7.2 当前自动更新链
 
@@ -399,13 +406,13 @@ OBS 模式当前真实 UI：
 - WGC 高帧率瓶颈已定位并打穿：
   - 不加 `MinUpdateInterval` 时，本地 preview 稳定卡在约 `56-57fps`
   - 加上 `MinUpdateInterval(1ms)` 后，纯本地 `display capture + native preview` smoke `10s` 内达到约 `194fps`
-- `1.6.1` 已完成 `npm run build:release`，且 server `/api/version` 已返回 `1.6.1`
+- `1.6.2` 已完成 `npm run build:release`，且 server `/api/version` 已返回 `1.6.2`
 
 但仍要强调：
 
 - “通过测试”不等于“已经千锤不烂”
 - 当前最该继续做的是 soak、重连、断链恢复、三端长时间播放
-- `host -> v1 -> v2` 在 `v1` 开启“音视频直通”后的 relay 视频链路，目前不能写成“已通过”
+- `host -> v1 -> v2` 在当前 viewer 唯一直通路径下的 relay 视频链路，目前不能写成“已通过”
 
 ### 8.4 当前调试与 smoke 能力的真实边界
 
@@ -533,6 +540,8 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 - OBS 本地 `SRT` ingest 已接入正式 host 模式，并支持 `H.264 / H.265 + AAC`
 - OBS 模式现在会等待有效节目流后再建房，断流会立即结束房间
 - OBS 推流地址已改成默认固定端口 `61080`，并支持持久化自定义端口
+- host 已支持“公开房间至大厅”开关，viewer 加入页已支持公开房间大厅与手动刷新
+- host 建房成功后会自动复制房间号到系统剪贴板
 - `viewer-left` 已补上游通知，`v2` 重连不再依赖残留旧下游 peer 被动超时
 - 关闭 `relay-downstream` 时不再误停 `viewer-upstream` 的原生音频运行时
 - 差分更新 installer cache seed 已补
@@ -548,12 +557,12 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 - Viewer fullscreen 已补播放器式 underbar 基础形态，并接入原生音量控制
 - 非 fullscreen 模式下 maximize / restore 引发的 viewer native surface 定位错误已修
 - Viewer 非 fullscreen 舞台背景与容器比例已经收紧，播放区外的空白区已改为项目当前深灰舞台风格
+- viewer 端旧的 `synced` / A/V sync 播放模式已从当前主线移除，只保留直通播放与手动音频延迟
 
 ## 11. 当前未完成项
 
 仍然没有彻底收口的部分：
 
-- 接收侧 A/V 调度还需继续 soak
 - relay 长链稳健性还需继续验证
 - `viewer-upstream passthrough -> relay-downstream` 视频链路仍有明显 regression，当前没有收口
 - popup overlay 虽已选定为正式路线，但仍需把正式验收项全部打磨完成
@@ -565,6 +574,7 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 - WGC 黄框虽然已有代码级关闭开关，但跨机器、跨系统、跨打包形态的最终验证还未完成
 - 差分更新成功率还没有达到目标状态
 - 三端 smoke 还缺真正自动化 harness，当前排障效率受人工点击和人工抄日志限制
+- viewer 端如果后续要重新引入“更平滑的播放策略”，必须基于新方案重新设计，不能把旧 `synced` 当作待恢复路线
 
 ## 12. 下一阶段顺序
 
@@ -588,6 +598,7 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 - 强化中间 relay 节点退出后的自动恢复
 - 重点消灭“连接失败 / 重连失败 / 偶发无声无画”
 - 继续验证高帧率 WGC 在正式双端链路中是否稳定传递，而不是只停留在本地 preview smoke
+- 不再把“恢复旧 A/V sync”列为备选方向，viewer 稳定性问题优先在现有直通主链路上定位
 
 ### 阶段 C：验证并稳住 H.265 主链路
 
@@ -627,7 +638,7 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 
 ## 14. 本次文档更新结论
 
-截至 `1.6.1` 当前仓库状态，最准确的总结是：
+截至 `1.6.2` 当前仓库状态，最准确的总结是：
 
 - native authority 已经是唯一主链路
 - `H.264 / H.265 + Opus / AAC + native relay fanout` 已经落地
@@ -640,7 +651,10 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 - WGC 运行中尺寸变化现在已经会触发 frame-pool 重建，`host preview` 和 `viewer` 不再共用一条会稳定产出坏帧的旧采集路径
 - “开播即最小化窗口”当前已经能通过启动期 placeholder + 恢复 soft refresh 接回真实视频与音频
 - OBS 推流地址当前默认固定为 `61080`，并支持持久化自定义端口；UI 已改成“复制并开始”的直接工作流
-- 当前最大的未收口问题已经明确收缩到：`viewer-upstream passthrough` 打开后，`host -> v1 -> v2` 的 relay 视频第二跳仍不稳定
+- viewer 加入页现在已有公开房间大厅；host 可以在开播前决定是否把房间公开到大厅
+- host 建房成功后，房间号会立即复制到系统剪贴板
+- viewer 当前只保留原始 `passthrough` 播放，旧 `synced` / A/V sync 路线已从主线移除；音频只保留手动延迟控制
+- 当前最大的未收口问题已经明确收缩到：当前 `viewer-upstream passthrough` 唯一路线下，`host -> v1 -> v2` 的 relay 视频第二跳仍不稳定
 - 当前最大的工程重点顺序已经明确：
   - 先继续收口 OBS 本地推流模式的边界与稳定性
   - 再收口 `v1 passthrough + v2 relay` 当前 regression
@@ -649,7 +663,7 @@ popup overlay 作为正式方案，当前最重要的验收点已经明确为：
 
 ## 15. 给下一个 Agent 的交接说明
 
-如果你是接手这个项目的下一个 agent，不要先发散找“是不是还要保留旧浏览器链路”，也不要先去碰 child embed。当前主线已经明确：native authority 是唯一媒体主链路，popup overlay 是正式打磨路线，但眼前第一优先级已经不是抽象架构，而是收口一个非常具体的 regression：`viewer-upstream` 开启“音视频直通”后，`host -> v1 -> v2` 的第二跳 relay 视频仍不稳定。先读本文，再看 [app-native-overrides.js](/d:/project/videosharing/server/public/app-native-overrides.js)、[main.js](/d:/project/videosharing/desktop/main.js)、[main.cpp](/d:/project/videosharing/media-agent/src/main.cpp) 这三个入口文件，确认当前 host、viewer、relay、update 的真实行为；然后优先用 `npm run dev:dual:native` 和 `npm run dev:triple:native` 复现实况。
+如果你是接手这个项目的下一个 agent，不要先发散找“是不是还要保留旧浏览器链路”，也不要先去碰 child embed。当前主线已经明确：native authority 是唯一媒体主链路，popup overlay 是正式打磨路线，viewer 当前只保留原始直通播放；眼前第一优先级已经不是抽象架构，而是收口一个非常具体的 regression：当前 `viewer-upstream passthrough` 唯一路线下，`host -> v1 -> v2` 的第二跳 relay 视频仍不稳定。先读本文，再看 [app-native-overrides.js](/d:/project/videosharing/server/public/app-native-overrides.js)、[main.js](/d:/project/videosharing/desktop/main.js)、[main.cpp](/d:/project/videosharing/media-agent/src/main.cpp) 这三个入口文件，确认当前 host、viewer、relay、update 的真实行为；然后优先用 `npm run dev:dual:native` 和 `npm run dev:triple:native` 复现实况。
 
 最近一轮已经做过、但还不能写成“修好了”的尝试包括：
 

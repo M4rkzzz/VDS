@@ -75,22 +75,8 @@ constexpr unsigned int kViewerAudioSampleRate = kTransportAudioSampleRate;
 constexpr unsigned int kViewerAudioChannelCount = kTransportAudioChannelCount;
 constexpr unsigned int kViewerAudioStartupBufferFrames = 960;    // 20 ms @ 48 kHz device smoothing
 constexpr unsigned int kViewerAudioMaxBufferedFrames = 9600;     // 200 ms @ 48 kHz
-constexpr std::uint64_t kPeerAvSyncInitialLatencyUs = 180000;
-constexpr std::uint64_t kPeerAvSyncMinLatencyUs = 120000;
-constexpr std::uint64_t kPeerAvSyncMaxLatencyUs = 400000;
-constexpr std::uint64_t kPeerAvSyncVideoClockRate = 90000;
-constexpr std::uint64_t kPeerAvSyncLateToleranceUs = 15000;
-constexpr std::uint64_t kPeerAvSyncEarlyRelaxUs = 50000;
-constexpr std::size_t kPeerAvSyncMaxQueuedVideoUnits = 120;
-constexpr std::size_t kPeerAvSyncMaxQueuedAudioBlocks = 32;
-constexpr std::uint64_t kPeerAvSyncMaxSleepChunkUs = 10000;
-constexpr std::uint64_t kPeerAvSyncForceReanchorWaitUs = 250000;
-constexpr std::uint64_t kPeerAvSyncVideoStallRecoverUs = 120000;
-constexpr std::uint64_t kPeerAvSyncVideoStallLeadAllowanceUs = 30000;
-constexpr std::size_t kPeerAvSyncVideoBacklogPriorityUnits = 6;
-constexpr std::size_t kPeerAvSyncAudioBacklogTrimTargetBlocks = 12;
-constexpr std::uint64_t kPeerAvSyncCatchupLatencyStepUs = 4000;
-constexpr std::uint64_t kPeerAvSyncAudioDispatchStarveUs = 40000;
+constexpr std::uint64_t kVideoRtpClockRate = 90000;
+constexpr std::uint64_t kSteadySleepMaxChunkUs = 10000;
 constexpr const char* kObsIngestVirtualUpstreamPeerId = "__obs_ingest_host__";
 constexpr int kDefaultObsIngestPort = 61080;
 constexpr int kMinObsIngestPort = 1024;
@@ -199,34 +185,17 @@ struct PeerState {
       std::string codec = "none";
       std::string last_error;
     };
-    struct ScheduledVideoUnit {
-      std::uint64_t remote_timestamp_us = 0;
-      std::int64_t local_arrival_us = 0;
-      std::string codec;
-      std::vector<std::uint8_t> bytes;
-    };
-    struct ScheduledAudioBlock {
-      std::uint64_t remote_timestamp_us = 0;
-      std::int64_t local_arrival_us = 0;
-      std::vector<std::int16_t> pcm;
-    };
     bool surface_attached = false;
     bool launch_attempted = false;
     bool running = false;
     bool decoder_ready = false;
-    bool av_sync_running = false;
-    bool av_sync_thread_started = false;
-    bool av_sync_anchor_initialized = false;
-    bool av_sync_stop_requested = false;
     bool closing = false;
     bool local_playback_enabled = false;
-    bool passthrough_playback_enabled = false;
     unsigned long process_id = 0;
     unsigned long long remote_frames_received = 0;
     unsigned long long remote_bytes_received = 0;
     unsigned long long decoded_frames_rendered = 0;
     unsigned long long scheduled_video_units = 0;
-    unsigned long long scheduled_audio_blocks = 0;
     unsigned long long submitted_video_units = 0;
     unsigned long long dispatched_audio_blocks = 0;
     unsigned long long dropped_video_units = 0;
@@ -237,14 +206,6 @@ struct PeerState {
     long long last_start_attempt_at_unix_ms = 0;
     long long last_start_success_at_unix_ms = 0;
     long long last_stop_at_unix_ms = 0;
-    long long av_sync_last_scheduler_wake_at_unix_ms = -1;
-    long long av_sync_last_video_submit_at_unix_ms = -1;
-    long long av_sync_last_audio_dispatch_at_unix_ms = -1;
-    long long av_sync_last_video_lateness_us = 0;
-    long long av_sync_last_audio_lateness_us = 0;
-    long long av_sync_anchor_remote_us = 0;
-    long long av_sync_anchor_local_us = 0;
-    long long av_sync_target_latency_us = static_cast<long long>(kPeerAvSyncInitialLatencyUs);
     int last_exit_code = std::numeric_limits<int>::min();
     std::string peer_id;
     std::string surface_id;
@@ -265,10 +226,6 @@ struct PeerState {
     std::vector<std::uint8_t> pending_video_annexb_bytes;
     std::vector<std::uint8_t> startup_video_decoder_config_au;
     bool startup_waiting_for_random_access = true;
-    std::deque<ScheduledVideoUnit> scheduled_video_queue;
-    std::deque<ScheduledAudioBlock> scheduled_audio_queue;
-    std::condition_variable av_sync_cv;
-    std::thread av_sync_thread;
 #ifdef _WIN32
     unsigned long thread_id = 0;
 #endif
@@ -557,7 +514,7 @@ struct ObsIngestState {
 std::string obs_ingest_json(const ObsIngestState& state);
 
 struct AgentRuntimeState {
-  std::string viewer_playback_mode = "synced";
+  std::string viewer_playback_mode = "passthrough";
   unsigned int viewer_audio_delay_ms = 0;
   bool host_session_running = false;
   std::string host_backend = "native";
@@ -603,18 +560,18 @@ struct AgentRuntimeState {
     bool stop_requested = false;
     bool thread_started = false;
     bool playback_primed = false;
-    bool passthrough_mode = false;
+    bool passthrough_mode = true;
     unsigned long long audio_packets_received = 0;
     unsigned long long audio_bytes_received = 0;
     unsigned long long pcm_frames_queued = 0;
     unsigned long long pcm_frames_played = 0;
     unsigned long long buffered_pcm_frames = 0;
-    unsigned int target_buffer_frames = kViewerAudioStartupBufferFrames;
+    unsigned int target_buffer_frames = 0;
     unsigned int channel_count = kViewerAudioChannelCount;
     unsigned int passthrough_audio_delay_ms = 0;
     float software_volume = 1.0f;
     std::string implementation = "native-waveout-opus-playback";
-    std::string reason = "viewer-audio-idle";
+    std::string reason = "viewer-audio-passthrough-ready";
     std::string last_error;
     std::mutex mutex;
     std::condition_variable cv;
@@ -729,7 +686,7 @@ bool sleep_until_steady_us(std::int64_t target_us, const std::atomic<bool>* stop
     const std::int64_t remaining_us = target_us - now_us;
     const auto sleep_for = std::chrono::microseconds(std::min<std::int64_t>(
       remaining_us,
-      static_cast<std::int64_t>(kPeerAvSyncMaxSleepChunkUs)
+      static_cast<std::int64_t>(kSteadySleepMaxChunkUs)
     ));
     std::this_thread::sleep_for(sleep_for);
   }
@@ -1436,7 +1393,7 @@ void viewer_audio_playback_worker(AgentRuntimeState::ViewerAudioPlaybackRuntime*
     runtime->running = true;
     runtime->ready = true;
     runtime->playback_primed = false;
-    runtime->reason = "viewer-audio-buffering";
+    runtime->reason = "viewer-audio-passthrough-ready";
   }
 
   std::vector<WAVEHDR*> in_flight_headers;
@@ -1481,15 +1438,6 @@ void viewer_audio_playback_worker(AgentRuntimeState::ViewerAudioPlaybackRuntime*
           runtime->playback_primed = true;
           runtime->reason = "viewer-audio-running";
         }
-      }
-
-      if (!runtime->passthrough_mode && !runtime->playback_primed) {
-        if (runtime->buffered_pcm_frames < runtime->target_buffer_frames) {
-          runtime->reason = "viewer-audio-buffering";
-          continue;
-        }
-        runtime->playback_primed = true;
-        runtime->reason = "viewer-audio-running";
       }
 
       pcm_block = std::move(runtime->pcm_queue.front().pcm);
@@ -1625,7 +1573,7 @@ void queue_viewer_audio_pcm_block(
     runtime.buffered_pcm_frames += pcm_sample_count_to_frames(queued_block.pcm.size(), runtime.channel_count);
     runtime.reason = runtime.passthrough_mode
       ? "viewer-audio-passthrough-queued"
-      : (runtime.playback_primed ? "viewer-audio-queued" : "viewer-audio-buffering");
+      : "viewer-audio-passthrough-queued";
     runtime.pcm_queue.push_back(std::move(queued_block));
     while (!runtime.pcm_queue.empty() && runtime.buffered_pcm_frames > kViewerAudioMaxBufferedFrames) {
       const unsigned int front_frames = pcm_sample_count_to_frames(runtime.pcm_queue.front().pcm.size(), runtime.channel_count);
@@ -1988,7 +1936,7 @@ void fanout_relay_video_units_now(
     return;
   }
 
-  const std::uint64_t timestamp_us = rtp_timestamp_to_us(rtp_timestamp, kPeerAvSyncVideoClockRate);
+  const std::uint64_t timestamp_us = rtp_timestamp_to_us(rtp_timestamp, kVideoRtpClockRate);
   for (const auto& access_unit : access_units) {
     cache_relay_video_bootstrap_access_unit(upstream_peer_id, codec, access_unit, timestamp_us);
   }
@@ -2220,307 +2168,12 @@ void fanout_relay_audio_frame(
   }
 }
 
-void ensure_peer_av_sync_anchor_locked(
-  PeerState::PeerVideoReceiverRuntime& runtime,
-  std::int64_t now_us,
-  std::uint64_t remote_timestamp_us) {
-  if (runtime.av_sync_anchor_initialized) {
-    return;
-  }
-  runtime.av_sync_anchor_initialized = true;
-  runtime.av_sync_anchor_remote_us = static_cast<long long>(remote_timestamp_us);
-  runtime.av_sync_anchor_local_us = now_us + runtime.av_sync_target_latency_us;
-}
-
-void retune_peer_av_sync_latency_locked(PeerState::PeerVideoReceiverRuntime& runtime, long long lateness_us) {
-  runtime.av_sync_last_video_lateness_us = lateness_us;
-  const long long previous_target_latency_us = runtime.av_sync_target_latency_us;
-  long long delta_us = 0;
-  if (lateness_us > static_cast<long long>(kPeerAvSyncLateToleranceUs)) {
-    const long long available_raise =
-      static_cast<long long>(kPeerAvSyncMaxLatencyUs) - runtime.av_sync_target_latency_us;
-    if (available_raise > 0) {
-      delta_us = std::min<long long>(available_raise, std::min<long long>(lateness_us + 10000, 50000));
-    }
-  } else if (lateness_us < -static_cast<long long>(kPeerAvSyncEarlyRelaxUs)) {
-    const long long available_drop =
-      runtime.av_sync_target_latency_us - static_cast<long long>(kPeerAvSyncMinLatencyUs);
-    if (available_drop > 0) {
-      delta_us = -std::min<long long>(available_drop, 2000);
-    }
-  }
-
-  if (delta_us == 0) {
-    return;
-  }
-
-  runtime.av_sync_target_latency_us += delta_us;
-  if (runtime.av_sync_anchor_initialized) {
-    runtime.av_sync_anchor_local_us += (runtime.av_sync_target_latency_us - previous_target_latency_us);
-  }
-}
-
-void peer_av_sync_worker(
-  PeerState::PeerVideoReceiverRuntime* runtime,
-  AgentRuntimeState::ViewerAudioPlaybackRuntime* audio_runtime) {
-  if (!runtime || !audio_runtime) {
-    return;
-  }
-
-  while (true) {
-    enum class DispatchKind {
-      None,
-      Audio,
-      Video
-    };
-
-    DispatchKind dispatch_kind = DispatchKind::None;
-    PeerState::PeerVideoReceiverRuntime::ScheduledAudioBlock audio_block;
-    PeerState::PeerVideoReceiverRuntime::ScheduledVideoUnit video_unit;
-    std::int64_t dispatch_target_local_us = 0;
-
-    {
-      std::unique_lock<std::mutex> lock(runtime->mutex);
-      runtime->av_sync_running = true;
-      if (runtime->scheduled_audio_queue.empty() && runtime->scheduled_video_queue.empty()) {
-        runtime->av_sync_cv.wait(lock, [&]() {
-          return runtime->av_sync_stop_requested ||
-            !runtime->scheduled_audio_queue.empty() ||
-            !runtime->scheduled_video_queue.empty();
-        });
-      }
-      runtime->av_sync_last_scheduler_wake_at_unix_ms = current_time_millis();
-
-      if (runtime->av_sync_stop_requested &&
-          runtime->scheduled_audio_queue.empty() &&
-          runtime->scheduled_video_queue.empty()) {
-        runtime->av_sync_running = false;
-        break;
-      }
-
-      if (runtime->scheduled_audio_queue.empty() && runtime->scheduled_video_queue.empty()) {
-        continue;
-      }
-
-      const std::int64_t now_us = current_time_micros_steady();
-      const std::int64_t now_unix_ms = current_time_millis();
-
-      if (runtime->scheduled_audio_queue.size() >= kPeerAvSyncMaxQueuedAudioBlocks) {
-        while (runtime->scheduled_audio_queue.size() > kPeerAvSyncAudioBacklogTrimTargetBlocks) {
-          runtime->scheduled_audio_queue.pop_front();
-          runtime->dropped_audio_blocks += 1;
-        }
-        runtime->reason = "peer-av-sync-audio-trimmed";
-      }
-
-      const auto compute_dispatch_time = [&](
-        std::uint64_t remote_timestamp_us,
-        std::int64_t local_arrival_us) -> std::int64_t {
-        if (remote_timestamp_us == 0) {
-          return local_arrival_us + runtime->av_sync_target_latency_us;
-        }
-        ensure_peer_av_sync_anchor_locked(*runtime, now_us, remote_timestamp_us);
-        return runtime->av_sync_anchor_local_us +
-          (static_cast<long long>(remote_timestamp_us) - runtime->av_sync_anchor_remote_us);
-      };
-
-      const bool surface_ready = runtime->surface && runtime->surface_attached;
-      if (!surface_ready && !runtime->scheduled_video_queue.empty()) {
-        runtime->reason = "peer-av-sync-waiting-for-surface";
-        continue;
-      }
-
-      std::int64_t next_audio_target_us = std::numeric_limits<std::int64_t>::max();
-      if (!runtime->scheduled_audio_queue.empty()) {
-        next_audio_target_us = compute_dispatch_time(
-          runtime->scheduled_audio_queue.front().remote_timestamp_us,
-          runtime->scheduled_audio_queue.front().local_arrival_us);
-      }
-
-      std::int64_t next_video_target_us = std::numeric_limits<std::int64_t>::max();
-      if (!runtime->scheduled_video_queue.empty()) {
-        next_video_target_us = compute_dispatch_time(
-          runtime->scheduled_video_queue.front().remote_timestamp_us,
-          runtime->scheduled_video_queue.front().local_arrival_us);
-      }
-
-      const auto choose_next_dispatch = [&]() {
-        dispatch_kind = next_audio_target_us <= next_video_target_us ? DispatchKind::Audio : DispatchKind::Video;
-        dispatch_target_local_us = dispatch_kind == DispatchKind::Audio ? next_audio_target_us : next_video_target_us;
-      };
-
-      choose_next_dispatch();
-      std::int64_t wait_us = dispatch_target_local_us - now_us;
-      const bool video_queue_backed_up =
-        runtime->scheduled_video_queue.size() >= kPeerAvSyncVideoBacklogPriorityUnits;
-      const bool video_submit_stalled =
-        !runtime->scheduled_video_queue.empty() &&
-        runtime->av_sync_last_video_submit_at_unix_ms > 0 &&
-        (now_unix_ms - runtime->av_sync_last_video_submit_at_unix_ms) >= static_cast<std::int64_t>(kPeerAvSyncVideoStallRecoverUs / 1000);
-
-      const bool audio_dispatch_starved =
-        !runtime->scheduled_audio_queue.empty() &&
-        runtime->submitted_video_units > 0 &&
-        (runtime->av_sync_last_audio_dispatch_at_unix_ms <= 0 ||
-         (now_unix_ms - runtime->av_sync_last_audio_dispatch_at_unix_ms) >=
-           static_cast<std::int64_t>(kPeerAvSyncAudioDispatchStarveUs / 1000));
-
-      if (video_queue_backed_up &&
-          !runtime->scheduled_video_queue.empty() &&
-          next_video_target_us > now_us + 4000 &&
-          runtime->av_sync_target_latency_us > static_cast<long long>(kPeerAvSyncMinLatencyUs)) {
-        const long long catchup_step_us = std::min<long long>(
-          static_cast<long long>(kPeerAvSyncCatchupLatencyStepUs),
-          runtime->av_sync_target_latency_us - static_cast<long long>(kPeerAvSyncMinLatencyUs)
-        );
-        runtime->av_sync_target_latency_us -= catchup_step_us;
-        if (!runtime->scheduled_audio_queue.empty()) {
-          next_audio_target_us = compute_dispatch_time(
-            runtime->scheduled_audio_queue.front().remote_timestamp_us,
-            runtime->scheduled_audio_queue.front().local_arrival_us);
-        }
-        if (!runtime->scheduled_video_queue.empty()) {
-          next_video_target_us = compute_dispatch_time(
-            runtime->scheduled_video_queue.front().remote_timestamp_us,
-            runtime->scheduled_video_queue.front().local_arrival_us);
-        }
-        choose_next_dispatch();
-        wait_us = dispatch_target_local_us - now_us;
-        runtime->reason = "peer-av-sync-video-catching-up";
-      }
-
-      if (audio_dispatch_starved &&
-          !runtime->scheduled_audio_queue.empty() &&
-          next_audio_target_us <= now_us + static_cast<std::int64_t>(kPeerAvSyncAudioDispatchStarveUs / 2)) {
-        dispatch_kind = DispatchKind::Audio;
-        dispatch_target_local_us = std::min(next_audio_target_us, now_us);
-        wait_us = dispatch_target_local_us - now_us;
-        runtime->reason = "peer-av-sync-audio-recovery";
-      } else if (!runtime->scheduled_video_queue.empty() &&
-                 (video_submit_stalled ||
-                  (video_queue_backed_up &&
-                   next_video_target_us <= (now_us + static_cast<std::int64_t>(kPeerAvSyncVideoStallLeadAllowanceUs))) &&
-                   runtime->scheduled_audio_queue.empty())) {
-        dispatch_kind = DispatchKind::Video;
-        dispatch_target_local_us = std::min(next_video_target_us, now_us);
-        wait_us = dispatch_target_local_us - now_us;
-        runtime->reason = "peer-av-sync-video-priority-recovery";
-      }
-
-      if (wait_us > 2000) {
-        runtime->reason = "peer-av-sync-waiting";
-        const auto wake_time = std::chrono::steady_clock::time_point(
-          std::chrono::microseconds(std::max<std::int64_t>(0, dispatch_target_local_us))
-        );
-        runtime->av_sync_cv.wait_until(lock, wake_time);
-        runtime->av_sync_last_scheduler_wake_at_unix_ms = current_time_millis();
-        continue;
-      }
-
-      if (dispatch_kind == DispatchKind::Audio) {
-        if (runtime->scheduled_audio_queue.empty()) {
-          continue;
-        }
-        audio_block = std::move(runtime->scheduled_audio_queue.front());
-        runtime->scheduled_audio_queue.pop_front();
-      } else {
-        if (runtime->scheduled_video_queue.empty()) {
-          continue;
-        }
-        video_unit = std::move(runtime->scheduled_video_queue.front());
-        runtime->scheduled_video_queue.pop_front();
-      }
-    }
-
-    const std::int64_t dispatch_now_us = current_time_micros_steady();
-    const long long lateness_us = dispatch_now_us - dispatch_target_local_us;
-
-    if (dispatch_kind == DispatchKind::Audio) {
-      queue_viewer_audio_pcm_block(*audio_runtime, std::move(audio_block.pcm));
-      std::lock_guard<std::mutex> lock(runtime->mutex);
-      runtime->dispatched_audio_blocks += 1;
-      runtime->av_sync_last_audio_dispatch_at_unix_ms = current_time_millis();
-      runtime->av_sync_last_audio_lateness_us = lateness_us;
-      runtime->reason = "peer-av-sync-audio-dispatched";
-      continue;
-    }
-
-    std::string warning_message;
-    const bool submitted = submit_scheduled_video_unit_to_surface(
-      runtime->peer_id.empty() ? (runtime->surface_id.empty() ? "peer-video" : runtime->surface_id) : runtime->peer_id,
-      *runtime,
-      video_unit.bytes,
-      video_unit.codec,
-      &warning_message
-    );
-    {
-      std::lock_guard<std::mutex> lock(runtime->mutex);
-      if (submitted) {
-        runtime->submitted_video_units += 1;
-        runtime->av_sync_last_video_submit_at_unix_ms = current_time_millis();
-        runtime->reason = "peer-av-sync-video-submitted";
-        retune_peer_av_sync_latency_locked(*runtime, lateness_us);
-      } else {
-        runtime->dropped_video_units += 1;
-        runtime->reason = "peer-av-sync-video-dropped";
-        if (!warning_message.empty()) {
-          runtime->last_error = warning_message;
-        }
-      }
-    }
-  }
-}
-
-void ensure_peer_av_sync_runtime(
-  PeerState::PeerVideoReceiverRuntime& runtime,
-  AgentRuntimeState::ViewerAudioPlaybackRuntime& audio_runtime) {
-  std::lock_guard<std::mutex> lock(runtime.mutex);
-  if (runtime.closing || runtime.av_sync_thread_started) {
-    return;
-  }
-  runtime.av_sync_stop_requested = false;
-  runtime.av_sync_running = true;
-  runtime.av_sync_thread_started = true;
-  runtime.av_sync_thread = std::thread(peer_av_sync_worker, &runtime, &audio_runtime);
-}
-
 void begin_close_peer_video_receiver_runtime(PeerState::PeerVideoReceiverRuntime& runtime) {
   std::lock_guard<std::mutex> lock(runtime.mutex);
   runtime.closing = true;
-  runtime.av_sync_stop_requested = true;
   runtime.pending_video_annexb_bytes.clear();
   runtime.startup_video_decoder_config_au.clear();
-  runtime.scheduled_audio_queue.clear();
-  runtime.scheduled_video_queue.clear();
-  runtime.av_sync_anchor_initialized = false;
   runtime.reason = "peer-closing";
-  runtime.av_sync_cv.notify_all();
-}
-
-void stop_peer_av_sync_runtime(PeerState::PeerVideoReceiverRuntime& runtime, bool clear_pending) {
-  {
-    std::lock_guard<std::mutex> lock(runtime.mutex);
-    runtime.av_sync_stop_requested = true;
-    if (clear_pending) {
-      runtime.scheduled_audio_queue.clear();
-      runtime.scheduled_video_queue.clear();
-      runtime.av_sync_anchor_initialized = false;
-    }
-    runtime.av_sync_cv.notify_all();
-  }
-  if (runtime.av_sync_thread.joinable()) {
-    runtime.av_sync_thread.join();
-  }
-  std::lock_guard<std::mutex> lock(runtime.mutex);
-  runtime.av_sync_running = false;
-  runtime.av_sync_thread_started = false;
-  runtime.av_sync_stop_requested = false;
-  if (clear_pending) {
-    runtime.scheduled_audio_queue.clear();
-    runtime.scheduled_video_queue.clear();
-    runtime.av_sync_last_video_lateness_us = 0;
-    runtime.av_sync_last_audio_lateness_us = 0;
-  }
 }
 
 void consume_remote_peer_audio_frame(
@@ -2569,7 +2222,6 @@ void consume_remote_peer_audio_frame(
     return;
   }
 
-  bool passthrough_enabled = false;
   {
     std::lock_guard<std::mutex> lock(runtime_ptr->mutex);
     if (runtime_ptr->closing) {
@@ -2577,40 +2229,13 @@ void consume_remote_peer_audio_frame(
     }
     if (runtime_ptr->startup_waiting_for_random_access) {
       runtime_ptr->dropped_audio_blocks += 1;
-      runtime_ptr->reason = "peer-av-sync-audio-waiting-for-random-access";
+      runtime_ptr->reason = "peer-audio-waiting-for-random-access";
       return;
     }
-    passthrough_enabled = runtime_ptr->passthrough_playback_enabled;
-    if (passthrough_enabled) {
-      runtime_ptr->dispatched_audio_blocks += 1;
-      runtime_ptr->reason = "peer-audio-passthrough-dispatched";
-      runtime_ptr->av_sync_last_audio_lateness_us = 0;
-    }
+    runtime_ptr->dispatched_audio_blocks += 1;
+    runtime_ptr->reason = "peer-audio-passthrough-dispatched";
   }
-  if (passthrough_enabled) {
-    queue_viewer_audio_pcm_block(audio_runtime, std::move(pcm));
-    return;
-  }
-  ensure_peer_av_sync_runtime(*runtime_ptr, audio_runtime);
-  std::lock_guard<std::mutex> lock(runtime_ptr->mutex);
-  if (runtime_ptr->closing) {
-    return;
-  }
-  PeerState::PeerVideoReceiverRuntime::ScheduledAudioBlock block;
-  block.remote_timestamp_us = rtp_timestamp_to_us(
-    rtp_timestamp,
-    (lowered_codec == "pcmu") ? 8000 : kTransportAudioSampleRate
-  );
-  block.local_arrival_us = current_time_micros_steady();
-  block.pcm = std::move(pcm);
-  runtime_ptr->scheduled_audio_queue.push_back(std::move(block));
-  runtime_ptr->scheduled_audio_blocks += 1;
-  while (runtime_ptr->scheduled_audio_queue.size() > kPeerAvSyncMaxQueuedAudioBlocks) {
-    runtime_ptr->scheduled_audio_queue.pop_front();
-    runtime_ptr->dropped_audio_blocks += 1;
-  }
-  runtime_ptr->reason = "peer-av-sync-audio-queued";
-  runtime_ptr->av_sync_cv.notify_all();
+  queue_viewer_audio_pcm_block(audio_runtime, std::move(pcm));
 }
 
 std::string to_lower_copy(const std::string& value) {
@@ -3150,10 +2775,6 @@ bool configure_host_audio_sender(AgentRuntimeState& state, PeerState& peer, std:
 void clear_host_audio_sender(PeerState& peer);
 void refresh_host_audio_senders(AgentRuntimeState& state);
 void stop_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& runtime, const std::string& reason);
-void ensure_peer_av_sync_runtime(
-  PeerState::PeerVideoReceiverRuntime& runtime,
-  AgentRuntimeState::ViewerAudioPlaybackRuntime& audio_runtime);
-void stop_peer_av_sync_runtime(PeerState::PeerVideoReceiverRuntime& runtime, bool clear_pending);
 bool update_peer_video_surface_layout(
   PeerState::PeerVideoReceiverRuntime& runtime,
   const NativeEmbeddedSurfaceLayout& layout,
@@ -3469,7 +3090,6 @@ void close_surface_attachment_handles(SurfaceAttachmentState& state) {
 
 void close_peer_video_receiver_handles(PeerState::PeerVideoReceiverRuntime& runtime) {
   begin_close_peer_video_receiver_runtime(runtime);
-  stop_peer_av_sync_runtime(runtime, true);
   reset_peer_audio_decoder_runtime(runtime);
   std::lock_guard<std::mutex> lock(runtime.mutex);
   runtime.running = false;
@@ -3606,7 +3226,6 @@ void stop_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& run
   runtime.pending_video_annexb_bytes.clear();
   runtime.startup_video_decoder_config_au.clear();
   runtime.startup_waiting_for_random_access = true;
-  runtime.av_sync_cv.notify_all();
   runtime.reason = reason;
   runtime.last_stop_at_unix_ms = current_time_millis();
 }
@@ -7703,7 +7322,7 @@ void obs_ingest_worker(AgentRuntimeState* state_ptr) {
           const std::uint32_t rtp_timestamp = packet_timestamp_at_clock_rate(
             format_context->streams[video_stream_index],
             &ready_packet,
-            static_cast<int>(kPeerAvSyncVideoClockRate)
+            static_cast<int>(kVideoRtpClockRate)
           );
           fanout_relay_video_units(kObsIngestVirtualUpstreamPeerId, video_codec, units, rtp_timestamp);
           {
@@ -8751,9 +8370,6 @@ bool submit_scheduled_video_unit_to_surface(
       runtime.pending_video_annexb_bytes.clear();
       runtime.startup_video_decoder_config_au.clear();
       runtime.startup_waiting_for_random_access = true;
-      runtime.scheduled_video_queue.clear();
-      runtime.scheduled_audio_queue.clear();
-      runtime.av_sync_anchor_initialized = false;
       runtime.reason = "peer-video-surface-decoder-recovering";
       runtime.last_error = snapshot.last_error;
     }
@@ -8912,9 +8528,6 @@ void consume_remote_peer_video_frame(
             continue;
           }
 
-          runtime.scheduled_video_queue.clear();
-          runtime.scheduled_audio_queue.clear();
-          runtime.av_sync_anchor_initialized = false;
           runtime.startup_waiting_for_random_access = false;
           if (!runtime.startup_video_decoder_config_au.empty()) {
             startup_units.push_back(runtime.startup_video_decoder_config_au);
@@ -8922,13 +8535,13 @@ void consume_remote_peer_video_frame(
           if (startup_units.empty() || startup_units.back() != decode_unit) {
             startup_units.push_back(decode_unit);
           }
-          runtime.reason = "peer-av-sync-video-bootstrap-random-access";
+          runtime.reason = "peer-video-bootstrap-random-access";
           break;
         }
 
         if (runtime.startup_waiting_for_random_access) {
           runtime.dropped_video_units += static_cast<unsigned long long>(decode_units.size());
-          runtime.reason = "peer-av-sync-waiting-for-random-access";
+          runtime.reason = "peer-video-waiting-for-random-access";
           waiting_for_random_access = true;
         }
       }
@@ -8948,14 +8561,12 @@ void consume_remote_peer_video_frame(
 
   fanout_relay_video_units(peer_id, codec_path, relay_decode_units, rtp_timestamp);
   bool local_playback_enabled = false;
-  bool passthrough_enabled = false;
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
     if (runtime.closing) {
       return;
     }
     local_playback_enabled = runtime.local_playback_enabled;
-    passthrough_enabled = runtime.passthrough_playback_enabled;
   }
 
   if (!local_playback_enabled) {
@@ -8964,58 +8575,27 @@ void consume_remote_peer_video_frame(
     return;
   }
 
-  if (passthrough_enabled) {
-    for (const auto& decode_unit : decode_units) {
-      std::string warning_message;
-      const bool submitted = submit_scheduled_video_unit_to_surface(
-        peer_id,
-        runtime,
-        decode_unit,
-        codec_path,
-        &warning_message
-      );
-      std::lock_guard<std::mutex> lock(runtime.mutex);
-      runtime.scheduled_video_units += 1;
-      if (submitted) {
-        runtime.submitted_video_units += 1;
-        runtime.av_sync_last_video_lateness_us = 0;
-        runtime.reason = "peer-video-passthrough-submitted";
-      } else {
-        runtime.dropped_video_units += 1;
-        runtime.reason = "peer-video-passthrough-dropped";
-        if (!warning_message.empty()) {
-          runtime.last_error = warning_message;
-        }
+  for (const auto& decode_unit : decode_units) {
+    std::string warning_message;
+    const bool submitted = submit_scheduled_video_unit_to_surface(
+      peer_id,
+      runtime,
+      decode_unit,
+      codec_path,
+      &warning_message
+    );
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    runtime.scheduled_video_units += 1;
+    if (submitted) {
+      runtime.submitted_video_units += 1;
+      runtime.reason = "peer-video-passthrough-submitted";
+    } else {
+      runtime.dropped_video_units += 1;
+      runtime.reason = "peer-video-passthrough-dropped";
+      if (!warning_message.empty()) {
+        runtime.last_error = warning_message;
       }
     }
-    refresh_peer_video_receiver_runtime(runtime);
-    update_peer_decoder_state_from_runtime(runtime_ptr, transport_session);
-    (void)peer_id;
-    return;
-  }
-
-  ensure_peer_av_sync_runtime(runtime, g_agent_runtime_for_audio->viewer_audio_playback);
-  {
-    std::lock_guard<std::mutex> lock(runtime.mutex);
-    if (runtime.closing) {
-      return;
-    }
-    for (const auto& decode_unit : decode_units) {
-      PeerState::PeerVideoReceiverRuntime::ScheduledVideoUnit unit;
-      unit.remote_timestamp_us = rtp_timestamp_to_us(rtp_timestamp, kPeerAvSyncVideoClockRate);
-      unit.local_arrival_us = current_time_micros_steady();
-      unit.codec = codec_path;
-      unit.bytes = decode_unit;
-      runtime.scheduled_video_queue.push_back(std::move(unit));
-      runtime.scheduled_video_units += 1;
-    }
-    while (runtime.scheduled_video_queue.size() > kPeerAvSyncMaxQueuedVideoUnits) {
-      runtime.scheduled_video_queue.pop_front();
-      runtime.dropped_video_units += 1;
-      runtime.reason = "peer-av-sync-video-overflow";
-    }
-    runtime.reason = "peer-av-sync-video-queued";
-    runtime.av_sync_cv.notify_all();
   }
 
   refresh_peer_video_receiver_runtime(runtime);
@@ -9341,18 +8921,18 @@ std::string peer_video_receiver_runtime_json(const std::shared_ptr<PeerState::Pe
     << ",\"remoteFramesReceived\":" << runtime->remote_frames_received
     << ",\"remoteBytesReceived\":" << runtime->remote_bytes_received
     << ",\"scheduledVideoUnits\":" << runtime->scheduled_video_units
-    << ",\"scheduledAudioBlocks\":" << runtime->scheduled_audio_blocks
+    << ",\"scheduledAudioBlocks\":0"
     << ",\"submittedVideoUnits\":" << runtime->submitted_video_units
     << ",\"dispatchedAudioBlocks\":" << runtime->dispatched_audio_blocks
     << ",\"droppedVideoUnits\":" << runtime->dropped_video_units
     << ",\"droppedAudioBlocks\":" << runtime->dropped_audio_blocks
-    << ",\"queuedVideoUnits\":" << runtime->scheduled_video_queue.size()
-    << ",\"queuedAudioBlocks\":" << runtime->scheduled_audio_queue.size()
-    << ",\"avSyncRunning\":" << (runtime->av_sync_running ? "true" : "false")
-    << ",\"avSyncAnchorInitialized\":" << (runtime->av_sync_anchor_initialized ? "true" : "false")
-    << ",\"targetLatencyMs\":" << (runtime->av_sync_target_latency_us / 1000)
-    << ",\"lastVideoLatenessMs\":" << (runtime->av_sync_last_video_lateness_us / 1000.0)
-    << ",\"lastAudioLatenessMs\":" << (runtime->av_sync_last_audio_lateness_us / 1000.0)
+    << ",\"queuedVideoUnits\":0"
+    << ",\"queuedAudioBlocks\":0"
+    << ",\"avSyncRunning\":false"
+    << ",\"avSyncAnchorInitialized\":false"
+    << ",\"targetLatencyMs\":0"
+    << ",\"lastVideoLatenessMs\":0"
+    << ",\"lastAudioLatenessMs\":0"
     << ",\"codecPath\":\"" << json_escape(runtime->codec_path) << "\""
     << ",\"reason\":\"" << json_escape(runtime->reason) << "\""
     << ",\"lastError\":\"" << json_escape(runtime->last_error) << "\""
@@ -10072,9 +9652,6 @@ int main(int argc, char* argv[]) {
       peer.receiver_runtime = std::make_shared<PeerState::PeerVideoReceiverRuntime>();
       peer.receiver_runtime->peer_id = peer.peer_id;
       peer.receiver_runtime->local_playback_enabled = peer.role == "viewer-upstream";
-      peer.receiver_runtime->passthrough_playback_enabled =
-        peer.receiver_runtime->local_playback_enabled &&
-        runtime_state.viewer_playback_mode == "passthrough";
 
       if (runtime_state.peer_transport_backend.transport_ready) {
         auto receiver_runtime = peer.receiver_runtime;
@@ -10495,9 +10072,6 @@ int main(int argc, char* argv[]) {
           peer_it->second.receiver_runtime->peer_id = peer_id;
           peer_it->second.receiver_runtime->local_playback_enabled =
             peer_it->second.role == "viewer-upstream";
-          peer_it->second.receiver_runtime->passthrough_playback_enabled =
-            peer_it->second.receiver_runtime->local_playback_enabled &&
-            runtime_state.viewer_playback_mode == "passthrough";
         }
 
         attachment.peer_id = peer_id;
@@ -10610,27 +10184,15 @@ int main(int argc, char* argv[]) {
     }
 
     if (method == "setViewerPlaybackMode") {
-      const std::string requested_mode = to_lower_copy(extract_string_value(line, "mode"));
-      const std::string normalized_mode = requested_mode == "passthrough" ? "passthrough" : "synced";
+      const std::string normalized_mode = "passthrough";
       runtime_state.viewer_playback_mode = normalized_mode;
       {
         std::lock_guard<std::mutex> lock(runtime_state.viewer_audio_playback.mutex);
-        runtime_state.viewer_audio_playback.passthrough_mode = normalized_mode == "passthrough";
-        runtime_state.viewer_audio_playback.target_buffer_frames =
-          normalized_mode == "passthrough" ? 0u : kViewerAudioStartupBufferFrames;
+        runtime_state.viewer_audio_playback.passthrough_mode = true;
+        runtime_state.viewer_audio_playback.target_buffer_frames = 0u;
         runtime_state.viewer_audio_playback.playback_primed = false;
-        runtime_state.viewer_audio_playback.reason =
-          normalized_mode == "passthrough" ? "viewer-audio-passthrough-ready" : "viewer-audio-buffering";
+        runtime_state.viewer_audio_playback.reason = "viewer-audio-passthrough-ready";
         runtime_state.viewer_audio_playback.cv.notify_all();
-      }
-      for (auto& entry : runtime_state.peers) {
-        if (!entry.second.receiver_runtime) {
-          continue;
-        }
-        std::lock_guard<std::mutex> lock(entry.second.receiver_runtime->mutex);
-        entry.second.receiver_runtime->passthrough_playback_enabled =
-          entry.second.receiver_runtime->local_playback_enabled &&
-          normalized_mode == "passthrough";
       }
       std::ostringstream payload;
       payload

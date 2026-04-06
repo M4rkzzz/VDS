@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     enableNativePeerTransport: ENABLE_NATIVE_PEER_TRANSPORT,
     enableNativeSurfaceEmbedding: ENABLE_NATIVE_SURFACE_EMBEDDING
   }),
+  writeClipboardText: (text) => ipcRenderer.invoke('clipboard-write-text', text),
   getDesktopSources: () => ipcRenderer.invoke('get-desktop-sources'),
   minimize: () => ipcRenderer.send('window-minimize'),
   minimizeToTray: () => ipcRenderer.send('window-minimize-to-tray'),

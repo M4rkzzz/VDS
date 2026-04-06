@@ -2,17 +2,18 @@
 
 VDS is an Electron desktop client plus a Node.js signaling server for cascade screen sharing.
 
-## 1.6.1 Overview
+## 1.6.2 Overview
 
-Version `1.6.1` keeps the native media path as the only mainline and adds OBS local ingest as a formal host mode instead of a side experiment.
+Version `1.6.2` keeps the native media path as the only mainline, keeps OBS local ingest as the formal second host backend, and adds a public-room lobby flow on top of direct join.
 
 Highlights:
 
-- added OBS local `SRT` ingest as a host backend with room creation delayed until valid OBS program media arrives
-- promoted `AAC` into the transport, relay, and native viewer playback path instead of forcing ingest-side `Opus` conversion
-- updated the OBS host UI to use a fixed default local port (`61080`), a one-click `Copy and Start` flow, and optional saved custom port overrides
+- added a lobby view for viewers with `Lobby / Direct` tabs, public room polling, and manual refresh
+- added host-side public room listing control so a room can opt into the lobby before going live
+- auto-copy the room code when room creation succeeds, including the OBS ingest path
+- kept the OBS host UI on a fixed default local port (`61080`), a one-click `Copy and Start` flow, and optional saved custom port overrides
 - kept native `H.264 / H.265` + encoded relay fanout as the core production path
-- preserved the recent WGC fixes for resize recovery, minimized-window startup recovery, and high-FPS capture behavior on Win11 24H2
+- kept viewer playback on the original passthrough path with manual audio delay instead of the removed legacy synced path
 
 Current media path:
 
@@ -79,11 +80,19 @@ OBS mode currently behaves like this:
 - VDS does not control OBS and does not use `obs-websocket`
 - OBS mode is local-only and not a generic remote SRT gateway
 
+Viewer join mode currently behaves like this:
+
+- default tab is `Lobby`
+- the lobby polls `/api/public-rooms` every `500ms` while the join panel is open
+- hosts choose whether a room is public before starting share
+- manual room code entry remains available in the `Direct` tab
+
 ## Current Highlights
 
 - H.265 is now part of the native mainline for host, viewer, and relay fanout
 - AAC is now part of the formal native transport / relay / viewer playback path
 - OBS local ingest is now a formal host backend, not a sidecar experiment
+- public room listing is now part of the default product flow instead of requiring room-code-only join every time
 - hardware encoder detection uses native self-test instead of raw FFmpeg enumeration
 - host and viewer UI expose native FPS diagnostics
 - Win11 24H2 WGC high-FPS capture requires `GraphicsCaptureSession.MinUpdateInterval(1ms)`
@@ -97,7 +106,7 @@ OBS mode currently behaves like this:
   - prepares `server/` for Docker upload
 - `server/` is the deployable server directory
 - desktop auto-update feed is served from `server/updates/`
-- `1.6.1` release assets are the installer, blockmap, and `latest.yml`
+- `1.6.2` release assets are the installer, blockmap, and `latest.yml`
 - release notes for recent versions are tracked in [CHANGELOG.md](/d:/project/videosharing/CHANGELOG.md)
 
 ## Source Control Rules
