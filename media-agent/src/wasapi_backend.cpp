@@ -1,4 +1,5 @@
 #include "wasapi_backend.h"
+#include "json_protocol.h"
 
 #ifdef _WIN32
 
@@ -28,38 +29,14 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
+using vds::media_agent::json_escape;
+
+constexpr int kWasapiStartTimeoutMs = 7000;
+
 std::string hresult_to_string(HRESULT hr) {
   char buffer[32];
   std::snprintf(buffer, sizeof(buffer), "HRESULT 0x%08lx", static_cast<unsigned long>(hr));
   return buffer;
-}
-
-std::string json_escape(const std::string& value) {
-  std::string escaped;
-  escaped.reserve(value.size());
-  for (const char ch : value) {
-    switch (ch) {
-      case '\\':
-        escaped += "\\\\";
-        break;
-      case '"':
-        escaped += "\\\"";
-        break;
-      case '\n':
-        escaped += "\\n";
-        break;
-      case '\r':
-        escaped += "\\r";
-        break;
-      case '\t':
-        escaped += "\\t";
-        break;
-      default:
-        escaped.push_back(ch);
-        break;
-    }
-  }
-  return escaped;
 }
 
 struct ScopedCoInitialize {
@@ -869,9 +846,16 @@ WasapiSessionStatus start_wasapi_process_loopback_session(int pid, const std::st
   state.worker = std::thread(capture_worker_main, static_cast<DWORD>(pid), process_name);
 
   std::unique_lock<std::mutex> lock(state.mutex);
-  state.start_cv.wait(lock, [&]() {
+  const bool start_completed = state.start_cv.wait_for(lock, std::chrono::milliseconds(kWasapiStartTimeoutMs), [&]() {
     return state.start_completed;
   });
+  if (!start_completed) {
+    state.stop_requested = true;
+    state.status.running = false;
+    state.status.capture_active = false;
+    state.status.reason = "native-wasapi-session-start-timeout";
+    state.status.last_error = "WASAPI process-loopback capture did not finish starting in time.";
+  }
   return state.status;
 #endif
 }

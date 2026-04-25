@@ -9,6 +9,7 @@ const ENABLE_AGENT_HOST_CAPTURE_PROCESS = process.env.VDS_ENABLE_AGENT_HOST_CAPT
 const ENABLE_NATIVE_HOST_PREVIEW_SURFACE = process.env.VDS_ENABLE_NATIVE_HOST_PREVIEW_SURFACE !== '0';
 const ENABLE_NATIVE_PEER_TRANSPORT = process.env.VDS_ENABLE_NATIVE_PEER_TRANSPORT !== '0';
 const ENABLE_NATIVE_SURFACE_EMBEDDING = process.env.VDS_ENABLE_NATIVE_SURFACE_EMBEDDING !== '0';
+const DEBUG_PRESET = String(process.env.VDS_DEBUG_PRESET || '').trim();
 const mediaEngineAudio = createMediaEngineAudioApi();
 
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -24,7 +25,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     enableAgentHostCaptureProcess: ENABLE_AGENT_HOST_CAPTURE_PROCESS,
     enableNativeHostPreviewSurface: ENABLE_NATIVE_HOST_PREVIEW_SURFACE,
     enableNativePeerTransport: ENABLE_NATIVE_PEER_TRANSPORT,
-    enableNativeSurfaceEmbedding: ENABLE_NATIVE_SURFACE_EMBEDDING
+    enableNativeSurfaceEmbedding: ENABLE_NATIVE_SURFACE_EMBEDDING,
+    debugPreset: DEBUG_PRESET
   }),
   writeClipboardText: (text) => ipcRenderer.invoke('clipboard-write-text', text),
   getDesktopSources: () => ipcRenderer.invoke('get-desktop-sources'),
@@ -71,6 +73,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getViewerVolume: () => ipcRenderer.invoke('media-engine-get-viewer-volume'),
     getCapabilities: () => ipcRenderer.invoke('media-engine-get-capabilities'),
     getStats: (options) => ipcRenderer.invoke('media-engine-get-stats', options),
+    openNatMapping: (options) => ipcRenderer.invoke('p2p-open-nat-mapping', options),
     onStatus: (callback) => {
       const listener = (_event, data) => callback(data);
       ipcRenderer.on('media-engine-status', listener);

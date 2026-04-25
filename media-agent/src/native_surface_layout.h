@@ -11,3 +11,6 @@ struct NativeEmbeddedSurfaceLayout {
   int width = 0;
   int height = 0;
 };
+
+NativeEmbeddedSurfaceLayout build_surface_layout_from_json(const std::string& json);
+std::string surface_layout_json(const NativeEmbeddedSurfaceLayout& layout);

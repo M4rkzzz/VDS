@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.6.3
+
+- added RTP loss recovery on the native peer transport with NACK retransmission support, PLI handling, and keyframe request diagnostics
+- added Trickle ICE candidate forwarding plus pure-P2P failfast reporting for clearer connection failures
+- added last-chance NAT-PMP / PCP port mapping after P2P failfast, then injects mapped srflx candidates through Trickle ICE when available
+- added advanced keyframe policy controls for `1s`, `0.5s`, and `all-intra` troubleshooting
+- tightened pure-P2P ICE policy by filtering TURN/TURNS configuration from server and renderer paths
+- expanded P2P diagnostics and release validation coverage
+
 ## 1.6.2
 
 - added a public-room lobby with `Lobby / Direct` join tabs, auto-refreshing room list polling, and manual refresh

@@ -4,7 +4,6 @@
 #include <atomic>
 #include <cmath>
 #include <cctype>
-#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -20,6 +19,7 @@
 #include <vector>
 
 #include "native_surface_layout.h"
+#include "time_utils.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -38,17 +38,8 @@ extern "C" {
 
 namespace {
 
-long long current_time_millis() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::system_clock::now().time_since_epoch()
-  ).count();
-}
-
-long long current_time_micros_steady() {
-  return std::chrono::duration_cast<std::chrono::microseconds>(
-    std::chrono::steady_clock::now().time_since_epoch()
-  ).count();
-}
+using vds::media_agent::current_time_micros_steady;
+using vds::media_agent::current_time_millis;
 
 std::string to_lower_ascii(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {

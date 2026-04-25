@@ -14,7 +14,6 @@
 #include <memory>
 #include <mutex>
 #include <limits>
-#include <iostream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -23,6 +22,8 @@
 #include <vector>
 
 #include "native_surface_layout.h"
+#include "agent_diagnostics.h"
+#include "time_utils.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -33,21 +34,11 @@
 
 namespace {
 
-long long current_time_millis() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::system_clock::now().time_since_epoch()
-  ).count();
-}
+using vds::media_agent::current_time_micros_steady;
+using vds::media_agent::current_time_millis;
 
 void emit_live_preview_breadcrumb(const std::string& step) {
-  std::cerr << "[media-agent breadcrumb] t=" << current_time_millis()
-            << " step=nativeLivePreview:" << step << std::endl;
-}
-
-long long current_time_micros_steady() {
-  return std::chrono::duration_cast<std::chrono::microseconds>(
-    std::chrono::steady_clock::now().time_since_epoch()
-  ).count();
+  emit_agent_breadcrumb("nativeLivePreview:" + step);
 }
 
 std::string to_lower_ascii(std::string value) {

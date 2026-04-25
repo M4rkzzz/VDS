@@ -22,6 +22,55 @@ body {
   overflow-y: auto;
 }
 
+html,
+body,
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+*:hover,
+*:focus,
+*:focus-within {
+  scrollbar-color: rgba(120, 120, 120, 0.56) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+*::-webkit-scrollbar-thumb {
+  min-height: 40px;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  background-clip: padding-box;
+}
+
+*:hover::-webkit-scrollbar-thumb,
+*:focus::-webkit-scrollbar-thumb,
+*:focus-within::-webkit-scrollbar-thumb {
+  background: rgba(120, 120, 120, 0.52);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 120, 120, 0.72);
+  background-clip: padding-box;
+}
+
 /* 自定义标题栏 */
 .title-bar {
   position: fixed;
@@ -131,6 +180,13 @@ body {
   text-transform: uppercase;
 }
 
+.debug-menu-section-hint {
+  margin: -2px 0 0;
+  color: rgba(244, 239, 229, 0.58);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .debug-menu-presets {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -150,6 +206,28 @@ body {
   transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
 }
 
+.debug-menu-preset {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-height: 58px;
+  padding: 10px 12px;
+  text-align: left;
+}
+
+.debug-menu-preset-label {
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.debug-menu-preset-description {
+  color: rgba(244, 239, 229, 0.62);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
 .debug-menu-preset:hover,
 .debug-menu-action:hover {
   background: rgba(255, 255, 255, 0.08);
@@ -164,7 +242,7 @@ body {
 
 .debug-menu-footer {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
 }
 
@@ -183,6 +261,15 @@ body {
 .debug-menu-item:hover {
   background: rgba(255, 255, 255, 0.08);
   border-color: rgba(255, 255, 255, 0.16);
+}
+
+.debug-menu-item.active {
+  background: rgba(0, 217, 255, 0.1);
+  border-color: rgba(0, 217, 255, 0.28);
+}
+
+.debug-menu-item-warning {
+  border-color: rgba(255, 193, 7, 0.22);
 }
 
 .debug-menu-item-main {
@@ -1420,7 +1507,6 @@ body:not(.native-embedded-fullscreen) .debug-menu {
   color: var(--vds-white);
 }
 
-body:not(.native-embedded-fullscreen)[data-app-view="host"] .debug-menu,
 body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu {
   border-color: rgba(0, 0, 0, 0.1);
   background: rgba(252, 249, 243, 0.98);
@@ -1429,8 +1515,6 @@ body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu {
 
 body:not(.native-embedded-fullscreen) .debug-menu-title,
 body:not(.native-embedded-fullscreen) .debug-menu-item-label,
-body:not(.native-embedded-fullscreen)[data-app-view="host"] .debug-menu-title,
-body:not(.native-embedded-fullscreen)[data-app-view="host"] .debug-menu-item-label,
 body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-title,
 body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-item-label {
   color: currentColor;
@@ -1441,8 +1525,6 @@ body:not(.native-embedded-fullscreen) .debug-menu-item-description {
   color: rgba(255, 255, 255, 0.62);
 }
 
-body:not(.native-embedded-fullscreen)[data-app-view="host"] .debug-menu-subtitle,
-body:not(.native-embedded-fullscreen)[data-app-view="host"] .debug-menu-item-description,
 body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-subtitle,
 body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-item-description {
   color: rgba(0, 0, 0, 0.56);
@@ -1453,7 +1535,6 @@ body:not(.native-embedded-fullscreen) .debug-menu-item {
   border-color: rgba(255, 255, 255, 0.05);
 }
 
-body:not(.native-embedded-fullscreen)[data-app-view="host"] .debug-menu-item,
 body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-item {
   background: rgba(0, 0, 0, 0.03);
   border-color: rgba(0, 0, 0, 0.06);
@@ -2179,7 +2260,9 @@ body:not(.native-embedded-fullscreen) .debug-menu-summary {
 
 body:not(.native-embedded-fullscreen) .debug-menu-subtitle,
 body:not(.native-embedded-fullscreen) .debug-menu-item-description,
-body:not(.native-embedded-fullscreen) .debug-menu-section-title {
+body:not(.native-embedded-fullscreen) .debug-menu-section-title,
+body:not(.native-embedded-fullscreen) .debug-menu-section-hint,
+body:not(.native-embedded-fullscreen) .debug-menu-preset-description {
   color: rgba(255, 255, 255, 0.62);
 }
 
@@ -2188,7 +2271,11 @@ body:not(.native-embedded-fullscreen)[data-app-view="home"] .debug-menu-item-des
 body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-subtitle,
 body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-item-description,
 body:not(.native-embedded-fullscreen)[data-app-view="home"] .debug-menu-section-title,
-body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-section-title {
+body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-section-title,
+body:not(.native-embedded-fullscreen)[data-app-view="home"] .debug-menu-section-hint,
+body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-section-hint,
+body:not(.native-embedded-fullscreen)[data-app-view="home"] .debug-menu-preset-description,
+body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-preset-description {
   color: rgba(0, 0, 0, 0.56);
 }
 
@@ -2248,11 +2335,22 @@ body:not(.native-embedded-fullscreen) .debug-menu-preset.active {
   color: var(--vds-white);
 }
 
+body:not(.native-embedded-fullscreen) .debug-menu-item.active {
+  background: rgba(0, 217, 255, 0.1);
+  border-color: rgba(0, 217, 255, 0.28);
+}
+
 body:not(.native-embedded-fullscreen)[data-app-view="home"] .debug-menu-preset.active,
 body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-preset.active {
   background: rgba(0, 0, 0, 0.08);
   border-color: rgba(0, 0, 0, 0.16);
   color: var(--vds-black);
+}
+
+body:not(.native-embedded-fullscreen)[data-app-view="home"] .debug-menu-item.active,
+body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .debug-menu-item.active {
+  background: rgba(0, 217, 255, 0.12);
+  border-color: rgba(0, 137, 160, 0.28);
 }
 
 body:not(.native-embedded-fullscreen) .debug-menu-item-main input {
@@ -3287,8 +3385,8 @@ body:not(.native-embedded-fullscreen) .workspace-side::-webkit-scrollbar,
 body:not(.native-embedded-fullscreen) .workspace-stage-panel::-webkit-scrollbar,
 body:not(.native-embedded-fullscreen) .modal-content::-webkit-scrollbar,
 body:not(.native-embedded-fullscreen) .source-audio-process-list::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
 }
 
 body:not(.native-embedded-fullscreen) .workspace-side::-webkit-scrollbar-track,
@@ -3302,9 +3400,10 @@ body:not(.native-embedded-fullscreen) .workspace-side::-webkit-scrollbar-thumb,
 body:not(.native-embedded-fullscreen) .workspace-stage-panel::-webkit-scrollbar-thumb,
 body:not(.native-embedded-fullscreen) .modal-content::-webkit-scrollbar-thumb,
 body:not(.native-embedded-fullscreen) .source-audio-process-list::-webkit-scrollbar-thumb {
+  min-height: 40px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.14);
   border: 2px solid transparent;
+  background: transparent;
   background-clip: padding-box;
 }
 
@@ -3312,7 +3411,19 @@ body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .workspace-side::-
 body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .workspace-stage-panel::-webkit-scrollbar-thumb,
 body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .modal-content::-webkit-scrollbar-thumb,
 body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .source-audio-process-list::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.16);
+  background: transparent;
+  background-clip: padding-box;
+}
+
+body:not(.native-embedded-fullscreen) .workspace-side:hover::-webkit-scrollbar-thumb,
+body:not(.native-embedded-fullscreen) .workspace-stage-panel:hover::-webkit-scrollbar-thumb,
+body:not(.native-embedded-fullscreen) .modal-content:hover::-webkit-scrollbar-thumb,
+body:not(.native-embedded-fullscreen) .source-audio-process-list:hover::-webkit-scrollbar-thumb,
+body:not(.native-embedded-fullscreen) .workspace-side:focus-within::-webkit-scrollbar-thumb,
+body:not(.native-embedded-fullscreen) .workspace-stage-panel:focus-within::-webkit-scrollbar-thumb,
+body:not(.native-embedded-fullscreen) .modal-content:focus-within::-webkit-scrollbar-thumb,
+body:not(.native-embedded-fullscreen) .source-audio-process-list:focus-within::-webkit-scrollbar-thumb {
+  background: rgba(120, 120, 120, 0.52);
   background-clip: padding-box;
 }
 
@@ -3321,14 +3432,18 @@ body:not(.native-embedded-fullscreen) .workspace-stage-panel,
 body:not(.native-embedded-fullscreen) .modal-content,
 body:not(.native-embedded-fullscreen) .source-audio-process-list {
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+  scrollbar-color: transparent transparent;
 }
 
-body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .workspace-side,
-body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .workspace-stage-panel,
-body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .modal-content,
-body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .source-audio-process-list {
-  scrollbar-color: rgba(0, 0, 0, 0.18) transparent;
+body:not(.native-embedded-fullscreen) .workspace-side:hover,
+body:not(.native-embedded-fullscreen) .workspace-stage-panel:hover,
+body:not(.native-embedded-fullscreen) .modal-content:hover,
+body:not(.native-embedded-fullscreen) .source-audio-process-list:hover,
+body:not(.native-embedded-fullscreen) .workspace-side:focus-within,
+body:not(.native-embedded-fullscreen) .workspace-stage-panel:focus-within,
+body:not(.native-embedded-fullscreen) .modal-content:focus-within,
+body:not(.native-embedded-fullscreen) .source-audio-process-list:focus-within {
+  scrollbar-color: rgba(120, 120, 120, 0.56) transparent;
 }
 
 body:not(.native-embedded-fullscreen) .workspace-stage,

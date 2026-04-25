@@ -50,6 +50,7 @@
   const nativePeerSignalBacklog = new Map();
   const nativePeerSignalWaiters = new Map();
   const attachedEmbeddedSurfaces = new Map();
+  const nativeDebugRateLimitState = new Map();
 
   const HOST_PREVIEW_SURFACE_ID = 'embedded-host-preview';
 
@@ -133,6 +134,40 @@
     }
 
     return isDebugModeEnabled();
+  }
+
+  function shouldEmitNativeDebugLog(key, intervalMs = 1000) {
+    if (verboseNativeLogs || intervalMs <= 0) {
+      return { emit: true, suppressed: 0 };
+    }
+
+    const now = Date.now();
+    const state = nativeDebugRateLimitState.get(key) || { lastAt: 0, suppressed: 0 };
+    if (now - state.lastAt < intervalMs) {
+      state.suppressed += 1;
+      nativeDebugRateLimitState.set(key, state);
+      return { emit: false, suppressed: state.suppressed };
+    }
+
+    const suppressed = state.suppressed;
+    nativeDebugRateLimitState.set(key, { lastAt: now, suppressed: 0 });
+    return { emit: true, suppressed };
+  }
+
+  function appendSuppressedDebugCount(payload, suppressed) {
+    if (!suppressed) {
+      return payload;
+    }
+    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+      return {
+        ...payload,
+        suppressed
+      };
+    }
+    return {
+      value: payload,
+      suppressed
+    };
   }
 
   function getNativeDebugCategoryFromScope(scope) {
@@ -258,12 +293,31 @@
     if (!shouldShowDebugLogsFor(category, 'nativeSteps')) {
       return;
     }
-    const normalized = summarizeNativeLogValue(payload);
+    const rate = shouldEmitNativeDebugLog(`step:${category}:${scope}`, 1000);
+    if (!rate.emit) {
+      return;
+    }
+    const normalized = summarizeNativeLogValue(appendSuppressedDebugCount(payload, rate.suppressed));
     try {
       console.log(`[media-engine step] ${scope} ${JSON.stringify(normalized)}`);
     } catch (_error) {
       console.log(`[media-engine step] ${scope}`, normalized || null);
     }
+  }
+
+  function logNativeStatsLine(label, fields, suppressed = 0) {
+    if (!shouldShowDebugLogsFor('video', 'periodicStats')) {
+      return;
+    }
+    console.log(
+      label,
+      ...fields,
+      suppressed ? `suppressed=${suppressed}` : ''
+    );
+  }
+
+  function logNativeWarningLine(label, ...args) {
+    console.warn(label, ...args);
   }
 
   function logRecoverableSurfaceSyncWarning(surfaceId, error) {
@@ -278,7 +332,7 @@
       logNativeStep('updateSurface:recoverable-error', { surfaceId, message }, 'video');
       return;
     }
-    console.warn('[media-engine] surface sync failed:', surfaceId, message);
+    logNativeWarningLine('[media-engine] surface sync failed:', surfaceId, message);
   }
 
   function clearRecoverableSurfaceSyncWarning(surfaceId) {
@@ -306,7 +360,7 @@
       logNativeStep(scope, { key, message }, category);
       return;
     }
-    console.warn(fallbackLabel, message);
+    logNativeWarningLine(fallbackLabel, message);
   }
 
   function waitForNextPaint() {
@@ -762,9 +816,15 @@
     }
 
     if (shouldShowDebugLogsFor(debugCategory, 'nativeEvents')) {
-      console.log('Native media engine event:', event.event, event.params || null);
-    } else if (eventName === 'warning') {
-      console.warn('Native media engine event:', event.event, event.params || null);
+      const rate = shouldEmitNativeDebugLog(`event:${debugCategory}:${eventName}:${stateName}`, 1000);
+      if (!rate.emit) {
+        return;
+      }
+      console.log(
+        'Native media engine event:',
+        event.event,
+        appendSuppressedDebugCount(event.params || null, rate.suppressed)
+      );
     }
   }
 
@@ -1117,9 +1177,12 @@
       try {
         await syncAllEmbeddedSurfaces();
       } catch (error) {
-        if (shouldShowDebugLogsFor('video', 'nativeSteps')) {
-          console.warn('[media-engine] syncAllEmbeddedSurfaces failed:', error);
-        }
+        logRecoverableNativeWarning('syncAllEmbeddedSurfaces:failed', error, {
+          key: 'sync-all-embedded-surfaces',
+          category: 'video',
+          channel: 'nativeSteps',
+          fallbackLabel: '[media-engine] syncAllEmbeddedSurfaces failed:'
+        });
       } finally {
         embeddedSurfaceSyncInFlight = false;
         if (embeddedSurfaceSyncPending) {
@@ -1297,7 +1360,8 @@
           ? String(qualitySettings.hardwareEncoderPreference).trim().toLowerCase()
           : '',
       encoderPreset: qualitySettings.encoderPreset || 'balanced',
-      encoderTune: qualitySettings.encoderTune === 'none' ? '' : (qualitySettings.encoderTune || '')
+      encoderTune: qualitySettings.encoderTune === 'none' ? '' : (qualitySettings.encoderTune || ''),
+      keyframePolicy: qualitySettings.keyframePolicy || '1s'
     };
 
     if (normalized.startsWith('screen:')) {
@@ -1497,14 +1561,177 @@
         disconnectTimerId: null,
         localCandidateCount: 0,
         localCandidateTypes: new Set(),
+        localHostUdpCandidates: [],
         remoteCandidateKeys: new Set(),
         restartAttempts: 0,
         restartInProgress: false,
+        natMappingAttempted: false,
+        natMappingInProgress: false,
         selectedCandidatePairLogged: false
       };
       peerConnectionMeta.set(peerId, meta);
     }
     return meta;
+  }
+
+  function classifyP2pFailure(meta) {
+    if (!meta) {
+      return '纯 P2P 建连超时';
+    }
+    if (meta.localCandidateCount <= 0) {
+      return '无本地候选，无法开始 P2P 连接';
+    }
+    if (!meta.localCandidateTypes || !meta.localCandidateTypes.has('srflx')) {
+      return '未获得公网反射候选，当前网络可能无法纯 P2P 穿透';
+    }
+    return '纯 P2P 无法穿透当前网络';
+  }
+
+  function rememberLocalIceCandidate(meta, candidate) {
+    if (!meta || !candidate) {
+      return;
+    }
+    meta.localCandidateCount += 1;
+    const candidateObject = typeof candidate === 'object'
+      ? candidate
+      : { candidate: String(candidate || '') };
+    const candidateText = String(candidateObject.candidate || '');
+    const typeMatch = candidateText.match(/\btyp\s+([a-z0-9-]+)/i);
+    const protocolMatch = candidateText.match(/^candidate:\S+\s+\d+\s+([a-z0-9-]+)\s+/i);
+    if (typeMatch) {
+      meta.localCandidateTypes.add(typeMatch[1].toLowerCase());
+    }
+    if (
+      typeMatch &&
+      protocolMatch &&
+      typeMatch[1].toLowerCase() === 'host' &&
+      protocolMatch[1].toLowerCase() === 'udp'
+    ) {
+      const key = JSON.stringify({
+        candidate: candidateText,
+        sdpMid: candidateObject.sdpMid || '',
+        sdpMLineIndex: Number.isFinite(candidateObject.sdpMLineIndex) ? candidateObject.sdpMLineIndex : 0
+      });
+      const exists = meta.localHostUdpCandidates.some((entry) => entry.key === key);
+      if (!exists) {
+        meta.localHostUdpCandidates.push({
+          key,
+          candidate: {
+            candidate: candidateText,
+            sdpMid: candidateObject.sdpMid || '',
+            sdpMLineIndex: Number.isFinite(candidateObject.sdpMLineIndex) ? candidateObject.sdpMLineIndex : 0
+          }
+        });
+        while (meta.localHostUdpCandidates.length > 16) {
+          meta.localHostUdpCandidates.shift();
+        }
+      }
+    }
+  }
+
+  async function attemptLastChanceNatMapping(peerId, reason) {
+    const meta = peerConnectionMeta.get(peerId);
+    const handle = nativePeerHandles.get(peerId);
+    if (!meta || !handle || handle.closed || meta.hasConnected || meta.natMappingAttempted || meta.natMappingInProgress) {
+      return false;
+    }
+    if (!window.isElectron || !mediaEngine || typeof mediaEngine.openNatMapping !== 'function') {
+      return false;
+    }
+
+    meta.natMappingAttempted = true;
+    meta.natMappingInProgress = true;
+    const candidates = (meta.localHostUdpCandidates || []).map((entry) => entry.candidate).filter(Boolean);
+    logNativeStep('peer-nat-mapping:start', {
+      peerId,
+      reason,
+      candidateCount: candidates.length
+    }, 'p2p');
+    if (!isHost) {
+      setViewerConnectionState('纯 P2P 直连失败，正在尝试路由器端口映射...');
+    }
+
+    try {
+      const result = await mediaEngine.openNatMapping({
+        peerId,
+        candidates,
+        lifetimeSeconds: 180
+      });
+      logNativeStep('peer-nat-mapping:result', {
+        peerId,
+        ok: Boolean(result && result.ok),
+        reason: result && result.reason,
+        mappedCandidates: result && Array.isArray(result.candidates) ? result.candidates.length : 0
+      }, 'p2p');
+      if (!result || !result.ok || !Array.isArray(result.candidates) || result.candidates.length === 0) {
+        return false;
+      }
+
+      for (const mappedCandidate of result.candidates) {
+        sendMessage({
+          type: 'ice-candidate',
+          targetId: peerId,
+          roomId: currentRoomId,
+          candidate: mappedCandidate,
+          trickle: true,
+          natMapping: true
+        });
+      }
+
+      meta.connectTimeoutId = window.setTimeout(async () => {
+        meta.connectTimeoutId = null;
+        const currentHandle = nativePeerHandles.get(peerId);
+        if (!meta.hasConnected && currentHandle && !currentHandle.closed && currentHandle.connectionState !== 'connected') {
+          if (!isHost) {
+            setViewerConnectionState(classifyP2pFailure(meta));
+          }
+          await closeNativePeerConnectionImpl(peerId, { clearRetryState: false }).catch(() => {});
+        }
+      }, 7000);
+      return true;
+    } catch (error) {
+      logNativeStep('peer-nat-mapping:failed', {
+        peerId,
+        message: error && error.message ? error.message : String(error)
+      }, 'p2p');
+      return false;
+    } finally {
+      meta.natMappingInProgress = false;
+    }
+  }
+
+  function armPeerConnectFailfast(peerId) {
+    const meta = peerConnectionMeta.get(peerId);
+    if (!meta || meta.connectTimeoutId) {
+      return;
+    }
+    meta.connectTimeoutId = window.setTimeout(async () => {
+      meta.connectTimeoutId = null;
+      if (meta.hasConnected) {
+        return;
+      }
+      const handle = nativePeerHandles.get(peerId);
+      if (!handle || handle.closed || handle.connectionState === 'connected') {
+        return;
+      }
+      const reason = classifyP2pFailure(meta);
+      const fallbackStarted = await attemptLastChanceNatMapping(peerId, reason);
+      if (fallbackStarted) {
+        return;
+      }
+      handle.connectionState = 'failed';
+      handle.iceConnectionState = 'failed';
+      logNativeStep('peer-connect-failfast', {
+        peerId,
+        reason,
+        localCandidateCount: meta.localCandidateCount,
+        localCandidateTypes: Array.from(meta.localCandidateTypes || [])
+      });
+      if (!isHost) {
+        setViewerConnectionState(reason);
+      }
+      await closeNativePeerConnectionImpl(peerId, { clearRetryState: false }).catch(() => {});
+    }, typeof P2P_CONNECT_FAILFAST_MS === 'number' ? P2P_CONNECT_FAILFAST_MS : 15000);
   }
 
   function createNativePeerConnectionImpl(peerId, isInitiator, kind = 'direct') {
@@ -1534,6 +1761,7 @@
     peerConnections.set(peerId, handle);
     nativePeerHandles.set(peerId, handle);
     ensurePeerMeta(peerId, isInitiator, kind);
+    armPeerConnectFailfast(peerId);
     return handle;
   }
 
@@ -1705,7 +1933,8 @@
     const payload = {
       type: params.type === 'candidate' ? 'ice-candidate' : params.type,
       targetId: params.targetId || params.peerId || params.remotePeerId,
-      roomId: currentRoomId
+      roomId: currentRoomId,
+      trickle: true
     };
 
     if (params.sdp) {
@@ -1713,6 +1942,11 @@
     }
     if (params.candidate) {
       payload.candidate = params.candidate;
+      const peerId = params.peerId || params.remotePeerId || params.targetId;
+      const meta = peerConnectionMeta.get(peerId);
+      if (meta) {
+        rememberLocalIceCandidate(meta, params.candidate);
+      }
     }
     if (params.isRelay) {
       payload.isRelay = true;
@@ -1805,7 +2039,12 @@
       updateHostEncoderDetail(null, params.obsIngest || null);
       if (currentRoomId || sessionRole === 'host') {
         teardownHostRoomPreservingSession('obs-ingest-ended').catch((error) => {
-          console.warn('[media-engine] failed to end OBS room after ingest stop:', error);
+          logRecoverableNativeWarning('obs-ingest:end-room-failed', error, {
+            key: 'obs-ingest-end-room-failed',
+            category: 'video',
+            channel: 'nativeSteps',
+            fallbackLabel: '[media-engine] failed to end OBS room after ingest stop:'
+          });
         });
       } else if (elements.hostStatus) {
         elements.hostStatus.textContent = '等待 OBS 推流...';
@@ -1959,7 +2198,15 @@
     }
 
     if (event.event === 'warning' && event.params && event.params.message) {
-      console.warn('[media-engine warning]', event.params.message);
+      const warningKey = `agent-warning:${event.params.scope || 'misc'}:${event.params.message}`;
+      const rate = shouldEmitNativeDebugLog(warningKey, 5000);
+      if (rate.emit) {
+        logNativeWarningLine(
+          '[media-engine warning]',
+          event.params.message,
+          rate.suppressed ? `suppressed=${rate.suppressed}` : ''
+        );
+      }
     }
   }
 
@@ -2259,34 +2506,36 @@
       }
 
       if (shouldShowDebugLogsFor('video', 'periodicStats')) {
-        console.log(
-          '[media-engine native-host-stats]',
-          `reason=${reason}`,
-          `backend=${currentHostBackend}`,
-          `hostRunning=${Boolean(stats && stats.hostSessionRunning)}`,
-          `captureReady=${Boolean(hostPlan && hostPlan.ready)}`,
-          `captureValidated=${Boolean(hostPlan && hostPlan.validated)}`,
-          `captureReason=${hostPlan && hostPlan.reason ? hostPlan.reason : 'n/a'}`,
-          `obsWaiting=${Boolean(obsIngest && obsIngest.waiting)}`,
-          `obsConnected=${Boolean(obsIngest && obsIngest.ingestConnected)}`,
-          `obsRunning=${Boolean(obsIngest && obsIngest.streamRunning)}`,
-          `obsVideoCodec=${obsIngest && obsIngest.videoCodec ? obsIngest.videoCodec : 'n/a'}`,
-          `obsAudioCodec=${obsIngest && obsIngest.audioCodec ? obsIngest.audioCodec : 'n/a'}`,
-          `sourceFramesCaptured=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.sourceFramesCaptured) ? peer.mediaBinding.sourceFramesCaptured : 0}`,
-          `avgCopyUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceCopyResourceUs) ? peer.mediaBinding.avgSourceCopyResourceUs : 0}`,
-          `avgMapUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceMapUs) ? peer.mediaBinding.avgSourceMapUs : 0}`,
-          `avgMemcpyUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceMemcpyUs) ? peer.mediaBinding.avgSourceMemcpyUs : 0}`,
-          `avgReadbackUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceTotalReadbackUs) ? peer.mediaBinding.avgSourceTotalReadbackUs : 0}`,
-          `surfaceRunning=${Boolean(surface && surface.running)}`,
-          `surfaceFramesRendered=${surface && Number.isFinite(surface.decodedFramesRendered) ? surface.decodedFramesRendered : 0}`,
-          `surfaceFrameStddevMs=${surface && typeof surface.frameIntervalStddevMs === 'number' ? surface.frameIntervalStddevMs.toFixed(3) : '0.000'}`,
-          `surfaceReason=${surface && surface.reason ? surface.reason : 'n/a'}`,
-          `peer=${peer && peer.peerId ? peer.peerId : 'n/a'}`,
-          `videoConfigured=${Boolean(peer && peer.peerTransport && peer.peerTransport.videoTrackConfigured)}`,
-          `videoOpen=${Boolean(peer && peer.peerTransport && peer.peerTransport.videoTrackOpen)}`,
-          `framesSent=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.framesSent) ? peer.mediaBinding.framesSent : 0}`,
-          `bindingReason=${peer && peer.mediaBinding && peer.mediaBinding.reason ? peer.mediaBinding.reason : 'n/a'}`
-        );
+        const rate = shouldEmitNativeDebugLog(`stats:host:${reason}`, reason === 'initial' ? 0 : 5000);
+        if (rate.emit) {
+          logNativeStatsLine('[media-engine native-host-stats]', [
+            `reason=${reason}`,
+            `backend=${currentHostBackend}`,
+            `hostRunning=${Boolean(stats && stats.hostSessionRunning)}`,
+            `captureReady=${Boolean(hostPlan && hostPlan.ready)}`,
+            `captureValidated=${Boolean(hostPlan && hostPlan.validated)}`,
+            `captureReason=${hostPlan && hostPlan.reason ? hostPlan.reason : 'n/a'}`,
+            `obsWaiting=${Boolean(obsIngest && obsIngest.waiting)}`,
+            `obsConnected=${Boolean(obsIngest && obsIngest.ingestConnected)}`,
+            `obsRunning=${Boolean(obsIngest && obsIngest.streamRunning)}`,
+            `obsVideoCodec=${obsIngest && obsIngest.videoCodec ? obsIngest.videoCodec : 'n/a'}`,
+            `obsAudioCodec=${obsIngest && obsIngest.audioCodec ? obsIngest.audioCodec : 'n/a'}`,
+            `sourceFramesCaptured=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.sourceFramesCaptured) ? peer.mediaBinding.sourceFramesCaptured : 0}`,
+            `avgCopyUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceCopyResourceUs) ? peer.mediaBinding.avgSourceCopyResourceUs : 0}`,
+            `avgMapUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceMapUs) ? peer.mediaBinding.avgSourceMapUs : 0}`,
+            `avgMemcpyUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceMemcpyUs) ? peer.mediaBinding.avgSourceMemcpyUs : 0}`,
+            `avgReadbackUs=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.avgSourceTotalReadbackUs) ? peer.mediaBinding.avgSourceTotalReadbackUs : 0}`,
+            `surfaceRunning=${Boolean(surface && surface.running)}`,
+            `surfaceFramesRendered=${surface && Number.isFinite(surface.decodedFramesRendered) ? surface.decodedFramesRendered : 0}`,
+            `surfaceFrameStddevMs=${surface && typeof surface.frameIntervalStddevMs === 'number' ? surface.frameIntervalStddevMs.toFixed(3) : '0.000'}`,
+            `surfaceReason=${surface && surface.reason ? surface.reason : 'n/a'}`,
+            `peer=${peer && peer.peerId ? peer.peerId : 'n/a'}`,
+            `videoConfigured=${Boolean(peer && peer.peerTransport && peer.peerTransport.videoTrackConfigured)}`,
+            `videoOpen=${Boolean(peer && peer.peerTransport && peer.peerTransport.videoTrackOpen)}`,
+            `framesSent=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.framesSent) ? peer.mediaBinding.framesSent : 0}`,
+            `bindingReason=${peer && peer.mediaBinding && peer.mediaBinding.reason ? peer.mediaBinding.reason : 'n/a'}`
+          ], rate.suppressed);
+        }
       }
 
       return stats;
@@ -2336,33 +2585,41 @@
       );
       updateViewerFpsIndicator(peer.peerTransport.remoteVideoFramesReceived || 0, renderedFrames);
       if (shouldShowDebugLogsFor('video', 'periodicStats')) {
-        console.log(
-          '[media-engine native-peer-stats]',
-          `reason=${reason}`,
-          `peer=${peer.peerId || 'n/a'}`,
-          `receiverConfigured=${Boolean(peer.peerTransport.videoReceiverConfigured)}`,
-          `decoderReady=${Boolean(peer.peerTransport.decoderReady)}`,
-          `framesReceived=${peer.peerTransport.remoteVideoFramesReceived || 0}`,
-          `framesRendered=${peer.peerTransport.decodedFramesRendered || 0}`,
-          `surfaceFrameStddevMs=${surface && typeof surface.frameIntervalStddevMs === 'number' ? surface.frameIntervalStddevMs.toFixed(3) : '0.000'}`,
-          `queuedVideo=${peer.receiverRuntime && peer.receiverRuntime.queuedVideoUnits ? peer.receiverRuntime.queuedVideoUnits : 0}`,
-          `queuedAudio=${peer.receiverRuntime && peer.receiverRuntime.queuedAudioBlocks ? peer.receiverRuntime.queuedAudioBlocks : 0}`,
-          `submittedVideo=${peer.receiverRuntime && peer.receiverRuntime.submittedVideoUnits ? peer.receiverRuntime.submittedVideoUnits : 0}`,
-          `dispatchedAudio=${peer.receiverRuntime && peer.receiverRuntime.dispatchedAudioBlocks ? peer.receiverRuntime.dispatchedAudioBlocks : 0}`,
-          `droppedVideo=${peer.receiverRuntime && peer.receiverRuntime.droppedVideoUnits ? peer.receiverRuntime.droppedVideoUnits : 0}`,
-          `droppedAudio=${peer.receiverRuntime && peer.receiverRuntime.droppedAudioBlocks ? peer.receiverRuntime.droppedAudioBlocks : 0}`,
-          `lastVideoLatenessMs=${peer.receiverRuntime && typeof peer.receiverRuntime.lastVideoLatenessMs === 'number' ? peer.receiverRuntime.lastVideoLatenessMs : 0}`,
-          `receiverReason=${peer.receiverRuntime && peer.receiverRuntime.reason ? peer.receiverRuntime.reason : 'n/a'}`,
-          `receiverError=${peer.receiverRuntime && peer.receiverRuntime.lastError ? peer.receiverRuntime.lastError : ''}`,
-          `mediaReady=${Boolean(peer.peerTransport.mediaPlaneReady)}`,
-          `surfaceReason=${surface && surface.reason ? surface.reason : 'n/a'}`,
-          `surfaceError=${surface && surface.lastError ? surface.lastError : ''}`
-        );
+        const rate = shouldEmitNativeDebugLog(`stats:viewer:${reason}:${upstreamPeerId}`, reason === 'initial' ? 0 : 5000);
+        if (rate.emit) {
+          logNativeStatsLine('[media-engine native-peer-stats]', [
+            `reason=${reason}`,
+            `peer=${peer.peerId || 'n/a'}`,
+            `receiverConfigured=${Boolean(peer.peerTransport.videoReceiverConfigured)}`,
+            `decoderReady=${Boolean(peer.peerTransport.decoderReady)}`,
+            `framesReceived=${peer.peerTransport.remoteVideoFramesReceived || 0}`,
+            `framesRendered=${peer.peerTransport.decodedFramesRendered || 0}`,
+            `surfaceFrameStddevMs=${surface && typeof surface.frameIntervalStddevMs === 'number' ? surface.frameIntervalStddevMs.toFixed(3) : '0.000'}`,
+            `queuedVideo=${peer.receiverRuntime && peer.receiverRuntime.queuedVideoUnits ? peer.receiverRuntime.queuedVideoUnits : 0}`,
+            `queuedAudio=${peer.receiverRuntime && peer.receiverRuntime.queuedAudioBlocks ? peer.receiverRuntime.queuedAudioBlocks : 0}`,
+            `submittedVideo=${peer.receiverRuntime && peer.receiverRuntime.submittedVideoUnits ? peer.receiverRuntime.submittedVideoUnits : 0}`,
+            `dispatchedAudio=${peer.receiverRuntime && peer.receiverRuntime.dispatchedAudioBlocks ? peer.receiverRuntime.dispatchedAudioBlocks : 0}`,
+            `droppedVideo=${peer.receiverRuntime && peer.receiverRuntime.droppedVideoUnits ? peer.receiverRuntime.droppedVideoUnits : 0}`,
+            `droppedAudio=${peer.receiverRuntime && peer.receiverRuntime.droppedAudioBlocks ? peer.receiverRuntime.droppedAudioBlocks : 0}`,
+            `lastVideoLatenessMs=${peer.receiverRuntime && typeof peer.receiverRuntime.lastVideoLatenessMs === 'number' ? peer.receiverRuntime.lastVideoLatenessMs : 0}`,
+            `receiverReason=${peer.receiverRuntime && peer.receiverRuntime.reason ? peer.receiverRuntime.reason : 'n/a'}`,
+            `receiverError=${peer.receiverRuntime && peer.receiverRuntime.lastError ? peer.receiverRuntime.lastError : ''}`,
+            `mediaReady=${Boolean(peer.peerTransport.mediaPlaneReady)}`,
+            `surfaceReason=${surface && surface.reason ? surface.reason : 'n/a'}`,
+            `surfaceError=${surface && surface.lastError ? surface.lastError : ''}`
+          ], rate.suppressed);
+        }
         const relayPeers = peers.filter((entry) => entry && entry.role === 'relay-downstream');
         relayPeers.forEach((relayPeer) => {
+          const relayRate = shouldEmitNativeDebugLog(
+            `stats:relay:${reason}:${relayPeer.peerId || 'unknown'}`,
+            reason === 'initial' ? 0 : 5000
+          );
+          if (!relayRate.emit) {
+            return;
+          }
           const relayRuntime = relayPeer.relaySubscriberRuntime || null;
-          console.log(
-            '[media-engine native-relay-stats]',
+          logNativeStatsLine('[media-engine native-relay-stats]', [
             `reason=${reason}`,
             `peer=${relayPeer.peerId || 'n/a'}`,
             `transportState=${relayPeer.peerTransport && relayPeer.peerTransport.connectionState ? relayPeer.peerTransport.connectionState : 'n/a'}`,
@@ -2375,7 +2632,7 @@
             `relayFramesSent=${relayRuntime && Number.isFinite(relayRuntime.framesSent) ? relayRuntime.framesSent : 0}`,
             `relayReason=${relayRuntime && relayRuntime.reason ? relayRuntime.reason : 'n/a'}`,
             `relayError=${relayRuntime && relayRuntime.lastError ? relayRuntime.lastError : ''}`
-          );
+          ], relayRate.suppressed);
         });
       }
 
@@ -2605,7 +2862,12 @@
           showError('原生音频当前不可用，将仅共享画面');
         }
       } catch (error) {
-        console.warn('[media-engine] native audio session start failed:', error);
+        logRecoverableNativeWarning('native-audio-session:start-failed', error, {
+          key: 'native-audio-session-start-failed',
+          category: 'audio',
+          channel: 'nativeSteps',
+          fallbackLabel: '[media-engine] native audio session start failed:'
+        });
         showError('原生音频启动失败，将仅共享画面');
       }
     }
@@ -2779,11 +3041,19 @@
     const nextAttempt = Number(existing.attempts || 0) + 1;
     if (nextAttempt > 2) {
       peerReconnectState.delete(nextViewerId);
-      console.warn('[media-engine relay] exhausted connect-to-next retries:', nextViewerId, error);
+      logRecoverableNativeWarning('relay:connect-to-next-exhausted', error, {
+        key: `relay-connect-exhausted:${nextViewerId}`,
+        category: 'connection',
+        channel: 'nativeSteps',
+        fallbackLabel: `[media-engine relay] exhausted connect-to-next retries: ${nextViewerId}`
+      });
       return;
     }
 
-    const retryDelayMs = nextAttempt * 750;
+    const retryDelays = Array.isArray(P2P_RECONNECT_DELAYS_MS) && P2P_RECONNECT_DELAYS_MS.length
+      ? P2P_RECONNECT_DELAYS_MS
+      : [750, 1500];
+    const retryDelayMs = retryDelays[Math.min(nextAttempt - 1, retryDelays.length - 1)];
     const timerId = setTimeout(async () => {
       peerReconnectState.delete(nextViewerId);
       if (sessionRole !== 'viewer' || isHost || !currentRoomId || !upstreamPeerId) {
@@ -3078,7 +3348,12 @@
         try {
           await createOfferToNextViewer(data.nextViewerId);
         } catch (error) {
-          console.warn('[media-engine relay] connect-to-next failed:', data.nextViewerId, error);
+          logRecoverableNativeWarning('relay:connect-to-next-failed', error, {
+            key: `relay-connect-failed:${data.nextViewerId}`,
+            category: 'connection',
+            channel: 'nativeSteps',
+            fallbackLabel: `[media-engine relay] connect-to-next failed: ${data.nextViewerId}`
+          });
           await closeNativePeerConnectionImpl(data.nextViewerId, { clearRetryState: true }).catch(() => {});
           scheduleRelayOfferRetry(data.nextViewerId, error);
         }
@@ -3306,7 +3581,7 @@
         event.preventDefault();
         event.stopImmediatePropagation();
         stopScreenShare().catch((error) => {
-          console.error('[media-engine] stopScreenShare failed:', error);
+          logNativeDebug('video', '[media-engine] stopScreenShare failed:', error && error.message ? error.message : String(error));
           showError(`停止共享失败：${error && error.message ? error.message : String(error)}`);
         });
       }, true);

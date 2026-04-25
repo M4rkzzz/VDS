@@ -10,6 +10,8 @@ const DEFAULT_ICE_SERVERS = [
   { urls: 'stun:stun.easyvoip.com:3478' },
   { urls: 'stun:stun.ekiga.net:3478' }
 ];
+const P2P_CONNECT_FAILFAST_MS = 15000;
+const P2P_RECONNECT_DELAYS_MS = [750, 1500];
 
 const runtimeConfig = getRuntimeConfig();
 const serverBaseUrl = runtimeConfig.serverUrl;
@@ -23,6 +25,10 @@ const DEBUG_CATEGORY_DEFINITIONS = Object.freeze({
   connection: {
     label: '连接',
     description: 'WebSocket、信令、ICE、Peer 建连与重连'
+  },
+  p2p: {
+    label: 'P2P 诊断',
+    description: '候选、RTT、NACK/PLI、关键帧请求与媒体平面状态'
   },
   video: {
     label: '视频',
@@ -48,15 +54,15 @@ const DEBUG_CHANNEL_DEFINITIONS = Object.freeze({
   },
   nativeEvents: {
     label: '原生事件',
-    description: 'media-state、peer-state、signal 事件摘要'
+    description: 'media-state、peer-state、signal 事件摘要，高频事件会被节流'
   },
   nativeSteps: {
     label: '原生步骤',
-    description: 'attach/createPeer/setRemoteDescription 等 step 明细'
+    description: 'attach/createPeer/setRemoteDescription 等 step 明细，同类步骤会被节流'
   },
   periodicStats: {
     label: '周期统计',
-    description: 'host/viewer 周期 stats 与抖动指标'
+    description: 'host/viewer 周期 stats 与抖动指标，默认按采样输出'
   },
   mainProcess: {
     label: '主进程桥接',
@@ -64,11 +70,11 @@ const DEBUG_CHANNEL_DEFINITIONS = Object.freeze({
   },
   agentBreadcrumbs: {
     label: 'Agent Breadcrumb',
-    description: 'native agent stderr breadcrumb 轨迹'
+    description: 'native agent stderr breadcrumb 轨迹，主进程会按内容归并'
   },
   agentStderr: {
     label: 'Agent STDERR',
-    description: 'native agent 原始 stderr 输出'
+    description: 'native agent 原始 stderr 输出，仅短时间深挖时打开'
   }
 });
 const DEBUG_PRESET_DEFINITIONS = Object.freeze({
@@ -78,6 +84,7 @@ const DEBUG_PRESET_DEFINITIONS = Object.freeze({
     config: {
       categories: {
         connection: false,
+        p2p: false,
         video: false,
         audio: false,
         update: false,
@@ -100,6 +107,7 @@ const DEBUG_PRESET_DEFINITIONS = Object.freeze({
     config: {
       categories: {
         connection: true,
+        p2p: true,
         video: true,
         audio: true,
         update: true,
@@ -122,6 +130,7 @@ const DEBUG_PRESET_DEFINITIONS = Object.freeze({
     config: {
       categories: {
         connection: true,
+        p2p: false,
         video: true,
         audio: false,
         update: false,
@@ -139,11 +148,12 @@ const DEBUG_PRESET_DEFINITIONS = Object.freeze({
     }
   },
   verbose: {
-    label: '全开',
-    description: '最大化日志，适合短时间深挖问题',
+    label: '短时全量',
+    description: '最大化日志，只适合短时间深挖问题，不建议长时间运行',
     config: {
       categories: {
         connection: true,
+        p2p: false,
         video: true,
         audio: true,
         update: true,
@@ -200,6 +210,7 @@ let publicRooms = [];
 let publicRoomsRefreshInFlight = false;
 let publicRoomsPollTimer = null;
 let publicRoomsLastError = '';
+let sourceSelectionInFlight = false;
 
 let viewerPlaybackPrefs = readViewerPlaybackPrefs();
 const initialObsIngestPrefs = readObsIngestPrefs();
@@ -222,7 +233,8 @@ let qualitySettings = {
   hardwareEncoderPreference: 'auto',
   encoderPreset: 'balanced',
   encoderTune: 'none',
-  publicRoomEnabled: false
+  publicRoomEnabled: false,
+  keyframePolicy: '1s'
 };
 let qualityCapabilities = null;
 let qualityCapabilitiesPromise = null;
@@ -262,6 +274,11 @@ const QUALITY_TUNE_OPTIONS = [
   { value: 'none', label: '默认' },
   { value: 'fastdecode', label: 'fastdecode' },
   { value: 'zerolatency', label: 'zerolatency' }
+];
+const QUALITY_KEYFRAME_OPTIONS = [
+  { value: '1s', label: '1s' },
+  { value: '0.5s', label: '0.5s' },
+  { value: 'all-intra', label: 'All-Intra', badge: '高带宽，高负载' }
 ];
 const QUALITY_HARDWARE_ENCODER_PATTERN = /(?:_amf|_mf|_qsv|_nvenc|videotoolbox|_d3d12va)/i;
 const PUBLIC_ROOMS_POLL_INTERVAL_MS = 500;
@@ -304,14 +321,16 @@ function getRuntimeConfig() {
     return {
       clientId: electronConfig.clientId || null,
       serverUrl: normalizeBaseUrl(electronConfig.serverUrl || DEFAULT_SERVER_URL),
-      disconnectGraceMs: Number(electronConfig.disconnectGraceMs || 30000)
+      disconnectGraceMs: Number(electronConfig.disconnectGraceMs || 30000),
+      debugPreset: String(electronConfig.debugPreset || '').trim()
     };
   }
 
   return {
     clientId: null,
     serverUrl: normalizeBaseUrl(window.location.origin || DEFAULT_SERVER_URL),
-    disconnectGraceMs: 30000
+    disconnectGraceMs: 30000,
+    debugPreset: ''
   };
 }
 
@@ -379,6 +398,11 @@ function normalizeDebugConfig(config, fallbackEnabled = false) {
 }
 
 function readDebugConfig() {
+  const runtimePreset = normalizeRuntimeDebugPreset(runtimeConfig.debugPreset);
+  if (runtimePreset) {
+    return normalizeDebugConfig(DEBUG_PRESET_DEFINITIONS[runtimePreset].config, false);
+  }
+
   const legacyEnabled = readDebugModeFlag();
   try {
     const raw = window.localStorage.getItem(DEBUG_CONFIG_STORAGE_KEY);
@@ -389,6 +413,16 @@ function readDebugConfig() {
   } catch (_error) {
     return buildDefaultDebugConfig(legacyEnabled);
   }
+}
+
+function normalizeRuntimeDebugPreset(preset) {
+  const normalized = String(preset || '').trim();
+  if (!normalized || normalized === 'profile') {
+    return '';
+  }
+  return Object.prototype.hasOwnProperty.call(DEBUG_PRESET_DEFINITIONS, normalized)
+    ? normalized
+    : '';
 }
 
 function isAnyDebugEnabled(config = debugConfig) {
@@ -439,28 +473,28 @@ function syncDebugUi() {
     checkboxes.forEach((input) => {
       const category = input.getAttribute('data-debug-category');
       const channel = input.getAttribute('data-debug-channel');
+      let checked = false;
       if (category) {
-        input.checked = Boolean(debugConfig.categories[category]);
+        checked = Boolean(debugConfig.categories[category]);
       } else if (channel) {
-        input.checked = Boolean(debugConfig.channels[channel]);
+        checked = Boolean(debugConfig.channels[channel]);
+      }
+      input.checked = checked;
+      const item = input.closest('.debug-menu-item');
+      if (item) {
+        item.classList.toggle('active', checked);
       }
     });
 
     const summary = elements.debugMenu.querySelector('[data-debug-summary]');
     if (summary) {
-      const categoryCount = DEBUG_CATEGORY_KEYS.filter((key) => debugConfig.categories[key]).length;
-      const channelCount = DEBUG_CHANNEL_KEYS.filter((key) => debugConfig.channels[key]).length;
-      summary.textContent = isAnyDebugPathEnabled()
-        ? `已启用 ${categoryCount} 个类别 / ${channelCount} 个通道`
-        : '当前为静默模式';
+      summary.textContent = describeDebugSelection();
     }
 
     const presetButtons = elements.debugMenu.querySelectorAll('[data-debug-preset]');
     presetButtons.forEach((button) => {
       const presetKey = button.getAttribute('data-debug-preset');
-      const preset = presetKey ? DEBUG_PRESET_DEFINITIONS[presetKey] : null;
-      const active = preset ? isSameDebugConfig(debugConfig, normalizeDebugConfig(preset.config, false)) : false;
-      button.classList.toggle('active', active);
+      button.classList.toggle('active', presetKey === getActiveDebugPresetKey());
     });
   }
 }
@@ -515,6 +549,33 @@ function isSameDebugConfig(left, right) {
   const normalizedLeft = normalizeDebugConfig(left, false);
   const normalizedRight = normalizeDebugConfig(right, false);
   return JSON.stringify(normalizedLeft) === JSON.stringify(normalizedRight);
+}
+
+function getActiveDebugPresetKey(config = debugConfig) {
+  return Object.keys(DEBUG_PRESET_DEFINITIONS).find((key) => (
+    isSameDebugConfig(config, DEBUG_PRESET_DEFINITIONS[key].config)
+  )) || '';
+}
+
+function describeDebugSelection(config = debugConfig) {
+  const presetKey = getActiveDebugPresetKey(config);
+  if (presetKey) {
+    const preset = DEBUG_PRESET_DEFINITIONS[presetKey];
+    return `当前预设：${preset.label}。${preset.description}`;
+  }
+
+  const enabledCategories = DEBUG_CATEGORY_KEYS
+    .filter((key) => config.categories[key])
+    .map((key) => DEBUG_CATEGORY_DEFINITIONS[key].label);
+  const enabledChannels = DEBUG_CHANNEL_KEYS
+    .filter((key) => config.channels[key])
+    .map((key) => DEBUG_CHANNEL_DEFINITIONS[key].label);
+
+  if (enabledCategories.length === 0 || enabledChannels.length === 0) {
+    return '已自定义，但类别或通道为空，当前不会输出调试日志。';
+  }
+
+  return `自定义：${enabledCategories.length} 个类别 / ${enabledChannels.length} 个通道`;
 }
 
 function setDebugConfig(nextConfig, options = {}) {
@@ -673,7 +734,7 @@ function setViewerAudioDelayMs(nextDelayMs, { applyNative = false } = {}) {
   renderViewerPlaybackPrefsUi();
   if (applyNative && sessionRole === 'viewer' && currentRoomId) {
     applyNativeViewerPlaybackPrefs({ includeMode: false }).catch((error) => {
-      console.warn('[media-engine] setViewerAudioDelay failed:', error);
+      debugLog('audio', '[media-engine] setViewerAudioDelay failed:', error && error.message ? error.message : String(error));
     });
   }
 }
@@ -925,6 +986,57 @@ function applyDebugPreset(presetKey) {
   setDebugConfig(normalizeDebugConfig(preset.config, false));
 }
 
+function handleDebugMenuInputChange(input) {
+  const category = input.getAttribute('data-debug-category');
+  const channel = input.getAttribute('data-debug-channel');
+  if (category) {
+    setDebugCategoryEnabled(category, input.checked);
+    return;
+  }
+  if (channel) {
+    setDebugChannelEnabled(channel, input.checked);
+  }
+}
+
+function handleDebugMenuClick(event) {
+  event.stopPropagation();
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+
+  const presetButton = target.closest('[data-debug-preset]');
+  if (!(presetButton instanceof HTMLElement)) {
+    return;
+  }
+
+  const presetKey = presetButton.getAttribute('data-debug-preset');
+  if (presetKey) {
+    applyDebugPreset(presetKey);
+  }
+}
+
+function bindDebugMenuUi() {
+  if (elements.btnDebugToggle) {
+    elements.btnDebugToggle.addEventListener('click', (event) => {
+      event.stopPropagation();
+      toggleDebugMenu();
+    });
+  }
+
+  if (!elements.debugMenu) {
+    return;
+  }
+
+  elements.debugMenu.addEventListener('click', handleDebugMenuClick);
+  elements.debugMenu.addEventListener('change', (event) => {
+    const input = event.target;
+    if (input instanceof HTMLInputElement) {
+      handleDebugMenuInputChange(input);
+    }
+  });
+}
+
 function debugLog(category, ...args) {
   let resolvedCategory = category;
   let resolvedArgs = args;
@@ -1110,11 +1222,16 @@ function normalizeIceUrl(url) {
   }
 
   // `?transport=` is valid for turn/turns URLs but not for stun URLs.
-  if (value.startsWith('stun:')) {
+  const lowered = value.toLowerCase();
+  if (lowered.startsWith('turn:') || lowered.startsWith('turns:')) {
+    return null;
+  }
+
+  if (lowered.startsWith('stun:')) {
     return value.replace(/\?.*$/, '');
   }
 
-  return value;
+  return null;
 }
 
 function sanitizeIceServers(servers) {
@@ -1136,10 +1253,7 @@ function sanitizeIceServers(servers) {
         return null;
       }
 
-      return {
-        ...server,
-        urls
-      };
+      return { urls };
     })
     .filter(Boolean);
 }
@@ -1372,6 +1486,7 @@ const elements = {
   qualityPresetOptions: document.getElementById('quality-preset-options'),
   qualityPresetNote: document.getElementById('quality-preset-note'),
   qualityTuneOptions: document.getElementById('quality-tune-options'),
+  qualityKeyframeOptions: document.getElementById('quality-keyframe-options'),
   qualityObsCustomPortEnabled: document.getElementById('quality-obs-custom-port-enabled'),
   qualityObsCustomPortRow: document.getElementById('quality-obs-custom-port-row'),
   qualityObsPort: document.getElementById('quality-obs-port'),
@@ -2056,6 +2171,13 @@ function renderQualitySettingsUi() {
     );
   }
 
+  if (elements.qualityKeyframeOptions) {
+    elements.qualityKeyframeOptions.innerHTML = buildSegmentGroupMarkup(
+      QUALITY_KEYFRAME_OPTIONS,
+      qualitySettings.keyframePolicy || '1s'
+    );
+  }
+
   if (elements.qualityBitrate) {
     elements.qualityBitrate.value = String(qualitySettings.bitrate);
   }
@@ -2238,6 +2360,13 @@ function bindQualitySettingsUi() {
     renderQualitySettingsUi();
   });
 
+  bindQualitySegmentGroup(elements.qualityKeyframeOptions, (value) => {
+    qualitySettings.keyframePolicy = QUALITY_KEYFRAME_OPTIONS.some((option) => option.value === value)
+      ? value
+      : '1s';
+    renderQualitySettingsUi();
+  });
+
   if (elements.qualityHardwareAcceleration) {
     elements.qualityHardwareAcceleration.addEventListener('change', () => {
       qualitySettings.hardwareAcceleration = Boolean(elements.qualityHardwareAcceleration.checked);
@@ -2371,7 +2500,8 @@ function renderDebugMenu() {
 
   const presetItems = Object.entries(DEBUG_PRESET_DEFINITIONS).map(([key, definition]) => `
     <button class="debug-menu-preset" type="button" data-debug-preset="${key}" title="${definition.description}">
-      ${definition.label}
+      <span class="debug-menu-preset-label">${definition.label}</span>
+      <span class="debug-menu-preset-description">${definition.description}</span>
     </button>
   `).join('');
 
@@ -2388,41 +2518,60 @@ function renderDebugMenu() {
     `;
   }).join('');
 
-  const channelItems = DEBUG_CHANNEL_KEYS.map((key) => {
-    const definition = DEBUG_CHANNEL_DEFINITIONS[key];
-    return `
-      <label class="debug-menu-item">
-        <span class="debug-menu-item-main">
-          <input type="checkbox" data-debug-channel="${key}">
-          <span class="debug-menu-item-label">${definition.label}</span>
-        </span>
-        <span class="debug-menu-item-description">${definition.description}</span>
-      </label>
-    `;
-  }).join('');
+  const regularChannelItems = DEBUG_CHANNEL_KEYS
+    .filter((key) => key !== 'agentStderr')
+    .map((key) => {
+      const definition = DEBUG_CHANNEL_DEFINITIONS[key];
+      return `
+        <label class="debug-menu-item">
+          <span class="debug-menu-item-main">
+            <input type="checkbox" data-debug-channel="${key}">
+            <span class="debug-menu-item-label">${definition.label}</span>
+          </span>
+          <span class="debug-menu-item-description">${definition.description}</span>
+        </label>
+      `;
+    }).join('');
+
+  const agentStderrDefinition = DEBUG_CHANNEL_DEFINITIONS.agentStderr;
+  const advancedChannelItems = `
+    <label class="debug-menu-item debug-menu-item-warning">
+      <span class="debug-menu-item-main">
+        <input type="checkbox" data-debug-channel="agentStderr">
+        <span class="debug-menu-item-label">${agentStderrDefinition.label}</span>
+      </span>
+      <span class="debug-menu-item-description">${agentStderrDefinition.description}</span>
+    </label>
+  `;
 
   elements.debugMenu.innerHTML = `
     <div class="debug-menu-header">
       <span class="debug-menu-title">调试控制台</span>
-      <span class="debug-menu-subtitle">按类别和日志通道组合控制，默认建议保持静默或使用排障预设。</span>
+      <span class="debug-menu-subtitle">先选快速模式；需要缩小范围时，再勾选问题范围和输出内容。</span>
     </div>
     <div class="debug-menu-summary" data-debug-summary>当前为静默模式</div>
     <div class="debug-menu-section">
-      <span class="debug-menu-section-title">预设</span>
+      <span class="debug-menu-section-title">快速模式</span>
+      <p class="debug-menu-section-hint">日常先用“排障”；只有短时间复现才用“短时全量”。</p>
       <div class="debug-menu-presets">${presetItems}</div>
     </div>
     <div class="debug-menu-section">
-      <span class="debug-menu-section-title">类别</span>
+      <span class="debug-menu-section-title">问题范围</span>
+      <p class="debug-menu-section-hint">选择要看的业务范围。至少需要一个范围和一个输出内容同时开启。</p>
       <div class="debug-menu-body">${categoryItems}</div>
     </div>
     <div class="debug-menu-section">
-      <span class="debug-menu-section-title">通道</span>
-      <div class="debug-menu-body">${channelItems}</div>
+      <span class="debug-menu-section-title">输出内容</span>
+      <p class="debug-menu-section-hint">越靠下越细，日志量越大；周期统计和 breadcrumb 已做采样。</p>
+      <div class="debug-menu-body">${regularChannelItems}</div>
+    </div>
+    <div class="debug-menu-section">
+      <span class="debug-menu-section-title">深度诊断</span>
+      <p class="debug-menu-section-hint">只在复现窗口很短、必须看 agent 原始 stderr 时打开。</p>
+      <div class="debug-menu-body">${advancedChannelItems}</div>
     </div>
     <div class="debug-menu-footer">
-      <button class="debug-menu-action" type="button" data-debug-preset="quiet">全部关闭</button>
-      <button class="debug-menu-action" type="button" data-debug-preset="diagnose">推荐排障</button>
-      <button class="debug-menu-action" type="button" data-debug-preset="verbose">全部开启</button>
+      <button class="debug-menu-action" type="button" data-debug-preset="quiet">恢复静默</button>
     </div>
   `;
 }
@@ -2433,6 +2582,7 @@ if (!window.isElectron) {
 }
 
 renderDebugMenu();
+bindDebugMenuUi();
 bindQualitySettingsUi();
 renderQualitySettingsUi();
 renderViewerPlaybackPrefsUi();
@@ -2508,7 +2658,7 @@ elements.sourceAudioEnabled.addEventListener('change', updateSourceAudioUi);
 // 画质设置弹窗事件
 elements.btnConfirmQuality.addEventListener('click', () => {
   confirmQualitySelection().catch((error) => {
-    console.error('Failed to confirm quality selection:', error);
+    debugLog('video', 'Failed to confirm quality selection:', error && error.message ? error.message : String(error));
     showError(error && error.message ? error.message : '无法开始共享');
   });
 });
@@ -2540,47 +2690,6 @@ elements.btnClose.addEventListener('click', () => {
   setCloseModalState('open');
   elements.closeModal.classList.remove('hidden');
 });
-
-if (elements.btnDebugToggle) {
-  elements.btnDebugToggle.addEventListener('click', (event) => {
-    event.stopPropagation();
-    toggleDebugMenu();
-  });
-}
-
-if (elements.debugMenu) {
-  elements.debugMenu.addEventListener('click', (event) => {
-    event.stopPropagation();
-  });
-
-  elements.debugMenu.addEventListener('change', (event) => {
-    const input = event.target;
-    if (!(input instanceof HTMLInputElement)) {
-      return;
-    }
-    const category = input.getAttribute('data-debug-category');
-    const channel = input.getAttribute('data-debug-channel');
-    if (category) {
-      setDebugCategoryEnabled(category, input.checked);
-      return;
-    }
-    if (channel) {
-      setDebugChannelEnabled(channel, input.checked);
-    }
-  });
-
-  elements.debugMenu.addEventListener('click', (event) => {
-    const target = event.target;
-    if (!(target instanceof HTMLElement)) {
-      return;
-    }
-
-    const presetKey = target.getAttribute('data-debug-preset');
-    if (presetKey) {
-      applyDebugPreset(presetKey);
-    }
-  });
-}
 
 document.addEventListener('click', () => {
   closeDebugMenu();
@@ -2666,7 +2775,7 @@ async function goBack() {
   try {
     await stopScreenShare();
   } catch (error) {
-    console.error('Failed to stop share while leaving host panel:', error);
+    debugLog('video', 'Failed to stop share while leaving host panel:', error && error.message ? error.message : String(error));
   }
   disconnectWebSocket();
   await transitionToHome('host');
@@ -2747,7 +2856,7 @@ function connectWebSocket() {
       try {
         await handleMessage(data);
       } catch (error) {
-        console.error('Unhandled message processing error:', error);
+        debugLog('connection', 'Unhandled message processing error:', error && error.message ? error.message : String(error));
       }
     };
 
@@ -2766,7 +2875,7 @@ function connectWebSocket() {
     };
 
     ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
+      debugLog('connection', 'WebSocket error:', error && error.message ? error.message : String(error));
 
       if (!settled) {
         wsConnectPromise = null;
@@ -3169,6 +3278,15 @@ function applyUpdateStatus(status) {
 
 // Host: 显示屏幕源选择弹窗
 async function showSourceSelection() {
+  if (sourceSelectionInFlight) {
+    return;
+  }
+
+  sourceSelectionInFlight = true;
+  if (elements.btnConfirmQuality) {
+    elements.btnConfirmQuality.disabled = true;
+  }
+
   try {
     await waitForWsConnected();
 
@@ -3185,8 +3303,13 @@ async function showSourceSelection() {
 
     showSourceModal(sources);
   } catch (error) {
-    console.error('Error loading sources:', error);
+    debugLog('video', 'Error loading sources:', error && error.message ? error.message : String(error));
     showError('Failed to list capture targets: ' + error.message);
+  } finally {
+    sourceSelectionInFlight = false;
+    if (elements.btnConfirmQuality) {
+      elements.btnConfirmQuality.disabled = false;
+    }
   }
 }
 
@@ -3212,7 +3335,7 @@ async function refreshSources() {
 
     btn.style.animation = '';
   } catch (error) {
-    console.error('Error refreshing sources:', error);
+    debugLog('video', 'Error refreshing sources:', error && error.message ? error.message : String(error));
     showError('刷新失败: ' + error.message);
     elements.btnRefreshSources.style.animation = '';
   }
@@ -3228,6 +3351,111 @@ function parseSelectedSourceAudioCandidates(selectedItem) {
     const parsed = JSON.parse(selectedItem.dataset.audioCandidates);
     return Array.isArray(parsed) ? parsed : [];
   } catch (_error) {
+    return [];
+  }
+}
+
+function withClientTimeout(promise, timeoutMs, timeoutMessage) {
+  const normalizedTimeout = Number(timeoutMs);
+  if (!Number.isFinite(normalizedTimeout) || normalizedTimeout <= 0) {
+    return promise;
+  }
+
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(timeoutMessage || 'operation-timeout')), normalizedTimeout);
+    })
+  ]);
+}
+
+function normalizeAudioProcessMatchValue(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\.exe$/i, '')
+    .replace(/\[[^\]]+\]/g, ' ')
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, ' ')
+    .trim();
+}
+
+function buildClientAudioCandidate(processInfo, confidence, reason) {
+  const pid = Number(processInfo && processInfo.pid);
+  const normalizedPid = Number.isFinite(pid) && pid > 0 ? pid : null;
+  const processName = String(processInfo && processInfo.name ? processInfo.name : `PID ${normalizedPid || 'unknown'}`);
+
+  return {
+    id: normalizedPid ? `process:${normalizedPid}` : `process:${processName}`,
+    mode: 'process',
+    pid: normalizedPid,
+    processName,
+    confidence,
+    reason
+  };
+}
+
+function matchAudioCandidatesForSource(source, processList) {
+  const processes = Array.isArray(processList) ? processList : [];
+  if (!source || !processes.length) {
+    return [];
+  }
+
+  const sourcePid = Number(source.pid);
+  const normalizedPid = Number.isFinite(sourcePid) && sourcePid > 0 ? sourcePid : null;
+  if (normalizedPid) {
+    const exactMatches = processes.filter((processInfo) => Number(processInfo && processInfo.pid) === normalizedPid);
+    if (exactMatches.length > 0) {
+      return exactMatches.map((processInfo) => buildClientAudioCandidate(processInfo, 1, 'window-pid-match'));
+    }
+  }
+
+  const normalizedTitle = normalizeAudioProcessMatchValue(source.title || source.name || '');
+  if (!normalizedTitle) {
+    return [];
+  }
+
+  const fuzzyMatches = [];
+  for (const processInfo of processes) {
+    const processToken = normalizeAudioProcessMatchValue(processInfo && processInfo.name);
+    if (!processToken) {
+      continue;
+    }
+
+    if (normalizedTitle.includes(processToken) || processToken.includes(normalizedTitle)) {
+      fuzzyMatches.push(buildClientAudioCandidate(processInfo, 0.35, 'window-title-match'));
+    }
+
+    if (fuzzyMatches.length >= 3) {
+      break;
+    }
+  }
+
+  return fuzzyMatches;
+}
+
+async function discoverAudioCandidatesForSource(source) {
+  const audioApi = window.electronAPI &&
+    window.electronAPI.mediaEngine &&
+    window.electronAPI.mediaEngine.audio;
+  if (!audioApi || !audioApi.isPlatformSupported || !audioApi.checkPermission || !audioApi.getProcessList) {
+    return [];
+  }
+
+  try {
+    const supported = await withClientTimeout(audioApi.isPlatformSupported(), 1500, 'audio-platform-probe-timeout');
+    if (!supported) {
+      return [];
+    }
+
+    const permission = await withClientTimeout(audioApi.checkPermission(), 1500, 'audio-permission-probe-timeout');
+    const permissionStatus = String(permission && permission.status ? permission.status : 'unknown');
+    if (permissionStatus !== 'authorized') {
+      return [];
+    }
+
+    const processList = await withClientTimeout(audioApi.getProcessList(), 2500, 'audio-process-list-timeout');
+    return matchAudioCandidatesForSource(source, processList);
+  } catch (error) {
+    debugLog('audio', '[source-audio] deferred audio discovery failed:', error && error.message ? error.message : String(error));
     return [];
   }
 }
@@ -3259,6 +3487,7 @@ function getSelectedCaptureSource() {
       displayId: selectedItem.dataset.displayId || null,
       nativeMonitorIndex: selectedItem.dataset.nativeMonitorIndex || null,
       hwnd: selectedItem.dataset.hwnd || null,
+      pid: selectedItem.dataset.pid ? Number(selectedItem.dataset.pid) : null,
       state: selectedItem.dataset.state || 'normal',
       isMinimized: selectedItem.dataset.isMinimized === 'true'
     };
@@ -3338,6 +3567,7 @@ function showSourceModal(sources) {
     item.dataset.displayId = source.displayId != null ? String(source.displayId) : '';
     item.dataset.nativeMonitorIndex = source.nativeMonitorIndex != null ? String(source.nativeMonitorIndex) : '';
     item.dataset.hwnd = source.hwnd != null ? String(source.hwnd) : '';
+    item.dataset.pid = source.pid != null ? String(source.pid) : '';
     item.dataset.state = source.state || 'normal';
     item.dataset.isMinimized = source.isMinimized ? 'true' : 'false';
     item.dataset.audioCandidates = JSON.stringify(Array.isArray(source.audioCandidates) ? source.audioCandidates : []);
@@ -3447,7 +3677,7 @@ async function confirmSourceAndShare() {
   try {
     await showAudioProcessSelection();
   } catch (error) {
-    console.error('Failed to start native share session:', error);
+    debugLog('video', 'Failed to start native share session:', error && error.message ? error.message : String(error));
     showError(error && error.message ? error.message : 'failed-to-start-native-share');
   }
 }
@@ -3462,14 +3692,24 @@ async function confirmSourceAndShare() {
 async function showAudioProcessSelection() {
   const selectedItem = getSelectedSourceItem();
   const audioEnabled = Boolean(elements.sourceAudioEnabled && elements.sourceAudioEnabled.checked);
-  const audioCandidates = parseSelectedSourceAudioCandidates(selectedItem);
-  const audioIndex = Math.max(0, Number(selectedItem && selectedItem.dataset.audioIndex) || 0);
-  const audioCandidate = audioCandidates[audioIndex] || null;
 
   if (!audioEnabled) {
     await startScreenShareWithSource(currentCaptureSource);
     return;
   }
+
+  let audioCandidates = parseSelectedSourceAudioCandidates(selectedItem);
+  if (!audioCandidates.length) {
+    audioCandidates = await discoverAudioCandidatesForSource(currentCaptureSource);
+    if (selectedItem && audioCandidates.length) {
+      selectedItem.dataset.audioCandidates = JSON.stringify(audioCandidates);
+      selectedItem.dataset.audioIndex = '0';
+      updateSourceAudioUi();
+    }
+  }
+
+  const audioIndex = Math.max(0, Number(selectedItem && selectedItem.dataset.audioIndex) || 0);
+  const audioCandidate = audioCandidates[audioIndex] || null;
 
   if (!audioCandidate || !audioCandidate.pid) {
     showError('当前窗口没有可用音频，将仅共享画面');
@@ -3538,7 +3778,7 @@ async function joinRoomById(roomId, { source = 'direct' } = {}) {
       includeMode: true
     });
   } catch (error) {
-    console.warn('[media-engine] apply viewer playback prefs before join failed:', error);
+    debugLog('audio', '[media-engine] apply viewer playback prefs before join failed:', error && error.message ? error.message : String(error));
   }
 
   currentRoomId = normalizedRoomId;

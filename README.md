@@ -2,18 +2,19 @@
 
 VDS is an Electron desktop client plus a Node.js signaling server for cascade screen sharing.
 
-## 1.6.2 Overview
+## 1.6.3 Overview
 
-Version `1.6.2` keeps the native media path as the only mainline, keeps OBS local ingest as the formal second host backend, and adds a public-room lobby flow on top of direct join.
+Version `1.6.3` focuses on pure-P2P stability: RTP loss recovery, Trickle ICE, failfast diagnostics, and last-chance NAT-PMP / PCP mapping after normal ICE fails.
 
 Highlights:
 
-- added a lobby view for viewers with `Lobby / Direct` tabs, public room polling, and manual refresh
-- added host-side public room listing control so a room can opt into the lobby before going live
-- auto-copy the room code when room creation succeeds, including the OBS ingest path
-- kept the OBS host UI on a fixed default local port (`61080`), a one-click `Copy and Start` flow, and optional saved custom port overrides
+- added NACK retransmission support, PLI handling, and keyframe request diagnostics in the native peer transport
+- added Trickle ICE candidate forwarding and clearer P2P failfast reasons
+- added last-chance NAT-PMP / PCP mapping after failfast, with mapped candidates injected through Trickle ICE
+- added advanced keyframe controls for `1s`, `0.5s`, and `all-intra` troubleshooting
+- kept TURN/TURNS filtered out of runtime ICE configuration to preserve the pure-P2P policy
 - kept native `H.264 / H.265` + encoded relay fanout as the core production path
-- kept viewer playback on the original passthrough path with manual audio delay instead of the removed legacy synced path
+- kept OBS local ingest and public-room lobby behavior from the 1.6.2 mainline
 
 Current media path:
 
@@ -71,6 +72,7 @@ Current desktop UI supports:
 - hardware encoder selection: auto or manually select validated hardware encoders
 - encoder preset: `quality / balanced / speed`
 - tune: `fastdecode / zerolatency`
+- keyframe interval: `1s / 0.5s / all-intra`
 
 OBS mode currently behaves like this:
 
@@ -106,7 +108,7 @@ Viewer join mode currently behaves like this:
   - prepares `server/` for Docker upload
 - `server/` is the deployable server directory
 - desktop auto-update feed is served from `server/updates/`
-- `1.6.2` release assets are the installer, blockmap, and `latest.yml`
+- `1.6.3` release assets are the installer, blockmap, and `latest.yml`
 - release notes for recent versions are tracked in [CHANGELOG.md](/d:/project/videosharing/CHANGELOG.md)
 
 ## Source Control Rules

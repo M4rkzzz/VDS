@@ -1,4 +1,6 @@
 const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, desktopCapturer, shell, screen, clipboard } = require('electron');
+const childProcess = require('child_process');
+const dgram = require('dgram');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -13,7 +15,11 @@ const ENABLE_AGENT_HOST_CAPTURE_PROCESS = process.env.VDS_ENABLE_AGENT_HOST_CAPT
 const ENABLE_NATIVE_HOST_PREVIEW_SURFACE = true;
 const ENABLE_NATIVE_PEER_TRANSPORT = true;
 const ENABLE_NATIVE_SURFACE_EMBEDDING = process.env.VDS_ENABLE_NATIVE_SURFACE_EMBEDDING !== '0';
-const DEBUG_CATEGORIES = ['connection', 'video', 'audio', 'update', 'misc'];
+const ENABLE_CAPTURE_TARGET_NATIVE_METADATA = process.env.VDS_ENABLE_CAPTURE_TARGET_NATIVE_METADATA !== '0';
+const ENABLE_CAPTURE_TARGET_WINDOW_ICONS = process.env.VDS_ENABLE_CAPTURE_TARGET_WINDOW_ICONS === '1';
+const CAPTURE_TARGET_LIST_TIMEOUT_MS = Number(process.env.VDS_CAPTURE_TARGET_LIST_TIMEOUT_MS || 2500);
+const DEBUG_PRESET = String(process.env.VDS_DEBUG_PRESET || '').trim();
+const DEBUG_CATEGORIES = ['connection', 'p2p', 'video', 'audio', 'update', 'misc'];
 const DEBUG_CHANNELS = ['renderer', 'nativeEvents', 'nativeSteps', 'periodicStats', 'mainProcess', 'agentBreadcrumbs', 'agentStderr'];
 
 let mainWindow = null;
@@ -27,11 +33,13 @@ let mediaAgentManager = null;
 let autoUpdater = null;
 let autoUpdaterConfigured = false;
 let rendererDebugConfig = buildDefaultRendererDebugConfig(false);
+const mainDebugRateLimitState = new Map();
 let quitInProgress = false;
 let quitFinalizeTimer = null;
 let audioCapture = undefined;
 let audioCaptureLoadError = null;
 let audioBridgeAttached = false;
+const activeNatMappings = new Map();
 let emulatedFullscreenState = {
   active: false,
   bounds: null,
@@ -157,14 +165,15 @@ ipcMain.handle('get-runtime-config', () => ({
   enableAgentHostCaptureProcess: ENABLE_AGENT_HOST_CAPTURE_PROCESS,
   enableNativeHostPreviewSurface: ENABLE_NATIVE_HOST_PREVIEW_SURFACE,
   enableNativePeerTransport: ENABLE_NATIVE_PEER_TRANSPORT,
-  enableNativeSurfaceEmbedding: ENABLE_NATIVE_SURFACE_EMBEDDING
+  enableNativeSurfaceEmbedding: ENABLE_NATIVE_SURFACE_EMBEDDING,
+  debugPreset: DEBUG_PRESET
 }));
 
 ipcMain.handle('get-desktop-sources', async () => {
   try {
     return await listDesktopSources();
   } catch (error) {
-    console.error('Error getting desktop sources:', error);
+    logMainProcessDebug('video', 'Error getting desktop sources:', error && error.message ? error.message : String(error));
     return [];
   }
 });
@@ -187,9 +196,13 @@ ipcMain.handle('media-engine-start', async () => getMediaAgentManager().start())
 ipcMain.handle('media-engine-stop', async () => getMediaAgentManager().stop());
 ipcMain.handle('media-engine-list-capture-targets', async () => {
   try {
-    return await listCaptureTargets();
+    return await withTimeout(
+      listCaptureTargets(),
+      CAPTURE_TARGET_LIST_TIMEOUT_MS,
+      'capture-target-list-timeout'
+    );
   } catch (error) {
-    console.error('[media-agent] listCaptureTargets failed:', error);
+    logMainProcessDebug('video', '[media-agent] listCaptureTargets failed:', error && error.message ? error.message : String(error));
     return [];
   }
 });
@@ -205,7 +218,7 @@ ipcMain.handle('media-engine-audio-is-capturing', () => {
     const capture = getAudioCapture();
     return Boolean(audioCapture && audioCapture.isCapturing);
   } catch (error) {
-    console.error('[media-engine] Failed to read audio capture state:', error);
+    logMainProcessDebug('audio', '[media-engine] Failed to read audio capture state:', error && error.message ? error.message : String(error));
     return false;
   }
 });
@@ -247,6 +260,7 @@ ipcMain.handle('media-engine-get-viewer-volume', async () => {
 });
 ipcMain.handle('media-engine-get-capabilities', async () => invokeMediaEngine('getCapabilities'));
 ipcMain.handle('media-engine-get-stats', async (_event, options) => invokeMediaEngine('getStats', options || {}));
+ipcMain.handle('p2p-open-nat-mapping', async (_event, options) => openP2PNatMappings(options || {}));
 ipcMain.handle('window-is-maximized', () => Boolean(mainWindow && mainWindow.isMaximized()));
 ipcMain.handle('window-get-bounds', () => {
   if (!mainWindow) {
@@ -688,6 +702,24 @@ function shouldLogMediaInvoke(method, category = 'misc') {
   return shouldLogMediaDebug(category, 'mainProcess');
 }
 
+function shouldEmitMainDebugLog(key, intervalMs = 1000) {
+  if (VERBOSE_MEDIA_LOGS || intervalMs <= 0) {
+    return { emit: true, suppressed: 0 };
+  }
+
+  const now = Date.now();
+  const state = mainDebugRateLimitState.get(key) || { lastAt: 0, suppressed: 0 };
+  if (now - state.lastAt < intervalMs) {
+    state.suppressed += 1;
+    mainDebugRateLimitState.set(key, state);
+    return { emit: false, suppressed: state.suppressed };
+  }
+
+  const suppressed = state.suppressed;
+  mainDebugRateLimitState.set(key, { lastAt: now, suppressed: 0 });
+  return { emit: true, suppressed };
+}
+
 function logMainProcessDebug(category, ...args) {
   if (!shouldLogMediaDebug(category, 'mainProcess')) {
     return;
@@ -705,11 +737,11 @@ function logMainProcessWarning(category, ...args) {
 function enrichEmbeddedSurfaceOptions(options) {
   const normalized = { ...(options || {}) };
   if (shouldLogMediaDebug('video', 'mainProcess')) {
-    console.log('[media-engine surface] enrich input:', JSON.stringify(summarizeMediaEnginePayload(normalized)));
+    logMainProcessDebug('video', '[media-engine surface] enrich input:', JSON.stringify(summarizeMediaEnginePayload(normalized)));
   }
   if (!normalized.embedded) {
     if (shouldLogMediaDebug('video', 'mainProcess')) {
-      console.log('[media-engine surface] non-embedded surface request');
+      logMainProcessDebug('video', '[media-engine surface] non-embedded surface request');
     }
     return normalized;
   }
@@ -720,7 +752,7 @@ function enrichEmbeddedSurfaceOptions(options) {
   }
   normalized.parentWindowHandle = parentWindowHandle;
   if (shouldLogMediaDebug('video', 'mainProcess')) {
-    console.log('[media-engine surface] enrich output:', JSON.stringify(summarizeMediaEnginePayload(normalized)));
+    logMainProcessDebug('video', '[media-engine surface] enrich output:', JSON.stringify(summarizeMediaEnginePayload(normalized)));
   }
   return normalized;
 }
@@ -774,13 +806,13 @@ function getAudioCapture() {
     if (audioCapture) {
       attachMediaEngineAudioBridge();
       if (shouldLogMediaDebug('audio')) {
-        console.log('Media engine audio bridge ready');
+        logMainProcessDebug('audio', 'Media engine audio bridge ready');
       }
     }
   } catch (error) {
     audioCapture = null;
     audioCaptureLoadError = error;
-    console.error('Failed to setup media engine audio bridge:', error);
+    logMainProcessDebug('audio', 'Failed to setup media engine audio bridge:', error && error.message ? error.message : String(error));
   }
 
   return audioCapture;
@@ -795,34 +827,394 @@ function invokeAudioCaptureOperation(method, ...args) {
   try {
     return capture[method](...args);
   } catch (error) {
-    console.error(`[media-engine] audio ${method} failed:`, error);
+    logMainProcessDebug('audio', `[media-engine] audio ${method} failed:`, error && error.message ? error.message : String(error));
     throw error;
   }
 }
 
-async function listDesktopSources() {
+function withTimeout(promise, timeoutMs, timeoutMessage) {
+  const normalizedTimeout = Number(timeoutMs);
+  if (!Number.isFinite(normalizedTimeout) || normalizedTimeout <= 0) {
+    return promise;
+  }
+
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(timeoutMessage || 'operation-timeout')), normalizedTimeout);
+    })
+  ]);
+}
+
+function parseIceCandidateForMapping(candidate) {
+  const raw = typeof candidate === 'string'
+    ? candidate
+    : String(candidate && candidate.candidate ? candidate.candidate : '');
+  const parts = raw.trim().split(/\s+/);
+  if (!raw || parts.length < 8) {
+    return null;
+  }
+
+  const foundation = parts[0].replace(/^candidate:/, '') || 'vds';
+  const component = Number(parts[1]) || 1;
+  const protocol = String(parts[2] || '').toLowerCase();
+  const priority = Number(parts[3]) || 1694498815;
+  const address = String(parts[4] || '').trim();
+  const port = Number(parts[5]);
+  const typIndex = parts.findIndex((part) => String(part).toLowerCase() === 'typ');
+  const type = typIndex >= 0 ? String(parts[typIndex + 1] || '').toLowerCase() : '';
+  if (protocol !== 'udp' || type !== 'host' || !isValidIpv4(address) || !Number.isInteger(port) || port <= 0 || port > 65535) {
+    return null;
+  }
+
+  return {
+    foundation,
+    component,
+    priority,
+    address,
+    port,
+    sdpMid: candidate && typeof candidate === 'object' ? String(candidate.sdpMid || '') : '',
+    sdpMLineIndex: candidate && typeof candidate === 'object' && Number.isFinite(candidate.sdpMLineIndex)
+      ? candidate.sdpMLineIndex
+      : 0
+  };
+}
+
+function isValidIpv4(address) {
+  const parts = String(address || '').split('.');
+  return parts.length === 4 && parts.every((part) => {
+    if (!/^\d{1,3}$/.test(part)) {
+      return false;
+    }
+    const value = Number(part);
+    return Number.isInteger(value) && value >= 0 && value <= 255;
+  });
+}
+
+function ipv4ToBuffer(address) {
+  return Buffer.from(String(address || '').split('.').map((part) => Number(part) & 0xff));
+}
+
+function bufferToIpv4(buffer, offset = 0) {
+  if (!buffer || buffer.length < offset + 4) {
+    return '';
+  }
+  return `${buffer[offset]}.${buffer[offset + 1]}.${buffer[offset + 2]}.${buffer[offset + 3]}`;
+}
+
+function ipv6MappedIpv4FromBuffer(buffer, offset = 0) {
+  if (!buffer || buffer.length < offset + 16) {
+    return '';
+  }
+  const prefixZero = buffer.subarray(offset, offset + 10).every((value) => value === 0);
+  const mapped = buffer[offset + 10] === 0xff && buffer[offset + 11] === 0xff;
+  if (!prefixZero || !mapped) {
+    return '';
+  }
+  return bufferToIpv4(buffer, offset + 12);
+}
+
+function execFilePromise(file, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    childProcess.execFile(file, args, {
+      windowsHide: true,
+      timeout: options.timeout || 2500,
+      maxBuffer: 64 * 1024
+    }, (error, stdout, stderr) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(String(stdout || stderr || '').trim());
+    });
+  });
+}
+
+async function resolveDefaultGatewayIpv4() {
+  if (process.platform === 'win32') {
+    try {
+      const output = await execFilePromise('powershell.exe', [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        "(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1 -ExpandProperty NextHop)"
+      ]);
+      const gateway = output.split(/\r?\n/).map((line) => line.trim()).find(isValidIpv4);
+      if (gateway) {
+        return gateway;
+      }
+    } catch (error) {
+      logMainProcessDebug('p2p', '[p2p-nat] Get-NetRoute failed:', error && error.message ? error.message : String(error));
+    }
+  }
+
+  try {
+    const command = process.platform === 'win32' ? 'route' : 'ip';
+    const args = process.platform === 'win32' ? ['print', '-4', '0.0.0.0'] : ['route', 'show', 'default'];
+    const output = await execFilePromise(command, args);
+    const match = output.match(/(?:default\s+via|0\.0\.0\.0\s+0\.0\.0\.0)\s+(\d+\.\d+\.\d+\.\d+)/i);
+    if (match && isValidIpv4(match[1])) {
+      return match[1];
+    }
+  } catch (error) {
+    logMainProcessDebug('p2p', '[p2p-nat] route lookup failed:', error && error.message ? error.message : String(error));
+  }
+
+  return '';
+}
+
+function udpRequest(address, port, payload, timeoutMs = 1200) {
+  return new Promise((resolve, reject) => {
+    const socket = dgram.createSocket('udp4');
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.close();
+      reject(new Error('udp-request-timeout'));
+    }, timeoutMs);
+
+    socket.once('error', (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.close();
+      reject(error);
+    });
+
+    socket.once('message', (message) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.close();
+      resolve(message);
+    });
+
+    socket.send(payload, port, address, (error) => {
+      if (error && !settled) {
+        settled = true;
+        clearTimeout(timer);
+        socket.close();
+        reject(error);
+      }
+    });
+  });
+}
+
+async function requestNatPmpExternalAddress(gateway) {
+  const response = await udpRequest(gateway, 5351, Buffer.from([0, 0]), 1200);
+  if (response.length < 12 || response[0] !== 0 || response[1] !== 128 || response.readUInt16BE(2) !== 0) {
+    throw new Error('nat-pmp-public-address-failed');
+  }
+  return bufferToIpv4(response, 8);
+}
+
+async function requestNatPmpUdpMapping(gateway, internalPort, lifetimeSeconds) {
+  const request = Buffer.alloc(12);
+  request[0] = 0;
+  request[1] = 1;
+  request.writeUInt16BE(internalPort, 4);
+  request.writeUInt16BE(internalPort, 6);
+  request.writeUInt32BE(lifetimeSeconds, 8);
+  const response = await udpRequest(gateway, 5351, request, 1200);
+  if (response.length < 16 || response[0] !== 0 || response[1] !== 129 || response.readUInt16BE(2) !== 0) {
+    throw new Error('nat-pmp-map-udp-failed');
+  }
+  return {
+    protocol: 'nat-pmp',
+    internalPort: response.readUInt16BE(8),
+    externalPort: response.readUInt16BE(10),
+    lifetimeSeconds: response.readUInt32BE(12)
+  };
+}
+
+async function requestPcpUdpMapping(gateway, internalPort, lifetimeSeconds) {
+  const nonce = Buffer.alloc(12);
+  for (let index = 0; index < nonce.length; index += 1) {
+    nonce[index] = Math.floor(Math.random() * 256);
+  }
+  const request = Buffer.alloc(60);
+  request[0] = 2;
+  request[1] = 1;
+  request.writeUInt32BE(lifetimeSeconds, 4);
+  nonce.copy(request, 24);
+  request[36] = 17;
+  request.writeUInt16BE(internalPort, 40);
+  request.writeUInt16BE(internalPort, 42);
+  const response = await udpRequest(gateway, 5351, request, 1500);
+  if (response.length < 60 || response[0] !== 2 || response[1] !== 129 || response[3] !== 0) {
+    throw new Error('pcp-map-udp-failed');
+  }
+  const externalAddress = ipv6MappedIpv4FromBuffer(response, 44);
+  if (!externalAddress) {
+    throw new Error('pcp-external-ipv4-unavailable');
+  }
+  return {
+    protocol: 'pcp',
+    internalPort: response.readUInt16BE(40),
+    externalPort: response.readUInt16BE(42),
+    externalAddress,
+    lifetimeSeconds: response.readUInt32BE(4)
+  };
+}
+
+function buildMappedIceCandidate(candidate, mapping, externalAddress) {
+  const publicIp = mapping.externalAddress || externalAddress;
+  if (!isValidIpv4(publicIp) || !mapping.externalPort) {
+    return null;
+  }
+  const foundation = `${candidate.foundation}mp`;
+  return {
+    candidate: `candidate:${foundation} ${candidate.component} udp ${Math.max(1, candidate.priority - 1000)} ${publicIp} ${mapping.externalPort} typ srflx raddr ${candidate.address} rport ${candidate.port}`,
+    sdpMid: candidate.sdpMid || 'video',
+    sdpMLineIndex: Number.isFinite(candidate.sdpMLineIndex) ? candidate.sdpMLineIndex : 0
+  };
+}
+
+async function openP2PNatMappings(options = {}) {
+  const lifetimeSeconds = Math.max(60, Math.min(600, Number(options.lifetimeSeconds) || 180));
+  const rawCandidates = Array.isArray(options.candidates) ? options.candidates : [];
+  const candidates = rawCandidates.map(parseIceCandidateForMapping).filter(Boolean);
+  const uniqueByPort = new Map();
+  for (const candidate of candidates) {
+    if (!uniqueByPort.has(candidate.port)) {
+      uniqueByPort.set(candidate.port, candidate);
+    }
+  }
+
+  if (uniqueByPort.size === 0) {
+    return {
+      ok: false,
+      reason: 'no-host-udp-candidates',
+      candidates: []
+    };
+  }
+
+  const gateway = await resolveDefaultGatewayIpv4();
+  if (!gateway) {
+    return {
+      ok: false,
+      reason: 'default-gateway-not-found',
+      candidates: []
+    };
+  }
+
+  let publicAddress = '';
+  try {
+    publicAddress = await requestNatPmpExternalAddress(gateway);
+  } catch (error) {
+    logMainProcessDebug('p2p', '[p2p-nat] NAT-PMP public address failed:', error && error.message ? error.message : String(error));
+  }
+
+  const mappedCandidates = [];
+  const errors = [];
+  for (const candidate of uniqueByPort.values()) {
+    try {
+      let mapping;
+      try {
+        mapping = await requestNatPmpUdpMapping(gateway, candidate.port, lifetimeSeconds);
+        if (!publicAddress) {
+          throw new Error('nat-pmp-public-address-unavailable');
+        }
+        mapping.externalAddress = publicAddress;
+      } catch (natPmpError) {
+        mapping = await requestPcpUdpMapping(gateway, candidate.port, lifetimeSeconds);
+        errors.push(`nat-pmp:${candidate.port}:${natPmpError && natPmpError.message ? natPmpError.message : String(natPmpError)}`);
+      }
+
+      const mappedCandidate = buildMappedIceCandidate(candidate, mapping, publicAddress);
+      if (mappedCandidate) {
+        mappedCandidates.push(mappedCandidate);
+        activeNatMappings.set(`${candidate.address}:${candidate.port}`, {
+          gateway,
+          internalPort: candidate.port,
+          protocol: mapping.protocol,
+          expiresAt: Date.now() + mapping.lifetimeSeconds * 1000
+        });
+      }
+    } catch (error) {
+      errors.push(`${candidate.port}:${error && error.message ? error.message : String(error)}`);
+    }
+  }
+
+  return {
+    ok: mappedCandidates.length > 0,
+    protocol: mappedCandidates.length > 0 ? 'nat-pmp/pcp' : '',
+    gateway,
+    candidates: mappedCandidates,
+    errors,
+    reason: mappedCandidates.length > 0 ? 'nat-mapping-ready' : 'nat-mapping-failed'
+  };
+}
+
+function releaseActiveNatMappings() {
+  for (const mapping of activeNatMappings.values()) {
+    if (!mapping || !mapping.gateway || !mapping.internalPort) {
+      continue;
+    }
+    if (mapping.protocol === 'nat-pmp') {
+      requestNatPmpUdpMapping(mapping.gateway, mapping.internalPort, 0).catch(() => {});
+    } else if (mapping.protocol === 'pcp') {
+      requestPcpUdpMapping(mapping.gateway, mapping.internalPort, 0).catch(() => {});
+    }
+  }
+  activeNatMappings.clear();
+}
+
+async function listDesktopSources(options = {}) {
+  const includeNativeFallbacks = options.includeNativeFallbacks === true;
+  const windowMetadata = options.windowMetadata instanceof Map
+    ? options.windowMetadata
+    : null;
   const rawSources = await desktopCapturer.getSources({
     types: ['window', 'screen'],
     thumbnailSize: { width: 320, height: 180 },
-    fetchWindowIcons: true
+    fetchWindowIcons: ENABLE_CAPTURE_TARGET_WINDOW_ICONS
   });
 
-  const normalizedSources = sortDesktopSources(rawSources.map(normalizeDesktopSource));
+  const normalizedSources = sortDesktopSources(rawSources.map(normalizeDesktopSource).filter(Boolean));
+  if (!includeNativeFallbacks) {
+    return normalizedSources;
+  }
+
   const syntheticSources = buildSyntheticFullscreenSources(normalizedSources);
-  const minimizedSources = buildSyntheticMinimizedSources(normalizedSources);
+  const minimizedSources = buildSyntheticMinimizedSources(normalizedSources, windowMetadata);
   return sortDesktopSources(normalizedSources.concat(syntheticSources, minimizedSources));
 }
 
 async function listCaptureTargets() {
-  const sources = await listDesktopSources();
-  const audioDiscovery = inspectAudioDiscovery();
+  const windowMetadata = ENABLE_CAPTURE_TARGET_NATIVE_METADATA
+    ? getTopLevelWindowMetadataMap()
+    : new Map();
+  const sources = await listDesktopSources({
+    includeNativeFallbacks: ENABLE_CAPTURE_TARGET_NATIVE_METADATA,
+    windowMetadata
+  });
+  const audioDiscovery = createDeferredAudioDiscoverySnapshot();
   const displayMetadata = getDisplayMetadataMap();
-  const windowMetadata = getTopLevelWindowMetadataMap();
 
   return sources.map((source) => buildCaptureTarget(source, audioDiscovery, windowMetadata, displayMetadata));
 }
 
-function inspectAudioDiscovery() {
+function createDeferredAudioDiscoverySnapshot() {
+  return {
+    supported: false,
+    permissionStatus: 'deferred',
+    permission: null,
+    processes: [],
+    error: null
+  };
+}
+
+function inspectAudioDiscovery(options = {}) {
+  const includeProcesses = options.includeProcesses === true;
   const snapshot = {
     supported: false,
     permissionStatus: 'unsupported',
@@ -844,7 +1236,7 @@ function inspectAudioDiscovery() {
     snapshot.permission = capture.checkPermission ? capture.checkPermission() : { status: 'unknown' };
     snapshot.permissionStatus = String(snapshot.permission && snapshot.permission.status ? snapshot.permission.status : 'unknown');
 
-    if (snapshot.permissionStatus === 'authorized' && capture.getProcessList) {
+    if (includeProcesses && snapshot.permissionStatus === 'authorized' && capture.getProcessList) {
       const processes = capture.getProcessList();
       snapshot.processes = Array.isArray(processes) ? processes : [];
     }
@@ -857,7 +1249,7 @@ function inspectAudioDiscovery() {
 }
 
 function getMediaEngineAudioBridgeStatus() {
-  const discovery = inspectAudioDiscovery();
+  const discovery = inspectAudioDiscovery({ includeProcesses: false });
   return {
     implementation: 'main-process-process-audio-capture',
     backendMode: 'renderer-web-audio-bridge',
@@ -1148,8 +1540,10 @@ function buildSyntheticFullscreenSources(existingSources) {
   }
 }
 
-function buildSyntheticMinimizedSources(existingSources) {
-  const windowMetadata = getTopLevelWindowMetadataMap();
+function buildSyntheticMinimizedSources(existingSources, windowMetadata = null) {
+  if (!(windowMetadata instanceof Map)) {
+    windowMetadata = getTopLevelWindowMetadataMap();
+  }
   if (!windowMetadata || windowMetadata.size === 0) {
     return [];
   }
@@ -1258,19 +1652,23 @@ function getMediaAgentManager() {
       logger: {
         log: (...args) => {
           if (shouldLogMediaDebug('video', 'agentStderr')) {
-            console.log(...args);
+            logMainProcessDebug('video', ...args);
           }
         },
         warn: (...args) => {
           const message = args.map((entry) => String(entry)).join(' ');
           if (message.includes('[media-agent breadcrumb]')) {
             if (shouldLogMediaDebug('video', 'agentBreadcrumbs')) {
-              console.warn(...args);
+              const normalizedMessage = message.replace(/\bt=\d+\b/g, 't=*');
+              const rate = shouldEmitMainDebugLog(`agent-breadcrumb:${normalizedMessage}`, 1000);
+              if (rate.emit) {
+                logMainProcessWarning('video', ...args, rate.suppressed ? `suppressed=${rate.suppressed}` : '');
+              }
             }
             return;
           }
           if (shouldLogMediaDebug('video', 'agentStderr')) {
-            console.warn(...args);
+            logMainProcessWarning('video', ...args);
           }
         },
         error: (...args) => {
@@ -1297,12 +1695,12 @@ function getMediaAgentManager() {
 async function invokeMediaEngine(method, params) {
   const debugCategory = getMediaEngineDebugCategory(method);
   if (shouldLogMediaInvoke(method, debugCategory)) {
-    console.log(`[media-agent invoke] ${method} request:`, JSON.stringify(summarizeMediaEnginePayload(params)));
+    logMainProcessDebug(debugCategory, `[media-agent invoke] ${method} request:`, JSON.stringify(summarizeMediaEnginePayload(params)));
   }
   try {
     const result = await getMediaAgentManager().invoke(method, params);
     if (shouldLogMediaInvoke(method, debugCategory)) {
-      console.log(`[media-agent invoke] ${method} result:`, JSON.stringify(summarizeMediaEnginePayload(result)));
+      logMainProcessDebug(debugCategory, `[media-agent invoke] ${method} result:`, JSON.stringify(summarizeMediaEnginePayload(result)));
     }
     return result;
   } catch (error) {
@@ -1337,13 +1735,29 @@ async function invokeMediaEngineHostSessionBridge(method, params) {
       try {
         await manager.stop();
       } catch (restartStopError) {
-        console.warn('[media-agent bridge] stopHostSession agent shutdown failed:', restartStopError);
+        const rate = shouldEmitMainDebugLog('host-session-bridge:stop-shutdown-failed', 5000);
+        if (rate.emit) {
+          logMainProcessWarning(
+            'connection',
+            '[media-agent bridge] stopHostSession agent shutdown failed:',
+            restartStopError,
+            rate.suppressed ? `suppressed=${rate.suppressed}` : ''
+          );
+        }
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
       try {
         await manager.start();
       } catch (restartStartError) {
-        console.warn('[media-agent bridge] stopHostSession agent restart failed:', restartStartError);
+        const rate = shouldEmitMainDebugLog('host-session-bridge:stop-restart-failed', 5000);
+        if (rate.emit) {
+          logMainProcessWarning(
+            'connection',
+            '[media-agent bridge] stopHostSession agent restart failed:',
+            restartStartError,
+            rate.suppressed ? `suppressed=${rate.suppressed}` : ''
+          );
+        }
       }
     }
     return result;
@@ -1353,13 +1767,29 @@ async function invokeMediaEngineHostSessionBridge(method, params) {
       try {
         await manager.stop();
       } catch (restartStopError) {
-        console.warn('[media-agent bridge] stopHostSession recovery shutdown failed:', restartStopError);
+        const rate = shouldEmitMainDebugLog('host-session-bridge:recovery-shutdown-failed', 5000);
+        if (rate.emit) {
+          logMainProcessWarning(
+            'connection',
+            '[media-agent bridge] stopHostSession recovery shutdown failed:',
+            restartStopError,
+            rate.suppressed ? `suppressed=${rate.suppressed}` : ''
+          );
+        }
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
       try {
         await manager.start();
       } catch (restartStartError) {
-        console.warn('[media-agent bridge] stopHostSession recovery restart failed:', restartStartError);
+        const rate = shouldEmitMainDebugLog('host-session-bridge:recovery-restart-failed', 5000);
+        if (rate.emit) {
+          logMainProcessWarning(
+            'connection',
+            '[media-agent bridge] stopHostSession recovery restart failed:',
+            restartStartError,
+            rate.suppressed ? `suppressed=${rate.suppressed}` : ''
+          );
+        }
       }
     }
     console.error(`[media-agent bridge] ${method} failed:`, error);
@@ -1557,16 +1987,25 @@ function cacheDownloadedInstallerForDifferentialUpdate(downloadedFile) {
 }
 
 function normalizeDesktopSource(source) {
-  return {
-    id: source.id,
-    name: source.name,
-    kind: String(source.id || '').startsWith('screen:') ? 'screen' : 'window',
-    displayId: getDesktopSourceDisplayId(source),
-    isSynthetic: false,
-    captureMode: String(source.id || '').startsWith('screen:') ? 'display' : 'window',
-    appIcon: source.appIcon ? source.appIcon.toDataURL() : null,
-    thumbnail: source.thumbnail ? source.thumbnail.toDataURL() : null
-  };
+  try {
+    if (!source || !source.id) {
+      return null;
+    }
+
+    return {
+      id: source.id,
+      name: source.name,
+      kind: String(source.id || '').startsWith('screen:') ? 'screen' : 'window',
+      displayId: getDesktopSourceDisplayId(source),
+      isSynthetic: false,
+      captureMode: String(source.id || '').startsWith('screen:') ? 'display' : 'window',
+      appIcon: source.appIcon ? source.appIcon.toDataURL() : null,
+      thumbnail: source.thumbnail ? source.thumbnail.toDataURL() : null
+    };
+  } catch (error) {
+    logMainProcessDebug('video', '[capture-targets] failed to normalize desktop source:', error && error.message ? error.message : String(error));
+    return null;
+  }
 }
 
 function sortDesktopSources(sources) {
@@ -1806,7 +2245,7 @@ function configureProfilePaths() {
   const profileRoot = path.join(os.tmpdir(), 'vds-profiles', profileName);
   app.setPath('userData', path.join(profileRoot, 'userData'));
   app.setPath('sessionData', path.join(profileRoot, 'sessionData'));
-  console.log(`Using Electron profile: ${profileName}`);
+  logMainProcessDebug('misc', `Using Electron profile: ${profileName}`);
 }
 
 function normalizeBaseUrl(baseUrl) {
@@ -1828,6 +2267,7 @@ app.whenReady().then(() => {
 
 app.on('before-quit', () => {
   app.isQuitting = true;
+  releaseActiveNatMappings();
   if (quitFinalizeTimer) {
     clearTimeout(quitFinalizeTimer);
     quitFinalizeTimer = null;

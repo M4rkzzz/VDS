@@ -1,16 +1,21 @@
 #include "peer_transport.h"
+#include "time_utils.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
+
+#include "json_protocol.h"
 
 #ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
 #ifdef RTC_ENABLE_MEDIA
@@ -23,7 +28,9 @@
 #include <rtc/h265rtpdepacketizer.hpp>
 #include <rtc/h265rtppacketizer.hpp>
 #include <rtc/nalunit.hpp>
+#include <rtc/plihandler.hpp>
 #include <rtc/rtpdepacketizer.hpp>
+#include <rtc/rtcpnackresponder.hpp>
 #include <rtc/rtcpreceivingsession.hpp>
 #include <rtc/rtppacketizationconfig.hpp>
 #include <rtc/rtcpsrreporter.hpp>
@@ -31,14 +38,10 @@
 
 namespace {
 
+using vds::media_agent::current_time_millis;
+
 std::atomic<std::uint32_t> g_next_video_ssrc { 0x24500000u };
 std::atomic<std::uint32_t> g_next_audio_ssrc { 0x24600000u };
-
-std::int64_t current_time_millis() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::system_clock::now().time_since_epoch()
-  ).count();
-}
 
 std::vector<std::string> default_ice_servers() {
   return {
@@ -201,6 +204,91 @@ std::string to_logical_peer_state(rtc::PeerConnection::State state) {
       return "connecting";
   }
 }
+
+std::string ensure_video_rtcp_feedback_lines(std::string sdp) {
+  if (sdp.find("a=rtcp-fb:") != std::string::npos &&
+      sdp.find(" nack") != std::string::npos &&
+      sdp.find("nack pli") != std::string::npos) {
+    return sdp;
+  }
+
+  std::size_t video_pos = sdp.find("m=video ");
+  if (video_pos == std::string::npos) {
+    return sdp;
+  }
+  std::size_t video_end = sdp.find("\r\nm=", video_pos + 1);
+  const std::size_t insert_pos = video_end == std::string::npos ? sdp.size() : video_end + 2;
+  const std::string video_section = sdp.substr(video_pos, insert_pos - video_pos);
+  if (video_section.find("a=rtcp-fb:* nack") != std::string::npos &&
+      video_section.find("a=rtcp-fb:* nack pli") != std::string::npos) {
+    return sdp;
+  }
+  const std::string feedback = "a=rtcp-fb:* nack\r\na=rtcp-fb:* nack pli\r\n";
+  sdp.insert(insert_pos, feedback);
+  return sdp;
+}
+
+std::uint64_t count_nack_requested_packets(const rtc::message_vector& messages) {
+  std::uint64_t requested = 0;
+  for (const auto& message : messages) {
+    if (!message || message->size() < 16) {
+      continue;
+    }
+    std::size_t offset = 0;
+    while (offset + 4 <= message->size()) {
+      const auto byte_at = [&](std::size_t index) -> std::uint8_t {
+        return std::to_integer<std::uint8_t>((*message)[index]);
+      };
+      const std::uint8_t fmt = byte_at(offset) & 0x1fu;
+      const std::uint8_t packet_type = byte_at(offset + 1);
+      const std::uint16_t length_words =
+        static_cast<std::uint16_t>((byte_at(offset + 2) << 8u) | byte_at(offset + 3));
+      const std::size_t packet_size = (static_cast<std::size_t>(length_words) + 1u) * 4u;
+      if (packet_size < 4 || offset + packet_size > message->size()) {
+        break;
+      }
+      if (packet_type == 205 && fmt == 1 && packet_size >= 16) {
+        for (std::size_t part = offset + 12; part + 4 <= offset + packet_size; part += 4) {
+          const std::uint16_t blp =
+            static_cast<std::uint16_t>((byte_at(part + 2) << 8u) | byte_at(part + 3));
+          requested += 1;
+          for (int bit = 0; bit < 16; ++bit) {
+            if ((blp & (1u << bit)) != 0) {
+              requested += 1;
+            }
+          }
+        }
+      }
+      offset += packet_size;
+    }
+  }
+  return requested;
+}
+
+class CountingRtcpNackResponder final : public rtc::MediaHandler {
+ public:
+  CountingRtcpNackResponder(
+    std::size_t max_size,
+    std::function<void(std::uint64_t)> on_nack_retransmission_value
+  ) : responder(std::make_shared<rtc::RtcpNackResponder>(max_size)),
+      on_nack_retransmission(std::move(on_nack_retransmission_value)) {}
+
+  void incoming(rtc::message_vector& messages, const rtc::message_callback& send) override {
+    const std::uint64_t requested = count_nack_requested_packets(messages);
+    responder->incoming(messages, send);
+    if (requested > 0 && on_nack_retransmission) {
+      on_nack_retransmission(requested);
+    }
+  }
+
+  void outgoing(rtc::message_vector& messages, const rtc::message_callback& send) override {
+    responder->outgoing(messages, send);
+  }
+
+ private:
+  std::shared_ptr<rtc::RtcpNackResponder> responder;
+  std::function<void(std::uint64_t)> on_nack_retransmission;
+};
 
 }  // namespace
 
@@ -410,7 +498,28 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     );
     rtp_config->mid = config.mid.empty() ? "video" : config.mid;
 
+    auto weak_self = weak_from_this();
     auto sender_reporter = std::make_shared<rtc::RtcpSrReporter>(rtp_config);
+    auto nack_responder = std::make_shared<CountingRtcpNackResponder>(256, [weak_self](std::uint64_t count) {
+      auto self = weak_self.lock();
+      if (!self) {
+        return;
+      }
+      std::lock_guard<std::mutex> lock(self->mutex);
+      self->snapshot.nack_retransmissions += count;
+      self->snapshot.reason = "nack-retransmit";
+      self->snapshot.updated_at_unix_ms = current_time_millis();
+    });
+    auto pli_handler = std::make_shared<rtc::PliHandler>([weak_self]() {
+      auto self = weak_self.lock();
+      if (!self) {
+        return;
+      }
+      std::lock_guard<std::mutex> lock(self->mutex);
+      self->snapshot.pli_requests_received += 1;
+      self->snapshot.reason = "pli-received";
+      self->snapshot.updated_at_unix_ms = current_time_millis();
+    });
     if (use_h265) {
       auto packetizer = std::make_shared<rtc::H265RtpPacketizer>(
         rtc::NalUnit::Separator::StartSequence,
@@ -425,8 +534,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       new_track->setMediaHandler(packetizer);
     }
     new_track->chainMediaHandler(sender_reporter);
+    new_track->chainMediaHandler(nack_responder);
+    new_track->chainMediaHandler(pli_handler);
 
-    auto weak_self = weak_from_this();
     new_track->onOpen([weak_self]() {
       auto self = weak_self.lock();
       if (!self) {
@@ -689,6 +799,32 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     if (snapshot.media_plane_ready) {
       snapshot.reason = "native-render-active";
     }
+  }
+
+  void request_keyframe(const std::string& reason) {
+    std::shared_ptr<rtc::Track> local_inbound_video_track;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      local_inbound_video_track = inbound_video_track;
+      snapshot.keyframe_requests_sent += 1;
+      if (reason == "decoder-recovery" || reason == "waiting-for-random-access") {
+        snapshot.decoder_recovery_count += 1;
+      }
+      snapshot.reason = reason.empty() ? "keyframe-requested" : reason;
+      snapshot.updated_at_unix_ms = current_time_millis();
+    }
+    if (local_inbound_video_track) {
+      local_inbound_video_track->requestKeyframe();
+    }
+  }
+
+  void add_dropped_video_units(std::uint64_t count) {
+    if (count == 0) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    snapshot.dropped_video_units += count;
+    snapshot.updated_at_unix_ms = current_time_millis();
   }
 
  private:
@@ -1030,7 +1166,10 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
 
       if (self->callbacks.on_local_description) {
-        self->callbacks.on_local_description(snapshot_copy.local_description_type, std::string(description));
+        self->callbacks.on_local_description(
+          snapshot_copy.local_description_type,
+          ensure_video_rtcp_feedback_lines(std::string(description))
+        );
       }
       if (self->callbacks.on_state_change) {
         self->callbacks.on_state_change(snapshot_copy, "local-description-created");
@@ -1702,6 +1841,52 @@ bool set_peer_transport_decoder_state(
 #endif
 }
 
+bool request_peer_transport_keyframe(
+  const std::shared_ptr<PeerTransportSession>& session,
+  const std::string& reason,
+  std::string* error
+) {
+#ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
+  if (!session) {
+    if (error) {
+      *error = "peer-transport-session-missing";
+    }
+    return false;
+  }
+
+  try {
+    session->request_keyframe(reason);
+    return true;
+  } catch (const std::exception& ex) {
+    if (error) {
+      *error = ex.what();
+    }
+    return false;
+  }
+#else
+  (void)session;
+  (void)reason;
+  if (error) {
+    *error = "libdatachannel backend is not compiled into this media-agent build";
+  }
+  return false;
+#endif
+}
+
+void add_peer_transport_dropped_video_units(
+  const std::shared_ptr<PeerTransportSession>& session,
+  std::uint64_t count
+) {
+#ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
+  if (session) {
+    session->add_dropped_video_units(count);
+  }
+#else
+  (void)session;
+  (void)count;
+#endif
+}
+
 void close_peer_transport_session(const std::shared_ptr<PeerTransportSession>& session) {
 #ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
   if (session) {
@@ -1722,4 +1907,97 @@ PeerTransportSnapshot get_peer_transport_snapshot(const std::shared_ptr<PeerTran
 #else
   return {};
 #endif
+}
+
+std::string peer_transport_backend_json(const PeerTransportBackendInfo& backend) {
+  std::ostringstream payload;
+  payload
+    << "{\"available\":" << (backend.available ? "true" : "false")
+    << ",\"transportReady\":" << (backend.transport_ready ? "true" : "false")
+    << ",\"mediaPlaneReady\":" << (backend.media_plane_ready ? "true" : "false")
+    << ",\"videoTrackSupport\":" << (backend.video_track_support ? "true" : "false")
+    << ",\"audioTrackSupport\":" << (backend.audio_track_support ? "true" : "false")
+    << ",\"backend\":\"" << vds::media_agent::json_escape(backend.backend) << "\""
+    << ",\"implementation\":\"" << vds::media_agent::json_escape(backend.implementation) << "\""
+    << ",\"mode\":\"" << vds::media_agent::json_escape(backend.mode) << "\""
+    << ",\"reason\":\"" << vds::media_agent::json_escape(backend.reason) << "\""
+    << ",\"lastError\":\"" << vds::media_agent::json_escape(backend.last_error) << "\""
+    << ",\"iceServers\":" << vds::media_agent::json_array_from_strings(backend.ice_servers)
+    << "}";
+  return payload.str();
+}
+
+std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot) {
+  std::ostringstream payload;
+  payload
+    << "{\"available\":" << (snapshot.available ? "true" : "false")
+    << ",\"transportReady\":" << (snapshot.transport_ready ? "true" : "false")
+    << ",\"mediaPlaneReady\":" << (snapshot.media_plane_ready ? "true" : "false")
+    << ",\"videoTrackSupport\":" << (snapshot.video_track_support ? "true" : "false")
+    << ",\"audioTrackSupport\":" << (snapshot.audio_track_support ? "true" : "false")
+    << ",\"videoTrackConfigured\":" << (snapshot.video_track_configured ? "true" : "false")
+    << ",\"audioTrackConfigured\":" << (snapshot.audio_track_configured ? "true" : "false")
+    << ",\"videoReceiverConfigured\":" << (snapshot.video_receiver_configured ? "true" : "false")
+    << ",\"audioReceiverConfigured\":" << (snapshot.audio_receiver_configured ? "true" : "false")
+    << ",\"videoTrackOpen\":" << (snapshot.video_track_open ? "true" : "false")
+    << ",\"audioTrackOpen\":" << (snapshot.audio_track_open ? "true" : "false")
+    << ",\"decoderReady\":" << (snapshot.decoder_ready ? "true" : "false")
+    << ",\"remoteVideoTrackAttached\":" << (snapshot.remote_video_track_attached ? "true" : "false")
+    << ",\"remoteAudioTrackAttached\":" << (snapshot.remote_audio_track_attached ? "true" : "false")
+    << ",\"localDescriptionCreated\":" << (snapshot.local_description_created ? "true" : "false")
+    << ",\"remoteDescriptionSet\":" << (snapshot.remote_description_set ? "true" : "false")
+    << ",\"dataChannelRequested\":" << (snapshot.data_channel_requested ? "true" : "false")
+    << ",\"dataChannelOpen\":" << (snapshot.data_channel_open ? "true" : "false")
+    << ",\"closed\":" << (snapshot.closed ? "true" : "false")
+    << ",\"localCandidateCount\":" << snapshot.local_candidate_count
+    << ",\"remoteCandidateCount\":" << snapshot.remote_candidate_count
+    << ",\"remoteTrackCount\":" << snapshot.remote_track_count
+    << ",\"bytesSent\":" << snapshot.bytes_sent
+    << ",\"bytesReceived\":" << snapshot.bytes_received
+    << ",\"videoFramesSent\":" << snapshot.video_frames_sent
+    << ",\"videoBytesSent\":" << snapshot.video_bytes_sent
+    << ",\"audioFramesSent\":" << snapshot.audio_frames_sent
+    << ",\"audioBytesSent\":" << snapshot.audio_bytes_sent
+    << ",\"remoteVideoFramesReceived\":" << snapshot.remote_video_frames_received
+    << ",\"remoteVideoBytesReceived\":" << snapshot.remote_video_bytes_received
+    << ",\"remoteAudioFramesReceived\":" << snapshot.remote_audio_frames_received
+    << ",\"remoteAudioBytesReceived\":" << snapshot.remote_audio_bytes_received
+    << ",\"decodedFramesRendered\":" << snapshot.decoded_frames_rendered
+    << ",\"nackRetransmissions\":" << snapshot.nack_retransmissions
+    << ",\"pliRequestsReceived\":" << snapshot.pli_requests_received
+    << ",\"keyframeRequestsSent\":" << snapshot.keyframe_requests_sent
+    << ",\"decoderRecoveryCount\":" << snapshot.decoder_recovery_count
+    << ",\"droppedVideoUnits\":" << snapshot.dropped_video_units
+    << ",\"connectionState\":\"" << vds::media_agent::json_escape(snapshot.connection_state) << "\""
+    << ",\"iceState\":\"" << vds::media_agent::json_escape(snapshot.ice_state) << "\""
+    << ",\"gatheringState\":\"" << vds::media_agent::json_escape(snapshot.gathering_state) << "\""
+    << ",\"signalingState\":\"" << vds::media_agent::json_escape(snapshot.signaling_state) << "\""
+    << ",\"localDescriptionType\":\"" << vds::media_agent::json_escape(snapshot.local_description_type) << "\""
+    << ",\"dataChannelLabel\":\"" << vds::media_agent::json_escape(snapshot.data_channel_label) << "\""
+    << ",\"videoMid\":\"" << vds::media_agent::json_escape(snapshot.video_mid) << "\""
+    << ",\"audioMid\":\"" << vds::media_agent::json_escape(snapshot.audio_mid) << "\""
+    << ",\"videoCodec\":\"" << vds::media_agent::json_escape(snapshot.video_codec) << "\""
+    << ",\"audioCodec\":\"" << vds::media_agent::json_escape(snapshot.audio_codec) << "\""
+    << ",\"codecPath\":\"" << vds::media_agent::json_escape(snapshot.codec_path) << "\""
+    << ",\"videoDecoderBackend\":\"" << vds::media_agent::json_escape(snapshot.video_decoder_backend) << "\""
+    << ",\"videoSource\":\"" << vds::media_agent::json_escape(snapshot.video_source) << "\""
+    << ",\"selectedLocalCandidate\":\"" << vds::media_agent::json_escape(snapshot.selected_local_candidate) << "\""
+    << ",\"selectedRemoteCandidate\":\"" << vds::media_agent::json_escape(snapshot.selected_remote_candidate) << "\""
+    << ",\"reason\":\"" << vds::media_agent::json_escape(snapshot.reason) << "\""
+    << ",\"lastError\":\"" << vds::media_agent::json_escape(snapshot.last_error) << "\""
+    << ",\"roundTripTimeMs\":";
+
+  vds::media_agent::append_nullable_int64(payload, snapshot.round_trip_time_ms);
+  payload << ",\"createdAtMs\":";
+  vds::media_agent::append_nullable_int64(payload, snapshot.created_at_unix_ms);
+  payload << ",\"updatedAtMs\":";
+  vds::media_agent::append_nullable_int64(payload, snapshot.updated_at_unix_ms);
+  payload << ",\"lastVideoFrameAtMs\":";
+  vds::media_agent::append_nullable_int64(payload, snapshot.last_video_frame_at_unix_ms);
+  payload << ",\"lastRemoteVideoFrameAtMs\":";
+  vds::media_agent::append_nullable_int64(payload, snapshot.last_remote_video_frame_at_unix_ms);
+  payload << ",\"lastDecodedFrameAtMs\":";
+  vds::media_agent::append_nullable_int64(payload, snapshot.last_decoded_frame_at_unix_ms);
+  payload << "}";
+  return payload.str();
 }

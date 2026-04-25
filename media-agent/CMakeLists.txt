@@ -7,13 +7,47 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL "Enable libdatachannel peer transport backend" OFF)
+option(VDS_MEDIA_AGENT_BUILD_TESTS "Build media-agent unit tests" ON)
 
 add_executable(vds-media-agent
+  src/agent_events.cpp
+  src/agent_diagnostics.cpp
+  src/agent_lifecycle.cpp
+  src/agent_rpc_router.cpp
+  src/agent_status_json.cpp
+  src/ffmpeg_probe.cpp
+  src/host_capture_plan.cpp
+  src/host_capture_process.cpp
+  src/host_session_controller.cpp
+  src/host_state_json.cpp
+  src/host_pipeline.cpp
+  src/json_protocol.cpp
   src/main.cpp
+  src/media_audio.cpp
   src/native_artifact_preview.cpp
   src/native_live_preview.cpp
+  src/native_surface_layout.cpp
   src/native_video_surface.cpp
+  src/obs_ingest_media.cpp
+  src/obs_ingest_runtime.cpp
+  src/obs_ingest_state.cpp
+  src/peer_control_runtime.cpp
+  src/peer_media_binding_runtime.cpp
   src/peer_transport.cpp
+  src/peer_receiver_runtime.cpp
+  src/peer_state_json.cpp
+  src/peer_video_sender.cpp
+  src/platform_utils.cpp
+  src/process_runner.cpp
+  src/relay_dispatch.cpp
+  src/string_utils.cpp
+  src/surface_attachment_runtime.cpp
+  src/surface_control_runtime.cpp
+  src/surface_target.cpp
+  src/time_utils.cpp
+  src/viewer_audio_playback.cpp
+  src/viewer_video_pipeline.cpp
+  src/video_access_unit.cpp
   src/wasapi_backend.cpp
   src/wgc_capture.cpp
 )
@@ -79,4 +113,39 @@ if(MSVC)
   target_compile_options(vds-media-agent PRIVATE /W4 /permissive-)
 else()
   target_compile_options(vds-media-agent PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(VDS_MEDIA_AGENT_BUILD_TESTS)
+  enable_testing()
+  add_executable(vds-media-agent-tests
+    tests/media_agent_unit_tests.cpp
+    src/ffmpeg_probe.cpp
+    src/host_pipeline.cpp
+    src/json_protocol.cpp
+    src/obs_ingest_state.cpp
+    src/platform_utils.cpp
+    src/process_runner.cpp
+    src/string_utils.cpp
+    src/surface_target.cpp
+    src/video_access_unit.cpp
+  )
+  target_include_directories(vds-media-agent-tests PRIVATE
+    src
+    "${VDS_MEDIA_AGENT_FFMPEG_ROOT}/include"
+  )
+  if(MSVC)
+    target_compile_options(vds-media-agent-tests PRIVATE /W4 /permissive-)
+  else()
+    target_compile_options(vds-media-agent-tests PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+  target_link_libraries(vds-media-agent-tests PRIVATE
+    "${VDS_MEDIA_AGENT_AVCODEC_LIBRARY}"
+    "${VDS_MEDIA_AGENT_AVFORMAT_LIBRARY}"
+    "${VDS_MEDIA_AGENT_AVUTIL_LIBRARY}"
+    "${VDS_MEDIA_AGENT_SWSCALE_LIBRARY}"
+  )
+  add_test(NAME vds-media-agent-unit-tests COMMAND vds-media-agent-tests)
+  set_tests_properties(vds-media-agent-unit-tests PROPERTIES
+    ENVIRONMENT "PATH=${VDS_MEDIA_AGENT_FFMPEG_ROOT}/bin;$ENV{PATH}"
+  )
 endif()

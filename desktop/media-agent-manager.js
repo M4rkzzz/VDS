@@ -64,7 +64,7 @@ class MediaAgentManager extends EventEmitter {
   }
 
   async start() {
-    if (this.child && !this.child.killed) {
+    if (this.child && !this.child.killed && this.child.exitCode === null && this.child.signalCode === null) {
       return this.getStatus();
     }
 
@@ -189,11 +189,11 @@ class MediaAgentManager extends EventEmitter {
       return status;
     }
 
-    if (!this.child || this.child.killed) {
+    if (!this.child || this.child.killed || this.child.exitCode !== null || this.child.signalCode !== null) {
       await this.start();
     }
 
-    if (!this.child || this.child.killed) {
+    if (!this.child || this.child.killed || this.child.exitCode !== null || this.child.signalCode !== null) {
       throw createMediaAgentError('MEDIA_AGENT_UNAVAILABLE', 'Native media agent binary is not available.');
     }
 
@@ -201,7 +201,20 @@ class MediaAgentManager extends EventEmitter {
       const id = this.requestId++;
       this.pendingRequests.set(id, { resolve, reject });
       const payload = JSON.stringify({ id, method, params });
-      this.child.stdin.write(payload + '\n', 'utf8');
+      const child = this.child;
+      const stdin = child && child.stdin;
+      if (!stdin || stdin.destroyed || child.exitCode !== null || child.signalCode !== null) {
+        this.pendingRequests.delete(id);
+        reject(this.buildExitError(child && child.exitCode, child && child.signalCode));
+        return;
+      }
+      stdin.write(payload + '\n', 'utf8', (error) => {
+        if (!error) {
+          return;
+        }
+        this.pendingRequests.delete(id);
+        reject(error);
+      });
     });
   }
 
@@ -363,6 +376,18 @@ class MediaAgentManager extends EventEmitter {
     this.recentStderrLines = [];
 
     child.stdin.setDefaultEncoding('utf8');
+    child.stdin.on('error', (error) => {
+      this.recordStderr(error && error.message ? error.message : String(error));
+      this.rejectAllPending(error);
+      this.updateStatus({
+        state: 'failed',
+        available: true,
+        running: false,
+        reason: 'stdin-error',
+        binaryPath,
+        lastError: error && error.message ? error.message : String(error)
+      });
+    });
     child.stderr.on('data', (chunk) => {
       const message = String(chunk || '').trim();
       if (message) {

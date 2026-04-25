@@ -1,8 +1,12 @@
 param(
   [string]$ServerUrl = 'http://127.0.0.1:3000',
   [int]$Port = 3000,
-  [string]$HostProfile = 'dev-host',
-  [string]$ViewerProfile = 'dev-viewer',
+  [Alias('HostProfile')]
+  [string]$ClientAProfile = 'dev-client-a',
+  [Alias('ViewerProfile')]
+  [string]$ClientBProfile = 'dev-client-b',
+  [ValidateSet('quiet', 'diagnose', 'traceVideo', 'verbose', 'profile')]
+  [string]$DebugPreset = 'quiet',
   [switch]$EnableNativePeerTransport,
   [switch]$SkipServer
 )
@@ -77,24 +81,27 @@ npm run server
   }
 }
 
-Start-DevWindow -Title 'VDS Dev Host' -CommandBody @"
+Start-DevWindow -Title 'VDS Dev Client A' -CommandBody @"
 Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
 `$env:SERVER_URL = '$normalizedServerUrl'
-`$env:VDS_PROFILE = '$HostProfile'
+`$env:VDS_PROFILE = '$ClientAProfile'
 `$env:VDS_ENABLE_NATIVE_PEER_TRANSPORT = '$([int]$nativePeerTransportEnabled)'
+`$env:VDS_DEBUG_PRESET = '$DebugPreset'
 npm start
 "@
 
-Start-DevWindow -Title 'VDS Dev Viewer' -CommandBody @"
+Start-DevWindow -Title 'VDS Dev Client B' -CommandBody @"
 Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
 `$env:SERVER_URL = '$normalizedServerUrl'
-`$env:VDS_PROFILE = '$ViewerProfile'
+`$env:VDS_PROFILE = '$ClientBProfile'
 `$env:VDS_ENABLE_NATIVE_PEER_TRANSPORT = '$([int]$nativePeerTransportEnabled)'
+`$env:VDS_DEBUG_PRESET = '$DebugPreset'
 npm start
 "@
 
 Write-Host "Dual dev environment launched."
 Write-Host "Server: $normalizedServerUrl"
-Write-Host "Host profile: $HostProfile"
-Write-Host "Viewer profile: $ViewerProfile"
+Write-Host "Client A profile: $ClientAProfile"
+Write-Host "Client B profile: $ClientBProfile"
+Write-Host "Debug preset: $DebugPreset"
 Write-Host "Native peer transport: $nativePeerTransportEnabled"

@@ -54,6 +54,11 @@ struct PeerTransportSnapshot {
   std::uint64_t remote_audio_frames_received = 0;
   std::uint64_t remote_audio_bytes_received = 0;
   std::uint64_t decoded_frames_rendered = 0;
+  std::uint64_t nack_retransmissions = 0;
+  std::uint64_t pli_requests_received = 0;
+  std::uint64_t keyframe_requests_sent = 0;
+  std::uint64_t decoder_recovery_count = 0;
+  std::uint64_t dropped_video_units = 0;
   std::int64_t round_trip_time_ms = -1;
   std::int64_t created_at_unix_ms = 0;
   std::int64_t updated_at_unix_ms = 0;
@@ -193,6 +198,20 @@ bool set_peer_transport_decoder_state(
   std::string* error
 );
 
+bool request_peer_transport_keyframe(
+  const std::shared_ptr<PeerTransportSession>& session,
+  const std::string& reason,
+  std::string* error
+);
+
+void add_peer_transport_dropped_video_units(
+  const std::shared_ptr<PeerTransportSession>& session,
+  std::uint64_t count
+);
+
 void close_peer_transport_session(const std::shared_ptr<PeerTransportSession>& session);
 
 PeerTransportSnapshot get_peer_transport_snapshot(const std::shared_ptr<PeerTransportSession>& session);
+
+std::string peer_transport_backend_json(const PeerTransportBackendInfo& backend);
+std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot);

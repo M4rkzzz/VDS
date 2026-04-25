@@ -4,6 +4,43 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 
+const VERBOSE_SERVER_LOGS = process.env.VDS_VERBOSE_SERVER_LOGS === '1';
+const serverLogRateLimitState = new Map();
+
+function logServerDebug(...args) {
+  if (VERBOSE_SERVER_LOGS) {
+    console.log(...args);
+  }
+}
+
+function shouldEmitServerLog(key, intervalMs = 5000) {
+  if (VERBOSE_SERVER_LOGS || intervalMs <= 0) {
+    return { emit: true, suppressed: 0 };
+  }
+
+  const now = Date.now();
+  const state = serverLogRateLimitState.get(key) || { lastAt: 0, suppressed: 0 };
+  if (now - state.lastAt < intervalMs) {
+    state.suppressed += 1;
+    serverLogRateLimitState.set(key, state);
+    return { emit: false, suppressed: state.suppressed };
+  }
+
+  const suppressed = state.suppressed;
+  serverLogRateLimitState.set(key, { lastAt: now, suppressed: 0 });
+  return { emit: true, suppressed };
+}
+
+function logServerWarning(key, message, error, intervalMs = 5000) {
+  const rate = shouldEmitServerLog(key, intervalMs);
+  if (!rate.emit) {
+    return;
+  }
+
+  const suffix = rate.suppressed ? `suppressed=${rate.suppressed}` : '';
+  console.error(message, error, suffix);
+}
+
 const DEFAULT_ICE_SERVERS = [
   { urls: 'stun:stun.cloudflare.com:3478' },
   { urls: 'stun:stun.linphone.org:3478' },
@@ -80,14 +117,14 @@ function startServer(options = {}) {
   });
 
   wss.on('connection', (ws) => {
-    console.log('New WebSocket connection');
+    logServerDebug('New WebSocket connection');
 
     ws.on('message', (message) => {
       try {
         const data = JSON.parse(message);
         handleMessage(ws, data);
       } catch (error) {
-        console.error('Error parsing message:', error);
+        logServerWarning('ws-message-parse', 'Error parsing message:', error);
       }
     });
 
@@ -120,7 +157,7 @@ function startServer(options = {}) {
         handleDisconnect(ws, true);
         break;
       default:
-        console.log('Unknown message type:', data.type);
+        logServerDebug('Unknown message type:', data.type);
     }
   }
 
@@ -148,7 +185,7 @@ function startServer(options = {}) {
       publicListing: room.publicListing
     });
 
-    console.log(`Room created: ${roomId} by ${data.clientId}`);
+    logServerDebug(`Room created: ${roomId} by ${data.clientId}`);
   }
 
   function handleJoinRoom(ws, data) {
@@ -573,16 +610,7 @@ function buildIceServers() {
     }
   }
 
-  const iceServers = sanitizeIceServers(DEFAULT_ICE_SERVERS);
-  if (process.env.TURN_URL) {
-    iceServers.unshift({
-      urls: process.env.TURN_URL.split(',').map((value) => value.trim()).filter(Boolean),
-      username: process.env.TURN_USERNAME || '',
-      credential: process.env.TURN_PASSWORD || ''
-    });
-  }
-
-  return iceServers;
+  return sanitizeIceServers(DEFAULT_ICE_SERVERS);
 }
 
 function normalizeIceUrl(url) {
@@ -591,11 +619,16 @@ function normalizeIceUrl(url) {
     return null;
   }
 
-  if (value.startsWith('stun:')) {
+  const lowered = value.toLowerCase();
+  if (lowered.startsWith('turn:') || lowered.startsWith('turns:')) {
+    return null;
+  }
+
+  if (lowered.startsWith('stun:')) {
     return value.replace(/\?.*$/, '');
   }
 
-  return value;
+  return null;
 }
 
 function sanitizeIceServers(servers) {
@@ -617,10 +650,7 @@ function sanitizeIceServers(servers) {
         return null;
       }
 
-      return {
-        ...server,
-        urls
-      };
+      return { urls };
     })
     .filter(Boolean);
 }

@@ -1,6 +1,7 @@
 #include "native_artifact_preview.h"
 
 #include "native_video_surface.h"
+#include "time_utils.h"
 
 #include <algorithm>
 #include <chrono>
@@ -23,11 +24,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-long long current_time_millis() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::system_clock::now().time_since_epoch()
-  ).count();
-}
+using vds::media_agent::current_time_millis;
 
 std::string to_lower_ascii(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
