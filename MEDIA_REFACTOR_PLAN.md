@@ -450,4 +450,17 @@ server 单元测试覆盖：
 9. 正式发布后，把 `## 2. 未发布改动记录` 中已发布条目迁移到 `CHANGELOG.md`，清空或重建未发布区域，并更新当前发布版本。
 10. 最后再跑一次 `npm run release:check`，确保发布后的文档、门禁和产物仍处于一致状态。
 
+GitHub 更新流程：
+
+1. 发布前检查文档版本：`README.md`、`CHANGELOG.md`、`MEDIA_REFACTOR_PLAN.md` 和 `docs/` 不应残留上一版本的主介绍文案。
+2. 确认本地门禁已通过：至少包括 `npm run build:release` 和发布后的 `npm run release:check`。
+3. 检查工作区：`git status -sb`，确认本次发布需要的源码、文档、脚本改动都已纳入提交范围；不要提交 `dist/`、`runtime/`、`server/updates/` 等被 `.gitignore` 排除的产物目录。
+4. 提交源码：`git add <本次发布相关文件>`，然后 `git commit -m "Release <version>"`。如发布后只修正文档，可用独立提交并把 tag 更新到该提交。
+5. 创建或更新 tag：`git tag -a v<version> -m "Release <version>"`；如果需要让 tag 指向修正文档后的新提交，使用 `git tag -fa v<version> -m "Release <version>"`。
+6. 推送源码和 tag：`git push origin master`，然后 `git push origin v<version>`；如果 tag 被修正过，使用 `git push --force origin v<version>`。
+7. 创建 GitHub Release，tag 使用 `v<version>`，标题使用 `VDS <version>`，正文从 `CHANGELOG.md` 对应版本摘取。
+8. 上传 release assets：`dist/VDS-Setup-<version>.exe`、`dist/VDS-Setup-<version>.exe.blockmap`、`dist/latest.yml`。
+9. 发布后复核：确认 GitHub Release 不是 draft/prerelease，确认 assets 的文件名和 size 与本地一致，确认 GitHub README 显示当前版本。
+10. 如果 `gh` 指向非官方 CLI 或未登录，可用 GitHub 网页创建 release；本机 Git credential helper 能推送代码不等于 `gh release` 可用。
+
 任何后续改动都要坚持 fail-fast、边界单一、可验证，不要静默 fallback 到旧 authority。
