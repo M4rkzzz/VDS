@@ -2,9 +2,9 @@
 
 VDS is an Electron desktop client plus a Node.js signaling server for cascade screen sharing.
 
-## 1.6.5 Overview
+## 1.6.6 Overview
 
-Version `1.6.5` focuses on VDS_web, DataChannel encoded media unification, WebCodecs playback, and native/web relay recovery while keeping the Windows native media path as the production authority.
+Version `1.6.6` focuses on Web H.265 playback correctness across native capture and OBS ingest, with WebCodecs decoder sizing driven by media manifests and actual decoded frame dimensions.
 
 Highlights:
 
@@ -17,6 +17,7 @@ Highlights:
 - added VDS_web TypeScript, build, and protocol tests to the release validation path
 - kept native `H.264 / H.265` + encoded relay fanout as the core production path
 - kept OBS local ingest and public-room lobby behavior from the 1.6.x mainline
+- fixed H.265 Web viewer display sizing for native capture and OBS ingest across 720p, 1080p, 2K, 4K, and non-standard source dimensions
 
 Current media path:
 
@@ -115,7 +116,7 @@ Viewer join mode currently behaves like this:
   - prepares `server/` for Docker upload
 - `server/` is the deployable server directory
 - desktop auto-update feed is served from `server/updates/`
-- `1.6.5` release assets are the installer, blockmap, and `latest.yml`
+- `1.6.6` release assets are the installer, blockmap, and `latest.yml`
 - release notes for recent versions are tracked in [CHANGELOG.md](CHANGELOG.md)
 
 ## Source Control Rules

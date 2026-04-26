@@ -465,12 +465,51 @@
       backend: currentHostBackend,
       videoCodec: obsIngest && obsIngest.videoCodec ? obsIngest.videoCodec : nativeHostEffectiveCodec,
       audioCodec: obsIngest && obsIngest.audioCodec ? obsIngest.audioCodec : undefined,
-      width: obsIngest && obsIngest.width ? obsIngest.width : (hostPipeline && hostPipeline.width),
-      height: obsIngest && obsIngest.height ? obsIngest.height : (hostPipeline && hostPipeline.height),
+      width: obsIngest
+        ? resolveObsManifestVideoDimension(obsIngest.width, 'width')
+        : resolveManifestVideoDimension(hostPipeline && hostPipeline.width, 0, 'width'),
+      height: obsIngest
+        ? resolveObsManifestVideoDimension(obsIngest.height, 'height')
+        : resolveManifestVideoDimension(hostPipeline && hostPipeline.height, 0, 'height'),
       frameRate: obsIngest && obsIngest.frameRate ? obsIngest.frameRate : (hostPipeline && hostPipeline.frameRate),
       audioSampleRate: obsIngest && obsIngest.audioSampleRate,
       audioChannels: obsIngest && obsIngest.audioChannelCount
     });
+  }
+
+  function buildHostMediaManifestFromObsIngest(obsIngest) {
+    return buildHostMediaManifest({
+      backend: 'obs-ingest',
+      videoCodec: obsIngest && obsIngest.videoCodec ? obsIngest.videoCodec : nativeHostEffectiveCodec,
+      audioCodec: obsIngest && obsIngest.audioCodec ? obsIngest.audioCodec : 'aac',
+      width: resolveObsManifestVideoDimension(obsIngest && obsIngest.width, 'width'),
+      height: resolveObsManifestVideoDimension(obsIngest && obsIngest.height, 'height'),
+      frameRate: obsIngest && obsIngest.frameRate,
+      audioSampleRate: obsIngest && obsIngest.audioSampleRate,
+      audioChannels: obsIngest && obsIngest.audioChannelCount
+    });
+  }
+
+  function resolveObsManifestVideoDimension(value, axis) {
+    const streamValue = Number(value || 0);
+    if (Number.isFinite(streamValue) && streamValue > 0) {
+      return Math.round(streamValue);
+    }
+    const qualityValue = Number(qualitySettings && qualitySettings[axis] || 0);
+    return Number.isFinite(qualityValue) && qualityValue > 0 ? Math.round(qualityValue) : 0;
+  }
+
+  function resolveManifestVideoDimension(primary, fallback, axis) {
+    const primaryValue = Number(primary || 0);
+    const fallbackValue = Number(fallback || 0);
+    const qualityValue = Number(qualitySettings && qualitySettings[axis] || 0);
+    const candidates = [primaryValue, fallbackValue, qualityValue]
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .map((value) => Math.round(value));
+    if (!candidates.length) {
+      return 0;
+    }
+    return Math.max(...candidates);
   }
 
   function rememberMediaManifest(mediaManifest) {
@@ -2547,7 +2586,7 @@
       nativeHostSessionRunning = true;
       obsIngestStreamActive = true;
       updateHostEncoderDetail(null, params.obsIngest || null);
-      ensureObsHostRoomCreated();
+      ensureObsHostRoomCreated(params.obsIngest || null);
       return;
     }
 
@@ -2980,7 +3019,7 @@
     }, 'video');
   }
 
-  function ensureObsHostRoomCreated() {
+  function ensureObsHostRoomCreated(obsIngest = null) {
     if (!isHost || !nativeHostSessionRunning || !isObsIngestHostBackend()) {
       return;
     }
@@ -2993,7 +3032,9 @@
       elements.hostStatus.textContent = 'OBS 节目流已接入，正在创建房间...';
       elements.hostStatus.classList.add('waiting');
     }
-    const mediaManifest = buildHostMediaManifestFromStats(latestP2pStatsSnapshot);
+    const mediaManifest = obsIngest
+      ? buildHostMediaManifestFromObsIngest(obsIngest)
+      : buildHostMediaManifestFromStats(latestP2pStatsSnapshot);
     rememberMediaManifest(mediaManifest);
     sendMessage({
       type: 'create-room',

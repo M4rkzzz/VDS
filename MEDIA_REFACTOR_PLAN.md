@@ -19,7 +19,7 @@
 
 最近一次对齐日期：`2026-04-26`
 
-当前发布版本：`1.6.5`
+当前发布版本：`1.6.6`
 
 ## 2. 未发布改动记录
 
@@ -27,12 +27,11 @@
 
 当前未发布改动：
 
-- 暂无。1.6.5 已发布条目已迁移到 `CHANGELOG.md`。
+- 暂无。1.6.6 已发布条目已迁移到 `CHANGELOG.md`。
 
 当前未发布改动已验证：
 
-- `npm run build:release`
-- `npm run release:check`
+- 待下一轮未发布改动产生后记录。
 
 ## 3. 当前结论
 
@@ -114,7 +113,7 @@
 
 当前验证结论：
 
-- `npm run build:release` 已通过，并刷新 `dist/VDS-Setup-1.6.5.exe`、`dist/VDS-Setup-1.6.5.exe.blockmap`、`server/updates/latest.yml` 和 `server/updates/VDS-Setup-1.6.5.*`。
+- `npm run build:release` 已通过，并刷新 `dist/VDS-Setup-1.6.6.exe`、`dist/VDS-Setup-1.6.6.exe.blockmap`、`server/updates/latest.yml` 和 `server/updates/VDS-Setup-1.6.6.*`。
 - `npm run verify:media-agent` 已通过。
 - `npm run check:logging` 已通过。
 - `node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`node --check server/server-core.js` 已通过。

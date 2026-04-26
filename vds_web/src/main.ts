@@ -53,6 +53,7 @@ let lastVideoKeyframeForRelay: {
   capturedAt: number;
 } | null = null;
 let lastBootstrapFrameId = '';
+let lastConsoleDiagnosticsAt = 0;
 
 const statusBadge = getElement<HTMLSpanElement>('statusBadge');
 const statusText = getElement<HTMLParagraphElement>('statusText');
@@ -85,21 +86,43 @@ const audioDelayDecrease = getElement<HTMLButtonElement>('audioDelayDecrease');
 const audioDelayIncrease = getElement<HTMLButtonElement>('audioDelayIncrease');
 const dataChannelCanvas = getElement<HTMLCanvasElement>('dataChannelCanvas');
 const dataChannelVideoPlayer = new WebCodecsVideoPlayer(dataChannelCanvas, {
-  onState: (state) => diagnostics.update({ relayProtocolState: state }),
+  onState: (state) => {
+    console.info(`[vds-web][webcodecs-state] ${state}`);
+    diagnostics.update({ relayProtocolState: state });
+  },
   onDecodedFrame: () => {
     diagnostics.incrementCounter('webDecodedVideoFrames');
     waitingMessage.classList.add('hidden');
   },
   onDroppedFrame: (reason) => {
+    console.info(`[vds-web][webcodecs-video-drop] ${toConsoleJson({
+      reason,
+      snapshot: diagnostics.getSnapshot()
+    })}`);
     diagnostics.incrementCounter('webDroppedVideoFrames');
     diagnostics.update({ relayFailureReason: reason });
   },
-  onPayloadFormat: (format) => diagnostics.update({ h264PayloadFormat: format })
+  onPayloadFormat: (format) => diagnostics.update({ h264PayloadFormat: format }),
+  onVideoFrameInfo: (info) => {
+    const snapshot = diagnostics.getSnapshot();
+    console.info(`[vds-web][video-frame] ${toConsoleJson({
+      ...info,
+      mediaManifestVideo: (snapshot.mediaManifest as { video?: unknown } | undefined)?.video,
+      decodedFrames: snapshot.webDecodedVideoFrames,
+      droppedFrames: snapshot.webDroppedVideoFrames,
+      encodedFramesReceived: snapshot.encodedFramesReceived,
+      relayProtocolState: snapshot.relayProtocolState
+    })}`);
+  }
 });
 const dataChannelAudioPlayer = new WebCodecsAudioPlayer({
-  onState: (state) => diagnostics.update({ relayProtocolState: state }),
+  onState: (state) => {
+    console.info(`[vds-web][webcodecs-audio-state] ${state}`);
+    diagnostics.update({ relayProtocolState: state });
+  },
   onDecodedBlock: () => diagnostics.incrementCounter('webDecodedAudioBlocks'),
   onDroppedBlock: (reason) => {
+    console.info(`[vds-web][webcodecs-audio-drop] ${reason}`);
     diagnostics.incrementCounter('webDroppedAudioBlocks');
     diagnostics.update({ relayFailureReason: reason });
   }
@@ -754,6 +777,14 @@ function handleInboundEncodedFrame(data: unknown, peerId: string): void {
       diagnostics.incrementCounter('encodedFramesReceived');
       diagnostics.update({ h264PayloadFormat: decoded.header.payloadFormat || 'unknown' });
       if (decoded.header.keyframe) {
+        console.info(`[vds-web][video-keyframe] ${toConsoleJson({
+          codec: decoded.header.codec,
+          payloadFormat: decoded.header.payloadFormat,
+          timestampUs: decoded.header.timestampUs,
+          sequence: decoded.header.sequence,
+          payloadBytes: decoded.payload.byteLength,
+          mediaManifestVideo: (diagnostics.getSnapshot().mediaManifest as { video?: unknown } | undefined)?.video
+        })}`);
         diagnostics.incrementCounter('encodedKeyframesReceived');
         lastVideoKeyframeForRelay = {
           timestampUs: decoded.header.timestampUs,
@@ -763,6 +794,18 @@ function handleInboundEncodedFrame(data: unknown, peerId: string): void {
           capturedAt: Date.now()
         };
         sendRelayBootstrapKeyframe();
+      }
+      const received = diagnostics.getSnapshot().encodedFramesReceived;
+      if (received === 1 || received % 120 === 0) {
+        console.info(`[vds-web][video-frame-received] ${toConsoleJson({
+          codec: decoded.header.codec,
+          keyframe: decoded.header.keyframe,
+          payloadFormat: decoded.header.payloadFormat,
+          timestampUs: decoded.header.timestampUs,
+          sequence: decoded.header.sequence,
+          payloadBytes: decoded.payload.byteLength,
+          encodedFramesReceived: received
+        })}`);
       }
     }
     diagnostics.update({
@@ -864,6 +907,17 @@ function renderCapability(report: CapabilityReport): void {
 
 function renderDiagnostics(): void {
   const snapshot = diagnostics.getSnapshot();
+  applyVideoManifestDisplaySize(snapshot.mediaManifest);
+  const now = Date.now();
+  if (
+    snapshot.mediaManifest &&
+    snapshot.webDecodedVideoFrames === 0 &&
+    snapshot.dataChannelFramesReceived === 0 &&
+    now - lastConsoleDiagnosticsAt > 1000
+  ) {
+    lastConsoleDiagnosticsAt = now;
+    console.info(`[vds-web][diagnostics] ${toConsoleJson(snapshot)}`);
+  }
   diagnosticsOutput.value = diagnostics.format();
   viewerRoomId.textContent = snapshot.roomId || '-';
   chainPositionText.textContent = Number.isFinite(snapshot.chainPosition) ? String(snapshot.chainPosition) : '-';
@@ -1007,6 +1061,16 @@ function getManifestVideoCodec(): string {
   return codec === 'hevc' ? 'h265' : codec;
 }
 
+function applyVideoManifestDisplaySize(mediaManifest: unknown): void {
+  if (!mediaManifest || typeof mediaManifest !== 'object') {
+    return;
+  }
+  const video = (mediaManifest as { video?: { width?: unknown; height?: unknown } }).video;
+  const width = Number(video?.width || 0);
+  const height = Number(video?.height || 0);
+  dataChannelVideoPlayer.setExpectedDisplaySize(width, height);
+}
+
 function getElement<T extends HTMLElement>(id: string): T {
   const element = document.getElementById(id);
   if (!element) {
@@ -1027,4 +1091,12 @@ function getClientId(): string {
 
 function errorToMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function toConsoleJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }

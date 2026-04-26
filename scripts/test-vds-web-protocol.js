@@ -45,6 +45,19 @@ function makeFramePayload() {
   ]).buffer;
 }
 
+function makeHevcFramePayload() {
+  return new Uint8Array([
+    0, 0, 0, 1,
+    0x42, 0x01, 0x01, 0x01,
+    0, 0, 0, 1,
+    0x44, 0x01, 0x01, 0x01, 0x01, 0x5d, 0x5d,
+    0, 0, 0, 1,
+    0x4e, 0x01, 0x01, 0x01,
+    0, 0, 0, 1,
+    0x26, 0x01, 0x80, 0x88, 0x84
+  ]).buffer;
+}
+
 function testDataChannelFrameEnvelope() {
   const protocol = loadTsModule('vds_web/src/datachannel-protocol.ts');
   const payload = makeFramePayload();
@@ -202,6 +215,275 @@ async function testWebCodecsPlayerDecodePath() {
   }
 }
 
+async function testWebCodecsHevc2kLevelSelection() {
+  const states = [];
+  const drops = [];
+  const supportedCodecs = [];
+
+  class FakeEncodedVideoChunk {
+    constructor(init) {
+      this.init = init;
+    }
+  }
+
+  class FakeVideoDecoder {
+    static async isConfigSupported(config) {
+      supportedCodecs.push(config.codec);
+      assert.deepStrictEqual(config.hevc, { format: 'annexb' });
+      if (config.codec === 'hev1.1.6.L150.B0') {
+        assert.strictEqual(config.codedWidth, 2560);
+        assert.strictEqual(config.codedHeight, 1440);
+        assert.strictEqual(config.displayAspectWidth, 2560);
+        assert.strictEqual(config.displayAspectHeight, 1440);
+      }
+      return { supported: config.codec === 'hev1.1.6.L150.B0' };
+    }
+
+    constructor(init) {
+      this.init = init;
+      this.state = 'unconfigured';
+    }
+
+    configure(config) {
+      this.config = config;
+      this.state = 'configured';
+    }
+
+    decode() {
+      this.init.output({
+        displayWidth: 2560,
+        displayHeight: 1440,
+        codedWidth: 2560,
+        codedHeight: 1440,
+        visibleRect: { x: 0, y: 0, width: 2560, height: 1440 },
+        close: () => {}
+      });
+    }
+
+    close() {
+      this.state = 'closed';
+    }
+  }
+
+  const fakeCanvas = {
+    width: 1,
+    height: 1,
+    getContext: () => ({
+      drawImage: () => {}
+    })
+  };
+
+  const previousWindow = global.window;
+  global.window = {
+    VideoDecoder: FakeVideoDecoder,
+    EncodedVideoChunk: FakeEncodedVideoChunk
+  };
+
+  try {
+    const playerModule = loadTsModule('vds_web/src/webcodecs-player.ts');
+    const player = new playerModule.WebCodecsH264Player(fakeCanvas, {
+      onState: (state) => states.push(state),
+      onDecodedFrame: () => {},
+      onDroppedFrame: (reason) => drops.push(reason),
+      onPayloadFormat: () => {}
+    });
+    player.setExpectedDisplaySize(2560, 1440);
+
+    await player.pushFrame({
+      protocol: 'vds-media-encoded-v1',
+      type: 'frame',
+      streamType: 'video',
+      codec: 'h265',
+      payloadFormat: 'annexb',
+      timestampUs: 9000,
+      sequence: 1,
+      keyframe: true,
+      config: true
+    }, makeHevcFramePayload());
+
+    assert.strictEqual(supportedCodecs[0], 'hev1.1.6.L150.B0');
+    assert.ok(states.includes('webcodecs-configured-hev1.1.6.L150.B0'));
+    assert.strictEqual(fakeCanvas.width, 2560);
+    assert.strictEqual(fakeCanvas.height, 1440);
+    assert.deepStrictEqual(drops, []);
+  } finally {
+    global.window = previousWindow;
+  }
+}
+
+async function testWebCodecsHevc1080pCodedDimensionAlignment() {
+  const seenConfigs = [];
+
+  class FakeEncodedVideoChunk {
+    constructor(init) {
+      this.init = init;
+    }
+  }
+
+  class FakeVideoDecoder {
+    static async isConfigSupported(config) {
+      seenConfigs.push(config);
+      return { supported: config.codec === 'hev1.1.6.L123.B0' };
+    }
+
+    constructor(init) {
+      this.init = init;
+      this.state = 'unconfigured';
+    }
+
+    configure(config) {
+      this.config = config;
+      this.state = 'configured';
+    }
+
+    decode() {
+      this.init.output({
+        displayWidth: 1920,
+        displayHeight: 1080,
+        codedWidth: 1920,
+        codedHeight: 1088,
+        visibleRect: { x: 0, y: 0, width: 1920, height: 1080 },
+        close: () => {}
+      });
+    }
+
+    close() {
+      this.state = 'closed';
+    }
+  }
+
+  const fakeCanvas = {
+    width: 1,
+    height: 1,
+    getContext: () => ({
+      drawImage: () => {}
+    })
+  };
+
+  const previousWindow = global.window;
+  global.window = {
+    VideoDecoder: FakeVideoDecoder,
+    EncodedVideoChunk: FakeEncodedVideoChunk
+  };
+
+  try {
+    const playerModule = loadTsModule('vds_web/src/webcodecs-player.ts');
+    const player = new playerModule.WebCodecsH264Player(fakeCanvas, {
+      onState: () => {},
+      onDecodedFrame: () => {},
+      onDroppedFrame: () => {},
+      onPayloadFormat: () => {}
+    });
+    player.setExpectedDisplaySize(1920, 1080);
+
+    await player.pushFrame({
+      protocol: 'vds-media-encoded-v1',
+      type: 'frame',
+      streamType: 'video',
+      codec: 'h265',
+      payloadFormat: 'annexb',
+      timestampUs: 9000,
+      sequence: 1,
+      keyframe: true,
+      config: true
+    }, makeHevcFramePayload());
+
+    assert.strictEqual(seenConfigs[0].codec, 'hev1.1.6.L123.B0');
+    assert.strictEqual(seenConfigs[0].codedWidth, 1920);
+    assert.strictEqual(seenConfigs[0].codedHeight, 1088);
+    assert.strictEqual(seenConfigs[0].displayAspectWidth, 1920);
+    assert.strictEqual(seenConfigs[0].displayAspectHeight, 1080);
+  } finally {
+    global.window = previousWindow;
+  }
+}
+
+async function testWebCodecsHevcUsesDecodedSizeWhenStreamIsSmallerThanManifest() {
+  const frameInfos = [];
+
+  class FakeEncodedVideoChunk {
+    constructor(init) {
+      this.init = init;
+    }
+  }
+
+  class FakeVideoDecoder {
+    static async isConfigSupported(config) {
+      return { supported: config.codec === 'hev1.1.6.L123.B0' };
+    }
+
+    constructor(init) {
+      this.init = init;
+      this.state = 'unconfigured';
+    }
+
+    configure(config) {
+      this.config = config;
+      this.state = 'configured';
+    }
+
+    decode() {
+      this.init.output({
+        displayWidth: 1280,
+        displayHeight: 720,
+        codedWidth: 1280,
+        codedHeight: 720,
+        visibleRect: { x: 0, y: 0, width: 1280, height: 720 },
+        close: () => {}
+      });
+    }
+
+    close() {
+      this.state = 'closed';
+    }
+  }
+
+  const fakeCanvas = {
+    width: 1,
+    height: 1,
+    getContext: () => ({
+      drawImage: () => {}
+    })
+  };
+
+  const previousWindow = global.window;
+  global.window = {
+    VideoDecoder: FakeVideoDecoder,
+    EncodedVideoChunk: FakeEncodedVideoChunk
+  };
+
+  try {
+    const playerModule = loadTsModule('vds_web/src/webcodecs-player.ts');
+    const player = new playerModule.WebCodecsH264Player(fakeCanvas, {
+      onState: () => {},
+      onDecodedFrame: () => {},
+      onDroppedFrame: () => {},
+      onPayloadFormat: () => {},
+      onVideoFrameInfo: (info) => frameInfos.push(info)
+    });
+    player.setExpectedDisplaySize(1920, 1080);
+
+    await player.pushFrame({
+      protocol: 'vds-media-encoded-v1',
+      type: 'frame',
+      streamType: 'video',
+      codec: 'h265',
+      payloadFormat: 'annexb',
+      timestampUs: 9000,
+      sequence: 1,
+      keyframe: true,
+      config: true
+    }, makeHevcFramePayload());
+
+    assert.strictEqual(fakeCanvas.width, 1280);
+    assert.strictEqual(fakeCanvas.height, 720);
+    assert.strictEqual(frameInfos[0].sourceWidth, 1280);
+    assert.strictEqual(frameInfos[0].sourceHeight, 720);
+  } finally {
+    global.window = previousWindow;
+  }
+}
+
 async function testWebCodecsAudioDecodePath() {
   const decodedChunks = [];
   const states = [];
@@ -345,6 +627,9 @@ async function main() {
   testDataChannelFrameRejection();
   testDataChannelFrameChunking();
   await testWebCodecsPlayerDecodePath();
+  await testWebCodecsHevc2kLevelSelection();
+  await testWebCodecsHevc1080pCodedDimensionAlignment();
+  await testWebCodecsHevcUsesDecodedSizeWhenStreamIsSmallerThanManifest();
   await testWebCodecsAudioDecodePath();
   console.log('vds-web protocol tests passed');
 }

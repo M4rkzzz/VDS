@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.6.6
+
+- improved Web H.265 playback sizing by configuring WebCodecs from the media manifest with codec-aware coded/display dimensions and safe fallback when unsupported
+- fixed native-capture H.265 Web viewer cropping where Edge reported a smaller HEVC visible/display rect than the intended coded frame
+- improved OBS ingest H.265 handling so Web playback adapts to the actual incoming stream resolution instead of assuming the desktop quality preset
+- added Web viewer console diagnostics for H.265 keyframes, WebCodecs configuration, and VideoFrame coded/display/visible/source rectangles
+- expanded VDS_web protocol tests for HEVC 1080p, 2K, and mismatched manifest-vs-decoded stream dimensions
+- kept the failed `hevc_metadata width/height` sender-side experiment out of the release path after confirming it could suppress Web video keyframes
+
 ## 1.6.5
 
 - added the VDS_web Chrome/Edge viewer with DataChannel encoded media playback, WebCodecs video/audio decode, manual audio delay, volume control, fullscreen playback, and a Windows-app-aligned viewer interface
