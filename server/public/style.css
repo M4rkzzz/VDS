@@ -621,6 +621,39 @@ body:not(.native-embedded-fullscreen) .workspace-panel.workspace-panel-preparing
   color: #00ff88;
 }
 
+.p2p-diagnostic-card,
+.capture-diagnostic-card {
+  display: none;
+}
+
+body.debug-mode-enabled .p2p-diagnostic-card,
+body.debug-mode-enabled .capture-diagnostic-card {
+  display: block;
+}
+
+.p2p-diagnostic-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  font-weight: 700;
+}
+
+.p2p-diagnostic-output {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.74);
+}
+
+body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .p2p-diagnostic-output {
+  color: rgba(0, 0, 0, 0.68);
+}
+
 #chain-position {
   color: #00d9ff;
   font-weight: bold;
@@ -2595,6 +2628,17 @@ body:not(.native-embedded-fullscreen) .workspace-side-title {
   font-size: clamp(52px, 6vw, 84px);
   line-height: 0.92;
   letter-spacing: -0.08em;
+}
+
+body:not(.native-embedded-fullscreen) .workspace-p2p-status {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.58);
+}
+
+body:not(.native-embedded-fullscreen)[data-app-view="viewer"] .workspace-p2p-status {
+  color: rgba(0, 0, 0, 0.58);
 }
 
 body:not(.native-embedded-fullscreen) .workspace-block {

@@ -99,6 +99,7 @@
           <div class="workspace-side-header">
             <p class="workspace-side-label">host</p>
             <h2 class="workspace-side-title">主持</h2>
+            <p id="host-p2p-status" class="workspace-p2p-status">P2P：等待</p>
           </div>
 
           <div class="status-bar workspace-block">
@@ -107,6 +108,22 @@
             <p class="status-detail">源线程帧率：<span id="host-source-fps">-</span></p>
             <p class="status-detail">预览帧率：<span id="host-capture-fps">-</span></p>
             <p class="status-detail">发送帧率：<span id="host-send-fps">-</span></p>
+          </div>
+
+          <div id="host-p2p-diagnostic" class="workspace-card workspace-block p2p-diagnostic-card">
+            <div class="p2p-diagnostic-header">
+              <span>P2P 诊断</span>
+              <button id="btn-copy-host-p2p-diagnostic" class="btn btn-small btn-secondary" type="button">复制</button>
+            </div>
+            <pre id="host-p2p-diagnostic-output" class="p2p-diagnostic-output">等待诊断数据...</pre>
+          </div>
+
+          <div id="host-capture-diagnostic" class="workspace-card workspace-block capture-diagnostic-card">
+            <div class="p2p-diagnostic-header">
+              <span>采集资源</span>
+              <button id="btn-copy-host-capture-diagnostic" class="btn btn-small btn-secondary" type="button">复制</button>
+            </div>
+            <pre id="host-capture-diagnostic-output" class="p2p-diagnostic-output">等待采集数据...</pre>
           </div>
 
           <div id="room-info" class="workspace-card workspace-block hidden">
@@ -179,6 +196,7 @@
           <div class="workspace-side-header workspace-side-header-viewer">
             <p class="workspace-side-label">join</p>
             <h2 class="workspace-side-title">加入</h2>
+            <p id="viewer-p2p-status" class="workspace-p2p-status">P2P：等待</p>
           </div>
 
           <div id="join-form" class="workspace-card workspace-join-card workspace-block">
@@ -212,6 +230,14 @@
             <p>你在链中的位置：<span id="chain-position">-</span></p>
             <p>接收帧率：<span id="viewer-receive-fps">-</span></p>
             <p>渲染帧率：<span id="viewer-render-fps">-</span></p>
+          </div>
+
+          <div id="viewer-p2p-diagnostic" class="workspace-card workspace-block p2p-diagnostic-card">
+            <div class="p2p-diagnostic-header">
+              <span>P2P 诊断</span>
+              <button id="btn-copy-viewer-p2p-diagnostic" class="btn btn-small btn-secondary" type="button">复制</button>
+            </div>
+            <pre id="viewer-p2p-diagnostic-output" class="p2p-diagnostic-output">等待诊断数据...</pre>
           </div>
 
           <div class="workspace-card workspace-block workspace-action-card">

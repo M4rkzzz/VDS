@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.6.4
+
+- improved session resume and server protocol safety with unguessable tokens, payload limits, room/viewer limits, message rate limits, and collision-safe room IDs
+- improved connection recovery stability by bounding pending messages, handling invalid WebSocket JSON safely, and making teardown paths more reliable
+- added compact P2P state visibility on host and viewer screens, including gathering, checking, connected, media waiting, reconnecting, failed, and NAT mapping states
+- added debug-only P2P diagnostics with copyable candidate counts, selected candidate pair, RTT, frame counters, loss recovery counters, and NAT-PMP/PCP fallback details
+- added debug-only native capture diagnostics for capture FPS, preview FPS, encode/send FPS, readback timings, encoder state, dropped frames, and audio capture state
+- improved native/media-agent reliability around Windows window title reads, special path quoting, invoke timeouts, and WASAPI callback isolation
+- improved the viewer lobby refresh experience so automatic refresh is silent while manual refresh still updates visible feedback
+- tightened server room lifecycle cleanup so host grace resume remains possible while expired rooms invalidate session tokens and clean viewer state
+- added a fixed `npm run release:check` gate that validates syntax, server tests, logging policy, media-agent verification, production audit, and update artifact metadata
+- refined NAT-PMP/PCP as a short last-chance pure-P2P fallback after ICE/failfast only, with mapped srflx candidates injected through Trickle ICE when available
+- documented the build and release handoff flow for future maintainers
+
 ## 1.6.3
 
 - added RTP loss recovery on the native peer transport with NACK retransmission support, PLI handling, and keyframe request diagnostics

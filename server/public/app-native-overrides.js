@@ -51,6 +51,22 @@
   const nativePeerSignalWaiters = new Map();
   const attachedEmbeddedSurfaces = new Map();
   const nativeDebugRateLimitState = new Map();
+  const P2P_UI_STATE_LABELS = Object.freeze({
+    idle: '等待',
+    gathering: '收集候选',
+    checking: '连接检查',
+    connected: '已直连',
+    'media-waiting': '媒体等待',
+    disconnected: '连接断开',
+    'restart-attempting': '重连中',
+    failed: '失败',
+    'waiting-viewer': '等待观众',
+    'nat-mapping': '端口映射'
+  });
+  const VIEWER_MEDIA_WAIT_TIMEOUT_MS = 7000;
+  const P2P_NAT_MAPPING_TIMEOUT_MS = 6000;
+  const P2P_NAT_MAPPING_CONNECT_WAIT_MS = 7000;
+  const P2P_NAT_MAPPING_MAX_CANDIDATES = 4;
 
   const HOST_PREVIEW_SURFACE_ID = 'embedded-host-preview';
 
@@ -83,6 +99,9 @@
   let nativeHostEffectiveCodec = 'h264';
   let currentHostBackend = 'native';
   let obsRoomCreatePending = false;
+  let viewerMediaWaitTimerId = null;
+  let latestP2pStatsSnapshot = null;
+  let latestHostCaptureDiagnosticReport = '等待采集数据...';
   let obsIngestStreamActive = false;
   let viewerFullscreenControlsHideTimerId = 0;
   let viewerFullscreenCursorPollTimerId = 0;
@@ -781,6 +800,24 @@
       sdpMid: String(candidate.sdpMid || ''),
       sdpMLineIndex: Number.isFinite(candidate.sdpMLineIndex) ? candidate.sdpMLineIndex : null
     });
+  }
+
+  function getIceCandidateText(candidate) {
+    if (!candidate) {
+      return '';
+    }
+    if (typeof candidate === 'string') {
+      return candidate;
+    }
+    return String(candidate.candidate || '');
+  }
+
+  function isAllowedPureP2pCandidate(candidate) {
+    const candidateText = getIceCandidateText(candidate);
+    if (!candidateText) {
+      return false;
+    }
+    return !/\btyp\s+relay\b/i.test(candidateText);
   }
 
   function isSameRemoteDescription(currentDescription, incomingDescription) {
@@ -1567,11 +1604,59 @@
         restartInProgress: false,
         natMappingAttempted: false,
         natMappingInProgress: false,
+        natMappingSuccess: false,
+        natMappingStartedAt: null,
+        natMappingCompletedAt: null,
+        natMappingDurationMs: null,
+        natMappingTriggerReason: '',
+        natMappingResultReason: '',
+        natMappingProtocol: '',
+        natMappingMappedCandidateCount: 0,
+        natMappingError: '',
         selectedCandidatePairLogged: false
       };
       peerConnectionMeta.set(peerId, meta);
     }
     return meta;
+  }
+
+  function getP2pStatusElementForPeer(peerId) {
+    const handle = nativePeerHandles.get(peerId);
+    if (handle && handle.role === 'host-downstream') {
+      return elements.hostP2pStatus || null;
+    }
+    if (handle && handle.role === 'viewer-upstream') {
+      return elements.viewerP2pStatus || null;
+    }
+    if (handle && handle.role === 'relay-downstream') {
+      return null;
+    }
+    if (isHost) {
+      return elements.hostP2pStatus || null;
+    }
+    return elements.viewerP2pStatus || null;
+  }
+
+  function setP2pStatusElementState(target, state) {
+    const label = P2P_UI_STATE_LABELS[state] || '';
+    if (!target || !label) {
+      return;
+    }
+    target.dataset.p2pState = state;
+    target.textContent = `P2P：${label}`;
+  }
+
+  function setP2pStateForPeer(peerId, state) {
+    const target = getP2pStatusElementForPeer(peerId);
+    if (!target) {
+      return;
+    }
+    const meta = peerConnectionMeta.get(peerId);
+    if (meta) {
+      meta.p2pUiState = state;
+    }
+    setP2pStatusElementState(target, state);
+    renderP2pDiagnosticReport();
   }
 
   function classifyP2pFailure(meta) {
@@ -1587,9 +1672,269 @@
     return '纯 P2P 无法穿透当前网络';
   }
 
+  function clearViewerMediaWaitTimer() {
+    if (viewerMediaWaitTimerId) {
+      clearTimeout(viewerMediaWaitTimerId);
+      viewerMediaWaitTimerId = null;
+    }
+  }
+
+  function armViewerMediaWaitTimer(peerId) {
+    clearViewerMediaWaitTimer();
+    if (!peerId) {
+      return;
+    }
+    viewerMediaWaitTimerId = window.setTimeout(() => {
+      viewerMediaWaitTimerId = null;
+      if (sessionRole !== 'viewer' || upstreamPeerId !== peerId || videoStarted || upstreamConnected) {
+        return;
+      }
+      setP2pStateForPeer(peerId, 'media-waiting');
+      setViewerConnectionState('已连接，等待画面...');
+    }, VIEWER_MEDIA_WAIT_TIMEOUT_MS);
+  }
+
+  function getCandidateTypeCountsFromMeta(meta) {
+    const counts = { host: 0, srflx: 0, relay: 0, other: 0 };
+    if (!meta || !(meta.localCandidateTypes instanceof Set)) {
+      return counts;
+    }
+    meta.localCandidateTypes.forEach((type) => {
+      if (Object.prototype.hasOwnProperty.call(counts, type)) {
+        counts[type] += 1;
+      } else {
+        counts.other += 1;
+      }
+    });
+    return counts;
+  }
+
+  function pickPeerStats(peerId) {
+    const peers = Array.isArray(latestP2pStatsSnapshot && latestP2pStatsSnapshot.peers)
+      ? latestP2pStatsSnapshot.peers
+      : [];
+    return peers.find((entry) => entry && entry.peerId === peerId) || null;
+  }
+
+  function formatDiagnosticValue(value, fallback = '-') {
+    if (value === null || value === undefined || value === '') {
+      return fallback;
+    }
+    if (typeof value === 'number' && !Number.isFinite(value)) {
+      return fallback;
+    }
+    if (typeof value === 'boolean') {
+      return value ? 'true' : 'false';
+    }
+    if (typeof value === 'object') {
+      try {
+        return JSON.stringify(value);
+      } catch (_error) {
+        return '[object]';
+      }
+    }
+    return String(value);
+  }
+
+  function normalizeDiagnosticNumber(value, fallback = '-') {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      return fallback;
+    }
+    return String(numeric);
+  }
+
+  function getCandidateType(candidateText) {
+    const match = String(candidateText || '').match(/\btyp\s+([a-z0-9-]+)/i);
+    return match ? match[1].toLowerCase() : '-';
+  }
+
+  function getCandidateProtocol(candidateText) {
+    const match = String(candidateText || '').match(/^candidate:\S+\s+\d+\s+([a-z0-9-]+)\s+/i);
+    return match ? match[1].toLowerCase() : '-';
+  }
+
+  function getCandidateAddressFamily(candidateText) {
+    const text = String(candidateText || '');
+    const parts = text.trim().split(/\s+/);
+    const address = parts.length >= 5 ? parts[4] : '';
+    if (address.includes(':')) {
+      return 'ipv6';
+    }
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(address)) {
+      return 'ipv4';
+    }
+    return '-';
+  }
+
+  function summarizeSelectedCandidate(candidateText) {
+    if (!candidateText) {
+      return '-';
+    }
+    const type = getCandidateType(candidateText);
+    const protocol = getCandidateProtocol(candidateText);
+    const family = getCandidateAddressFamily(candidateText);
+    return `${type}/${protocol}/${family}`;
+  }
+
+  function buildP2pDiagnosticReport() {
+    const lines = [];
+    const activeStatus = isHost
+      ? (elements.hostP2pStatus && elements.hostP2pStatus.textContent)
+      : (elements.viewerP2pStatus && elements.viewerP2pStatus.textContent);
+    lines.push(`role: ${formatDiagnosticValue(sessionRole || (isHost ? 'host' : 'viewer'))}`);
+    lines.push(`roomId: ${formatDiagnosticValue(currentRoomId)}`);
+    lines.push(`clientId: ${formatDiagnosticValue(clientId)}`);
+    lines.push(`p2pStatus: ${formatDiagnosticValue(activeStatus)}`);
+    lines.push(`upstreamPeerId: ${formatDiagnosticValue(upstreamPeerId)}`);
+    lines.push(`hostId: ${formatDiagnosticValue(hostId)}`);
+    lines.push(`chainPosition: ${Number.isInteger(myChainPosition) ? myChainPosition : '-'}`);
+    lines.push(`connected: ${formatDiagnosticValue(upstreamConnected)}`);
+    lines.push(`videoStarted: ${formatDiagnosticValue(videoStarted)}`);
+    lines.push(`natMappingAvailable: ${formatDiagnosticValue(Boolean(mediaEngine && typeof mediaEngine.openNatMapping === 'function'))}`);
+    lines.push('');
+    lines.push('peers:');
+
+    if (nativePeerHandles.size === 0) {
+      lines.push('- none');
+    }
+
+    for (const [peerId, handle] of nativePeerHandles.entries()) {
+      const meta = peerConnectionMeta.get(peerId) || null;
+      const candidateCounts = getCandidateTypeCountsFromMeta(meta);
+      const statsPeer = pickPeerStats(peerId);
+      const peerTransport = statsPeer && statsPeer.peerTransport ? statsPeer.peerTransport : {};
+      const receiverRuntime = statsPeer && statsPeer.receiverRuntime ? statsPeer.receiverRuntime : {};
+      const selectedLocalCandidate = peerTransport.selectedLocalCandidate || '';
+      const selectedRemoteCandidate = peerTransport.selectedRemoteCandidate || '';
+      lines.push(`- peerId: ${peerId}`);
+      lines.push(`  role: ${formatDiagnosticValue(handle.role)}`);
+      lines.push(`  kind: ${formatDiagnosticValue(handle.kind)}`);
+      lines.push(`  connectionState: ${formatDiagnosticValue(handle.connectionState)}`);
+      lines.push(`  iceConnectionState: ${formatDiagnosticValue(handle.iceConnectionState)}`);
+      lines.push(`  signalingState: ${formatDiagnosticValue(handle.signalingState)}`);
+      lines.push(`  p2pUiState: ${formatDiagnosticValue(meta && meta.p2pUiState)}`);
+      lines.push(`  localCandidateCount: ${meta && Number.isFinite(meta.localCandidateCount) ? meta.localCandidateCount : 0}`);
+      lines.push(`  localCandidateTypes: host=${candidateCounts.host}, srflx=${candidateCounts.srflx}, relay=${candidateCounts.relay}, other=${candidateCounts.other}`);
+      lines.push(`  remoteCandidateCount: ${meta && meta.remoteCandidateKeys ? meta.remoteCandidateKeys.size : 0}`);
+      lines.push(`  restartAttempts: ${meta && Number.isFinite(meta.restartAttempts) ? meta.restartAttempts : 0}`);
+      lines.push(`  restartInProgress: ${formatDiagnosticValue(Boolean(meta && meta.restartInProgress))}`);
+      lines.push(`  natMappingAttempted: ${formatDiagnosticValue(Boolean(meta && meta.natMappingAttempted))}`);
+      lines.push(`  natMappingInProgress: ${formatDiagnosticValue(Boolean(meta && meta.natMappingInProgress))}`);
+      lines.push(`  natMappingSuccess: ${formatDiagnosticValue(Boolean(meta && meta.natMappingSuccess))}`);
+      lines.push(`  natMappingDurationMs: ${formatDiagnosticValue(meta && meta.natMappingDurationMs)}`);
+      lines.push(`  natMappingTriggerReason: ${formatDiagnosticValue(meta && meta.natMappingTriggerReason)}`);
+      lines.push(`  natMappingResultReason: ${formatDiagnosticValue(meta && meta.natMappingResultReason)}`);
+      lines.push(`  natMappingProtocol: ${formatDiagnosticValue(meta && meta.natMappingProtocol)}`);
+      lines.push(`  natMappingMappedCandidates: ${formatDiagnosticValue(meta && meta.natMappingMappedCandidateCount)}`);
+      lines.push(`  natMappingError: ${formatDiagnosticValue(meta && meta.natMappingError)}`);
+      lines.push(`  selectedCandidatePair: local=${summarizeSelectedCandidate(selectedLocalCandidate)}, remote=${summarizeSelectedCandidate(selectedRemoteCandidate)}`);
+      lines.push(`  selectedLocalCandidate: ${formatDiagnosticValue(selectedLocalCandidate)}`);
+      lines.push(`  selectedRemoteCandidate: ${formatDiagnosticValue(selectedRemoteCandidate)}`);
+      lines.push(`  rttMs: ${normalizeDiagnosticNumber(peerTransport.roundTripTimeMs)}`);
+      lines.push(`  videoSent: ${formatDiagnosticValue(peerTransport.videoFramesSent || (statsPeer && statsPeer.mediaBinding && statsPeer.mediaBinding.framesSent) || 0)}`);
+      lines.push(`  videoReceived: ${formatDiagnosticValue(peerTransport.remoteVideoFramesReceived || 0)}`);
+      lines.push(`  videoDecoded: ${formatDiagnosticValue(peerTransport.decodedFramesRendered || 0)}`);
+      lines.push(`  audioSent: ${formatDiagnosticValue(peerTransport.audioFramesSent || 0)}`);
+      lines.push(`  audioReceived: ${formatDiagnosticValue(peerTransport.remoteAudioFramesReceived || 0)}`);
+      lines.push(`  nackRetransmissions: ${formatDiagnosticValue(peerTransport.nackRetransmissions || 0)}`);
+      lines.push(`  pliRequestsReceived: ${formatDiagnosticValue(peerTransport.pliRequestsReceived || 0)}`);
+      lines.push(`  keyframeRequestsSent: ${formatDiagnosticValue(peerTransport.keyframeRequestsSent || 0)}`);
+      lines.push(`  decoderRecoveryCount: ${formatDiagnosticValue(peerTransport.decoderRecoveryCount || 0)}`);
+      lines.push(`  droppedVideoUnits: ${formatDiagnosticValue(receiverRuntime.droppedVideoUnits || 0)}`);
+      lines.push(`  droppedAudioBlocks: ${formatDiagnosticValue(receiverRuntime.droppedAudioBlocks || 0)}`);
+      lines.push(`  receiverReason: ${formatDiagnosticValue(receiverRuntime.reason)}`);
+      lines.push(`  receiverError: ${formatDiagnosticValue(receiverRuntime.lastError)}`);
+    }
+
+    return lines.join('\n');
+  }
+
+  function renderP2pDiagnosticReport() {
+    const report = buildP2pDiagnosticReport();
+    if (elements.hostP2pDiagnosticOutput) {
+      elements.hostP2pDiagnosticOutput.textContent = report;
+    }
+    if (elements.viewerP2pDiagnosticOutput) {
+      elements.viewerP2pDiagnosticOutput.textContent = report;
+    }
+  }
+
+  function buildHostCaptureDiagnosticReportFromStats(stats, fpsSnapshot = {}) {
+    const peers = Array.isArray(stats && stats.peers) ? stats.peers : [];
+    const peer = peers.find((entry) => entry && entry.role === 'host-downstream') || {};
+    const mediaBinding = peer.mediaBinding || {};
+    const peerTransport = peer.peerTransport || {};
+    const surfaces = Array.isArray(stats && stats.surfaces) ? stats.surfaces : [];
+    const surface = surfaces.find((entry) =>
+      entry &&
+      (entry.target === 'host-session-video' || entry.target === 'host-capture-artifact')
+    ) || {};
+    const hostPlan = stats && stats.hostCapturePlan ? stats.hostCapturePlan : {};
+    const hostPipeline = stats && stats.hostPipeline ? stats.hostPipeline : {};
+    const audioBackend = stats && stats.audioBackend ? stats.audioBackend : {};
+
+    return [
+      `backend: ${formatDiagnosticValue(currentHostBackend)}`,
+      `captureKind: ${formatDiagnosticValue(hostPlan.captureKind)}`,
+      `captureState: ${formatDiagnosticValue(hostPlan.captureState)}`,
+      `target: ${formatDiagnosticValue(hostPlan.captureBackend)}`,
+      `resolution: ${formatDiagnosticValue(mediaBinding.width || hostPlan.width)}x${formatDiagnosticValue(mediaBinding.height || hostPlan.height)}`,
+      `configuredFps: ${formatDiagnosticValue(mediaBinding.frameRate || hostPlan.frameRate)}`,
+      `bitrateKbps: ${formatDiagnosticValue(mediaBinding.bitrateKbps || hostPlan.bitrateKbps)}`,
+      `captureFps: ${formatDiagnosticValue(fpsSnapshot.sourceFps)}`,
+      `previewFps: ${formatDiagnosticValue(fpsSnapshot.previewFps)}`,
+      `encodeFps: ${formatDiagnosticValue(fpsSnapshot.sendFps)}`,
+      `sourceFramesCaptured: ${formatDiagnosticValue(mediaBinding.sourceFramesCaptured || 0)}`,
+      `framesSent: ${formatDiagnosticValue(mediaBinding.framesSent || peerTransport.videoFramesSent || 0)}`,
+      `droppedVideoUnits: ${formatDiagnosticValue(peerTransport.droppedVideoUnits || 0)}`,
+      `encodeQueueDepth: ${formatDiagnosticValue(mediaBinding.encodeQueueDepth)}`,
+      `avgCopyResourceUs: ${formatDiagnosticValue(mediaBinding.avgSourceCopyResourceUs || 0)}`,
+      `avgMapUs: ${formatDiagnosticValue(mediaBinding.avgSourceMapUs || 0)}`,
+      `avgMemcpyUs: ${formatDiagnosticValue(mediaBinding.avgSourceMemcpyUs || 0)}`,
+      `avgReadbackUs: ${formatDiagnosticValue(mediaBinding.avgSourceTotalReadbackUs || 0)}`,
+      `surfaceRunning: ${formatDiagnosticValue(surface.running)}`,
+      `surfaceRenderedFrames: ${formatDiagnosticValue(surface.decodedFramesRendered || 0)}`,
+      `surfaceFrameStddevMs: ${formatDiagnosticValue(surface.frameIntervalStddevMs)}`,
+      `encoder: ${formatDiagnosticValue(hostPipeline.selectedVideoEncoder || mediaBinding.videoEncoderBackend)}`,
+      `encoderBackend: ${formatDiagnosticValue(hostPipeline.videoEncoderBackend || mediaBinding.videoEncoderBackend)}`,
+      `hardware: ${formatDiagnosticValue(hostPipeline.hardware)}`,
+      `audioCaptureActive: ${formatDiagnosticValue(audioBackend.captureActive)}`,
+      `audioPacketsCaptured: ${formatDiagnosticValue(audioBackend.packetsCaptured || 0)}`,
+      `audioFramesCaptured: ${formatDiagnosticValue(audioBackend.framesCaptured || 0)}`,
+      `reason: ${formatDiagnosticValue(mediaBinding.reason || hostPlan.reason || hostPipeline.reason)}`,
+      `lastError: ${formatDiagnosticValue(mediaBinding.lastError || hostPlan.lastError || hostPipeline.lastError)}`
+    ].join('\n');
+  }
+
+  function buildHostCaptureDiagnosticReport() {
+    return latestHostCaptureDiagnosticReport;
+  }
+
+  function renderHostCaptureDiagnosticReport() {
+    if (elements.hostCaptureDiagnosticOutput) {
+      elements.hostCaptureDiagnosticOutput.textContent = latestHostCaptureDiagnosticReport;
+    }
+  }
+
+  function withP2pTimeout(promise, timeoutMs, timeoutMessage) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        window.setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+      })
+    ]);
+  }
+
   function rememberLocalIceCandidate(meta, candidate) {
     if (!meta || !candidate) {
       return;
+    }
+    for (const [peerId, peerMeta] of peerConnectionMeta.entries()) {
+      if (peerMeta === meta) {
+        setP2pStateForPeer(peerId, 'gathering');
+        break;
+      }
     }
     meta.localCandidateCount += 1;
     const candidateObject = typeof candidate === 'object'
@@ -1641,28 +1986,55 @@
 
     meta.natMappingAttempted = true;
     meta.natMappingInProgress = true;
-    const candidates = (meta.localHostUdpCandidates || []).map((entry) => entry.candidate).filter(Boolean);
+    meta.natMappingSuccess = false;
+    meta.natMappingStartedAt = Date.now();
+    meta.natMappingCompletedAt = null;
+    meta.natMappingDurationMs = null;
+    meta.natMappingTriggerReason = reason || '';
+    meta.natMappingResultReason = 'in-progress';
+    meta.natMappingProtocol = '';
+    meta.natMappingMappedCandidateCount = 0;
+    meta.natMappingError = '';
+    const candidates = (meta.localHostUdpCandidates || [])
+      .map((entry) => entry.candidate)
+      .filter(Boolean)
+      .slice(0, P2P_NAT_MAPPING_MAX_CANDIDATES);
     logNativeStep('peer-nat-mapping:start', {
       peerId,
       reason,
       candidateCount: candidates.length
     }, 'p2p');
+    setP2pStateForPeer(peerId, 'nat-mapping');
     if (!isHost) {
       setViewerConnectionState('纯 P2P 直连失败，正在尝试路由器端口映射...');
     }
 
     try {
-      const result = await mediaEngine.openNatMapping({
-        peerId,
-        candidates,
-        lifetimeSeconds: 180
-      });
+      const result = await withP2pTimeout(
+        mediaEngine.openNatMapping({
+          peerId,
+          candidates,
+          lifetimeSeconds: 180
+        }),
+        P2P_NAT_MAPPING_TIMEOUT_MS,
+        'nat-mapping-timeout'
+      );
       logNativeStep('peer-nat-mapping:result', {
         peerId,
         ok: Boolean(result && result.ok),
         reason: result && result.reason,
+        protocol: result && result.protocol,
         mappedCandidates: result && Array.isArray(result.candidates) ? result.candidates.length : 0
       }, 'p2p');
+      meta.natMappingCompletedAt = Date.now();
+      meta.natMappingDurationMs = meta.natMappingCompletedAt - meta.natMappingStartedAt;
+      meta.natMappingSuccess = Boolean(result && result.ok);
+      meta.natMappingResultReason = result && result.reason ? String(result.reason) : 'nat-mapping-failed';
+      meta.natMappingProtocol = result && result.protocol ? String(result.protocol) : '';
+      meta.natMappingMappedCandidateCount = result && Array.isArray(result.candidates) ? result.candidates.length : 0;
+      meta.natMappingError = result && Array.isArray(result.errors) && result.errors.length > 0
+        ? result.errors.slice(0, 3).join('; ')
+        : '';
       if (!result || !result.ok || !Array.isArray(result.candidates) || result.candidates.length === 0) {
         return false;
       }
@@ -1682,14 +2054,20 @@
         meta.connectTimeoutId = null;
         const currentHandle = nativePeerHandles.get(peerId);
         if (!meta.hasConnected && currentHandle && !currentHandle.closed && currentHandle.connectionState !== 'connected') {
+          setP2pStateForPeer(peerId, 'failed');
           if (!isHost) {
-            setViewerConnectionState(classifyP2pFailure(meta));
+            setViewerConnectionState('端口映射已尝试，但当前网络仍无法纯 P2P 穿透');
           }
           await closeNativePeerConnectionImpl(peerId, { clearRetryState: false }).catch(() => {});
         }
-      }, 7000);
+      }, P2P_NAT_MAPPING_CONNECT_WAIT_MS);
       return true;
     } catch (error) {
+      meta.natMappingCompletedAt = Date.now();
+      meta.natMappingDurationMs = meta.natMappingStartedAt ? meta.natMappingCompletedAt - meta.natMappingStartedAt : null;
+      meta.natMappingSuccess = false;
+      meta.natMappingResultReason = 'nat-mapping-error';
+      meta.natMappingError = error && error.message ? error.message : String(error);
       logNativeStep('peer-nat-mapping:failed', {
         peerId,
         message: error && error.message ? error.message : String(error)
@@ -1697,7 +2075,41 @@
       return false;
     } finally {
       meta.natMappingInProgress = false;
+      renderP2pDiagnosticReport();
     }
+  }
+
+  async function finalizeP2pFailureWithNatMapping(peerId, reason, source) {
+    const meta = peerConnectionMeta.get(peerId);
+    const handle = nativePeerHandles.get(peerId);
+    if (!meta || !handle || handle.closed || meta.hasConnected || handle.connectionState === 'connected') {
+      return;
+    }
+
+    clearPeerConnectionTimeout(peerId);
+    const fallbackStarted = await attemptLastChanceNatMapping(peerId, reason);
+    if (fallbackStarted) {
+      return;
+    }
+
+    handle.connectionState = 'failed';
+    handle.iceConnectionState = 'failed';
+    setP2pStateForPeer(peerId, 'failed');
+    logNativeStep('peer-connect-failed', {
+      peerId,
+      source,
+      reason,
+      localCandidateCount: meta.localCandidateCount,
+      localCandidateTypes: Array.from(meta.localCandidateTypes || []),
+      natMappingAttempted: Boolean(meta.natMappingAttempted),
+      natMappingResultReason: meta.natMappingResultReason || ''
+    }, 'p2p');
+    if (!isHost) {
+      setViewerConnectionState(meta.natMappingAttempted
+        ? `纯 P2P 无法穿透当前网络（端口映射：${meta.natMappingResultReason || '失败'}）`
+        : reason);
+    }
+    await closeNativePeerConnectionImpl(peerId, { clearRetryState: false }).catch(() => {});
   }
 
   function armPeerConnectFailfast(peerId) {
@@ -1715,22 +2127,7 @@
         return;
       }
       const reason = classifyP2pFailure(meta);
-      const fallbackStarted = await attemptLastChanceNatMapping(peerId, reason);
-      if (fallbackStarted) {
-        return;
-      }
-      handle.connectionState = 'failed';
-      handle.iceConnectionState = 'failed';
-      logNativeStep('peer-connect-failfast', {
-        peerId,
-        reason,
-        localCandidateCount: meta.localCandidateCount,
-        localCandidateTypes: Array.from(meta.localCandidateTypes || [])
-      });
-      if (!isHost) {
-        setViewerConnectionState(reason);
-      }
-      await closeNativePeerConnectionImpl(peerId, { clearRetryState: false }).catch(() => {});
+      await finalizeP2pFailureWithNatMapping(peerId, reason, 'connect-failfast');
     }, typeof P2P_CONNECT_FAILFAST_MS === 'number' ? P2P_CONNECT_FAILFAST_MS : 15000);
   }
 
@@ -1761,6 +2158,7 @@
     peerConnections.set(peerId, handle);
     nativePeerHandles.set(peerId, handle);
     ensurePeerMeta(peerId, isInitiator, kind);
+    setP2pStateForPeer(peerId, 'gathering');
     armPeerConnectFailfast(peerId);
     return handle;
   }
@@ -1836,6 +2234,11 @@
       throw new Error(`unexpected-renderer-peer-handle:${peerId}`);
     }
 
+    if (!isAllowedPureP2pCandidate(candidate)) {
+      logNativeStep('addRemoteIceCandidate:blocked-relay', { peerId }, 'p2p');
+      return;
+    }
+
     const candidateKey = buildRemoteCandidateKey(candidate);
     const meta = peerConnectionMeta.get(peerId);
     if (candidateKey && meta && meta.remoteCandidateKeys.has(candidateKey)) {
@@ -1851,6 +2254,7 @@
       peerId,
       candidate
     });
+    setP2pStateForPeer(peerId, 'checking');
     if (candidateKey && meta) {
       meta.remoteCandidateKeys.add(candidateKey);
       if (meta.remoteCandidateKeys.size > 64) {
@@ -1885,6 +2289,10 @@
     if (params.state === 'connected') {
       handle.connectionState = 'connected';
       handle.iceConnectionState = 'connected';
+      setP2pStateForPeer(params.peerId, handle.role === 'viewer-upstream' ? 'media-waiting' : 'connected');
+      if (handle.role === 'viewer-upstream') {
+        armViewerMediaWaitTimer(params.peerId);
+      }
       const meta = peerConnectionMeta.get(params.peerId);
       if (meta) {
         meta.hasConnected = true;
@@ -1899,18 +2307,24 @@
     if (params.state === 'connecting') {
       handle.connectionState = 'connecting';
       handle.iceConnectionState = 'checking';
+      setP2pStateForPeer(params.peerId, 'checking');
       return;
     }
 
     if (params.state === 'disconnected') {
       handle.connectionState = 'disconnected';
       handle.iceConnectionState = 'disconnected';
+      setP2pStateForPeer(params.peerId, 'restart-attempting');
       return;
     }
 
     if (params.state === 'failed') {
       handle.connectionState = 'failed';
       handle.iceConnectionState = 'failed';
+      if (handle.role === 'viewer-upstream') {
+        clearViewerMediaWaitTimer();
+      }
+      void finalizeP2pFailureWithNatMapping(params.peerId, 'ICE failed', 'ice-failed');
       return;
     }
 
@@ -1941,6 +2355,12 @@
       payload.sdp = params.sdp;
     }
     if (params.candidate) {
+      if (!isAllowedPureP2pCandidate(params.candidate)) {
+        logNativeStep('signal:candidate:blocked-relay', {
+          peerId: params.peerId || params.remotePeerId || params.targetId
+        }, 'p2p');
+        return;
+      }
       payload.candidate = params.candidate;
       const peerId = params.peerId || params.remotePeerId || params.targetId;
       const meta = peerConnectionMeta.get(peerId);
@@ -2090,6 +2510,7 @@
       if (options.clearRetryState) {
         clearPeerReconnect(peerId);
       }
+      renderP2pDiagnosticReport();
     }
   }
 
@@ -2131,6 +2552,11 @@
     }
 
     updateNativePeerSignalState(peerId, signal);
+    if (options.reconnect || options.iceRestart) {
+      setP2pStateForPeer(peerId, 'restart-attempting');
+    } else {
+      setP2pStateForPeer(peerId, 'gathering');
+    }
 
     sendMessage({
       type: 'offer',
@@ -2215,6 +2641,7 @@
       clearInterval(nativeViewerStatsIntervalId);
       nativeViewerStatsIntervalId = null;
     }
+    renderP2pDiagnosticReport();
   }
 
   function resetHostFpsIndicators() {
@@ -2254,7 +2681,11 @@
       if (elements.hostSendFps) {
         elements.hostSendFps.textContent = Number.isFinite(sentFrames) && sentFrames > 0 ? '0 fps' : '-';
       }
-      return;
+      return {
+        sourceFps: Number.isFinite(sourceFrames) && sourceFrames > 0 ? 0 : '-',
+        previewFps: Number.isFinite(previewFrames) && previewFrames > 0 ? 0 : '-',
+        sendFps: Number.isFinite(sentFrames) && sentFrames > 0 ? 0 : '-'
+      };
     }
 
     const deltaMs = Math.max(1, nowMs - hostFramesSampleAtMs);
@@ -2282,6 +2713,11 @@
     hostPreviewFramesSample = Number.isFinite(previewFrames) ? previewFrames : hostPreviewFramesSample;
     hostSendFramesSample = Number.isFinite(sentFrames) ? sentFrames : hostSendFramesSample;
     hostFramesSampleAtMs = nowMs;
+    return {
+      sourceFps: Number.isFinite(sourceFps) ? Math.round(sourceFps) : '-',
+      previewFps: Number.isFinite(previewFps) ? Math.round(previewFps) : '-',
+      sendFps: Number.isFinite(sendFps) ? Math.round(sendFps) : '-'
+    };
   }
 
   function resetViewerFpsIndicator() {
@@ -2338,6 +2774,7 @@
       clearInterval(nativeHostStatsIntervalId);
       nativeHostStatsIntervalId = null;
     }
+    renderP2pDiagnosticReport();
   }
 
   function updateHostEncoderDetail(pipeline, obsIngest = null) {
@@ -2402,12 +2839,14 @@
 
     sessionRole = null;
     currentRoomId = null;
+    currentSessionToken = null;
     hostId = null;
     upstreamPeerId = null;
     relayStream = null;
     upstreamConnected = false;
     viewerReadySent = false;
     videoStarted = false;
+    clearViewerMediaWaitTimer();
     obsRoomCreatePending = false;
     obsIngestStreamActive = false;
 
@@ -2453,6 +2892,7 @@
 
     try {
       const stats = await mediaEngine.getStats({});
+      latestP2pStatsSnapshot = stats || null;
       currentHostBackend = normalizeHostBackendName(stats && stats.hostBackend ? stats.hostBackend : currentHostBackend);
       const peers = Array.isArray(stats && stats.peers) ? stats.peers : [];
       const peer = peers.find((entry) => entry && entry.role === 'host-downstream');
@@ -2484,7 +2924,9 @@
         : NaN;
 
       updateHostEncoderDetail(hostPipeline, obsIngest);
-      updateHostFpsIndicators(sourceFrames, captureFrames, sentFrames);
+      const hostFpsSnapshot = updateHostFpsIndicators(sourceFrames, captureFrames, sentFrames) || {};
+      latestHostCaptureDiagnosticReport = buildHostCaptureDiagnosticReportFromStats(stats, hostFpsSnapshot);
+      renderHostCaptureDiagnosticReport();
       if (isObsIngestHostBackend()) {
         if (obsIngest && obsIngest.waiting) {
           elements.hostStatus.textContent = '等待 OBS 推流...';
@@ -2538,6 +2980,7 @@
         }
       }
 
+      renderP2pDiagnosticReport();
       return stats;
     } catch (error) {
       logRecoverableNativeWarning('native-host-stats:failed', error, {
@@ -2570,9 +3013,11 @@
 
     try {
       const stats = await mediaEngine.getStats({});
+      latestP2pStatsSnapshot = stats || null;
       const peers = Array.isArray(stats && stats.peers) ? stats.peers : [];
       const peer = peers.find((entry) => entry && entry.peerId === upstreamPeerId);
       if (!peer || !peer.peerTransport) {
+        renderP2pDiagnosticReport();
         return stats;
       }
 
@@ -2639,9 +3084,13 @@
       if (renderedFrames > 0 || peer.peerTransport.mediaPlaneReady) {
         upstreamConnected = true;
         videoStarted = true;
+        clearViewerMediaWaitTimer();
         elements.waitingMessage.classList.add('hidden');
-        elements.connectionStatus.textContent = '已连接（原生）';
+        elements.connectionStatus.textContent = '已连接';
         elements.connectionStatus.classList.add('connected');
+        if (elements.viewerP2pStatus) {
+          setP2pStatusElementState(elements.viewerP2pStatus, 'connected');
+        }
         if (!viewerVolumeSynced) {
           viewerVolumeSynced = true;
           refreshViewerVolumeUi().catch((error) => {
@@ -2664,6 +3113,7 @@
         }
       }
 
+      renderP2pDiagnosticReport();
       return stats;
     } catch (error) {
       logRecoverableNativeWarning('native-peer-stats:failed', error, {
@@ -2893,8 +3343,14 @@
       logNativeStep('stopScreenShare:preview-detached', {}, 'video');
 
       const peerIds = Array.from(nativePeerHandles.keys());
-      await Promise.all(peerIds.map((peerId) => closeNativePeerConnectionImpl(peerId, { clearRetryState: true })));
+      const peerCloseResults = await Promise.allSettled(
+        peerIds.map((peerId) => closeNativePeerConnectionImpl(peerId, { clearRetryState: true }))
+      );
+      const failedPeerCloses = peerCloseResults.filter((result) => result.status === 'rejected').length;
       logNativeStep('stopScreenShare:peers-closed', { peerCount: peerIds.length }, 'video');
+      if (failedPeerCloses > 0) {
+        logNativeStep('stopScreenShare:peer-close-failures', { failedPeerCloses }, 'video');
+      }
 
       await Promise.all([
         typeof mediaEngine.stopAudioSession === 'function'
@@ -2923,12 +3379,14 @@
 
       sessionRole = null;
       currentRoomId = null;
+      currentSessionToken = null;
       hostId = null;
       upstreamPeerId = null;
       relayStream = null;
       upstreamConnected = false;
       viewerReadySent = false;
       videoStarted = false;
+      clearViewerMediaWaitTimer();
 
       elements.roomInfo.classList.add('hidden');
       elements.viewerCount.textContent = '0';
@@ -3218,6 +3676,7 @@
         }
         currentRoomId = data.roomId;
         sessionRole = 'host';
+        currentSessionToken = data.sessionToken || '';
         elements.roomIdDisplay.textContent = data.roomId;
         elements.roomInfo.classList.remove('hidden');
         elements.btnStartShare.classList.add('hidden');
@@ -3237,6 +3696,9 @@
         if (typeof window.__vdsRenderHostPublicListingUi === 'function') {
           window.__vdsRenderHostPublicListingUi();
         }
+        if (elements.hostP2pStatus) {
+          setP2pStatusElementState(elements.hostP2pStatus, 'waiting-viewer');
+        }
         startNativeHostStatsPolling();
         if (hostWaitingWindowRestore) {
           syncHostWaitingWindowRestoreUi(true);
@@ -3252,12 +3714,14 @@
         resetViewerFpsIndicator();
         currentRoomId = data.roomId;
         sessionRole = 'viewer';
+        currentSessionToken = data.sessionToken || '';
         myChainPosition = data.chainPosition;
         hostId = data.hostId;
         upstreamPeerId = data.upstreamPeerId || data.hostId;
         viewerReadySent = false;
         videoStarted = false;
         upstreamConnected = false;
+        clearViewerMediaWaitTimer();
         if (typeof window.__vdsHandleViewerJoinSucceeded === 'function') {
           window.__vdsHandleViewerJoinSucceeded();
         }
@@ -3269,12 +3733,13 @@
         if (typeof window.__vdsRenderViewerPlaybackPrefsUi === 'function') {
           window.__vdsRenderViewerPlaybackPrefsUi();
         }
-        setViewerConnectionState('等待原生上游连接...');
+        setViewerConnectionState('等待上游连接...');
         return;
 
       case 'session-resumed':
         currentRoomId = data.roomId;
         sessionRole = data.role;
+        currentSessionToken = data.sessionToken || currentSessionToken || '';
         if (data.role === 'host') {
           obsRoomCreatePending = false;
           obsIngestStreamActive = isObsIngestHostBackend() ? true : obsIngestStreamActive;
@@ -3286,6 +3751,9 @@
           elements.btnStopShare.classList.remove('hidden');
           if (typeof window.__vdsRenderHostPublicListingUi === 'function') {
             window.__vdsRenderHostPublicListingUi();
+          }
+          if (elements.hostP2pStatus) {
+            setP2pStatusElementState(elements.hostP2pStatus, 'waiting-viewer');
           }
           startNativeHostStatsPolling();
           if (hostWaitingWindowRestore) {
@@ -3304,6 +3772,7 @@
         hostId = data.hostId || hostId;
         upstreamPeerId = data.upstreamPeerId || hostId;
         myChainPosition = data.chainPosition;
+        clearViewerMediaWaitTimer();
         if (typeof window.__vdsHandleViewerJoinSucceeded === 'function') {
           window.__vdsHandleViewerJoinSucceeded();
         }
@@ -3316,9 +3785,9 @@
           window.__vdsRenderViewerPlaybackPrefsUi();
         }
         if (!upstreamConnected) {
-          setViewerConnectionState('正在恢复原生上游连接...');
+          setViewerConnectionState('正在恢复上游连接...');
         } else if (elements.connectionStatus) {
-          elements.connectionStatus.textContent = '已连接（原生）';
+          elements.connectionStatus.textContent = '已连接';
           elements.connectionStatus.classList.add('connected');
         }
         return;
@@ -3385,7 +3854,7 @@
         clearAllRelayOfferRetries();
         myChainPosition = data.newChainPosition;
         upstreamPeerId = data.upstreamPeerId || hostId;
-        await resetViewerMediaPipeline('正在重建原生上游连接...');
+        await resetViewerMediaPipeline('正在重建上游连接...');
         elements.chainPosition.textContent = String(myChainPosition + 1);
         return;
 
@@ -3681,6 +4150,10 @@
   window.clearAllPeerConnections = clearAllPeerConnections;
   window.handleMessage = handleMessage;
   window.setViewerConnectionState = setViewerConnectionState;
+  window.__vdsBuildP2pDiagnosticReport = buildP2pDiagnosticReport;
+  window.__vdsRenderP2pDiagnosticReport = renderP2pDiagnosticReport;
+  window.__vdsBuildHostCaptureDiagnosticReport = buildHostCaptureDiagnosticReport;
+  window.__vdsRenderHostCaptureDiagnosticReport = renderHostCaptureDiagnosticReport;
 
   nativeUiReadyPromise = initializeNativeUi();
 

@@ -6,6 +6,7 @@
 #include "json_protocol.h"
 #include "host_pipeline.h"
 #include "obs_ingest_state.h"
+#include "platform_utils.h"
 #include "surface_target.h"
 #include "video_access_unit.h"
 
@@ -84,6 +85,9 @@ void test_host_pipeline_selection() {
   expect_eq(normalize_host_keyframe_policy("500ms"), "0.5s", "host keyframe half-second normalization");
   expect_eq(normalize_host_keyframe_policy("allintra"), "all-intra", "host keyframe all-intra normalization");
   expect_eq(normalize_host_keyframe_policy("bad"), "1s", "host keyframe policy fallback");
+  expect_eq(vds::media_agent::quote_command_path("C:\\tools\\ffmpeg.exe"), "C:\\tools\\ffmpeg.exe", "safe command path does not require quotes");
+  expect_eq(vds::media_agent::quote_command_path("C:\\Program Files\\ffmpeg.exe"), "\"C:\\Program Files\\ffmpeg.exe\"", "path with spaces is quoted");
+  expect_true(vds::media_agent::quote_command_path("C:\\bad|path\\ffmpeg.exe").find('|') != std::string::npos, "dangerous metachar path is contained in quotes");
 
   HostPipelineState hardware_pipeline = select_host_pipeline(ffmpeg, "h264", true, "", "quality", "zerolatency");
   expect_eq(hardware_pipeline.selected_video_encoder, "h264_nvenc", "hardware-preferred H.264 pipeline selects NVENC");

@@ -10,11 +10,26 @@
 namespace vds::media_agent {
 
 std::string quote_command_path(const std::string& path) {
-  if (path.find(' ') == std::string::npos && path.find('&') == std::string::npos) {
+  if (path.empty()) {
+    return "\"\"";
+  }
+
+  const bool needs_quote = path.find_first_of(" \t&|<>()^%\"") != std::string::npos;
+  if (!needs_quote) {
     return path;
   }
 
-  return "\"" + path + "\"";
+  std::string quoted;
+  quoted.reserve(path.size() + 2);
+  quoted.push_back('"');
+  for (const char ch : path) {
+    if (ch == '"') {
+      quoted.push_back('\\');
+    }
+    quoted.push_back(ch);
+  }
+  quoted.push_back('"');
+  return quoted;
 }
 
 std::string build_gdigrab_hwnd_target(const std::string& hwnd_value) {
@@ -58,7 +73,7 @@ BOOL CALLBACK enum_windows_for_title_proc(HWND hwnd, LPARAM lparam) {
     return TRUE;
   }
 
-  std::wstring title_wide(static_cast<std::size_t>(title_length), L'\0');
+  std::wstring title_wide(static_cast<std::size_t>(title_length) + 1, L'\0');
   const int copied = GetWindowTextW(hwnd, title_wide.data(), title_length + 1);
   if (copied <= 0) {
     return TRUE;

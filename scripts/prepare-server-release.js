@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const projectRoot = path.resolve(__dirname, '..');
 const serverDir = path.join(projectRoot, 'server');
@@ -133,12 +134,55 @@ function copyFile(artifactsDir, fileName) {
 
 function copyVersionedArtifacts(version, options = {}) {
   const { includeInstaller = false } = options;
-  const artifactsDir = resolveArtifactsDir(version);
+  let artifactsDir = null;
+  try {
+    artifactsDir = resolveArtifactsDir(version);
+  } catch (error) {
+    const retainedBlockmapPath = path.join(updatesDir, `VDS-Setup-${version}.exe.blockmap`);
+    if (!includeInstaller && fs.existsSync(retainedBlockmapPath)) {
+      return null;
+    }
+    throw error;
+  }
+
   copyFile(artifactsDir, `VDS-Setup-${version}.exe.blockmap`);
   if (includeInstaller) {
     copyFile(artifactsDir, `VDS-Setup-${version}.exe`);
   }
   return artifactsDir;
+}
+
+function parseLatestManifest(content) {
+  const result = {};
+  for (const line of String(content || '').split(/\r?\n/)) {
+    const match = /^([A-Za-z0-9_-]+):\s*(.+?)\s*$/.exec(line);
+    if (match) {
+      result[match[1]] = match[2].replace(/^['"]|['"]$/g, '');
+    }
+  }
+  return result;
+}
+
+function validateLatestManifest(artifactsDir, version) {
+  const latestPath = path.join(artifactsDir, 'latest.yml');
+  const installerName = `VDS-Setup-${version}.exe`;
+  const installerPath = path.join(artifactsDir, installerName);
+  const manifest = parseLatestManifest(fs.readFileSync(latestPath, 'utf8'));
+  const stat = fs.statSync(installerPath);
+  const sha512 = crypto.createHash('sha512').update(fs.readFileSync(installerPath)).digest('base64');
+
+  if (manifest.version && manifest.version !== version) {
+    throw new Error(`latest.yml version mismatch: expected ${version}, got ${manifest.version}`);
+  }
+  if (manifest.path && manifest.path !== installerName) {
+    throw new Error(`latest.yml path mismatch: expected ${installerName}, got ${manifest.path}`);
+  }
+  if (manifest.size && Number(manifest.size) !== stat.size) {
+    throw new Error(`latest.yml size mismatch: expected ${stat.size}, got ${manifest.size}`);
+  }
+  if (manifest.sha512 && manifest.sha512 !== sha512) {
+    throw new Error('latest.yml sha512 mismatch');
+  }
 }
 
 function isBlockmapFile(fileName) {
@@ -177,6 +221,7 @@ function pruneOldArtifacts(dirPath, currentVersion, oldVersions) {
 function main() {
   const version = readLatestVersion();
   const artifactsDir = resolveArtifactsDir(version);
+  validateLatestManifest(artifactsDir, version);
   const retainedVersions = uniqueVersions(
     [version]
       .concat(readRetainedVersions(updatesDir))

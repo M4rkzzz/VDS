@@ -3,14 +3,27 @@ const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const VERBOSE_SERVER_LOGS = process.env.VDS_VERBOSE_SERVER_LOGS === '1';
 const serverLogRateLimitState = new Map();
+const DEFAULT_MAX_WS_PAYLOAD_BYTES = 64 * 1024;
+const DEFAULT_MAX_CONNECTIONS = 256;
+const DEFAULT_MAX_ROOMS = 128;
+const DEFAULT_MAX_VIEWERS_PER_ROOM = 16;
+const DEFAULT_MAX_MESSAGES_PER_WINDOW = 120;
+const DEFAULT_MESSAGE_RATE_WINDOW_MS = 10000;
+const MAX_ID_LENGTH = 128;
+const MAX_SIGNAL_FIELD_LENGTH = 65536;
 
 function logServerDebug(...args) {
   if (VERBOSE_SERVER_LOGS) {
     console.log(...args);
   }
+}
+
+function logServerInfo(...args) {
+  console.log(...args);
 }
 
 function shouldEmitServerLog(key, intervalMs = 5000) {
@@ -55,7 +68,13 @@ const DEFAULT_ICE_SERVERS = [
 function startServer(options = {}) {
   const baseDir = options.baseDir || __dirname;
   const port = Number(options.port || process.env.PORT || 3000);
-  const disconnectGraceMs = Number(process.env.DISCONNECT_GRACE_MS || 30000);
+  const disconnectGraceMs = normalizePositiveInt(options.disconnectGraceMs || process.env.DISCONNECT_GRACE_MS, 30000);
+  const maxPayload = normalizePositiveInt(options.maxPayload || process.env.WS_MAX_PAYLOAD_BYTES, DEFAULT_MAX_WS_PAYLOAD_BYTES);
+  const maxConnections = normalizePositiveInt(options.maxConnections || process.env.WS_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS);
+  const maxRooms = normalizePositiveInt(options.maxRooms || process.env.WS_MAX_ROOMS, DEFAULT_MAX_ROOMS);
+  const maxViewersPerRoom = normalizePositiveInt(options.maxViewersPerRoom || process.env.WS_MAX_VIEWERS_PER_ROOM, DEFAULT_MAX_VIEWERS_PER_ROOM);
+  const maxMessagesPerWindow = normalizePositiveInt(options.maxMessagesPerWindow || process.env.WS_MAX_MESSAGES_PER_WINDOW, DEFAULT_MAX_MESSAGES_PER_WINDOW);
+  const messageRateWindowMs = normalizePositiveInt(options.messageRateWindowMs || process.env.WS_MESSAGE_RATE_WINDOW_MS, DEFAULT_MESSAGE_RATE_WINDOW_MS);
   const appVersion = resolveAppVersion(baseDir);
   const iceServers = buildIceServers();
   const publicDir = resolveExistingPath([
@@ -71,8 +90,19 @@ function startServer(options = {}) {
 
   const app = express();
   const server = http.createServer(app);
-  const wss = new WebSocket.Server({ server });
+  const wss = new WebSocket.Server({ server, maxPayload });
   const rooms = new Map();
+  let activeConnections = 0;
+
+  logServerInfo('[server limits]', {
+    maxPayload,
+    maxConnections,
+    maxRooms,
+    maxViewersPerRoom,
+    maxMessagesPerWindow,
+    messageRateWindowMs,
+    disconnectGraceMs
+  });
 
   app.use((req, res, next) => {
     if (req.path.startsWith('/api/')) {
@@ -117,11 +147,27 @@ function startServer(options = {}) {
   });
 
   wss.on('connection', (ws) => {
+    if (activeConnections >= maxConnections) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'server-busy',
+        message: 'Server connection limit reached'
+      });
+      ws.close(1013, 'server-busy');
+      return;
+    }
+
+    activeConnections += 1;
+    ws.__vdsRateWindowStartedAt = Date.now();
+    ws.__vdsRateWindowCount = 0;
     logServerDebug('New WebSocket connection');
 
     ws.on('message', (message) => {
       try {
         const data = JSON.parse(message);
+        if (!validateInboundMessage(ws, data, maxMessagesPerWindow, messageRateWindowMs)) {
+          return;
+        }
         handleMessage(ws, data);
       } catch (error) {
         logServerWarning('ws-message-parse', 'Error parsing message:', error);
@@ -129,6 +175,7 @@ function startServer(options = {}) {
     });
 
     ws.on('close', () => {
+      activeConnections = Math.max(0, activeConnections - 1);
       handleDisconnect(ws, false);
     });
   });
@@ -162,12 +209,23 @@ function startServer(options = {}) {
   }
 
   function handleCreateRoom(ws, data) {
-    const roomId = generateRoomId();
+    if (rooms.size >= maxRooms) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'room-limit-reached',
+        message: 'Room limit reached'
+      });
+      return;
+    }
+
+    const roomId = generateRoomId(rooms);
+    const hostToken = generateSessionToken();
     const room = {
       id: roomId,
       publicListing: data.publicListing === true,
       host: {
         clientId: data.clientId,
+        sessionToken: hostToken,
         ws: ws,
         disconnectTimer: null
       },
@@ -182,6 +240,7 @@ function startServer(options = {}) {
       type: 'room-created',
       roomId: roomId,
       clientId: data.clientId,
+      sessionToken: hostToken,
       publicListing: room.publicListing
     });
 
@@ -203,6 +262,15 @@ function startServer(options = {}) {
 
     const existingViewer = room.viewers.find((candidate) => candidate.clientId === clientId);
     if (existingViewer) {
+      if (!isValidSessionToken(existingViewer.sessionToken, data.sessionToken)) {
+        sendJson(ws, {
+          type: 'error',
+          code: 'session-token-invalid',
+          message: 'Session token is invalid'
+        });
+        return;
+      }
+
       const rebindRequired = existingViewer.ws !== ws;
       clearDisconnectTimer(existingViewer);
       existingViewer.ws = ws;
@@ -213,6 +281,7 @@ function startServer(options = {}) {
           type: 'room-joined',
           roomId,
           clientId,
+          sessionToken: existingViewer.sessionToken,
           hostId: room.host.clientId,
           upstreamPeerId: resolveViewerUpstreamId(room, existingViewer.chainPosition),
           chainPosition: existingViewer.chainPosition,
@@ -226,9 +295,20 @@ function startServer(options = {}) {
       return;
     }
 
+    if (room.viewers.length >= maxViewersPerRoom) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'viewer-limit-reached',
+        message: 'Room viewer limit reached'
+      });
+      return;
+    }
+
     const chainPosition = room.viewers.length;
+    const viewerToken = generateSessionToken();
     const viewer = {
       clientId,
+      sessionToken: viewerToken,
       ws,
       chainPosition,
       mediaReady: false,
@@ -244,6 +324,7 @@ function startServer(options = {}) {
       type: 'room-joined',
       roomId,
       clientId,
+      sessionToken: viewerToken,
       hostId: room.host.clientId,
       upstreamPeerId: resolveViewerUpstreamId(room, chainPosition),
       chainPosition,
@@ -273,6 +354,15 @@ function startServer(options = {}) {
     }
 
     if (data.role === 'host' && room.host.clientId === data.clientId) {
+      if (!isValidSessionToken(room.host.sessionToken, data.sessionToken)) {
+        sendJson(ws, {
+          type: 'error',
+          code: 'session-token-invalid',
+          message: 'Session token is invalid'
+        });
+        return;
+      }
+
       clearDisconnectTimer(room.host);
       room.host.ws = ws;
       attachSocketMetadata(ws, room.id, data.clientId, 'host');
@@ -280,6 +370,7 @@ function startServer(options = {}) {
         type: 'session-resumed',
         role: 'host',
         roomId: room.id,
+        sessionToken: room.host.sessionToken,
         viewerCount: room.viewers.length
       });
       return;
@@ -291,6 +382,14 @@ function startServer(options = {}) {
         type: 'error',
         code: 'session-not-found',
         message: 'Session not found'
+      });
+      return;
+    }
+    if (!isValidSessionToken(viewer.sessionToken, data.sessionToken)) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'session-token-invalid',
+        message: 'Session token is invalid'
       });
       return;
     }
@@ -306,6 +405,7 @@ function startServer(options = {}) {
       type: 'session-resumed',
       role: 'viewer',
       roomId: room.id,
+      sessionToken: viewer.sessionToken,
       hostId: room.host.clientId,
       upstreamPeerId: resolveViewerUpstreamId(room, viewer.chainPosition),
       chainPosition: viewer.chainPosition,
@@ -439,14 +539,12 @@ function startServer(options = {}) {
   }
 
   function finalizeHostDisconnect(room) {
-    clearDisconnectTimer(room.host);
     room.viewers.forEach((viewer) => {
       if (isSocketOpen(viewer.ws)) {
         sendJson(viewer.ws, { type: 'host-disconnected' });
       }
-      clearDisconnectTimer(viewer);
     });
-    rooms.delete(room.id);
+    destroyRoom(room, 'host-disconnected');
   }
 
   function finalizeViewerDisconnect(room, clientId) {
@@ -513,6 +611,29 @@ function startServer(options = {}) {
         notifyViewerToConnectNext(room, previousViewer, nextViewer);
       }
     }
+  }
+
+  function destroyRoom(room, reason) {
+    if (!room || !rooms.has(room.id)) {
+      return;
+    }
+
+    clearDisconnectTimer(room.host);
+    room.host.sessionToken = null;
+    room.host.ws = null;
+    room.viewers.forEach((viewer) => {
+      clearDisconnectTimer(viewer);
+      viewer.sessionToken = null;
+      viewer.ws = null;
+      viewer.mediaReady = false;
+      viewer.relayEstablished = false;
+      viewer.connectRequestPending = false;
+    });
+    room.viewers = [];
+    room.destroyedAt = Date.now();
+    room.destroyReason = reason || 'room-destroyed';
+    rooms.delete(room.id);
+    logServerDebug(`Room destroyed: ${room.id} (${room.destroyReason})`);
   }
 
 function notifyHostToConnectViewer(room, viewer, reconnect) {
@@ -680,6 +801,112 @@ function isSocketOpen(ws) {
   return Boolean(ws && ws.readyState === WebSocket.OPEN);
 }
 
+function normalizePositiveInt(value, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return fallback;
+  }
+  return Math.floor(numeric);
+}
+
+function validateInboundMessage(ws, data, maxMessagesPerWindow, messageRateWindowMs) {
+  if (!data || typeof data !== 'object' || typeof data.type !== 'string' || data.type.length > 64) {
+    sendJson(ws, {
+      type: 'error',
+      code: 'invalid-message',
+      message: 'Invalid message'
+    });
+    return false;
+  }
+
+  const now = Date.now();
+  if (!ws.__vdsRateWindowStartedAt || now - ws.__vdsRateWindowStartedAt > messageRateWindowMs) {
+    ws.__vdsRateWindowStartedAt = now;
+    ws.__vdsRateWindowCount = 0;
+  }
+  ws.__vdsRateWindowCount += 1;
+  if (ws.__vdsRateWindowCount > maxMessagesPerWindow) {
+    sendJson(ws, {
+      type: 'error',
+      code: 'message-rate-limit',
+      message: 'Too many messages'
+    });
+    ws.close(1008, 'message-rate-limit');
+    return false;
+  }
+
+  const idKeys = ['roomId', 'clientId', 'targetId', 'fromClientId', 'role', 'sessionToken'];
+  for (const key of idKeys) {
+    if (data[key] != null && (typeof data[key] !== 'string' || data[key].length > MAX_ID_LENGTH)) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'invalid-message',
+        message: `Invalid ${key}`
+      });
+      return false;
+    }
+  }
+
+  for (const key of ['sdp', 'candidate']) {
+    if (data[key] != null) {
+      const value = typeof data[key] === 'string'
+        ? data[key]
+        : JSON.stringify(data[key]);
+      if (value.length > MAX_SIGNAL_FIELD_LENGTH) {
+        sendJson(ws, {
+          type: 'error',
+          code: 'message-too-large',
+          message: `${key} is too large`
+        });
+        return false;
+      }
+    }
+  }
+
+  if ((data.type === 'create-room' || data.type === 'join-room' || data.type === 'resume-session') &&
+      typeof data.clientId !== 'string') {
+    sendJson(ws, {
+      type: 'error',
+      code: 'invalid-message',
+      message: 'Invalid clientId'
+    });
+    return false;
+  }
+  if ((data.type === 'join-room' || data.type === 'resume-session') &&
+      typeof data.roomId !== 'string') {
+    sendJson(ws, {
+      type: 'error',
+      code: 'invalid-message',
+      message: 'Invalid roomId'
+    });
+    return false;
+  }
+  if (data.type === 'resume-session' && data.role !== 'host' && data.role !== 'viewer') {
+    sendJson(ws, {
+      type: 'error',
+      code: 'invalid-message',
+      message: 'Invalid role'
+    });
+    return false;
+  }
+
+  return true;
+}
+
+function generateSessionToken() {
+  return crypto.randomBytes(24).toString('base64url');
+}
+
+function isValidSessionToken(expected, actual) {
+  if (typeof expected !== 'string' || typeof actual !== 'string' || !expected || !actual) {
+    return false;
+  }
+  const expectedBuffer = Buffer.from(expected);
+  const actualBuffer = Buffer.from(actual);
+  return expectedBuffer.length === actualBuffer.length &&
+    crypto.timingSafeEqual(expectedBuffer, actualBuffer);
+}
+
 function resolveAppVersion(baseDir) {
   const candidates = [
     path.join(baseDir, 'package.json'),
@@ -722,10 +949,19 @@ function resolveViewerUpstreamId(room, chainPosition) {
   return previousViewer ? previousViewer.clientId : room.host.clientId;
 }
 
-function generateRoomId() {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
+function generateRoomId(existingRooms) {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const roomId = crypto.randomBytes(3).toString('hex').toUpperCase();
+    if (!existingRooms || !existingRooms.has(roomId)) {
+      return roomId;
+    }
+  }
+
+  throw new Error('room-id-generation-failed');
 }
 
 module.exports = {
-  startServer
+  startServer,
+  generateRoomId,
+  validateInboundMessage
 };

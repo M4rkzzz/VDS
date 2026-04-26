@@ -19,9 +19,21 @@
 
 最近一次对齐日期：`2026-04-26`
 
-当前发布版本：`1.6.3`
+当前发布版本：`1.6.4`
 
-## 2. 当前结论
+## 2. 未发布改动记录
+
+本区域只记录当前工作区已经发生、但尚未进入正式 release 的改动。发布新版本后，应把已发布条目移动到 `CHANGELOG.md`，并清空或重建本区域。
+
+当前未发布改动：
+
+- 暂无。1.6.4 已发布条目已迁移到 `CHANGELOG.md`。
+
+当前未发布改动已验证：
+
+- 暂无。
+
+## 3. 当前结论
 
 项目当前已经进入 `native authority` 路线，并且本轮 `media-agent` 模块化已经收尾。
 
@@ -57,9 +69,9 @@
 - OBS 本地 SRT ingest 是正式 host backend
 - `media-agent/src/main.cpp` 已不再承载业务实现，只是进程级入口
 
-## 3. 当前代码状态
+## 4. 当前代码状态
 
-### 3.1 主入口
+### 4.1 主入口
 
 - [server/public/app.js](/d:/project/videosharing/server/public/app.js)
   - 页面主流程、WebSocket、房间状态、基础 UI
@@ -79,7 +91,7 @@
 - [media-agent/src/agent_runtime.h](/d:/project/videosharing/media-agent/src/agent_runtime.h)
   - `AgentRuntimeState`、`PeerState` 和主要运行时状态结构
 
-### 3.2 media-agent 模块化结果
+### 4.2 media-agent 模块化结果
 
 本轮模块化已经完成并通过验收。详细记录见：
 
@@ -98,16 +110,16 @@
 
 当前验证结论：
 
-- `npm run build:release` 已通过，并刷新 `dist/VDS-Setup-1.6.3.exe`、`dist/VDS-Setup-1.6.3.exe.blockmap`、`server/updates/latest.yml` 和 `server/updates/VDS-Setup-1.6.3.*`。
+- `npm run build:release` 已通过，并刷新 `dist/VDS-Setup-1.6.4.exe`、`dist/VDS-Setup-1.6.4.exe.blockmap`、`server/updates/latest.yml` 和 `server/updates/VDS-Setup-1.6.4.*`。
 - `npm run verify:media-agent` 已通过。
 - `npm run check:logging` 已通过。
 - `node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`node --check server/server-core.js` 已通过。
 - `npm run e2e:media-agent` 已通过自动门禁并输出人工验收清单。
 - dual native、triple native、OBS ingest 人工端到端验证已通过。
 
-## 4. 媒体主链路
+## 5. 媒体主链路
 
-### 4.1 Host
+### 5.1 Host
 
 当前 host 有两套正式 backend。
 
@@ -146,7 +158,7 @@
 - OBS 默认端口为 `61080`，可持久化自定义端口。
 - WGC 黄框已有代码级关闭请求，但跨系统、跨机器、跨打包形态仍应继续观察。
 
-### 4.2 Viewer
+### 5.2 Viewer
 
 当前 viewer 主链路：
 
@@ -164,7 +176,7 @@
 - 兼容 `PCMU fallback`
 - 支持 `AAC`
 
-### 4.3 Relay
+### 5.3 Relay
 
 当前 relay 不再走 browser stream 转发。
 
@@ -190,7 +202,7 @@
 - 正常目标观众数以 3 人为主。
 - 极限场景按不超过 5 人规划。
 
-## 5. UI 和产品形态
+## 6. UI 和产品形态
 
 当前页面形态：
 
@@ -210,7 +222,7 @@
 - 旧 manual 中部分页面描述已过时。
 - 当前 UI 事实应以 `server/public/app.js` 和对应 HTML/CSS 为准。
 
-## 6. 质量设置
+## 7. 质量设置
 
 当前质量设置已经对齐 native 参数：
 
@@ -233,9 +245,9 @@ OBS 模式：
 - 确认后进入 `等待 OBS 推流...`
 - 收到有效 OBS 节目流后才创建房间
 
-## 7. 验证能力
+## 8. 验证能力
 
-### 7.1 自动化门禁
+### 8.1 自动化门禁
 
 当前最低验证基线：
 
@@ -246,7 +258,9 @@ OBS 模式：
 - `node --check desktop/preload.js`
 - `node --check server/server-core.js`
 - `node --check server/index.js`
+- `npm run test:server`
 - `npm run verify:media-agent`
+- `npm audit --omit=dev`
 
 `npm run verify:media-agent` 覆盖：
 
@@ -274,7 +288,14 @@ agent smoke 覆盖：
 - `BAD_REQUEST`
 - `NOT_IMPLEMENTED`
 
-### 7.2 本地联调脚本
+server 单元测试覆盖：
+
+- host resume token 冒充失败
+- host 合法 resume 成功
+- roomId 碰撞规避
+- 单连接消息频率限制
+
+### 8.2 本地联调脚本
 
 当前仓库具备：
 
@@ -298,7 +319,7 @@ agent smoke 覆盖：
 - 它们不是全自动 UI harness。
 - 三端真实端到端仍需要人工观察画面、音频、状态与退出清理。
 
-### 7.3 最近已通过的链路
+### 8.3 最近已通过的链路
 
 截至 `2026-04-26`：
 
@@ -308,8 +329,16 @@ agent smoke 覆盖：
 - OBS ingest 已通过。
 - OBS `prepareObsIngest` 已进入 agent smoke。
 - `main.cpp` 进程级入口状态已通过完整门禁验证。
+- 本轮未发布修复已通过 `npm run test:server`、`npm run verify:media-agent`、`npm run check:logging` 和 `npm audit --omit=dev`。
+- Phase 1 P2P 状态机手测已通过：正常直连、Trickle ICE、TURN/relay candidate 阻止、15s failfast、媒体等待、快速重连、大厅自动刷新回归。
+- Phase 2 P2P 诊断报告手测已通过：调试模式可见、默认 UI 隐藏、诊断内容刷新、一键复制可用。
+- Phase 3 原生采集资源占用观测手测已通过：调试模式可见、默认 UI 隐藏、采集资源内容刷新、一键复制可用。
+- Phase 4 服务端生命周期基础单测已通过：host grace resume、host grace 过期销毁、旧 token 失效、旧房间不可加入。
+- Phase 4 服务端生命周期手测已通过：host/viewer grace resume、grace 过期清理、空房间清理、旧房间不可加入、服务端限制配置输出。
+- Phase 5 发布流程强约束已通过：`npm run release:check` 已覆盖语法、server tests、logging check、media-agent verify、production audit 和发布产物一致性校验。
+- Phase 6 NAT-PMP/PCP 兜底已通过：`npm run release:check` 已通过，代码路径脑内模拟已确认只在 ICE/failfast 后短时兜底并写入诊断。
 
-## 8. 当前已完成项
+## 9. 当前已完成项
 
 以下内容已经真实存在，不再是计划：
 
@@ -346,14 +375,19 @@ agent smoke 覆盖：
 - 调试子菜单已整理为 `快速模式 / 问题范围 / 输出内容 / 深度诊断`。
 - 双端/三端脚本默认统一调试状态，避免不同 profile 继承不同 localStorage 调试开关。
 - `npm run check:logging` 已建立为日志出口防回退门禁。
+- P2P 连接状态机与 Trickle ICE 收口已完成：host/viewer 标题下方展示固定 P2P 状态，TURN/relay candidate 被阻止，初始建连 failfast、媒体等待和快速重连路径已收口。
+- 调试模式 P2P 诊断报告已完成：可复制 role、room、candidate counts、selected candidate pair、RTT、帧计数、NACK/PLI/keyframe/recovery、丢弃计数和 NAT-PMP/PCP 状态。
+- 原生采集资源占用观测已完成：调试模式下可复制 capture/preview/encode FPS、读回耗时、编码器、分辨率、丢弃计数和音频采集状态。
+- 服务端资源生命周期清理已完成：host grace resume、过期销毁、session token 失效、viewer 状态清理、限制配置输出和稳定错误码均已收口。
+- 发布流程强约束已完成：`npm run release:check` 固定覆盖 syntax check、server tests、logging check、media-agent verify、production audit 和发布产物一致性校验。
+- NAT-PMP/PCP 兜底复核已完成：仅在 ICE/failfast 后短时尝试，成功通过 Trickle ICE 注入映射候选，失败明确进入 pure P2P failed 并写入诊断。
 
-## 9. 当前未完成项与风险
+## 10. 当前未完成项与风险
 
 仍需要继续观察或推进的部分：
 
 - 日志调试系统本轮已收口，后续只需要在真实双端/三端场景中微调采样间隔和白名单。
-- 纯 P2P 已过滤 TURN/TURNS 配置，并启用 Trickle ICE candidate 转发、15s failfast 和 750ms/1500ms 快速重试；failfast 后会把 NAT-PMP/PCP 作为最后一道自动端口映射尝试，成功时通过 Trickle ICE 注入映射后的 srflx 候选，失败才关闭 peer。
-- Peer transport 已接入 `RtcpNackResponder`、PLI handler、receiver keyframe request，并补 selected candidate pair、candidate counts、RTT、帧计数、NACK/PLI/keyframe/recovery/dropped 诊断字段。
+- 纯 P2P 状态机、诊断、采集观测、服务端生命周期、发布强约束和 NAT-PMP/PCP 兜底均已完成；后续只按真实用户反馈做小步修正。
 - popup overlay 仍需围绕跟随稳定、全屏稳定、弹窗遮挡、点击前台继续打磨。
 - WGC 黄框关闭请求已接入，但跨机器、跨系统、跨打包形态仍需验证。
 - 差分更新成功率还需要持续实测。
@@ -362,53 +396,11 @@ agent smoke 覆盖：
 - 三端联调目前仍主要依赖人工观察，缺少真正自动化 UI harness。
 - viewer 如果后续要重新优化播放顺滑度，必须基于新方案设计，不能回滚旧 `synced` 路线。
 
-## 10. 下一阶段顺序
+## 11. 下一阶段顺序
 
-### 阶段 A：稳定性 soak
+暂无。
 
-目标：
-
-- 双端 native 长时间播放。
-- 三端 native 长时间播放。
-- OBS ingest 长时间播放。
-- 晚加入、断线重连、host stop/start、viewer leave/rejoin。
-- 根据真实控制台输出微调日志采样间隔。
-
-### 阶段 B：OBS ingest 边界验证
-
-目标：
-
-- 默认端口、自定义端口、端口占用。
-- 重复 prepare/start/stop。
-- OBS 断流立即结束房间。
-- H.264/H.265 + AAC 双 codec 验证。
-
-### 阶段 C：popup overlay 正式打磨
-
-目标：
-
-- 跟随稳定。
-- 全屏稳定。
-- 弹窗遮挡正确。
-- 点击前台正确。
-
-### 阶段 D：发布链继续收口
-
-目标：
-
-- 差分更新继续实测。
-- 明确线上保留版本策略。
-- 提高后续版本差分更新成功率。
-
-### 阶段 E：自动化能力补强
-
-目标：
-
-- 设计三端 UI 自动化 harness。
-- 自动建房、加入、收集 stats、判断音视频稳定。
-- 减少依赖人工点击和人工抄日志。
-
-## 11. 明确禁止
+## 12. 明确禁止
 
 禁止重新做这些事情：
 
@@ -419,7 +411,7 @@ agent smoke 覆盖：
 - 用抽象层掩盖当前还没稳定的真实问题。
 - 回滚旧 `synced` / A/V sync 作为 viewer 播放问题的默认方案。
 
-## 12. 给下一个 Agent 的交接说明
+## 13. 给下一个 Agent 的交接说明
 
 接手时先读：
 
@@ -435,12 +427,27 @@ agent smoke 覆盖：
 
 处理问题时的原则：
 
+- 本轮 Phase 1-6 已全部完成并归档到第 9 节；第 11 节暂无下一阶段计划，后续按线上反馈重新立项。
 - 先跑 `npm run verify:media-agent`。
 - 日志相关改动必须跑 `npm run check:logging`。
 - 涉及真实窗口、音频、OBS、relay 时，再跑 `npm run e2e:media-agent` 并按清单手测。
-- 连接问题先看 `native-peer-stats` 的 `queuedVideo / queuedAudio / submittedVideo / dispatchedAudio / dropped* / receiverReason`。
+- 连接问题优先补齐并查看 P2P 诊断报告；当前过渡期先看 `native-peer-stats` 的 `queuedVideo / queuedAudio / submittedVideo / dispatchedAudio / dropped* / receiverReason`。
+- 采集资源问题只能把 stats 放在调试模式或 P2P/媒体诊断范围内，默认 UI 不展示。
 - relay 问题先区分“没发出去”还是“发出去但下游起播/渲染追不上”。
 - WGC 高帧率问题先确认 `GraphicsCaptureSession.MinUpdateInterval` 是否生效。
 - 更新问题先区分“服务端产物不一致”和“客户端本地 installer 基底不匹配”。
+
+构建发布全流程：
+
+1. 发布前先确认工作区变更都已记录到 `## 2. 未发布改动记录`，并确认 `package.json` 版本号是目标版本。
+2. 如需要升级版本，先同步更新 `package.json`、`package-lock.json`、本文档 `当前发布版本` 和相关 changelog 草稿。
+3. 运行 `npm run release:check`。该命令会执行 syntax check、server tests、logging check、media-agent verify、production audit，并校验当前 `dist` 与 `server/updates` 里的 installer、blockmap、`latest.yml` 一致性。
+4. 如果只是检查当前已有产物，`npm run release:check` 通过即可进入人工验收；如果需要重新出包，先运行 `npm run build:release`。
+5. `npm run build:release` 会先执行 Electron 打包，再运行 `npm run prepare-server-release`，把当前版本 installer、blockmap 和 `latest.yml` 准备到 `server/updates`。
+6. 出包后必须再次运行 `npm run release:check`，确认新产物的 version、path、sha512、size 与 installer 一致，且 `dist` 与 `server/updates` 当前 installer 元数据一致。
+7. 做发布手测：安装当前 `dist/VDS-Setup-<version>.exe`，确认应用可启动；如涉及更新链路，确认客户端能读取 `server/updates/latest.yml` 并识别目标版本。
+8. 发布前不要删除旧版本 blockmap；`prepare-server-release` 会按保留策略保留旧 blockmap，用于提高差分更新成功率。
+9. 正式发布后，把 `## 2. 未发布改动记录` 中已发布条目迁移到 `CHANGELOG.md`，清空或重建未发布区域，并更新当前发布版本。
+10. 最后再跑一次 `npm run release:check`，确保发布后的文档、门禁和产物仍处于一致状态。
 
 任何后续改动都要坚持 fail-fast、边界单一、可验证，不要静默 fallback 到旧 authority。

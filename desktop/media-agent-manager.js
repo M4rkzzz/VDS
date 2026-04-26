@@ -7,6 +7,8 @@ const readline = require('readline');
 const DEFAULT_BINARY_NAME = process.platform === 'win32'
   ? 'vds-media-agent.exe'
   : 'vds-media-agent';
+const DEFAULT_INVOKE_TIMEOUT_MS = 30000;
+const DEFAULT_PING_TIMEOUT_MS = 5000;
 
 class MediaAgentManager extends EventEmitter {
   constructor(options = {}) {
@@ -17,6 +19,8 @@ class MediaAgentManager extends EventEmitter {
     this.pendingRequests = new Map();
     this.requestId = 1;
     this.startPromise = null;
+    this.defaultInvokeTimeoutMs = Number(options.defaultInvokeTimeoutMs || DEFAULT_INVOKE_TIMEOUT_MS);
+    this.pingTimeoutMs = Number(options.pingTimeoutMs || DEFAULT_PING_TIMEOUT_MS);
     this.recentStderrLines = [];
     this.status = {
       state: 'idle',
@@ -176,7 +180,7 @@ class MediaAgentManager extends EventEmitter {
     });
   }
 
-  async invoke(method, params = {}) {
+  async invoke(method, params = {}, options = {}) {
     if (method === 'getStatus') {
       const status = this.getStatus();
       if (status.available && !status.running) {
@@ -199,12 +203,45 @@ class MediaAgentManager extends EventEmitter {
 
     return new Promise((resolve, reject) => {
       const id = this.requestId++;
-      this.pendingRequests.set(id, { resolve, reject });
-      const payload = JSON.stringify({ id, method, params });
+      const timeoutMs = Math.max(1000, Number(options.timeoutMs || this.defaultInvokeTimeoutMs || DEFAULT_INVOKE_TIMEOUT_MS));
       const child = this.child;
+      const timeoutId = setTimeout(() => {
+        const request = this.pendingRequests.get(id);
+        if (!request) {
+          return;
+        }
+        this.pendingRequests.delete(id);
+        const error = new Error(`media-agent-invoke-timeout:${method}`);
+        error.code = 'MEDIA_AGENT_INVOKE_TIMEOUT';
+        request.reject(error);
+        this.rejectAllPending(error);
+        if (child && this.child === child) {
+          child.__vdsExpectedExit = true;
+          child.__vdsExpectedExitReason = 'invoke-timeout';
+          this.stopChildProcess(child, 1000).catch(() => {});
+          this.child = null;
+          this.updateStatus({
+            state: 'failed',
+            running: false,
+            reason: 'invoke-timeout',
+            lastError: error.message
+          });
+        }
+      }, timeoutMs);
+      const finishResolve = (value) => {
+        clearTimeout(timeoutId);
+        resolve(value);
+      };
+      const finishReject = (error) => {
+        clearTimeout(timeoutId);
+        reject(error);
+      };
+      this.pendingRequests.set(id, { resolve: finishResolve, reject: finishReject, timeoutId });
+      const payload = JSON.stringify({ id, method, params });
       const stdin = child && child.stdin;
       if (!stdin || stdin.destroyed || child.exitCode !== null || child.signalCode !== null) {
         this.pendingRequests.delete(id);
+        clearTimeout(timeoutId);
         reject(this.buildExitError(child && child.exitCode, child && child.signalCode));
         return;
       }
@@ -213,6 +250,7 @@ class MediaAgentManager extends EventEmitter {
           return;
         }
         this.pendingRequests.delete(id);
+        clearTimeout(timeoutId);
         reject(error);
       });
     });
@@ -443,7 +481,7 @@ class MediaAgentManager extends EventEmitter {
     });
 
     try {
-      await this.invoke('ping');
+      await this.invoke('ping', {}, { timeoutMs: this.pingTimeoutMs });
     } catch (error) {
       await this.stop();
       throw error;
@@ -502,6 +540,9 @@ class MediaAgentManager extends EventEmitter {
     }
 
     this.pendingRequests.delete(payload.id);
+    if (request.timeoutId) {
+      clearTimeout(request.timeoutId);
+    }
     if (payload.error) {
       request.reject(createMediaAgentError(payload.error.code, payload.error.message));
       return;
@@ -512,6 +553,9 @@ class MediaAgentManager extends EventEmitter {
 
   rejectAllPending(error) {
     for (const request of this.pendingRequests.values()) {
+      if (request.timeoutId) {
+        clearTimeout(request.timeoutId);
+      }
       request.reject(error);
     }
     this.pendingRequests.clear();

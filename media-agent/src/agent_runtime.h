@@ -485,13 +485,28 @@ struct AgentRuntimeState {
 };
 
 struct HostAudioDispatchState {
+  struct QueuedCapturePacket {
+    std::vector<unsigned char> bytes;
+    unsigned int frames = 0;
+    unsigned int sample_rate = 0;
+    unsigned int channel_count = 0;
+    unsigned int bits_per_sample = 0;
+    unsigned int block_align = 0;
+    bool silent = false;
+  };
   std::mutex mutex;
+  std::condition_variable cv;
   std::vector<std::weak_ptr<PeerTransportSession>> sessions;
+  std::deque<QueuedCapturePacket> capture_queue;
   unsigned long long next_timestamp_samples = 0;
+  unsigned long long dropped_capture_packets = 0;
   std::deque<std::int16_t> pending_pcm;
   AVCodecContext* encoder_context = nullptr;
   AVPacket* encoder_packet = nullptr;
   int encoder_frame_size = 960;
+  bool worker_started = false;
+  bool stop_requested = false;
+  std::thread worker;
   std::string last_error;
 };
 

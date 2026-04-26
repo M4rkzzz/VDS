@@ -109,7 +109,7 @@ Viewer join mode currently behaves like this:
 - `server/` is the deployable server directory
 - desktop auto-update feed is served from `server/updates/`
 - `1.6.3` release assets are the installer, blockmap, and `latest.yml`
-- release notes for recent versions are tracked in [CHANGELOG.md](/d:/project/videosharing/CHANGELOG.md)
+- release notes for recent versions are tracked in [CHANGELOG.md](CHANGELOG.md)
 
 ## Source Control Rules
 

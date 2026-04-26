@@ -1,8 +1,11 @@
 #include "media_audio.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <sstream>
+#include <thread>
 
 #include "agent_events.h"
 #include "json_protocol.h"
@@ -24,7 +27,8 @@ using vds::media_agent::extract_int_value;
 using vds::media_agent::extract_string_value;
 using vds::media_agent::json_escape;
 
-AgentRuntimeState* g_agent_runtime_for_audio = nullptr;
+std::atomic<bool> g_host_audio_capture_active { false };
+constexpr std::size_t kMaxQueuedHostAudioCapturePackets = 64;
 
 HostAudioDispatchState& host_audio_dispatch_state() {
   static HostAudioDispatchState state;
@@ -40,8 +44,7 @@ void emit_wasapi_pcm_packet(
   const unsigned char* data,
   unsigned int frames,
   bool silent) {
-  AgentRuntimeState* runtime = g_agent_runtime_for_audio;
-  if (!runtime || !runtime->audio_session.capture_active) {
+  if (!g_host_audio_capture_active.load(std::memory_order_acquire)) {
     return;
   }
 
@@ -259,6 +262,113 @@ bool send_host_audio_opus_frame_locked(
   return true;
 }
 
+WasapiSessionStatus status_from_queued_packet(const HostAudioDispatchState::QueuedCapturePacket& packet) {
+  WasapiSessionStatus status;
+  status.sample_rate = packet.sample_rate;
+  status.channel_count = packet.channel_count;
+  status.bits_per_sample = packet.bits_per_sample;
+  status.block_align = packet.block_align;
+  return status;
+}
+
+void process_host_audio_capture_packet(
+  HostAudioDispatchState& state,
+  const HostAudioDispatchState::QueuedCapturePacket& packet) {
+  std::vector<std::shared_ptr<PeerTransportSession>> sessions;
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    for (auto it = state.sessions.begin(); it != state.sessions.end();) {
+      const auto session = it->lock();
+      if (!session) {
+        it = state.sessions.erase(it);
+        continue;
+      }
+      sessions.push_back(session);
+      ++it;
+    }
+  }
+
+  if (sessions.empty()) {
+    return;
+  }
+
+  std::string encoder_error;
+  if (!ensure_host_audio_encoder_locked(state, &encoder_error)) {
+    state.last_error = encoder_error;
+    return;
+  }
+
+  const WasapiSessionStatus status = status_from_queued_packet(packet);
+  std::vector<std::int16_t> pcm = packet.silent
+    ? std::vector<std::int16_t>(static_cast<std::size_t>(std::max(1u, static_cast<unsigned int>((static_cast<std::uint64_t>(packet.frames) * kTransportAudioSampleRate) / std::max(1u, status.sample_rate)))) * kTransportAudioChannelCount, 0)
+    : convert_capture_pcm_to_opus_input(packet.bytes.data(), packet.frames, status);
+  if (pcm.empty()) {
+    return;
+  }
+
+  for (const std::int16_t sample : pcm) {
+    state.pending_pcm.push_back(sample);
+  }
+
+  while (state.pending_pcm.size() >= static_cast<std::size_t>(state.encoder_frame_size) * kTransportAudioChannelCount) {
+    std::string send_error;
+    if (!send_host_audio_opus_frame_locked(state, sessions, &send_error)) {
+      state.last_error = send_error;
+      break;
+    }
+  }
+}
+
+void host_audio_dispatch_worker_main() {
+  auto& state = host_audio_dispatch_state();
+  while (true) {
+    HostAudioDispatchState::QueuedCapturePacket packet;
+    {
+      std::unique_lock<std::mutex> lock(state.mutex);
+      state.cv.wait(lock, [&state]() {
+        return state.stop_requested || !state.capture_queue.empty();
+      });
+      if (state.stop_requested && state.capture_queue.empty()) {
+        break;
+      }
+      packet = std::move(state.capture_queue.front());
+      state.capture_queue.pop_front();
+    }
+
+    process_host_audio_capture_packet(state, packet);
+  }
+
+  reset_host_audio_encoder_locked(state);
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.worker_started = false;
+    state.stop_requested = false;
+  }
+}
+
+void ensure_host_audio_dispatch_worker_running_locked(HostAudioDispatchState& state) {
+  if (state.worker_started) {
+    return;
+  }
+  state.stop_requested = false;
+  state.worker_started = true;
+  state.worker = std::thread(host_audio_dispatch_worker_main);
+}
+
+void stop_host_audio_dispatch_worker(HostAudioDispatchState& state) {
+  std::thread worker;
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.stop_requested = true;
+    state.capture_queue.clear();
+    worker = std::move(state.worker);
+  }
+  state.cv.notify_all();
+  if (worker.joinable()) {
+    worker.join();
+  }
+}
+
 bool ensure_peer_audio_decoder_runtime(
   const std::shared_ptr<PeerState::PeerVideoReceiverRuntime>& runtime_ptr,
   const std::string& codec_name,
@@ -353,7 +463,7 @@ bool ensure_peer_audio_decoder_runtime(
 } // namespace
 
 void attach_wasapi_audio_callbacks(AgentRuntimeState& state) {
-  g_agent_runtime_for_audio = &state;
+  (void)state;
   set_wasapi_event_callback(emit_wasapi_backend_event);
   set_wasapi_pcm_packet_callback(emit_wasapi_pcm_packet);
 }
@@ -364,6 +474,7 @@ AudioSessionCommandResult start_audio_session_from_request(
   const int pid = extract_int_value(request_json, "pid", 0);
   const std::string process_name = extract_string_value(request_json, "processName");
   state.audio_session = build_audio_session_state(start_wasapi_process_loopback_session(pid, process_name));
+  g_host_audio_capture_active.store(state.audio_session.capture_active, std::memory_order_release);
   refresh_host_audio_senders(state);
 
   emit_event(
@@ -399,6 +510,7 @@ AudioSessionCommandResult start_audio_session_from_request(
 }
 
 AudioSessionCommandResult stop_audio_session_from_request(AgentRuntimeState& state) {
+  g_host_audio_capture_active.store(false, std::memory_order_release);
   state.audio_session = build_audio_session_state(stop_wasapi_process_loopback_session());
   reset_host_audio_transport_sessions();
   refresh_host_audio_senders(state);
@@ -574,9 +686,13 @@ void unregister_host_audio_transport_session(const std::shared_ptr<PeerTransport
 
 void reset_host_audio_transport_sessions() {
   auto& state = host_audio_dispatch_state();
-  std::lock_guard<std::mutex> lock(state.mutex);
-  state.sessions.clear();
-  state.next_timestamp_samples = 0;
+  stop_host_audio_dispatch_worker(state);
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.sessions.clear();
+    state.capture_queue.clear();
+    state.next_timestamp_samples = 0;
+  }
   reset_host_audio_encoder_locked(state);
 }
 
@@ -587,46 +703,35 @@ void dispatch_host_audio_capture_packet(
   bool silent) {
   auto& state = host_audio_dispatch_state();
 
-  std::vector<std::shared_ptr<PeerTransportSession>> sessions;
-  std::lock_guard<std::mutex> lock(state.mutex);
-  for (auto it = state.sessions.begin(); it != state.sessions.end();) {
-    const auto session = it->lock();
-    if (!session) {
-      it = state.sessions.erase(it);
-      continue;
+  if (!silent && (!data || frames == 0 || status.block_align == 0)) {
+    return;
+  }
+
+  HostAudioDispatchState::QueuedCapturePacket packet;
+  packet.frames = frames;
+  packet.sample_rate = status.sample_rate;
+  packet.channel_count = status.channel_count;
+  packet.bits_per_sample = status.bits_per_sample;
+  packet.block_align = status.block_align;
+  packet.silent = silent;
+  if (!silent) {
+    const std::size_t byte_count = static_cast<std::size_t>(frames) * status.block_align;
+    packet.bytes.assign(data, data + byte_count);
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.sessions.empty()) {
+      return;
     }
-    sessions.push_back(session);
-    ++it;
-  }
-
-  if (sessions.empty()) {
-    return;
-  }
-
-  std::string encoder_error;
-  if (!ensure_host_audio_encoder_locked(state, &encoder_error)) {
-    state.last_error = encoder_error;
-    return;
-  }
-
-  std::vector<std::int16_t> pcm = silent
-    ? std::vector<std::int16_t>(static_cast<std::size_t>(std::max(1u, static_cast<unsigned int>((static_cast<std::uint64_t>(frames) * kTransportAudioSampleRate) / std::max(1u, status.sample_rate)))) * kTransportAudioChannelCount, 0)
-    : convert_capture_pcm_to_opus_input(data, frames, status);
-  if (pcm.empty()) {
-    return;
-  }
-
-  for (const std::int16_t sample : pcm) {
-    state.pending_pcm.push_back(sample);
-  }
-
-  while (state.pending_pcm.size() >= static_cast<std::size_t>(state.encoder_frame_size) * kTransportAudioChannelCount) {
-    std::string send_error;
-    if (!send_host_audio_opus_frame_locked(state, sessions, &send_error)) {
-      state.last_error = send_error;
-      break;
+    ensure_host_audio_dispatch_worker_running_locked(state);
+    if (state.capture_queue.size() >= kMaxQueuedHostAudioCapturePackets) {
+      state.capture_queue.pop_front();
+      state.dropped_capture_packets += 1;
     }
+    state.capture_queue.push_back(std::move(packet));
   }
+  state.cv.notify_one();
 }
 
 std::string audio_session_json(const AudioSessionState& session) {

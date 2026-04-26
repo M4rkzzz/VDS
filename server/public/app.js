@@ -194,12 +194,14 @@ let resumeOnNextConnect = false;
 const pendingMessages = [];
 const pendingRemoteCandidates = new Map();
 const MAX_PENDING_REMOTE_CANDIDATES_PER_PEER = 32;
+const MAX_PENDING_MESSAGES = 256;
 let wsManualClose = false; // 标记是否为手动关闭
 
 // Session state
 let isHost = false;
 let sessionRole = null;
 let currentRoomId = null;
+let currentSessionToken = null;
 let localStream = null;
 let myChainPosition = -1; // 观众在链中的位置
 let hostId = null; // Host的clientId
@@ -208,6 +210,7 @@ let viewerJoinPending = false;
 let viewerPendingJoinSource = null;
 let publicRooms = [];
 let publicRoomsRefreshInFlight = false;
+let publicRoomsManualRefreshInFlight = false;
 let publicRoomsPollTimer = null;
 let publicRoomsLastError = '';
 let sourceSelectionInFlight = false;
@@ -588,6 +591,12 @@ function setDebugConfig(nextConfig, options = {}) {
     propagateDebugConfig(debugConfig);
   }
   syncDebugUi();
+  if (typeof window.__vdsRenderP2pDiagnosticReport === 'function') {
+    window.__vdsRenderP2pDiagnosticReport();
+  }
+  if (typeof window.__vdsRenderHostCaptureDiagnosticReport === 'function') {
+    window.__vdsRenderHostCaptureDiagnosticReport();
+  }
 }
 
 function readViewerPlaybackPrefs() {
@@ -780,7 +789,7 @@ function renderPublicRooms() {
   }
 
   let statusText = '';
-  if (publicRoomsRefreshInFlight && publicRooms.length === 0) {
+  if (publicRoomsManualRefreshInFlight && publicRooms.length === 0) {
     statusText = '正在获取公开房间...';
   } else if (publicRoomsLastError) {
     statusText = publicRoomsLastError;
@@ -829,8 +838,8 @@ function renderViewerJoinUi() {
   }
   if (elements.btnRefreshPublicRooms) {
     elements.btnRefreshPublicRooms.classList.toggle('hidden', !isLobby);
-    elements.btnRefreshPublicRooms.classList.toggle('is-refreshing', isLobby && publicRoomsRefreshInFlight);
-    elements.btnRefreshPublicRooms.disabled = viewerJoinPending || publicRoomsRefreshInFlight;
+    elements.btnRefreshPublicRooms.classList.toggle('is-refreshing', isLobby && publicRoomsManualRefreshInFlight);
+    elements.btnRefreshPublicRooms.disabled = viewerJoinPending || publicRoomsManualRefreshInFlight;
   }
   if (elements.viewerPublicRoomsPanel) {
     elements.viewerPublicRoomsPanel.classList.toggle('hidden', !isLobby);
@@ -881,9 +890,13 @@ async function refreshPublicRooms({ manual = false, force = false } = {}) {
     return publicRooms;
   }
 
+  const showRefreshUi = Boolean(manual);
   publicRoomsRefreshInFlight = true;
-  publicRoomsLastError = '';
-  renderViewerJoinUi();
+  publicRoomsManualRefreshInFlight = showRefreshUi;
+  if (showRefreshUi) {
+    publicRoomsLastError = '';
+    renderViewerJoinUi();
+  }
 
   try {
     const response = await fetch(`${serverBaseUrl}/api/public-rooms`, {
@@ -901,13 +914,17 @@ async function refreshPublicRooms({ manual = false, force = false } = {}) {
         }))
         .filter((room) => room.roomId)
       : [];
+    publicRoomsLastError = '';
   } catch (_error) {
-    publicRoomsLastError = '大厅列表暂不可用';
-    if (manual) {
+    if (showRefreshUi) {
+      publicRoomsLastError = '大厅列表暂不可用';
       showError('无法刷新公开房间列表');
     }
   } finally {
     publicRoomsRefreshInFlight = false;
+    if (showRefreshUi) {
+      publicRoomsManualRefreshInFlight = false;
+    }
     renderViewerJoinUi();
   }
 
@@ -1448,6 +1465,14 @@ const elements = {
   chainPosition: document.getElementById('chain-position'),
   viewerReceiveFps: document.getElementById('viewer-receive-fps'),
   viewerRenderFps: document.getElementById('viewer-render-fps'),
+  hostP2pStatus: document.getElementById('host-p2p-status'),
+  viewerP2pStatus: document.getElementById('viewer-p2p-status'),
+  hostP2pDiagnosticOutput: document.getElementById('host-p2p-diagnostic-output'),
+  viewerP2pDiagnosticOutput: document.getElementById('viewer-p2p-diagnostic-output'),
+  hostCaptureDiagnosticOutput: document.getElementById('host-capture-diagnostic-output'),
+  btnCopyHostP2pDiagnostic: document.getElementById('btn-copy-host-p2p-diagnostic'),
+  btnCopyViewerP2pDiagnostic: document.getElementById('btn-copy-viewer-p2p-diagnostic'),
+  btnCopyHostCaptureDiagnostic: document.getElementById('btn-copy-host-capture-diagnostic'),
   hostStatus: document.getElementById('host-status'),
   hostStatusDetail: document.getElementById('host-status-detail'),
   hostSourceFps: document.getElementById('host-source-fps'),
@@ -2625,6 +2650,21 @@ elements.btnBackViewer.addEventListener('click', goBackViewer);
 elements.btnCopyRoom.addEventListener('click', () => {
   copyRoomId().catch(() => {});
 });
+if (elements.btnCopyHostP2pDiagnostic) {
+  elements.btnCopyHostP2pDiagnostic.addEventListener('click', () => {
+    copyP2pDiagnosticReport().catch(() => {});
+  });
+}
+if (elements.btnCopyViewerP2pDiagnostic) {
+  elements.btnCopyViewerP2pDiagnostic.addEventListener('click', () => {
+    copyP2pDiagnosticReport().catch(() => {});
+  });
+}
+if (elements.btnCopyHostCaptureDiagnostic) {
+  elements.btnCopyHostCaptureDiagnostic.addEventListener('click', () => {
+    copyHostCaptureDiagnosticReport().catch(() => {});
+  });
+}
 if (elements.viewerAudioDelayInput) {
   elements.viewerAudioDelayInput.addEventListener('input', (event) => {
     setViewerAudioDelayMs(event.target.value, {
@@ -2745,6 +2785,10 @@ async function showHostPanel() {
   await transitionToWorkspace('host');
   isHost = true;
   renderHostPublicListingUi();
+  if (elements.hostP2pStatus) {
+    elements.hostP2pStatus.dataset.p2pState = 'idle';
+    elements.hostP2pStatus.textContent = 'P2P：等待';
+  }
   elements.hostStatus.textContent = '正在连接...';
   elements.hostStatus.classList.add('waiting');
   try {
@@ -2758,6 +2802,10 @@ async function showHostPanel() {
 async function showViewerPanel() {
   await transitionToWorkspace('viewer');
   isHost = false;
+  if (elements.viewerP2pStatus) {
+    elements.viewerP2pStatus.dataset.p2pState = 'idle';
+    elements.viewerP2pStatus.textContent = 'P2P：等待';
+  }
   setViewerJoinMode('lobby');
   renderViewerJoinUi();
   updatePublicRoomsPollingState();
@@ -2842,6 +2890,7 @@ function connectWebSocket() {
           roomId: currentRoomId,
           clientId: clientId,
           role: sessionRole,
+          sessionToken: currentSessionToken || '',
           needsMediaReconnect: sessionRole === 'viewer' && !upstreamConnected
         });
         resumeOnNextConnect = false;
@@ -2852,8 +2901,11 @@ function connectWebSocket() {
     };
 
     ws.onmessage = async (event) => {
-      const data = JSON.parse(event.data);
       try {
+        const data = JSON.parse(event.data);
+        if (!data || typeof data !== 'object') {
+          return;
+        }
         await handleMessage(data);
       } catch (error) {
         debugLog('connection', 'Unhandled message processing error:', error && error.message ? error.message : String(error));
@@ -2958,7 +3010,9 @@ function removePendingMessages(predicate) {
   }
 
   for (let index = pendingMessages.length - 1; index >= 0; index -= 1) {
-    if (predicate(pendingMessages[index])) {
+    const entry = pendingMessages[index];
+    const payload = entry && entry.payload ? entry.payload : entry;
+    if (predicate(payload)) {
       pendingMessages.splice(index, 1);
     }
   }
@@ -2966,7 +3020,42 @@ function removePendingMessages(predicate) {
 
 function flushPendingMessages() {
   while (pendingMessages.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
-    sendRawMessage(pendingMessages.shift());
+    const entry = pendingMessages.shift();
+    sendRawMessage(entry && entry.payload ? entry.payload : entry);
+  }
+}
+
+function pendingMessagePriority(data) {
+  const type = data && data.type;
+  if (type === 'ice-candidate' || type === 'candidate') {
+    return 1;
+  }
+  if (type === 'offer' || type === 'answer' || type === 'viewer-ready') {
+    return 2;
+  }
+  return 3;
+}
+
+function enqueuePendingMessage(data) {
+  const entry = {
+    payload: data,
+    priority: pendingMessagePriority(data),
+    queuedAt: Date.now()
+  };
+  pendingMessages.push(entry);
+
+  while (pendingMessages.length > MAX_PENDING_MESSAGES) {
+    let dropIndex = 0;
+    let dropPriority = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < pendingMessages.length; index += 1) {
+      const candidate = pendingMessages[index];
+      const priority = candidate && Number.isFinite(candidate.priority) ? candidate.priority : 0;
+      if (priority < dropPriority) {
+        dropPriority = priority;
+        dropIndex = index;
+      }
+    }
+    pendingMessages.splice(dropIndex, 1);
   }
 }
 
@@ -2982,7 +3071,7 @@ function sendMessage(data, options = {}) {
     return false;
   }
 
-  pendingMessages.push(data);
+  enqueuePendingMessage(data);
   connectWebSocket().catch(() => {});
   return false;
 }
@@ -3783,11 +3872,13 @@ async function joinRoomById(roomId, { source = 'direct' } = {}) {
 
   currentRoomId = normalizedRoomId;
   sessionRole = 'viewer';
+  currentSessionToken = null;
   updatePublicRoomsPollingState();
   sendMessage({
     type: 'join-room',
     roomId: normalizedRoomId,
     clientId: clientId,
+    sessionToken: currentSessionToken || '',
     viewerPlaybackMode: viewerPlaybackPrefs.mode,
     viewerAudioDelayMs: viewerPlaybackPrefs.audioDelayMs
   });
@@ -3853,6 +3944,44 @@ async function copyRoomId(options = {}) {
 }
 
 window.__vdsCopyRoomIdToClipboard = copyRoomId;
+
+async function copyP2pDiagnosticReport() {
+  if (typeof window.__vdsBuildP2pDiagnosticReport !== 'function') {
+    showError('P2P 诊断尚不可用');
+    return false;
+  }
+
+  const report = String(window.__vdsBuildP2pDiagnosticReport() || '').trim();
+  if (!report) {
+    showError('P2P 诊断尚无数据');
+    return false;
+  }
+
+  await copyTextToClipboard(report, {
+    successMessage: 'P2P 诊断已复制',
+    failureMessage: '复制 P2P 诊断失败'
+  });
+  return true;
+}
+
+async function copyHostCaptureDiagnosticReport() {
+  if (typeof window.__vdsBuildHostCaptureDiagnosticReport !== 'function') {
+    showError('采集资源诊断尚不可用');
+    return false;
+  }
+
+  const report = String(window.__vdsBuildHostCaptureDiagnosticReport() || '').trim();
+  if (!report) {
+    showError('采集资源诊断尚无数据');
+    return false;
+  }
+
+  await copyTextToClipboard(report, {
+    successMessage: '采集资源诊断已复制',
+    failureMessage: '复制采集资源诊断失败'
+  });
+  return true;
+}
 
 // 显示错误
 function showError(message) {
@@ -3974,6 +4103,7 @@ async function stopScreenShare() {
 
   currentRoomId = null;
   sessionRole = null;
+  currentSessionToken = null;
   hostId = null;
   upstreamPeerId = null;
   relayPc = null;
@@ -3988,12 +4118,17 @@ async function stopScreenShare() {
   elements.btnStopShare.classList.add('hidden');
   elements.hostStatus.textContent = '准备就绪';
   elements.hostStatus.classList.remove('waiting');
+  if (elements.hostP2pStatus) {
+    elements.hostP2pStatus.dataset.p2pState = 'idle';
+    elements.hostP2pStatus.textContent = 'P2P：等待';
+  }
   renderHostPublicListingUi();
 }
 
 async function resetViewerState() {
   currentRoomId = null;
   sessionRole = null;
+  currentSessionToken = null;
   hostId = null;
   upstreamPeerId = null;
   myChainPosition = -1;
@@ -4012,6 +4147,10 @@ async function resetViewerState() {
   elements.waitingMessage.classList.remove('hidden');
   elements.connectionStatus.textContent = '等待连接...';
   elements.connectionStatus.classList.remove('connected');
+  if (elements.viewerP2pStatus) {
+    elements.viewerP2pStatus.dataset.p2pState = 'idle';
+    elements.viewerP2pStatus.textContent = 'P2P：等待';
+  }
   if (elements.viewerReceiveFps) {
     elements.viewerReceiveFps.textContent = '-';
   }
