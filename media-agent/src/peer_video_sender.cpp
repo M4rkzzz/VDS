@@ -679,7 +679,33 @@ bool start_peer_video_sender(
         timestamp_us = runtime->next_frame_timestamp_us;
       }
 
-      if (!send_peer_transport_video_frame(transport_session, access_unit, codec_path, timestamp_us, error)) {
+      const PeerTransportSnapshot transport_snapshot = get_peer_transport_snapshot(transport_session);
+      const bool use_encoded_data_channel =
+        transport_snapshot.encoded_media_data_channel_requested ||
+        transport_snapshot.encoded_media_data_channel_supported;
+      if (use_encoded_data_channel) {
+        if (!transport_snapshot.encoded_media_data_channel_ready) {
+          std::lock_guard<std::mutex> lock(runtime->mutex);
+          runtime->reason = "peer-video-sender-waiting-for-datachannel-ready";
+          runtime->updated_at_unix_ms = current_time_millis();
+          if (runtime->next_frame_send_deadline_steady_us > 0) {
+            runtime->next_frame_send_deadline_steady_us =
+              current_time_micros_steady() + static_cast<std::int64_t>(runtime->frame_interval_us);
+          }
+          return true;
+        }
+        PeerEncodedMediaDataChannelFrame frame;
+        frame.stream_type = "video";
+        frame.codec = codec_path;
+        frame.timestamp_us = timestamp_us;
+        frame.sequence = runtime->frames_sent;
+        frame.keyframe = video_access_unit_has_random_access_nal(codec_path, access_unit);
+        frame.config = video_access_unit_has_decoder_config_nal(codec_path, access_unit);
+        frame.payload = access_unit;
+        if (!send_peer_transport_encoded_media_frame(transport_session, frame, error)) {
+          return false;
+        }
+      } else if (!send_peer_transport_video_frame(transport_session, access_unit, codec_path, timestamp_us, error)) {
         return false;
       }
 
@@ -693,7 +719,7 @@ bool start_peer_video_sender(
       return true;
     };
 
-    const auto flush_video_bootstrap_access_units = [&runtime, &send_video_access_unit, &codec_path](std::string* error) -> bool {
+    const auto flush_video_bootstrap_access_units = [&runtime, &transport_session, &send_video_access_unit, &codec_path](std::string* error) -> bool {
       std::vector<std::uint8_t> decoder_config_au;
       std::vector<std::uint8_t> random_access_au;
       {
@@ -706,6 +732,16 @@ bool start_peer_video_sender(
       }
 
       if (!video_bootstrap_is_complete(codec_path, decoder_config_au, random_access_au)) {
+        return true;
+      }
+
+      const PeerTransportSnapshot transport_snapshot = get_peer_transport_snapshot(transport_session);
+      if ((transport_snapshot.encoded_media_data_channel_requested ||
+           transport_snapshot.encoded_media_data_channel_supported) &&
+          !transport_snapshot.encoded_media_data_channel_ready) {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        runtime->reason = "peer-video-sender-waiting-for-datachannel-bootstrap";
+        runtime->updated_at_unix_ms = current_time_millis();
         return true;
       }
 
@@ -767,10 +803,18 @@ bool start_peer_video_sender(
           runtime->updated_at_unix_ms = current_time_millis();
           continue;
         }
-        if (!transport_snapshot.video_track_open) {
+        const bool use_encoded_data_channel =
+          transport_snapshot.encoded_media_data_channel_requested ||
+          transport_snapshot.encoded_media_data_channel_supported;
+        const bool media_channel_ready = use_encoded_data_channel
+          ? transport_snapshot.encoded_media_data_channel_ready
+          : transport_snapshot.video_track_open;
+        if (!media_channel_ready) {
           cache_video_bootstrap_access_unit(access_unit);
           std::lock_guard<std::mutex> lock(runtime->mutex);
-          runtime->reason = "peer-video-sender-waiting-for-video-track-open";
+          runtime->reason = use_encoded_data_channel
+            ? "peer-video-sender-waiting-for-datachannel-ready"
+            : "peer-video-sender-waiting-for-video-track-open";
           runtime->updated_at_unix_ms = current_time_millis();
           continue;
         }
@@ -837,10 +881,18 @@ bool start_peer_video_sender(
         runtime->updated_at_unix_ms = current_time_millis();
         continue;
       }
-      if (!transport_snapshot.video_track_open) {
+      const bool use_encoded_data_channel =
+        transport_snapshot.encoded_media_data_channel_requested ||
+        transport_snapshot.encoded_media_data_channel_supported;
+      const bool media_channel_ready = use_encoded_data_channel
+        ? transport_snapshot.encoded_media_data_channel_ready
+        : transport_snapshot.video_track_open;
+      if (!media_channel_ready) {
         cache_video_bootstrap_access_unit(access_unit);
         std::lock_guard<std::mutex> lock(runtime->mutex);
-        runtime->reason = "peer-video-sender-waiting-for-video-track-open";
+        runtime->reason = use_encoded_data_channel
+          ? "peer-video-sender-waiting-for-datachannel-ready"
+          : "peer-video-sender-waiting-for-video-track-open";
         runtime->updated_at_unix_ms = current_time_millis();
         continue;
       }

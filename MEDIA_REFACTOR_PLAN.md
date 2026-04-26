@@ -19,7 +19,7 @@
 
 最近一次对齐日期：`2026-04-26`
 
-当前发布版本：`1.6.4`
+当前发布版本：`1.6.5`
 
 ## 2. 未发布改动记录
 
@@ -27,11 +27,12 @@
 
 当前未发布改动：
 
-- 暂无。1.6.4 已发布条目已迁移到 `CHANGELOG.md`。
+- 暂无。1.6.5 已发布条目已迁移到 `CHANGELOG.md`。
 
 当前未发布改动已验证：
 
-- 暂无。
+- `npm run build:release`
+- `npm run release:check`
 
 ## 3. 当前结论
 
@@ -68,6 +69,9 @@
 - child embed 不作为近期主线
 - OBS 本地 SRT ingest 是正式 host backend
 - `media-agent/src/main.cpp` 已不再承载业务实现，只是进程级入口
+- VDS_web 不能按 WebRTC media track 模型承担 native viewer 的 relay 节点职责。
+- Web relay 正式方向改为 `DataChannel encoded frame relay`，与 Windows native 端统一到 `vds-media-encoded-v1` 协议。
+- Windows 端默认使用 DataChannel encoded media：对端不支持、版本不兼容、codec 不支持、首帧/bootstrap 超时、DataChannel 未打开或协议握手失败时，都要 failfast，不允许长时间卡在“连接中/relay 检测中”，也不静默切回旧 media track 主链路。
 
 ## 4. 当前代码状态
 
@@ -110,7 +114,7 @@
 
 当前验证结论：
 
-- `npm run build:release` 已通过，并刷新 `dist/VDS-Setup-1.6.4.exe`、`dist/VDS-Setup-1.6.4.exe.blockmap`、`server/updates/latest.yml` 和 `server/updates/VDS-Setup-1.6.4.*`。
+- `npm run build:release` 已通过，并刷新 `dist/VDS-Setup-1.6.5.exe`、`dist/VDS-Setup-1.6.5.exe.blockmap`、`server/updates/latest.yml` 和 `server/updates/VDS-Setup-1.6.5.*`。
 - `npm run verify:media-agent` 已通过。
 - `npm run check:logging` 已通过。
 - `node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`node --check server/server-core.js` 已通过。
@@ -398,7 +402,64 @@ server 单元测试覆盖：
 
 ## 11. 下一阶段顺序
 
-暂无。
+### Phase W1：DataChannel encoded media 协议定义
+
+状态：已开始，已落地 Web 端初版协议骨架。
+
+目标：
+
+- 明确采用 `DataChannel encoded frame relay`，不再继续尝试标准 WebRTC media sender 注入式 relay。
+- 定义协议名：`vds-media-encoded-v1`。已完成。
+- 定义握手字段：`protocolVersion`、`role`、`supportedVideoCodecs`、`supportedAudioCodecs`、`maxFrameBytes`、`bootstrapRequired`。已完成；`clockRate` 后续按音视频分流补齐。
+- 定义数据帧 envelope：`streamType`、`codec`、`timestampUs`、`sequence`、`keyframe`、`config`、`payload`。已完成初版。
+- 定义控制消息：`hello`、`hello-ack`、`keyframe-request`、`bootstrap`、`stats`、`error`、`close`。已完成初版类型定义，当前已接入 `hello/hello-ack/error`。
+- 禁止把 DataChannel bytes 静默转换成 canvas/WebCodecs 重编码 relay 作为“成功”。
+
+### Phase W2：Windows native 自动检测与 failfast 适配
+
+状态：基础实现已落地，已完成信令能力透传、renderer 默认启用、native peer transport 主动创建/接受 DataChannel、DataChannel encoded frame 入站解码入口、native host/OBS/relay DataChannel 出站 fanout；Win-Win 端到端已实测有画面有声音，后续继续补 Web 音频和三端 soak。
+
+目标：
+
+- Win native 默认使用 `vds-media-encoded-v1` DataChannel encoded media，不再把 `rtc::Track` media path 作为默认主链路。
+- 对端明确不支持 `vds-media-encoded-v1` 时 failfast；当前已能主动创建或接受 `vds-media-encoded-v1` DataChannel。
+- 自动检测对端协议版本、codec、最大帧尺寸、bootstrap 能力。当前 server 已透传能力，Win renderer 已能识别协议版本。
+- 失败原因必须可区分：`datachannel-protocol-unsupported`、`datachannel-version-mismatch`、`datachannel-codec-unsupported`、`datachannel-open-timeout`、`datachannel-bootstrap-timeout`、`datachannel-frame-invalid`。
+- 检测失败必须 failfast，不能长期显示“连接中/relay 检测中”。当前已覆盖 DataChannel open/ack timeout、`datachannel-version-mismatch`、`datachannel-frame-invalid*`、发送失败和连接失败路径。
+- 诊断报告显示 encoded DataChannel 状态和计数。当前 native stats 已暴露 `encodedMediaDataChannel*` 字段。
+- DataChannel encoded frame ingest 已接入现有 native video/audio receiver 入口；native host/OBS/relay fanout 已可把上游 encoded frame 通过 DataChannel 发给下游。下一步重点验证 Web/Web 和 Win/Web/Win 三端组合里的 bootstrap、音频播放和长时间稳定性。
+
+### Phase W3：VDS_web DataChannel relay harness
+
+状态：基础实现已落地，Web viewer 可接收上游 encoded frame 统计，并在下游 DataChannel ready 后按 `vds-media-encoded-v1` envelope 转发；Web 作为 DataChannel 下游已增加 H.264 WebCodecs canvas 播放验证路径；Web->Web relay 已增加 DataChannel 大帧分片、重组和最近关键帧 bootstrap。
+
+目标：
+
+- VDS_web viewer 收到上游 encoded frames 后，通过 `vds-media-encoded-v1` DataChannel 转发给下游。
+- Web 端只负责 encoded frame relay，不承诺作为标准 WebRTC media sender relay。
+- 下游如果是 Web，先以 WebCodecs H.264 canvas 播放器和诊断 harness 验证；下游如果是 Win native，走新增 native DataChannel ingest。
+- relay 成功标准：`encodedFramesReceived > 0`、`dataChannelFramesForwarded > 0`、`reencodePathUsed = false`。
+- relay 失败必须给出明确协议失败原因。
+
+### Phase W4：解码与播放边界
+
+目标：
+
+- Web 观看第一阶段只承诺 `H.264 + Opus`。
+- `H.265 / AAC` 在 Web 端不作为默认承诺能力；检测到不支持时拒绝加入或提示主持端切换。
+- Win native 继续支持 `H.264/H.265 + Opus/AAC/PCMU`。
+- 如果 Web 后续要播放 DataChannel encoded stream，必须单独设计 WebCodecs/AudioWorklet 播放器和音画同步，不混入当前 WebRTC `<video>` 路线。
+- 当前已落地最小 H.264 WebCodecs canvas 播放验证；音频播放、音画同步、H.265/AAC 仍不承诺。
+
+### Phase W5：回归与发布门禁
+
+目标：
+
+- 增加协议单测：握手成功、版本不兼容、codec 不支持、首帧超时、非法帧拒绝。
+- 当前已增加 `npm run test:vds-web`，覆盖 DataChannel frame envelope encode/decode、非法 frame 拒绝，以及 WebCodecs H.264 canvas 播放关键路径。
+- 增加 server 信令测试：Web viewer capability 宣告不破坏旧 Windows 客户端。
+- 增加 dual:web 手测清单：Win host + Web viewer、Web relay unsupported、DataChannel 协议 failfast。
+- 发布前继续跑 `npm run release:check`，并补充 DataChannel 协议专项验证。
 
 ## 12. 明确禁止
 
@@ -427,7 +488,7 @@ server 单元测试覆盖：
 
 处理问题时的原则：
 
-- 本轮 Phase 1-6 已全部完成并归档到第 9 节；第 11 节暂无下一阶段计划，后续按线上反馈重新立项。
+- 本轮 Phase 1-6 已全部完成并归档到第 9 节；新的第 11 节已改为 VDS_web DataChannel encoded media 后续计划。
 - 先跑 `npm run verify:media-agent`。
 - 日志相关改动必须跑 `npm run check:logging`。
 - 涉及真实窗口、音频、OBS、relay 时，再跑 `npm run e2e:media-agent` 并按清单手测。
@@ -441,9 +502,9 @@ server 单元测试覆盖：
 
 1. 发布前先确认工作区变更都已记录到 `## 2. 未发布改动记录`，并确认 `package.json` 版本号是目标版本。
 2. 如需要升级版本，先同步更新 `package.json`、`package-lock.json`、本文档 `当前发布版本` 和相关 changelog 草稿。
-3. 运行 `npm run release:check`。该命令会执行 syntax check、server tests、logging check、media-agent verify、production audit，并校验当前 `dist` 与 `server/updates` 里的 installer、blockmap、`latest.yml` 一致性。
+3. 运行 `npm run release:check`。该命令会执行 syntax check、VDS_web TypeScript check、VDS_web build、server tests、logging check、media-agent verify、production audit，并校验当前 `dist` 与 `server/updates` 里的 installer、blockmap、`latest.yml` 一致性。
 4. 如果只是检查当前已有产物，`npm run release:check` 通过即可进入人工验收；如果需要重新出包，先运行 `npm run build:release`。
-5. `npm run build:release` 会先执行 Electron 打包，再运行 `npm run prepare-server-release`，把当前版本 installer、blockmap 和 `latest.yml` 准备到 `server/updates`。
+5. `npm run build:release` 会先构建 VDS_web 静态产物，再执行 Electron 打包，最后运行 `npm run prepare-server-release`，把当前版本 installer、blockmap 和 `latest.yml` 准备到 `server/updates`。
 6. 出包后必须再次运行 `npm run release:check`，确认新产物的 version、path、sha512、size 与 installer 一致，且 `dist` 与 `server/updates` 当前 installer 元数据一致。
 7. 做发布手测：安装当前 `dist/VDS-Setup-<version>.exe`，确认应用可启动；如涉及更新链路，确认客户端能读取 `server/updates/latest.yml` 并识别目标版本。
 8. 发布前不要删除旧版本 blockmap；`prepare-server-release` 会按保留策略保留旧 blockmap，用于提高差分更新成功率。

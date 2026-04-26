@@ -288,7 +288,21 @@ void fanout_relay_video_units_now(
       );
       continue;
     }
-    if (!snapshot.video_track_open) {
+    const bool use_encoded_data_channel =
+      snapshot.encoded_media_data_channel_requested ||
+      snapshot.encoded_media_data_channel_supported;
+    if (use_encoded_data_channel && !snapshot.encoded_media_data_channel_ready) {
+      update_relay_subscriber_runtime(
+        upstream_peer_id,
+        target.peer_id,
+        "relay-waiting-for-datachannel-encoded-ready",
+        "",
+        0,
+        0
+      );
+      continue;
+    }
+    if (!use_encoded_data_channel && !snapshot.video_track_open) {
       update_relay_subscriber_runtime(
         upstream_peer_id,
         target.peer_id,
@@ -335,7 +349,21 @@ void fanout_relay_video_units_now(
     }
     for (const auto& access_unit : units_to_send) {
       const std::uint64_t unit_timestamp_us = access_unit.timestamp_us > 0 ? access_unit.timestamp_us : timestamp_us;
-      if (!send_peer_transport_video_frame(target.session, access_unit.bytes, codec, unit_timestamp_us, &send_error)) {
+      bool sent = false;
+      if (use_encoded_data_channel) {
+        PeerEncodedMediaDataChannelFrame frame;
+        frame.stream_type = "video";
+        frame.codec = vds::media_agent::normalize_video_codec(codec);
+        frame.timestamp_us = unit_timestamp_us;
+        frame.sequence = sent_frames;
+        frame.keyframe = vds::media_agent::video_access_unit_has_random_access_nal(frame.codec, access_unit.bytes);
+        frame.config = vds::media_agent::video_access_unit_has_decoder_config_nal(frame.codec, access_unit.bytes);
+        frame.payload = access_unit.bytes;
+        sent = send_peer_transport_encoded_media_frame(target.session, frame, &send_error);
+      } else {
+        sent = send_peer_transport_video_frame(target.session, access_unit.bytes, codec, unit_timestamp_us, &send_error);
+      }
+      if (!sent) {
         send_failed = true;
         break;
       }
@@ -356,7 +384,7 @@ void fanout_relay_video_units_now(
       update_relay_subscriber_runtime(
         upstream_peer_id,
         target.peer_id,
-        "relay-video-forwarding",
+        use_encoded_data_channel ? "relay-datachannel-video-forwarding" : "relay-video-forwarding",
         "",
         sent_frames,
         sent_bytes
@@ -584,7 +612,21 @@ void fanout_relay_audio_frame(
       );
       continue;
     }
-    if (!snapshot.audio_track_open) {
+    const bool use_encoded_data_channel =
+      snapshot.encoded_media_data_channel_requested ||
+      snapshot.encoded_media_data_channel_supported;
+    if (use_encoded_data_channel && !snapshot.encoded_media_data_channel_ready) {
+      update_relay_subscriber_runtime(
+        upstream_peer_id,
+        target.peer_id,
+        "relay-waiting-for-datachannel-encoded-ready",
+        "",
+        0,
+        0
+      );
+      continue;
+    }
+    if (!use_encoded_data_channel && !snapshot.audio_track_open) {
       update_relay_subscriber_runtime(
         upstream_peer_id,
         target.peer_id,
@@ -597,11 +639,23 @@ void fanout_relay_audio_frame(
     }
 
     std::string send_error;
-    if (!send_peer_transport_audio_frame(target.session, frame, timestamp_us, &send_error)) {
+    bool sent = false;
+    if (use_encoded_data_channel) {
+      PeerEncodedMediaDataChannelFrame encoded_frame;
+      encoded_frame.stream_type = "audio";
+      encoded_frame.codec = lowered_codec;
+      encoded_frame.timestamp_us = timestamp_us;
+      encoded_frame.sequence = 0;
+      encoded_frame.payload = frame;
+      sent = send_peer_transport_encoded_media_frame(target.session, encoded_frame, &send_error);
+    } else {
+      sent = send_peer_transport_audio_frame(target.session, frame, timestamp_us, &send_error);
+    }
+    if (!sent) {
       update_relay_subscriber_runtime(
         upstream_peer_id,
         target.peer_id,
-        "relay-audio-send-failed",
+        use_encoded_data_channel ? "relay-datachannel-audio-send-failed" : "relay-audio-send-failed",
         send_error,
         0,
         0
@@ -612,7 +666,7 @@ void fanout_relay_audio_frame(
     update_relay_subscriber_runtime(
       upstream_peer_id,
       target.peer_id,
-      "relay-audio-forwarding",
+      use_encoded_data_channel ? "relay-datachannel-audio-forwarding" : "relay-audio-forwarding",
       "",
       0,
       0

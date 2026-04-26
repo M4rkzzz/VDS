@@ -105,6 +105,10 @@ std::string build_peer_state_json(const PeerState& peer, const std::string& stat
     << ",\"role\":\"" << vds::media_agent::json_escape(peer.role) << "\""
     << ",\"initiator\":" << (peer.initiator ? "true" : "false")
     << ",\"state\":\"" << vds::media_agent::json_escape(state) << "\""
+    << ",\"mediaSessionId\":\"" << vds::media_agent::json_escape(peer.media_session_id) << "\""
+    << ",\"mediaManifestVersion\":" << peer.media_manifest_version
+    << ",\"expectedVideoCodec\":\"" << vds::media_agent::json_escape(peer.expected_video_codec) << "\""
+    << ",\"expectedAudioCodec\":\"" << vds::media_agent::json_escape(peer.expected_audio_codec) << "\""
     << ",\"driver\":\"" << vds::media_agent::json_escape(peer.transport.transport_ready ? "libdatachannel-native-webrtc" : "stub-native-media-agent") << "\""
     << ",\"transportReady\":" << (peer.transport.transport_ready ? "true" : "false")
     << ",\"mediaBinding\":" << peer_media_binding_json(peer.media_binding)
@@ -141,6 +145,10 @@ std::string build_peer_result_json(const PeerState& peer) {
     << "{\"peerId\":\"" << vds::media_agent::json_escape(peer.peer_id) << "\""
     << ",\"role\":\"" << vds::media_agent::json_escape(peer.role) << "\""
     << ",\"initiator\":" << (peer.initiator ? "true" : "false")
+    << ",\"mediaSessionId\":\"" << vds::media_agent::json_escape(peer.media_session_id) << "\""
+    << ",\"mediaManifestVersion\":" << peer.media_manifest_version
+    << ",\"expectedVideoCodec\":\"" << vds::media_agent::json_escape(peer.expected_video_codec) << "\""
+    << ",\"expectedAudioCodec\":\"" << vds::media_agent::json_escape(peer.expected_audio_codec) << "\""
     << ",\"transportReady\":" << (peer.transport.transport_ready ? "true" : "false")
     << ",\"implementation\":\"" << vds::media_agent::json_escape(peer.transport.transport_ready ? "libdatachannel" : "stub") << "\""
     << ",\"mediaBinding\":" << peer_media_binding_json(peer.media_binding)
@@ -181,6 +189,10 @@ std::string build_stats_json(AgentRuntimeState& state) {
       << ",\"initiator\":" << (peer.initiator ? "true" : "false")
       << ",\"remoteDescription\":" << (peer.has_remote_description ? "true" : "false")
       << ",\"remoteCandidateCount\":" << peer.remote_candidate_count
+      << ",\"mediaSessionId\":\"" << vds::media_agent::json_escape(peer.media_session_id) << "\""
+      << ",\"mediaManifestVersion\":" << peer.media_manifest_version
+      << ",\"expectedVideoCodec\":\"" << vds::media_agent::json_escape(peer.expected_video_codec) << "\""
+      << ",\"expectedAudioCodec\":\"" << vds::media_agent::json_escape(peer.expected_audio_codec) << "\""
       << ",\"mediaBinding\":" << peer_media_binding_json(peer.media_binding)
       << ",\"peerTransport\":" << peer_transport_snapshot_json(peer.transport)
       << ",\"receiverRuntime\":" << peer_video_receiver_runtime_json(peer.receiver_runtime)

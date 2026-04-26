@@ -98,6 +98,8 @@
   let hostWaitingWindowRestore = false;
   let nativeHostEffectiveCodec = 'h264';
   let currentHostBackend = 'native';
+  let currentHostMediaSessionId = '';
+  let currentMediaManifest = null;
   let obsRoomCreatePending = false;
   let viewerMediaWaitTimerId = null;
   let latestP2pStatsSnapshot = null;
@@ -407,6 +409,74 @@
     return !isObsIngestHostBackend(backend) &&
       nativeHostPreviewEnabled &&
       !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
+  }
+
+  function ensureHostMediaSessionId() {
+    if (!currentHostMediaSessionId) {
+      currentHostMediaSessionId = `media-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    }
+    return currentHostMediaSessionId;
+  }
+
+  function buildHostMediaManifest(source = {}) {
+    const backend = normalizeHostBackendName(source.backend || currentHostBackend);
+    const videoCodec = normalizeNativeVideoCodec(
+      source.videoCodec || source.codec || nativeHostEffectiveCodec,
+      'h264'
+    );
+    const audioCodec = String(source.audioCodec || (backend === 'obs-ingest' ? 'aac' : 'opus')).trim().toLowerCase();
+    const width = Number(source.width || (qualitySettings && qualitySettings.width) || 0);
+    const height = Number(source.height || (qualitySettings && qualitySettings.height) || 0);
+    const fps = Number(source.fps || source.frameRate || (qualitySettings && qualitySettings.frameRate) || 0);
+    return {
+      protocol: 'vds-media-encoded-v1',
+      protocolVersion: 1,
+      mediaSessionId: ensureHostMediaSessionId(),
+      manifestVersion: 1,
+      sourceType: backend === 'obs-ingest' ? 'obs-ingest' : 'native-capture',
+      updatedAt: Date.now(),
+      video: {
+        codec: videoCodec,
+        payloadFormat: 'annexb',
+        width: Number.isFinite(width) ? Math.max(0, Math.round(width)) : 0,
+        height: Number.isFinite(height) ? Math.max(0, Math.round(height)) : 0,
+        fps: Number.isFinite(fps) ? Math.max(0, Math.round(fps)) : 0,
+        keyframeIntervalMs: 1000,
+        configVersion: 1,
+        config: {}
+      },
+      audio: {
+        codec: audioCodec === 'aac' ? 'aac' : 'opus',
+        payloadFormat: audioCodec === 'aac' ? 'aac-adts' : 'opus-raw',
+        sampleRate: Number(source.audioSampleRate || 48000),
+        channels: Number(source.audioChannels || 2),
+        frameDurationMs: audioCodec === 'aac' ? 23 : 20,
+        profile: audioCodec === 'aac' ? 'aac-lc' : '',
+        configVersion: 1,
+        config: {}
+      }
+    };
+  }
+
+  function buildHostMediaManifestFromStats(stats) {
+    const obsIngest = stats && stats.obsIngest ? stats.obsIngest : null;
+    const hostPipeline = stats && stats.hostPipeline ? stats.hostPipeline : null;
+    return buildHostMediaManifest({
+      backend: currentHostBackend,
+      videoCodec: obsIngest && obsIngest.videoCodec ? obsIngest.videoCodec : nativeHostEffectiveCodec,
+      audioCodec: obsIngest && obsIngest.audioCodec ? obsIngest.audioCodec : undefined,
+      width: obsIngest && obsIngest.width ? obsIngest.width : (hostPipeline && hostPipeline.width),
+      height: obsIngest && obsIngest.height ? obsIngest.height : (hostPipeline && hostPipeline.height),
+      frameRate: obsIngest && obsIngest.frameRate ? obsIngest.frameRate : (hostPipeline && hostPipeline.frameRate),
+      audioSampleRate: obsIngest && obsIngest.audioSampleRate,
+      audioChannels: obsIngest && obsIngest.audioChannelCount
+    });
+  }
+
+  function rememberMediaManifest(mediaManifest) {
+    if (mediaManifest && typeof mediaManifest === 'object') {
+      currentMediaManifest = mediaManifest;
+    }
   }
 
   function isViewerFullscreenMode() {
@@ -985,17 +1055,25 @@
     return '';
   }
 
-  function isMediaOfferSignal(signal) {
+  function isMediaOfferSignal(signal, options = {}) {
     const sdpText = extractNativeSignalSdpText(signal);
-    return sdpText.includes('m=video');
+    if (sdpText.includes('m=video')) {
+      return true;
+    }
+
+    return Boolean(
+      options.allowEncodedDataChannel &&
+      sdpText.includes('m=application') &&
+      sdpText.includes('webrtc-datachannel')
+    );
   }
 
-  async function waitForNativeMediaOffer(peerId, timeoutMs = 15000) {
+  async function waitForNativeMediaOffer(peerId, timeoutMs = 15000, options = {}) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const remainingMs = Math.max(1, deadline - Date.now());
       const signal = await waitForNativePeerSignal(peerId, 'offer', remainingMs);
-      if (isMediaOfferSignal(signal)) {
+      if (isMediaOfferSignal(signal, options)) {
         return signal;
       }
     }
@@ -1789,6 +1867,12 @@
     lines.push(`upstreamPeerId: ${formatDiagnosticValue(upstreamPeerId)}`);
     lines.push(`hostId: ${formatDiagnosticValue(hostId)}`);
     lines.push(`chainPosition: ${Number.isInteger(myChainPosition) ? myChainPosition : '-'}`);
+    if (currentMediaManifest) {
+      lines.push(`mediaSessionId: ${formatDiagnosticValue(currentMediaManifest.mediaSessionId)}`);
+      lines.push(`manifestVersion: ${formatDiagnosticValue(currentMediaManifest.manifestVersion)}`);
+      lines.push(`videoManifest: ${formatDiagnosticValue(currentMediaManifest.video && currentMediaManifest.video.codec)}/${formatDiagnosticValue(currentMediaManifest.video && currentMediaManifest.video.payloadFormat)}`);
+      lines.push(`audioManifest: ${formatDiagnosticValue(currentMediaManifest.audio && currentMediaManifest.audio.codec)}/${formatDiagnosticValue(currentMediaManifest.audio && currentMediaManifest.audio.payloadFormat)}`);
+    }
     lines.push(`connected: ${formatDiagnosticValue(upstreamConnected)}`);
     lines.push(`videoStarted: ${formatDiagnosticValue(videoStarted)}`);
     lines.push(`natMappingAvailable: ${formatDiagnosticValue(Boolean(mediaEngine && typeof mediaEngine.openNatMapping === 'function'))}`);
@@ -1832,8 +1916,19 @@
       lines.push(`  selectedLocalCandidate: ${formatDiagnosticValue(selectedLocalCandidate)}`);
       lines.push(`  selectedRemoteCandidate: ${formatDiagnosticValue(selectedRemoteCandidate)}`);
       lines.push(`  rttMs: ${normalizeDiagnosticNumber(peerTransport.roundTripTimeMs)}`);
-      lines.push(`  videoSent: ${formatDiagnosticValue(peerTransport.videoFramesSent || (statsPeer && statsPeer.mediaBinding && statsPeer.mediaBinding.framesSent) || 0)}`);
-      lines.push(`  videoReceived: ${formatDiagnosticValue(peerTransport.remoteVideoFramesReceived || 0)}`);
+      lines.push(`  mediaSessionId: ${formatDiagnosticValue(statsPeer && statsPeer.mediaSessionId)}`);
+      lines.push(`  mediaManifestVersion: ${formatDiagnosticValue(statsPeer && statsPeer.mediaManifestVersion)}`);
+      lines.push(`  expectedVideoCodec: ${formatDiagnosticValue(statsPeer && statsPeer.expectedVideoCodec)}`);
+      lines.push(`  expectedAudioCodec: ${formatDiagnosticValue(statsPeer && statsPeer.expectedAudioCodec)}`);
+      lines.push(`  encodedDataChannelRequested: ${formatDiagnosticValue(Boolean(peerTransport.encodedMediaDataChannelRequested))}`);
+      lines.push(`  encodedDataChannelOpen: ${formatDiagnosticValue(Boolean(peerTransport.encodedMediaDataChannelOpen))}`);
+      lines.push(`  encodedDataChannelReady: ${formatDiagnosticValue(Boolean(peerTransport.encodedMediaDataChannelReady))}`);
+      lines.push(`  encodedDataChannelState: ${formatDiagnosticValue(peerTransport.encodedMediaDataChannelState)}`);
+      lines.push(`  encodedDataChannelFramesSent: ${formatDiagnosticValue(peerTransport.encodedMediaDataChannelFramesSent || 0)}`);
+      lines.push(`  encodedDataChannelFramesReceived: ${formatDiagnosticValue(peerTransport.encodedMediaDataChannelFramesReceived || 0)}`);
+      lines.push(`  encodedDataChannelInvalidFrames: ${formatDiagnosticValue(peerTransport.encodedMediaDataChannelInvalidFrames || 0)}`);
+      lines.push(`  videoSent: ${formatDiagnosticValue(peerTransport.videoFramesSent || peerTransport.encodedMediaDataChannelFramesSent || (statsPeer && statsPeer.mediaBinding && statsPeer.mediaBinding.framesSent) || 0)}`);
+      lines.push(`  videoReceived: ${formatDiagnosticValue(peerTransport.remoteVideoFramesReceived || peerTransport.encodedMediaDataChannelFramesReceived || 0)}`);
       lines.push(`  videoDecoded: ${formatDiagnosticValue(peerTransport.decodedFramesRendered || 0)}`);
       lines.push(`  audioSent: ${formatDiagnosticValue(peerTransport.audioFramesSent || 0)}`);
       lines.push(`  audioReceived: ${formatDiagnosticValue(peerTransport.remoteAudioFramesReceived || 0)}`);
@@ -2131,7 +2226,8 @@
     }, typeof P2P_CONNECT_FAILFAST_MS === 'number' ? P2P_CONNECT_FAILFAST_MS : 15000);
   }
 
-  function createNativePeerConnectionImpl(peerId, isInitiator, kind = 'direct') {
+  function createNativePeerConnectionImpl(peerId, isInitiator, kind = 'direct', options = {}) {
+    const encodedMediaDataChannel = options.encodedMediaDataChannel !== false;
     const role = isHost
       ? 'host-downstream'
       : (kind === 'relay-viewer' ? 'relay-downstream' : 'viewer-upstream');
@@ -2141,6 +2237,7 @@
       role,
       kind,
       initiator: Boolean(isInitiator),
+      encodedMediaDataChannel,
       relaySourcePeerId: null,
       connectionState: 'new',
       iceConnectionState: 'new',
@@ -2151,7 +2248,9 @@
       __readyPromise: mediaEngine.createPeer({
         peerId,
         role,
-        initiator: Boolean(isInitiator)
+        initiator: Boolean(isInitiator),
+        encodedMediaDataChannel,
+        mediaManifest: options.mediaManifest || currentMediaManifest || null
       })
     };
 
@@ -2218,7 +2317,8 @@
     await mediaEngine.setRemoteDescription({
       peerId,
       type: description.type,
-      sdp: description.sdp
+      sdp: description.sdp,
+      mediaManifest: currentMediaManifest || null
     });
     logNativeStep('setRemoteDescription:applied', {
       peerId,
@@ -2531,7 +2631,13 @@
     dropQueuedNativePeerSignals(peerId, (entry) => entry && entry.type === 'offer');
     await ensureNativePeerConnectionReady(peerId, pc);
     const attachResult = await attachNativePeerMediaSources(peerId, pc);
-    if (attachResult && attachResult.peerTransport && attachResult.peerTransport.videoTrackConfigured !== true) {
+    const encodedDataChannelRequested = pc.encodedMediaDataChannel === true;
+    if (
+      attachResult &&
+      attachResult.peerTransport &&
+      attachResult.peerTransport.videoTrackConfigured !== true &&
+      !encodedDataChannelRequested
+    ) {
       throw new Error(`native-peer-video-track-not-configured:${peerId}`);
     }
 
@@ -2539,7 +2645,10 @@
     if (
       pc.localDescription &&
       pc.localDescription.type === 'offer' &&
-      isMediaOfferSignal({ type: 'offer', sdp: pc.localDescription })
+      isMediaOfferSignal(
+        { type: 'offer', sdp: pc.localDescription },
+        { allowEncodedDataChannel: encodedDataChannelRequested }
+      )
     ) {
       signal = {
         peerId,
@@ -2548,7 +2657,11 @@
         sdp: pc.localDescription
       };
     } else {
-      signal = await waitForNativeMediaOffer(peerId);
+      signal = await waitForNativeMediaOffer(
+        peerId,
+        15000,
+        { allowEncodedDataChannel: encodedDataChannelRequested }
+      );
     }
 
     updateNativePeerSignalState(peerId, signal);
@@ -2842,6 +2955,8 @@
     currentSessionToken = null;
     hostId = null;
     upstreamPeerId = null;
+    currentMediaManifest = null;
+    currentHostMediaSessionId = '';
     relayStream = null;
     upstreamConnected = false;
     viewerReadySent = false;
@@ -2878,10 +2993,13 @@
       elements.hostStatus.textContent = 'OBS 节目流已接入，正在创建房间...';
       elements.hostStatus.classList.add('waiting');
     }
+    const mediaManifest = buildHostMediaManifestFromStats(latestP2pStatsSnapshot);
+    rememberMediaManifest(mediaManifest);
     sendMessage({
       type: 'create-room',
       clientId,
-      publicListing: Boolean(qualitySettings && qualitySettings.publicRoomEnabled)
+      publicListing: Boolean(qualitySettings && qualitySettings.publicRoomEnabled),
+      mediaManifest
     });
   }
 
@@ -2972,8 +3090,9 @@
             `surfaceFrameStddevMs=${surface && typeof surface.frameIntervalStddevMs === 'number' ? surface.frameIntervalStddevMs.toFixed(3) : '0.000'}`,
             `surfaceReason=${surface && surface.reason ? surface.reason : 'n/a'}`,
             `peer=${peer && peer.peerId ? peer.peerId : 'n/a'}`,
-            `videoConfigured=${Boolean(peer && peer.peerTransport && peer.peerTransport.videoTrackConfigured)}`,
-            `videoOpen=${Boolean(peer && peer.peerTransport && peer.peerTransport.videoTrackOpen)}`,
+            `encodedDataChannelReady=${Boolean(peer && peer.peerTransport && peer.peerTransport.encodedMediaDataChannelReady)}`,
+            `encodedDataChannelState=${peer && peer.peerTransport && peer.peerTransport.encodedMediaDataChannelState ? peer.peerTransport.encodedMediaDataChannelState : 'n/a'}`,
+            `encodedDataChannelFramesSent=${peer && peer.peerTransport && Number.isFinite(peer.peerTransport.encodedMediaDataChannelFramesSent) ? peer.peerTransport.encodedMediaDataChannelFramesSent : 0}`,
             `framesSent=${peer && peer.mediaBinding && Number.isFinite(peer.mediaBinding.framesSent) ? peer.mediaBinding.framesSent : 0}`,
             `bindingReason=${peer && peer.mediaBinding && peer.mediaBinding.reason ? peer.mediaBinding.reason : 'n/a'}`
           ], rate.suppressed);
@@ -3028,7 +3147,12 @@
         peer.peerTransport.decodedFramesRendered || 0,
         surface && surface.decodedFramesRendered ? surface.decodedFramesRendered : 0
       );
-      updateViewerFpsIndicator(peer.peerTransport.remoteVideoFramesReceived || 0, renderedFrames);
+      const receivedFrames = Number.isFinite(peer.peerTransport.remoteVideoFramesReceived)
+        ? peer.peerTransport.remoteVideoFramesReceived
+        : (Number.isFinite(peer.peerTransport.encodedMediaDataChannelFramesReceived)
+          ? peer.peerTransport.encodedMediaDataChannelFramesReceived
+          : 0);
+      updateViewerFpsIndicator(receivedFrames, renderedFrames);
       if (shouldShowDebugLogsFor('video', 'periodicStats')) {
         const rate = shouldEmitNativeDebugLog(`stats:viewer:${reason}:${upstreamPeerId}`, reason === 'initial' ? 0 : 5000);
         if (rate.emit) {
@@ -3037,7 +3161,8 @@
             `peer=${peer.peerId || 'n/a'}`,
             `receiverConfigured=${Boolean(peer.peerTransport.videoReceiverConfigured)}`,
             `decoderReady=${Boolean(peer.peerTransport.decoderReady)}`,
-            `framesReceived=${peer.peerTransport.remoteVideoFramesReceived || 0}`,
+            `framesReceived=${receivedFrames}`,
+            `encodedDataChannelFramesReceived=${peer.peerTransport.encodedMediaDataChannelFramesReceived || 0}`,
             `framesRendered=${peer.peerTransport.decodedFramesRendered || 0}`,
             `surfaceFrameStddevMs=${surface && typeof surface.frameIntervalStddevMs === 'number' ? surface.frameIntervalStddevMs.toFixed(3) : '0.000'}`,
             `queuedVideo=${peer.receiverRuntime && peer.receiverRuntime.queuedVideoUnits ? peer.receiverRuntime.queuedVideoUnits : 0}`,
@@ -3068,8 +3193,10 @@
             `reason=${reason}`,
             `peer=${relayPeer.peerId || 'n/a'}`,
             `transportState=${relayPeer.peerTransport && relayPeer.peerTransport.connectionState ? relayPeer.peerTransport.connectionState : 'n/a'}`,
-            `videoTrackOpen=${Boolean(relayPeer.peerTransport && relayPeer.peerTransport.videoTrackOpen)}`,
-            `audioTrackOpen=${Boolean(relayPeer.peerTransport && relayPeer.peerTransport.audioTrackOpen)}`,
+            `encodedDataChannelReady=${Boolean(relayPeer.peerTransport && relayPeer.peerTransport.encodedMediaDataChannelReady)}`,
+            `encodedDataChannelState=${relayPeer.peerTransport && relayPeer.peerTransport.encodedMediaDataChannelState ? relayPeer.peerTransport.encodedMediaDataChannelState : 'n/a'}`,
+            `encodedDataChannelFramesSent=${relayPeer.peerTransport && Number.isFinite(relayPeer.peerTransport.encodedMediaDataChannelFramesSent) ? relayPeer.peerTransport.encodedMediaDataChannelFramesSent : 0}`,
+            `encodedDataChannelFramesReceived=${relayPeer.peerTransport && Number.isFinite(relayPeer.peerTransport.encodedMediaDataChannelFramesReceived) ? relayPeer.peerTransport.encodedMediaDataChannelFramesReceived : 0}`,
             `videoFramesSent=${relayPeer.peerTransport && Number.isFinite(relayPeer.peerTransport.videoFramesSent) ? relayPeer.peerTransport.videoFramesSent : 0}`,
             `audioFramesSent=${relayPeer.peerTransport && Number.isFinite(relayPeer.peerTransport.audioFramesSent) ? relayPeer.peerTransport.audioFramesSent : 0}`,
             `pendingBootstrap=${Boolean(relayRuntime && relayRuntime.pendingVideoBootstrap)}`,
@@ -3235,10 +3362,20 @@
           showError('原生预览暂不可用，已自动改为无预览开播');
         }
 
+        const mediaManifest = buildHostMediaManifest({
+          backend: 'native',
+          videoCodec: effectiveCodec,
+          width: session && session.pipeline && session.pipeline.width,
+          height: session && session.pipeline && session.pipeline.height,
+          frameRate: session && session.pipeline && session.pipeline.frameRate,
+          audioCodec: 'opus'
+        });
+        rememberMediaManifest(mediaManifest);
         sendMessage({
           type: 'create-room',
           clientId,
-          publicListing: Boolean(qualitySettings && qualitySettings.publicRoomEnabled)
+          publicListing: Boolean(qualitySettings && qualitySettings.publicRoomEnabled),
+          mediaManifest
         });
         return;
       } catch (error) {
@@ -3382,6 +3519,8 @@
       currentSessionToken = null;
       hostId = null;
       upstreamPeerId = null;
+      currentMediaManifest = null;
+      currentHostMediaSessionId = '';
       relayStream = null;
       upstreamConnected = false;
       viewerReadySent = false;
@@ -3407,12 +3546,12 @@
     }
   }
 
-  function createPeerConnection(peerId, isInitiator, kind = 'direct') {
+  function createPeerConnection(peerId, isInitiator, kind = 'direct', options = {}) {
     if (!isNativePeerDriverActive()) {
       throw new Error('native-peer-transport-disabled');
     }
 
-    return createNativePeerConnectionImpl(peerId, isInitiator, kind);
+    return createNativePeerConnectionImpl(peerId, isInitiator, kind, options);
   }
 
   async function createOffer(viewerId, options = {}) {
@@ -3436,7 +3575,12 @@
       await closeNativePeerConnectionImpl(viewerId);
     }
 
-    const pc = createPeerConnection(viewerId, true, 'host-viewer');
+    const pc = createPeerConnection(
+      viewerId,
+      true,
+      'host-viewer',
+      { encodedMediaDataChannel: true, mediaManifest: currentMediaManifest }
+    );
     pc.__offerPromise = createAndSendPeerOffer(viewerId, pc, options)
       .finally(() => {
         pc.__offerPromise = null;
@@ -3445,10 +3589,29 @@
     return pc;
   }
 
-  async function createOfferToNextViewer(nextViewerId) {
+  function supportsDataChannelEncodedMedia(mediaCapabilities) {
+    const encoded = mediaCapabilities && mediaCapabilities.encodedMediaDataChannel;
+    return Boolean(
+      encoded &&
+      encoded.protocol === 'vds-media-encoded-v1' &&
+      Number(encoded.protocolVersion || 0) === 1
+    );
+  }
+
+  function createNonRetryableRelayError(message) {
+    const error = new Error(message);
+    error.nonRetryableRelay = true;
+    return error;
+  }
+
+  async function createOfferToNextViewer(nextViewerId, nextViewerMediaCapabilities) {
     if (!nextViewerId) {
       throw new Error('native-relay-next-viewer-missing');
     }
+    if (nextViewerMediaCapabilities && !supportsDataChannelEncodedMedia(nextViewerMediaCapabilities)) {
+      throw createNonRetryableRelayError('datachannel-protocol-unsupported');
+    }
+    const useEncodedDataChannel = true;
     if (isHost || sessionRole !== 'viewer') {
       throw new Error('native-relay-role-invalid');
     }
@@ -3475,7 +3638,12 @@
       await closeNativePeerConnectionImpl(nextViewerId);
     }
 
-    const pc = createPeerConnection(nextViewerId, false, 'relay-viewer');
+    const pc = createPeerConnection(
+      nextViewerId,
+      false,
+      'relay-viewer',
+      { encodedMediaDataChannel: useEncodedDataChannel, mediaManifest: currentMediaManifest }
+    );
     pc.relaySourcePeerId = upstreamPeerId;
     pc.__offerPromise = createAndSendPeerOffer(nextViewerId, pc, { isRelay: true })
       .finally(() => {
@@ -3488,6 +3656,16 @@
 
   function scheduleRelayOfferRetry(nextViewerId, error) {
     if (!nextViewerId || sessionRole !== 'viewer' || isHost) {
+      return;
+    }
+    if (error && error.nonRetryableRelay) {
+      peerReconnectState.delete(nextViewerId);
+      logRecoverableNativeWarning('relay:connect-to-next-failfast', error, {
+        key: `relay-connect-failfast:${nextViewerId}`,
+        category: 'connection',
+        channel: 'nativeSteps',
+        fallbackLabel: `[media-engine relay] failfast connect-to-next: ${nextViewerId}`
+      });
       return;
     }
 
@@ -3519,7 +3697,7 @@
       }
 
       try {
-        await createOfferToNextViewer(nextViewerId);
+          await createOfferToNextViewer(nextViewerId);
       } catch (retryError) {
         scheduleRelayOfferRetry(nextViewerId, retryError);
       }
@@ -3549,12 +3727,18 @@
       sdpLength: remoteDescription.sdp ? String(remoteDescription.sdp).length : 0
     });
 
-    if (!isHost && upstreamPeerId && upstreamPeerId !== fromId) {
-      await resetViewerMediaPipeline('正在切换上游连接...');
-    }
+    const switchingViewerUpstream = !isHost && upstreamPeerId && upstreamPeerId !== fromId;
+    rememberMediaManifest(data.mediaManifest);
 
     if (!isHost) {
       upstreamPeerId = fromId;
+      if (switchingViewerUpstream) {
+        upstreamConnected = false;
+        viewerReadySent = false;
+        videoStarted = false;
+        clearViewerMediaWaitTimer();
+        setViewerConnectionState('正在切换上游连接...');
+      }
     }
 
     let pc = peerConnections.get(fromId);
@@ -3569,7 +3753,7 @@
       if (pc) {
         await closeNativePeerConnectionImpl(fromId);
       }
-      pc = createPeerConnection(fromId, false, 'upstream');
+      pc = createPeerConnection(fromId, false, 'upstream', { mediaManifest: currentMediaManifest });
     } else if (isSameRemoteDescription(pc.remoteDescription, remoteDescription)) {
       await flushQueuedRemoteCandidates(fromId, pc);
       if (!isHost) {
@@ -3586,7 +3770,29 @@
     await createAndSendPeerAnswer(fromId, pc);
     if (!isHost) {
       startNativeViewerStatsPolling();
+      if (switchingViewerUpstream) {
+        closeStaleViewerUpstreamPeers(fromId);
+      }
     }
+  }
+
+  function closeStaleViewerUpstreamPeers(activePeerId) {
+    if (isHost || !activePeerId) {
+      return;
+    }
+    const stalePeerIds = Array.from(peerConnections.keys())
+      .filter((peerId) => peerId && peerId !== activePeerId);
+    if (stalePeerIds.length === 0) {
+      return;
+    }
+    window.setTimeout(() => {
+      stalePeerIds.forEach((peerId) => {
+        if (peerId === upstreamPeerId) {
+          return;
+        }
+        closeNativePeerConnectionImpl(peerId, { clearRetryState: true }).catch(() => {});
+      });
+    }, 250);
   }
 
   async function handleAnswer(data) {
@@ -3662,6 +3868,7 @@
     switch (data.type) {
       case 'room-created':
         obsRoomCreatePending = false;
+        rememberMediaManifest(data.mediaManifest);
         if (isObsIngestHostBackend() && !obsIngestStreamActive) {
           sendMessage({
             type: 'leave-room',
@@ -3710,6 +3917,7 @@
 
       case 'room-joined':
         clearAllRelayOfferRetries();
+        rememberMediaManifest(data.mediaManifest);
         await clearAllPeerConnections({ clearRetryState: true });
         resetViewerFpsIndicator();
         currentRoomId = data.roomId;
@@ -3740,6 +3948,7 @@
         currentRoomId = data.roomId;
         sessionRole = data.role;
         currentSessionToken = data.sessionToken || currentSessionToken || '';
+        rememberMediaManifest(data.mediaManifest);
         if (data.role === 'host') {
           obsRoomCreatePending = false;
           obsIngestStreamActive = isObsIngestHostBackend() ? true : obsIngestStreamActive;
@@ -3804,18 +4013,31 @@
         return;
 
       case 'viewer-joined':
+        rememberMediaManifest(data.mediaManifest);
         if (!nativeHostSessionRunning) {
           throw new Error('native-host-session-not-running');
         }
         if (!data.reconnect) {
-          updateViewerCount(data.viewerId);
+          if (Number.isFinite(Number(data.viewerCount))) {
+            elements.viewerCount.textContent = String(Math.max(0, Number(data.viewerCount) || 0));
+          } else {
+            updateViewerCount(data.viewerId);
+          }
         }
-        await createOffer(data.viewerId, { force: Boolean(data.reconnect) });
+        await createOffer(data.viewerId, {
+          force: Boolean(data.reconnect),
+          viewerMediaCapabilities: data.viewerMediaCapabilities
+        });
+        return;
+
+      case 'viewer-count-updated':
+        elements.viewerCount.textContent = String(Math.max(0, Number(data.viewerCount) || 0));
         return;
 
       case 'connect-to-next':
         try {
-          await createOfferToNextViewer(data.nextViewerId);
+          rememberMediaManifest(data.mediaManifest);
+          await createOfferToNextViewer(data.nextViewerId, data.nextViewerMediaCapabilities);
         } catch (error) {
           logRecoverableNativeWarning('relay:connect-to-next-failed', error, {
             key: `relay-connect-failed:${data.nextViewerId}`,
@@ -3846,15 +4068,44 @@
         return;
 
       case 'viewer-left':
-        updateViewerCount(null, data.leftPosition);
+        if (Number.isFinite(Number(data.viewerCount))) {
+          elements.viewerCount.textContent = String(Math.max(0, Number(data.viewerCount) || 0));
+        } else {
+          updateViewerCount(null, data.leftPosition);
+        }
         await closeNativePeerConnectionImpl(data.viewerId, { clearRetryState: true });
         return;
 
       case 'chain-reconnect':
         clearAllRelayOfferRetries();
+        rememberMediaManifest(data.mediaManifest);
         myChainPosition = data.newChainPosition;
-        upstreamPeerId = data.upstreamPeerId || hostId;
-        await resetViewerMediaPipeline('正在重建上游连接...');
+        {
+          const nextUpstreamPeerId = data.upstreamPeerId || hostId;
+          const currentUpstreamPeer = nextUpstreamPeerId ? peerConnections.get(nextUpstreamPeerId) : null;
+          const alreadySwitchingToRequestedUpstream =
+            nextUpstreamPeerId &&
+            upstreamPeerId === nextUpstreamPeerId &&
+            currentUpstreamPeer &&
+            ['new', 'connecting', 'connected'].includes(currentUpstreamPeer.connectionState);
+          upstreamPeerId = nextUpstreamPeerId;
+          if (!alreadySwitchingToRequestedUpstream) {
+            upstreamConnected = false;
+            viewerReadySent = false;
+            videoStarted = false;
+            clearViewerMediaWaitTimer();
+            setViewerConnectionState('正在重建上游连接...');
+          }
+          if (currentRoomId && nextUpstreamPeerId) {
+            sendMessage({
+              type: 'viewer-reconnect-ready',
+              roomId: currentRoomId,
+              clientId,
+              chainPosition: myChainPosition,
+              upstreamPeerId: nextUpstreamPeerId
+            });
+          }
+        }
         elements.chainPosition.textContent = String(myChainPosition + 1);
         return;
 

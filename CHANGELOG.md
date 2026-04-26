@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.5
+
+- added the VDS_web Chrome/Edge viewer with DataChannel encoded media playback, WebCodecs video/audio decode, manual audio delay, volume control, fullscreen playback, and a Windows-app-aligned viewer interface
+- unified native and web relay direction around `vds-media-encoded-v1` DataChannel encoded media, including media manifest sync, session/version handshake checks, chunked large-frame delivery, bootstrap keyframe forwarding, and failfast diagnostics
+- improved Native-Web-Native and Native-Web-Web relay recovery so middle-node exits can trigger chain reconnect, reconnect-ready signaling, stale-peer cleanup, and restored host/viewer negotiation without stale failfast UI
+- fixed DataChannel viewer diagnostics and counters, including video-only receive FPS, absolute viewer counts, audio receive accounting, early ICE candidate caching, and clearer encoded DataChannel state reporting
+- improved Web playback reliability with Opus/AAC/H.265 capability handling, continuous WebCodecs audio scheduling to reduce pops, and stale DataChannel error suppression after successful reconnect
+- improved Windows startup/share stability by isolating Win32/Koffi window metadata discovery in a helper process while keeping minimized-window detection, and by clearing `ELECTRON_RUN_AS_NODE` in dev startup
+- added `dual:web` and `triple:nwn` local test scripts plus VDS_web TypeScript, build, and protocol tests to the release gate
+
 ## 1.6.4
 
 - improved session resume and server protocol safety with unguessable tokens, payload limits, room/viewer limits, message rate limits, and collision-safe room IDs

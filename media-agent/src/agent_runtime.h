@@ -138,6 +138,12 @@ struct PeerState {
   bool initiator = false;
   bool has_remote_description = false;
   int remote_candidate_count = 0;
+  std::string media_session_id;
+  int media_manifest_version = 0;
+  std::string expected_video_codec;
+  std::string expected_audio_codec;
+  std::string expected_video_payload_format;
+  std::string expected_audio_payload_format;
   struct MediaBindingState {
     bool attached = false;
     bool sender_configured = false;

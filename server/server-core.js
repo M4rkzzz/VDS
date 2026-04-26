@@ -118,6 +118,14 @@ function startServer(options = {}) {
   });
 
   if (publicDir) {
+    app.get('/', (req, res, next) => {
+      const webEntry = path.join(publicDir, 'vds_web', 'index.html');
+      if (!isElectronUserAgent(req) && fs.existsSync(webEntry)) {
+        res.sendFile(webEntry);
+        return;
+      }
+      next();
+    });
     app.use(express.static(publicDir));
   }
 
@@ -191,6 +199,9 @@ function startServer(options = {}) {
       case 'resume-session':
         handleResumeSession(ws, data);
         break;
+      case 'host-media-manifest':
+        handleHostMediaManifest(ws, data);
+        break;
       case 'offer':
       case 'answer':
       case 'ice-candidate':
@@ -199,6 +210,9 @@ function startServer(options = {}) {
         break;
       case 'viewer-ready':
         handleViewerReady(ws, data);
+        break;
+      case 'viewer-reconnect-ready':
+        handleViewerReconnectReady(ws, data);
         break;
       case 'leave-room':
         handleDisconnect(ws, true);
@@ -220,12 +234,15 @@ function startServer(options = {}) {
 
     const roomId = generateRoomId(rooms);
     const hostToken = generateSessionToken();
+    const mediaManifest = sanitizeMediaManifest(data.mediaManifest);
     const room = {
       id: roomId,
       publicListing: data.publicListing === true,
+      mediaManifest,
       host: {
         clientId: data.clientId,
         sessionToken: hostToken,
+        mediaCapabilities: sanitizeMediaCapabilities(data.mediaCapabilities),
         ws: ws,
         disconnectTimer: null
       },
@@ -241,7 +258,8 @@ function startServer(options = {}) {
       roomId: roomId,
       clientId: data.clientId,
       sessionToken: hostToken,
-      publicListing: room.publicListing
+      publicListing: room.publicListing,
+      mediaManifest: room.mediaManifest
     });
 
     logServerDebug(`Room created: ${roomId} by ${data.clientId}`);
@@ -256,6 +274,14 @@ function startServer(options = {}) {
         type: 'error',
         code: 'room-not-found',
         message: '该房间已不存在'
+      });
+      return;
+    }
+    if (!room.mediaManifest) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'host-media-manifest-missing',
+        message: 'Host media manifest is not ready'
       });
       return;
     }
@@ -274,6 +300,7 @@ function startServer(options = {}) {
       const rebindRequired = existingViewer.ws !== ws;
       clearDisconnectTimer(existingViewer);
       existingViewer.ws = ws;
+      existingViewer.mediaCapabilities = sanitizeMediaCapabilities(data.mediaCapabilities) || existingViewer.mediaCapabilities;
       attachSocketMetadata(ws, roomId, clientId, 'viewer');
 
       if (rebindRequired) {
@@ -285,7 +312,9 @@ function startServer(options = {}) {
           hostId: room.host.clientId,
           upstreamPeerId: resolveViewerUpstreamId(room, existingViewer.chainPosition),
           chainPosition: existingViewer.chainPosition,
-          isFirstViewer: existingViewer.chainPosition === 0
+          isFirstViewer: existingViewer.chainPosition === 0,
+          mediaCapabilities: existingViewer.mediaCapabilities,
+          mediaManifest: room.mediaManifest
         });
 
         if (!existingViewer.mediaReady || !existingViewer.relayEstablished) {
@@ -310,6 +339,7 @@ function startServer(options = {}) {
       clientId,
       sessionToken: viewerToken,
       ws,
+      mediaCapabilities: sanitizeMediaCapabilities(data.mediaCapabilities),
       chainPosition,
       mediaReady: false,
       relayEstablished: false,
@@ -328,13 +358,17 @@ function startServer(options = {}) {
       hostId: room.host.clientId,
       upstreamPeerId: resolveViewerUpstreamId(room, chainPosition),
       chainPosition,
-      isFirstViewer: chainPosition === 0
+      isFirstViewer: chainPosition === 0,
+      mediaCapabilities: viewer.mediaCapabilities,
+      mediaManifest: room.mediaManifest
     });
 
     if (chainPosition === 0) {
       notifyHostToConnectViewer(room, viewer, false);
       return;
     }
+
+    notifyHostViewerCount(room);
 
     const previousViewer = room.viewers[chainPosition - 1];
     if (previousViewer && previousViewer.mediaReady && isSocketOpen(previousViewer.ws)) {
@@ -371,7 +405,8 @@ function startServer(options = {}) {
         role: 'host',
         roomId: room.id,
         sessionToken: room.host.sessionToken,
-        viewerCount: room.viewers.length
+        viewerCount: room.viewers.length,
+        mediaManifest: room.mediaManifest
       });
       return;
     }
@@ -409,7 +444,9 @@ function startServer(options = {}) {
       hostId: room.host.clientId,
       upstreamPeerId: resolveViewerUpstreamId(room, viewer.chainPosition),
       chainPosition: viewer.chainPosition,
-      viewerCount: room.viewers.length
+      viewerCount: room.viewers.length,
+      mediaCapabilities: viewer.mediaCapabilities,
+      mediaManifest: room.mediaManifest
     });
 
     if (data.needsMediaReconnect) {
@@ -443,6 +480,45 @@ function startServer(options = {}) {
     if (nextViewer && isSocketOpen(ws)) {
       notifyViewerToConnectNext(room, viewer, nextViewer);
     }
+  }
+
+  function handleViewerReconnectReady(ws, data) {
+    const room = rooms.get(ws.roomId);
+    if (!room) {
+      return;
+    }
+
+    const viewer = room.viewers.find((candidate) => candidate.clientId === ws.clientId);
+    if (!viewer) {
+      return;
+    }
+    if (Number(data.chainPosition) !== viewer.chainPosition) {
+      return;
+    }
+
+    viewer.mediaReady = false;
+    viewer.relayEstablished = false;
+    viewer.connectRequestPending = false;
+
+    if (viewer.chainPosition === 0) {
+      notifyHostToConnectViewer(room, viewer, true);
+      return;
+    }
+
+    const previousViewer = room.viewers[viewer.chainPosition - 1];
+    if (previousViewer && previousViewer.mediaReady && isSocketOpen(previousViewer.ws)) {
+      notifyViewerToConnectNext(room, previousViewer, viewer);
+    }
+  }
+
+  function notifyHostViewerCount(room) {
+    if (!room || !isSocketOpen(room.host && room.host.ws)) {
+      return;
+    }
+    sendJson(room.host.ws, {
+      type: 'viewer-count-updated',
+      viewerCount: room.viewers.length
+    });
   }
 
   function forwardMessage(ws, data) {
@@ -489,8 +565,49 @@ function startServer(options = {}) {
     if (!data.fromClientId) {
       data.fromClientId = ws.clientId;
     }
+    if (!data.mediaManifest && room.mediaManifest) {
+      data.mediaManifest = room.mediaManifest;
+    }
 
     sendJson(targetWs, data);
+  }
+
+  function handleHostMediaManifest(ws, data) {
+    const room = rooms.get(data.roomId || ws.roomId);
+    if (!room || ws.role !== 'host' || room.host.clientId !== ws.clientId) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'session-not-found',
+        message: 'Session not found'
+      });
+      return;
+    }
+    if (!isValidSessionToken(room.host.sessionToken, data.sessionToken)) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'session-token-invalid',
+        message: 'Session token is invalid'
+      });
+      return;
+    }
+
+    const mediaManifest = sanitizeMediaManifest(data.mediaManifest);
+    if (!mediaManifest) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'host-media-manifest-invalid',
+        message: 'Host media manifest is invalid'
+      });
+      return;
+    }
+    room.mediaManifest = mediaManifest;
+    sendJson(ws, {
+      type: 'host-media-manifest-ack',
+      roomId: room.id,
+      mediaSessionId: mediaManifest.mediaSessionId,
+      manifestVersion: mediaManifest.manifestVersion,
+      mediaManifest
+    });
   }
 
   function handleDisconnect(ws, immediate) {
@@ -559,6 +676,7 @@ function startServer(options = {}) {
         : null;
     const [viewer] = room.viewers.splice(viewerIndex, 1);
     clearDisconnectTimer(viewer);
+    notifyHostViewerCount(room);
 
     const leftPosition = viewer.chainPosition;
     room.viewers.forEach((candidate, index) => {
@@ -570,7 +688,8 @@ function startServer(options = {}) {
       sendJson(room.host.ws, {
         type: 'viewer-left',
         viewerId: clientId,
-        leftPosition
+        leftPosition,
+        viewerCount: room.viewers.length
       });
     }
 
@@ -586,11 +705,13 @@ function startServer(options = {}) {
       const candidate = room.viewers[index];
       candidate.mediaReady = false;
       candidate.relayEstablished = false;
+      candidate.connectRequestPending = true;
       if (isSocketOpen(candidate.ws)) {
         sendJson(candidate.ws, {
           type: 'chain-reconnect',
           newChainPosition: index,
-          upstreamPeerId: resolveViewerUpstreamId(room, index)
+          upstreamPeerId: resolveViewerUpstreamId(room, index),
+          mediaManifest: room.mediaManifest
         });
       }
     }
@@ -650,6 +771,9 @@ function notifyHostToConnectViewer(room, viewer, reconnect) {
     type: 'viewer-joined',
     viewerId: viewer.clientId,
     viewerChainPosition: viewer.chainPosition,
+    viewerMediaCapabilities: viewer.mediaCapabilities,
+    mediaManifest: room.mediaManifest,
+    viewerCount: room.viewers.length,
     reconnect
   });
 }
@@ -694,7 +818,9 @@ function notifyViewerToConnectNext(room, previousViewer, nextViewer) {
   sendJson(previousViewer.ws, {
     type: 'connect-to-next',
     nextViewerId: nextViewer.clientId,
-    nextViewerChainPosition: nextViewer.chainPosition
+    nextViewerChainPosition: nextViewer.chainPosition,
+    nextViewerMediaCapabilities: nextViewer.mediaCapabilities,
+    mediaManifest: room.mediaManifest
   });
 }
 
@@ -717,6 +843,140 @@ function buildPublicRoomSummaryList(rooms) {
       viewerCount: Array.isArray(room.viewers) ? room.viewers.length : 0,
       createdAt: Number(room.createdAt || 0)
     }));
+}
+
+function isElectronUserAgent(req) {
+  const userAgent = String((req && req.headers && req.headers['user-agent']) || '');
+  return /\bElectron\//i.test(userAgent);
+}
+
+function sanitizeMediaCapabilities(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const encoded = value.encodedMediaDataChannel;
+  if (!encoded || typeof encoded !== 'object' || Array.isArray(encoded)) {
+    return {
+      webViewer: value.webViewer === true,
+      encodedMediaDataChannel: null
+    };
+  }
+
+  return {
+    webViewer: value.webViewer === true,
+    encodedMediaDataChannel: {
+      protocol: String(encoded.protocol || '').slice(0, 64),
+      protocolVersion: Number(encoded.protocolVersion || 0),
+      supportedVideoCodecs: sanitizeStringList(encoded.supportedVideoCodecs, 8, 32),
+      supportedAudioCodecs: sanitizeStringList(encoded.supportedAudioCodecs, 8, 32),
+      maxFrameBytes: normalizePositiveInt(encoded.maxFrameBytes, 0),
+      bootstrapRequired: encoded.bootstrapRequired === true
+    }
+  };
+}
+
+function sanitizeMediaManifest(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const protocol = String(value.protocol || '').trim().slice(0, 64);
+  const video = sanitizeVideoManifest(value.video);
+  const audio = sanitizeAudioManifest(value.audio);
+  if (protocol !== 'vds-media-encoded-v1' || !video) {
+    return null;
+  }
+
+  return {
+    protocol,
+    protocolVersion: normalizePositiveInt(value.protocolVersion, 1),
+    mediaSessionId: String(value.mediaSessionId || '').trim().slice(0, MAX_ID_LENGTH) || generateSessionToken(),
+    manifestVersion: normalizePositiveInt(value.manifestVersion, 1),
+    sourceType: String(value.sourceType || 'native-capture').trim().slice(0, 64),
+    updatedAt: normalizePositiveInt(value.updatedAt, Date.now()),
+    video,
+    audio
+  };
+}
+
+function sanitizeVideoManifest(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const codec = normalizeCodecName(value.codec);
+  if (codec !== 'h264' && codec !== 'h265' && codec !== 'hevc') {
+    return null;
+  }
+  const payloadFormat = normalizePayloadFormat(value.payloadFormat, codec === 'h264' ? 'annexb' : 'annexb');
+  return {
+    codec: codec === 'hevc' ? 'h265' : codec,
+    payloadFormat,
+    width: normalizePositiveInt(value.width, 0),
+    height: normalizePositiveInt(value.height, 0),
+    fps: normalizePositiveInt(value.fps || value.frameRate, 0),
+    keyframeIntervalMs: normalizePositiveInt(value.keyframeIntervalMs, 1000),
+    profile: String(value.profile || '').trim().slice(0, 64),
+    level: String(value.level || '').trim().slice(0, 32),
+    configVersion: normalizePositiveInt(value.configVersion, 1),
+    config: sanitizeCodecConfig(value.config, codec)
+  };
+}
+
+function sanitizeAudioManifest(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const codec = normalizeCodecName(value.codec);
+  if (codec !== 'opus' && codec !== 'aac') {
+    return null;
+  }
+  return {
+    codec,
+    payloadFormat: normalizePayloadFormat(value.payloadFormat, codec === 'opus' ? 'opus-raw' : 'aac-adts'),
+    sampleRate: normalizePositiveInt(value.sampleRate, 48000),
+    channels: normalizePositiveInt(value.channels, 2),
+    frameDurationMs: normalizePositiveInt(value.frameDurationMs, codec === 'opus' ? 20 : 23),
+    profile: String(value.profile || '').trim().slice(0, 64),
+    configVersion: normalizePositiveInt(value.configVersion, 1),
+    config: sanitizeCodecConfig(value.config, codec)
+  };
+}
+
+function normalizeCodecName(value) {
+  return String(value || '').trim().toLowerCase().replace(/\./g, '');
+}
+
+function normalizePayloadFormat(value, fallback) {
+  const normalized = String(value || fallback || '').trim().toLowerCase().slice(0, 32);
+  return normalized || fallback;
+}
+
+function sanitizeCodecConfig(value, codec) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  const allowedKeys = codec === 'h264'
+    ? ['sps', 'pps']
+    : (codec === 'h265' || codec === 'hevc' ? ['vps', 'sps', 'pps'] : ['audioSpecificConfig']);
+  const result = {};
+  for (const key of allowedKeys) {
+    if (typeof value[key] === 'string') {
+      result[key] = value[key].slice(0, 8192);
+    }
+  }
+  return result;
+}
+
+function sanitizeStringList(value, maxItems, maxLength) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .slice(0, maxItems)
+    .map((item) => String(item || '').trim().slice(0, maxLength))
+    .filter(Boolean);
 }
 
 function buildIceServers() {
@@ -863,7 +1123,7 @@ function validateInboundMessage(ws, data, maxMessagesPerWindow, messageRateWindo
     }
   }
 
-  if ((data.type === 'create-room' || data.type === 'join-room' || data.type === 'resume-session') &&
+  if ((data.type === 'create-room' || data.type === 'join-room' || data.type === 'resume-session' || data.type === 'host-media-manifest') &&
       typeof data.clientId !== 'string') {
     sendJson(ws, {
       type: 'error',
@@ -872,7 +1132,7 @@ function validateInboundMessage(ws, data, maxMessagesPerWindow, messageRateWindo
     });
     return false;
   }
-  if ((data.type === 'join-room' || data.type === 'resume-session') &&
+  if ((data.type === 'join-room' || data.type === 'resume-session' || data.type === 'host-media-manifest') &&
       typeof data.roomId !== 'string') {
     sendJson(ws, {
       type: 'error',

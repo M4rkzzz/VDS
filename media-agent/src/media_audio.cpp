@@ -249,7 +249,24 @@ bool send_host_audio_opus_frame_locked(
     );
     std::string send_error;
     for (const auto& session : sessions) {
-      send_peer_transport_audio_frame(session, encoded, timestamp_us, &send_error);
+      const PeerTransportSnapshot snapshot = get_peer_transport_snapshot(session);
+      const bool use_encoded_data_channel =
+        snapshot.encoded_media_data_channel_requested ||
+        snapshot.encoded_media_data_channel_supported;
+      if (use_encoded_data_channel) {
+        if (!snapshot.encoded_media_data_channel_ready) {
+          continue;
+        }
+        PeerEncodedMediaDataChannelFrame encoded_frame;
+        encoded_frame.stream_type = "audio";
+        encoded_frame.codec = "opus";
+        encoded_frame.timestamp_us = timestamp_us;
+        encoded_frame.sequence = state.next_timestamp_samples;
+        encoded_frame.payload = encoded;
+        send_peer_transport_encoded_media_frame(session, encoded_frame, &send_error);
+      } else {
+        send_peer_transport_audio_frame(session, encoded, timestamp_us, &send_error);
+      }
     }
     av_packet_unref(state.encoder_packet);
     emitted_packet = true;

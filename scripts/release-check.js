@@ -129,6 +129,9 @@ function main() {
     run('node', ['--check', fileName]);
   }
 
+  run('npm', ['run', 'check:vds-web']);
+  run('npm', ['run', 'test:vds-web']);
+  run('npm', ['run', 'build:vds-web']);
   run('npm', ['run', 'test:server']);
   run('npm', ['run', 'check:logging']);
   run('npm', ['run', 'verify:media-agent']);

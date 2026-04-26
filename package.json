@@ -1,16 +1,22 @@
 {
   "name": "screenshare-relay",
-  "version": "1.6.4",
+  "version": "1.6.5",
   "description": "Multi-viewer screen sharing with cascade relay (蜈蚣法) - Electron Edition",
   "main": "desktop/main.js",
   "scripts": {
-    "start": "electron .",
-    "dev": "electron .",
+    "start": "powershell -ExecutionPolicy Bypass -File scripts/start-electron-dev.ps1 .",
+    "dev": "powershell -ExecutionPolicy Bypass -File scripts/start-electron-dev.ps1 .",
     "dev:dual": "powershell -ExecutionPolicy Bypass -File scripts/start-dual-test-env.ps1",
     "dev:dual:native": "powershell -ExecutionPolicy Bypass -File scripts/start-dual-test-env.ps1 -EnableNativePeerTransport",
+    "dual:web": "powershell -ExecutionPolicy Bypass -File scripts/start-dual-web-test-env.ps1 -EnableNativePeerTransport",
+    "triple:nwn": "powershell -ExecutionPolicy Bypass -File scripts/start-triple-nwn-test-env.ps1 -EnableNativePeerTransport",
+    "dev:dual:web": "powershell -ExecutionPolicy Bypass -File scripts/start-dual-web-test-env.ps1 -EnableNativePeerTransport",
     "dev:triple": "powershell -ExecutionPolicy Bypass -File scripts/start-triple-test-env.ps1",
     "dev:triple:native": "powershell -ExecutionPolicy Bypass -File scripts/start-triple-test-env.ps1 -EnableNativePeerTransport",
     "server": "node server/index.js",
+    "build:vds-web": "vite build --config vds_web/vite.config.ts",
+    "check:vds-web": "tsc -p vds_web/tsconfig.json --noEmit",
+    "test:vds-web": "node scripts/test-vds-web-protocol.js",
     "build": "electron-builder",
     "build:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/build-media-agent.ps1 -Configuration Release",
     "smoke:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/smoke-media-agent.ps1",
@@ -22,7 +28,7 @@
     "rebuild": "electron-rebuild -f",
     "prepare-server-release": "node scripts/prepare-server-release.js",
     "release:check": "node scripts/release-check.js",
-    "build:release": "npm run build && npm run prepare-server-release"
+    "build:release": "npm run build:vds-web && npm run build && npm run prepare-server-release"
   },
   "dependencies": {
     "electron-updater": "^6.8.3",
@@ -34,7 +40,9 @@
   "devDependencies": {
     "electron": "^39.0.0",
     "electron-builder": "^25.1.8",
-    "electron-rebuild": "^3.2.9"
+    "electron-rebuild": "^3.2.9",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.10"
   },
   "build": {
     "appId": "com.vds.app",

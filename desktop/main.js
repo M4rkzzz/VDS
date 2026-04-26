@@ -47,6 +47,7 @@ let emulatedFullscreenState = {
 };
 
 configureProfilePaths();
+installProcessDiagnostics();
 
 function buildDefaultRendererDebugConfig(enabled = false) {
   return {
@@ -409,6 +410,18 @@ function createWindow() {
 
   mainWindow.webContents.on('did-finish-load', () => {
     sendToRenderer('media-engine-status', getMediaAgentManager().getStatus());
+  });
+
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    writeUpdateLog('error', `[electron] renderer process gone: ${formatLogMessage(details)}`);
+  });
+
+  mainWindow.webContents.on('unresponsive', () => {
+    writeUpdateLog('warn', '[electron] renderer process became unresponsive');
+  });
+
+  mainWindow.webContents.on('responsive', () => {
+    writeUpdateLog('info', '[electron] renderer process became responsive');
   });
 
   mainWindow.loadFile(path.resolve(__dirname, '../server/public', 'index.html'));
@@ -1184,14 +1197,14 @@ async function listDesktopSources(options = {}) {
     return normalizedSources;
   }
 
-  const syntheticSources = buildSyntheticFullscreenSources(normalizedSources);
+  const syntheticSources = buildSyntheticFullscreenSources(normalizedSources, windowMetadata);
   const minimizedSources = buildSyntheticMinimizedSources(normalizedSources, windowMetadata);
   return sortDesktopSources(normalizedSources.concat(syntheticSources, minimizedSources));
 }
 
 async function listCaptureTargets() {
   const windowMetadata = ENABLE_CAPTURE_TARGET_NATIVE_METADATA
-    ? getTopLevelWindowMetadataMap()
+    ? await getTopLevelWindowMetadataMap()
     : new Map();
   const sources = await listDesktopSources({
     includeNativeFallbacks: ENABLE_CAPTURE_TARGET_NATIVE_METADATA,
@@ -1443,7 +1456,16 @@ function normalizeProcessMatchValue(value) {
     .trim();
 }
 
-function getTopLevelWindowMetadataMap() {
+async function getTopLevelWindowMetadataMap() {
+  const helperMetadata = await getTopLevelWindowMetadataMapFromHelper();
+  if (helperMetadata) {
+    return helperMetadata;
+  }
+
+  if (process.env.VDS_CAPTURE_TARGET_METADATA_IN_PROCESS !== '1') {
+    return new Map();
+  }
+
   const api = getWin32WindowCaptureApi();
   const metadata = new Map();
   if (!api || !api.EnumWindows) {
@@ -1474,6 +1496,8 @@ function getTopLevelWindowMetadataMap() {
         hwnd: String(handleValue),
         pid: getWindowProcessId(api, hwnd),
         title,
+        rect: getWindowRect(api, hwnd),
+        isForeground: api.GetForegroundWindow && api.GetForegroundWindow() === hwnd,
         isVisible: api.IsWindowVisible ? Boolean(api.IsWindowVisible(hwnd)) : true,
         isMinimized: api.IsIconic ? Boolean(api.IsIconic(hwnd)) : false
       });
@@ -1487,31 +1511,137 @@ function getTopLevelWindowMetadataMap() {
   return metadata;
 }
 
-function buildSyntheticFullscreenSources(existingSources) {
-  const api = getWin32WindowCaptureApi();
-  if (!api || typeof api.GetForegroundWindow !== 'function') {
+function getTopLevelWindowMetadataMapFromHelper() {
+  if (process.platform !== 'win32') {
+    return Promise.resolve(new Map());
+  }
+
+  const helperPath = path.join(__dirname, 'window-metadata-helper.js');
+  const timeoutMs = Number(process.env.VDS_CAPTURE_TARGET_METADATA_TIMEOUT_MS || 1200);
+  const electronRunAsNode = process.execPath && /electron(?:\.exe)?$/i.test(path.basename(process.execPath));
+  const env = {
+    ...process.env,
+    VDS_PARENT_PROCESS_ID: String(process.pid)
+  };
+  if (electronRunAsNode) {
+    env.ELECTRON_RUN_AS_NODE = '1';
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let stdout = '';
+    let stderr = '';
+    const child = childProcess.spawn(process.execPath, [helperPath], {
+      env,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    const finish = (metadata) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeoutId);
+      resolve(metadata);
+    };
+
+    const timeoutId = setTimeout(() => {
+      if (child && !child.killed) {
+        child.kill();
+      }
+      const rate = shouldEmitMainDebugLog('capture-target-metadata-helper-timeout', 5000);
+      if (rate.emit) {
+        logMainProcessWarning('video', '[capture-targets] metadata helper timed out', rate.suppressed ? `suppressed=${rate.suppressed}` : '');
+      }
+      finish(null);
+    }, Math.max(300, timeoutMs));
+
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk || '');
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk || '');
+    });
+
+    child.once('error', (error) => {
+      const rate = shouldEmitMainDebugLog('capture-target-metadata-helper-error', 5000);
+      if (rate.emit) {
+        logMainProcessWarning('video', '[capture-targets] metadata helper failed:', error && error.message ? error.message : String(error), rate.suppressed ? `suppressed=${rate.suppressed}` : '');
+      }
+      finish(null);
+    });
+
+    child.once('exit', (code) => {
+      if (settled) {
+        return;
+      }
+      if (code !== 0) {
+        const rate = shouldEmitMainDebugLog(`capture-target-metadata-helper-exit:${code}`, 5000);
+        if (rate.emit) {
+          logMainProcessWarning('video', '[capture-targets] metadata helper exited:', code, stderr.trim(), rate.suppressed ? `suppressed=${rate.suppressed}` : '');
+        }
+        finish(null);
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(stdout);
+        const windows = Array.isArray(parsed && parsed.windows) ? parsed.windows : [];
+        const metadata = new Map();
+        for (const entry of windows) {
+          const hwnd = String(entry && entry.hwnd ? entry.hwnd : '').trim();
+          const title = String(entry && entry.title ? entry.title : '').trim();
+          if (!hwnd || !title) {
+            continue;
+          }
+          metadata.set(hwnd, {
+            hwnd,
+            pid: normalizePid(entry.pid),
+            title,
+            rect: entry.rect || null,
+            isForeground: Boolean(entry.isForeground),
+            isVisible: entry.isVisible !== false,
+            isMinimized: Boolean(entry.isMinimized)
+          });
+        }
+        finish(metadata);
+      } catch (error) {
+        const rate = shouldEmitMainDebugLog('capture-target-metadata-helper-parse', 5000);
+        if (rate.emit) {
+          logMainProcessWarning('video', '[capture-targets] metadata helper returned invalid JSON:', error && error.message ? error.message : String(error), rate.suppressed ? `suppressed=${rate.suppressed}` : '');
+        }
+        finish(null);
+      }
+    });
+  });
+}
+
+function buildSyntheticFullscreenSources(existingSources, windowMetadata = null) {
+  if (!(windowMetadata instanceof Map) || windowMetadata.size === 0) {
     return [];
   }
 
   try {
-    const hwnd = api.GetForegroundWindow();
-    if (!hwnd) {
+    const foregroundWindow = Array.from(windowMetadata.values()).find((windowInfo) => windowInfo && windowInfo.isForeground);
+    if (!foregroundWindow) {
       return [];
     }
 
-    const handleValue = getWindowHandleValue(api, hwnd);
+    const handleValue = String(foregroundWindow.hwnd || '').trim();
     if (!handleValue || hasDesktopSourceForWindowHandle(existingSources, handleValue)) {
       return [];
     }
 
-    const title = getWindowTitle(api, hwnd);
-    const pid = getWindowProcessId(api, hwnd);
-    const rect = getWindowRect(api, hwnd);
+    const title = String(foregroundWindow.title || '').trim();
+    const pid = normalizePid(foregroundWindow.pid);
+    const rect = foregroundWindow.rect || null;
     if (!title || !pid || pid === process.pid || !rect) {
       return [];
     }
 
-    if ((api.IsWindowVisible && !api.IsWindowVisible(hwnd)) || (api.IsIconic && api.IsIconic(hwnd))) {
+    if (!foregroundWindow.isVisible || foregroundWindow.isMinimized) {
       return [];
     }
 
@@ -1542,7 +1672,7 @@ function buildSyntheticFullscreenSources(existingSources) {
 
 function buildSyntheticMinimizedSources(existingSources, windowMetadata = null) {
   if (!(windowMetadata instanceof Map)) {
-    windowMetadata = getTopLevelWindowMetadataMap();
+    return [];
   }
   if (!windowMetadata || windowMetadata.size === 0) {
     return [];
@@ -2246,6 +2376,31 @@ function configureProfilePaths() {
   app.setPath('userData', path.join(profileRoot, 'userData'));
   app.setPath('sessionData', path.join(profileRoot, 'sessionData'));
   logMainProcessDebug('misc', `Using Electron profile: ${profileName}`);
+}
+
+function installProcessDiagnostics() {
+  process.on('uncaughtException', (error) => {
+    writeUpdateLog('error', `[electron] uncaughtException: ${formatLogMessage(error)}`);
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    writeUpdateLog('error', `[electron] unhandledRejection: ${formatLogMessage(reason)}`);
+  });
+
+  app.on('render-process-gone', (_event, webContents, details) => {
+    writeUpdateLog('error', {
+      event: '[electron] app render-process-gone',
+      url: webContents && !webContents.isDestroyed() ? webContents.getURL() : '',
+      details
+    });
+  });
+
+  app.on('child-process-gone', (_event, details) => {
+    writeUpdateLog('error', {
+      event: '[electron] child-process-gone',
+      details
+    });
+  });
 }
 
 function normalizeBaseUrl(baseUrl) {

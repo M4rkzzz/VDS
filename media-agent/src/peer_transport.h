@@ -39,6 +39,10 @@ struct PeerTransportSnapshot {
   bool remote_description_set = false;
   bool data_channel_requested = false;
   bool data_channel_open = false;
+  bool encoded_media_data_channel_requested = false;
+  bool encoded_media_data_channel_supported = false;
+  bool encoded_media_data_channel_open = false;
+  bool encoded_media_data_channel_ready = false;
   bool closed = false;
   int local_candidate_count = 0;
   int remote_candidate_count = 0;
@@ -53,6 +57,12 @@ struct PeerTransportSnapshot {
   std::uint64_t remote_video_bytes_received = 0;
   std::uint64_t remote_audio_frames_received = 0;
   std::uint64_t remote_audio_bytes_received = 0;
+  std::uint64_t encoded_media_data_channel_messages_received = 0;
+  std::uint64_t encoded_media_data_channel_frames_sent = 0;
+  std::uint64_t encoded_media_data_channel_bytes_sent = 0;
+  std::uint64_t encoded_media_data_channel_frames_received = 0;
+  std::uint64_t encoded_media_data_channel_bytes_received = 0;
+  std::uint64_t encoded_media_data_channel_invalid_frames = 0;
   std::uint64_t decoded_frames_rendered = 0;
   std::uint64_t nack_retransmissions = 0;
   std::uint64_t pli_requests_received = 0;
@@ -71,6 +81,10 @@ struct PeerTransportSnapshot {
   std::string signaling_state = "stable";
   std::string local_description_type;
   std::string data_channel_label = "vds-control";
+  std::string encoded_media_data_channel_protocol = "vds-media-encoded-v1";
+  std::string encoded_media_data_channel_state = "idle";
+  std::string media_session_id;
+  int media_manifest_version = 0;
   std::string video_mid = "video";
   std::string audio_mid = "audio";
   std::string video_codec = "h264";
@@ -113,12 +127,28 @@ struct PeerAudioTrackConfig {
   int bitrate_kbps = 128;
 };
 
+struct PeerEncodedMediaDataChannelFrame {
+  std::string message_type = "frame";
+  std::string stream_type;
+  std::string codec;
+  std::uint64_t timestamp_us = 0;
+  std::uint64_t sequence = 0;
+  bool keyframe = false;
+  bool config = false;
+  std::string frame_id;
+  std::uint64_t chunk_index = 0;
+  std::uint64_t chunk_count = 0;
+  std::uint64_t frame_payload_bytes = 0;
+  std::vector<std::uint8_t> payload;
+};
+
 struct PeerTransportCallbacks {
   std::function<void(const std::string& type, const std::string& sdp)> on_local_description;
   std::function<void(const std::string& candidate, const std::string& sdp_mid)> on_local_candidate;
   std::function<void(const PeerTransportSnapshot& snapshot, const std::string& logical_state)> on_state_change;
   std::function<void(const std::vector<std::uint8_t>& frame, const std::string& codec, std::uint32_t rtp_timestamp)> on_remote_video_frame;
   std::function<void(const std::vector<std::uint8_t>& frame, const std::string& codec, std::uint32_t rtp_timestamp)> on_remote_audio_frame;
+  std::function<void(const PeerEncodedMediaDataChannelFrame& frame)> on_encoded_media_data_channel_frame;
   std::function<void(const std::string& message)> on_warning;
 };
 
@@ -130,6 +160,7 @@ std::shared_ptr<PeerTransportSession> create_peer_transport_session(
   const std::string& peer_id,
   bool initiator,
   const PeerTransportCallbacks& callbacks,
+  bool encoded_media_data_channel,
   std::string* error
 );
 
@@ -189,6 +220,12 @@ bool send_peer_transport_audio_frame(
   std::string* error
 );
 
+bool send_peer_transport_encoded_media_frame(
+  const std::shared_ptr<PeerTransportSession>& session,
+  const PeerEncodedMediaDataChannelFrame& frame,
+  std::string* error
+);
+
 bool set_peer_transport_decoder_state(
   const std::shared_ptr<PeerTransportSession>& session,
   bool decoder_ready,
@@ -202,6 +239,12 @@ bool request_peer_transport_keyframe(
   const std::shared_ptr<PeerTransportSession>& session,
   const std::string& reason,
   std::string* error
+);
+
+void set_peer_transport_media_manifest(
+  const std::shared_ptr<PeerTransportSession>& session,
+  const std::string& media_session_id,
+  int manifest_version
 );
 
 void add_peer_transport_dropped_video_units(
