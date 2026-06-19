@@ -2456,3 +2456,12 @@
 - 建议：默认关键帧间隔调到 `2s`，减少 IDR 突发密度；保留 `1s/0.5s/all-intra` 作为手动诊断或低延迟恢复选项。native stats 轮询从 2 秒放宽到 5 秒，避免诊断采样参与流畅度竞争。
 - 修改意见：按建议修改
 - 处理结果：已处理。默认 `qualitySettings.keyframePolicy`、media-agent `HostPipelineState/AgentRuntimeState` 默认值和 unknown policy fallback 均改为 `2s`；FFmpeg sender 对 `2s` 输出 `-g fps*2` 和 `force_key_frames expr:gte(t,n_forced*2)`；media manifest 的 `keyframeIntervalMs` 按当前策略输出 500/1000/2000；native host/viewer stats polling 改为 5000ms。已保留 UI 中 `1s`、`0.5s`、`All-Intra` 选项用于手动回退或诊断。
+
+### RUNTIME-FIX-P1-020 打包版 media-agent 落后于开发运行时导致预览差异
+
+- 位置：`package.json:31`、`package.json:33`、`scripts/release-check.js:1`
+- 问题：开发环境运行 `runtime/media-agent/vds-media-agent.exe`，安装包运行 `dist/win-unpacked/resources/runtime/media-agent/vds-media-agent.exe`。现场比对发现两者 SHA256 不一致，说明安装包内 agent 是旧二进制；同时旧 `build:release` 在打包后执行 `release:check`，而 `release:check` 又会重新跑 `verify:media-agent`，存在“打包后 runtime 被重新生成，安装包未同步”的流程漏洞。
+- 影响：开发版和打包版实际运行的 native preview/WGC 崩溃收敛代码不同，表现为打包版更容易无预览或行为和测试版不一致。
+- 建议：发布流程拆成打包前检查和打包后校验。打包前允许 `build:vds-web`、`verify:media-agent` 生成运行时；打包后禁止再重建运行时，只校验 installer、server updates 和 packaged media-agent 哈希一致。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `release:precheck` 和 `release:check --postbuild` 两阶段入口；`build:release` 改为 `release:precheck -> electron-builder -> prepare-server-release -> release:check -> release:github`。`release:check` 打包后不再执行 `verify:media-agent`，并新增 `validatePackagedMediaAgentRuntime()` 比对 `runtime/media-agent/vds-media-agent.exe` 与 `dist/win-unpacked/resources/runtime/media-agent/vds-media-agent.exe` 的 SHA256，不一致会直接失败并提示重新打包。已通过 `node --check scripts/release-check.js`。

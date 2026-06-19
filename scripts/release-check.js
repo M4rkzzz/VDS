@@ -4,6 +4,11 @@ const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
 const projectRoot = path.resolve(__dirname, '..');
+const mode = process.argv.includes('--prebuild')
+  ? 'prebuild'
+  : process.argv.includes('--postbuild')
+    ? 'postbuild'
+    : 'postbuild';
 
 function run(name, args) {
   const display = [name].concat(args).join(' ');
@@ -46,6 +51,34 @@ function readLatestManifest(filePath) {
 
 function fileSha512(filePath) {
   return crypto.createHash('sha512').update(fs.readFileSync(filePath)).digest('base64');
+}
+
+function fileSha256Hex(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex').toUpperCase();
+}
+
+function validatePackagedMediaAgentRuntime() {
+  const runtimeBinaryPath = path.join(projectRoot, 'runtime', 'media-agent', 'vds-media-agent.exe');
+  const packagedBinaryPath = path.join(projectRoot, 'dist', 'win-unpacked', 'resources', 'runtime', 'media-agent', 'vds-media-agent.exe');
+
+  ensureFile(runtimeBinaryPath);
+  ensureFile(packagedBinaryPath);
+
+  const runtimeHash = fileSha256Hex(runtimeBinaryPath);
+  const packagedHash = fileSha256Hex(packagedBinaryPath);
+
+  if (runtimeHash !== packagedHash) {
+    throw new Error(
+      [
+        'Packaged media-agent binary differs from runtime/media-agent.',
+        `runtime/media-agent/vds-media-agent.exe sha256=${runtimeHash}`,
+        `dist/win-unpacked/resources/runtime/media-agent/vds-media-agent.exe sha256=${packagedHash}`,
+        'Run npm run build after npm run verify:media-agent so the installer includes the current agent.'
+      ].join('\n')
+    );
+  }
+
+  console.log('\nPackaged media-agent runtime matches runtime/media-agent.');
 }
 
 function validateLatestManifest(dirPath, version, label) {
@@ -133,18 +166,25 @@ function main() {
 
   run('npm', ['run', 'check:vds-web']);
   run('npm', ['run', 'test:vds-web']);
-  run('npm', ['run', 'build:vds-web']);
+  if (mode === 'prebuild') {
+    run('npm', ['run', 'build:vds-web']);
+  }
   run('npm', ['run', 'test:server']);
   run('npm', ['run', 'check:logging']);
-  run('npm', ['run', 'verify:media-agent']);
+  if (mode === 'prebuild') {
+    run('npm', ['run', 'verify:media-agent']);
+  }
   run('npm', ['audit', '--omit=dev']);
   run('npm', ['--prefix', 'server', 'audit', '--omit=dev']);
   run('node', ['scripts/check-server-docker-context.js']);
 
-  validateReleaseArtifacts();
+  if (mode === 'postbuild') {
+    validatePackagedMediaAgentRuntime();
+    validateReleaseArtifacts();
+  }
   validateUnreleasedSection();
 
-  console.log('\nRelease check passed.');
+  console.log(`\nRelease ${mode} check passed.`);
 }
 
 main();

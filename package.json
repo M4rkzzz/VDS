@@ -29,8 +29,9 @@
     "rebuild": "electron-rebuild -f",
     "prepare-server-release": "node scripts/prepare-server-release.js",
     "release:github": "node scripts/publish-github-release.js",
-    "release:check": "node scripts/release-check.js",
-    "build:release": "npm run build:vds-web && npm run verify:media-agent && npm run build && npm run prepare-server-release && npm run release:check && npm run release:github"
+    "release:precheck": "node scripts/release-check.js --prebuild",
+    "release:check": "node scripts/release-check.js --postbuild",
+    "build:release": "npm run release:precheck && npm run build && npm run prepare-server-release && npm run release:check && npm run release:github"
   },
   "dependencies": {
     "electron-updater": "^6.8.3",
