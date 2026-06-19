@@ -27,11 +27,11 @@
 
 当前未发布改动：
 
-- 1.6.8 准备发布：修复安装包环境无法枚举最小化窗口捕获目标的问题，保持开发环境和安装包行为一致。
+- 下次发布携带：Docker compose/server image 暴露 3010 后台端口，并设置 `ADMIN_PORT=3010`。
 
 当前未发布改动已验证：
 
-- packaged helper 已用 `dist/win-unpacked/VDS.exe` + `ELECTRON_RUN_AS_NODE=1` 直接执行验证，可返回包含 `isMinimized:true` 的窗口元数据；完整 `npm run build:release` 待本次提交后执行。
+- `node --check scripts/check-server-docker-context.js` 和 `npm run check:server-docker` 已通过。
 
 ## 3. 当前结论
 

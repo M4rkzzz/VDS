@@ -6,7 +6,9 @@ services:
     container_name: vds-signaling
     ports:
       - "3000:3000"
+      - "3010:3010"
     restart: unless-stopped
     environment:
       PORT: 3000
+      ADMIN_PORT: 3010
       DISCONNECT_GRACE_MS: 30000
