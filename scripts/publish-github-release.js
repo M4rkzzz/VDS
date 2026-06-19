@@ -35,7 +35,7 @@ function run(name, args, options = {}) {
     cwd: projectRoot,
     encoding: options.capture ? 'utf8' : undefined,
     stdio: options.capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
-    shell: process.platform === 'win32' && !path.isAbsolute(name) && (name === 'npm' || name === 'gh' || name === 'git')
+    shell: process.platform === 'win32' && !path.isAbsolute(name) && (name === 'npm' || name === 'gh')
   });
 
   if (result.error) {
