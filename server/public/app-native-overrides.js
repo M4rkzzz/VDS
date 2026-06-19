@@ -94,6 +94,7 @@
   let windowBoundsSurfaceSyncRafId = 0;
   let windowBoundsSurfaceSyncFinalTimerId = 0;
   const embeddedSurfaceTrackingIntervalMs = 180;
+  const nativeStatsPollingIntervalMs = 5000;
   let currentWindowBounds = null;
   let hostPreviewRequested = true;
   let hostSourceFramesSample = null;
@@ -448,7 +449,9 @@
         width: Number.isFinite(width) ? Math.max(0, Math.round(width)) : 0,
         height: Number.isFinite(height) ? Math.max(0, Math.round(height)) : 0,
         fps: Number.isFinite(fps) ? Math.max(0, Math.round(fps)) : 0,
-        keyframeIntervalMs: 1000,
+        keyframeIntervalMs: qualitySettings && qualitySettings.keyframePolicy === '0.5s'
+          ? 500
+          : (qualitySettings && qualitySettings.keyframePolicy === '1s' ? 1000 : 2000),
         configVersion: 1,
         config: {}
       },
@@ -1662,7 +1665,7 @@
           : '',
       encoderPreset: qualitySettings.encoderPreset || 'balanced',
       encoderTune: qualitySettings.encoderTune === 'none' ? '' : (qualitySettings.encoderTune || ''),
-      keyframePolicy: qualitySettings.keyframePolicy || '1s'
+      keyframePolicy: qualitySettings.keyframePolicy || '2s'
     };
 
     if (normalized.startsWith('screen:')) {
@@ -3501,7 +3504,7 @@
         return;
       }
       pollNativeHostStats('periodic');
-    }, 2000);
+    }, nativeStatsPollingIntervalMs);
     pollNativeHostStats('initial');
   }
 
@@ -3639,7 +3642,7 @@
         return;
       }
       pollNativeViewerStats('periodic');
-    }, 2000);
+    }, nativeStatsPollingIntervalMs);
     pollNativeViewerStats('initial');
   }
 

@@ -28,10 +28,12 @@
 当前未发布改动：
 
 - 下次发布携带：Docker compose/server image 暴露 3010 后台端口，并设置 `ADMIN_PORT=3010`。
+- 下次发布携带：默认关键帧间隔从 1s 调整为 2s，native stats 轮询从 2s 放宽到 5s，用于缓解约一秒一次的 IDR/诊断突发卡顿。
 
 当前未发布改动已验证：
 
 - `node --check scripts/check-server-docker-context.js` 和 `npm run check:server-docker` 已通过。
+- `node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run test:vds-web`、`npm run test:server`、`npm run check:logging`、`npm run verify:media-agent` 已通过。
 
 ## 3. 当前结论
 

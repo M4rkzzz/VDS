@@ -243,7 +243,7 @@ let qualitySettings = {
   encoderPreset: 'balanced',
   encoderTune: 'none',
   publicRoomEnabled: false,
-  keyframePolicy: '1s'
+  keyframePolicy: '2s'
 };
 let qualityCapabilities = null;
 let qualityCapabilitiesPromise = null;
@@ -285,6 +285,7 @@ const QUALITY_TUNE_OPTIONS = [
   { value: 'zerolatency', label: 'zerolatency' }
 ];
 const QUALITY_KEYFRAME_OPTIONS = [
+  { value: '2s', label: '2s' },
   { value: '1s', label: '1s' },
   { value: '0.5s', label: '0.5s' },
   { value: 'all-intra', label: 'All-Intra', badge: '高带宽，高负载' }
@@ -2136,7 +2137,7 @@ function renderQualitySettingsUi() {
   if (elements.qualityKeyframeOptions) {
     elements.qualityKeyframeOptions.innerHTML = buildSegmentGroupMarkup(
       QUALITY_KEYFRAME_OPTIONS,
-      qualitySettings.keyframePolicy || '1s'
+      qualitySettings.keyframePolicy || '2s'
     );
   }
 
@@ -2325,7 +2326,7 @@ function bindQualitySettingsUi() {
   bindQualitySegmentGroup(elements.qualityKeyframeOptions, (value) => {
     qualitySettings.keyframePolicy = QUALITY_KEYFRAME_OPTIONS.some((option) => option.value === value)
       ? value
-      : '1s';
+      : '2s';
     renderQualitySettingsUi();
   });
 

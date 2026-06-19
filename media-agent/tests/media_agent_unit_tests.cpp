@@ -85,7 +85,8 @@ void test_host_pipeline_selection() {
   expect_eq(normalize_host_encoder_tune("film"), "", "host encoder tune rejects unsupported value");
   expect_eq(normalize_host_keyframe_policy("500ms"), "0.5s", "host keyframe half-second normalization");
   expect_eq(normalize_host_keyframe_policy("allintra"), "all-intra", "host keyframe all-intra normalization");
-  expect_eq(normalize_host_keyframe_policy("bad"), "1s", "host keyframe policy fallback");
+  expect_eq(normalize_host_keyframe_policy("2s"), "2s", "host keyframe two-second normalization");
+  expect_eq(normalize_host_keyframe_policy("bad"), "2s", "host keyframe policy fallback");
   expect_eq(vds::media_agent::quote_command_path("C:\\tools\\ffmpeg.exe"), "C:\\tools\\ffmpeg.exe", "safe command path does not require quotes");
   expect_eq(vds::media_agent::quote_command_path("C:\\Program Files\\ffmpeg.exe"), "\"C:\\Program Files\\ffmpeg.exe\"", "path with spaces is quoted");
   expect_true(vds::media_agent::quote_command_path("C:\\bad|path\\ffmpeg.exe").find('|') != std::string::npos, "dangerous metachar path is contained in quotes");

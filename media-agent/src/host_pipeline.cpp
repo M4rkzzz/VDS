@@ -238,10 +238,16 @@ std::string normalize_host_keyframe_policy(const std::string& policy) {
   if (lowered == "0.5s" || lowered == "500ms" || lowered == "half-second") {
     return "0.5s";
   }
+  if (lowered == "1s" || lowered == "1000ms" || lowered == "one-second") {
+    return "1s";
+  }
+  if (lowered == "2s" || lowered == "2000ms" || lowered == "two-second") {
+    return "2s";
+  }
   if (lowered == "all-intra" || lowered == "intra" || lowered == "allintra") {
     return "all-intra";
   }
-  return "1s";
+  return "2s";
 }
 
 std::string build_ffmpeg_peer_video_sender_command(
@@ -298,9 +304,12 @@ std::string build_ffmpeg_peer_video_sender_command(
   } else if (keyframe_policy == "0.5s") {
     command << " -g " << std::max(1, normalized_frame_rate / 2);
     command << " -force_key_frames " << vds::media_agent::quote_command_path("expr:gte(t,n_forced*0.5)");
-  } else {
+  } else if (keyframe_policy == "1s") {
     command << " -g " << std::max(1, normalized_frame_rate);
     command << " -force_key_frames " << vds::media_agent::quote_command_path("expr:gte(t,n_forced*1)");
+  } else {
+    command << " -g " << std::max(1, normalized_frame_rate * 2);
+    command << " -force_key_frames " << vds::media_agent::quote_command_path("expr:gte(t,n_forced*2)");
   }
 
   append_video_encoder_runtime_flags(command, pipeline);

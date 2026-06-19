@@ -2447,3 +2447,12 @@
 - 建议：只要用 Electron 可执行文件启动 JS helper，就显式设置 `ELECTRON_RUN_AS_NODE=1`，不要依赖可执行文件名判断是否为 `electron.exe`。
 - 修改意见：按建议修改
 - 处理结果：已处理。`getTopLevelWindowMetadataMapFromHelper()` 现在对子进程 env 无条件设置 `ELECTRON_RUN_AS_NODE=1`，确保 packaged `VDS.exe` 也以 Node 模式执行 `window-metadata-helper.js`，恢复安装包枚举最小化窗口能力。
+
+### RUNTIME-FIX-P2-007 观看画面出现约一秒一顿的周期性卡顿
+
+- 位置：`server/public/app.js:246`、`server/public/app-native-overrides.js:452`、`media-agent/src/host_pipeline.cpp:236`
+- 问题：默认关键帧策略是 `1s`，编码器每秒强制 IDR/GOP 边界，10Mbps/1080p 场景下 IDR 帧容易形成 DataChannel 与解码突发；同时 native host/viewer stats 每 2 秒轮询一次，双端同机或多客户端错峰时可能表现为约 1 秒一次的轻微抢占。
+- 影响：媒体链路已连接且平均 FPS 正常，但用户看到“流畅一秒、咯噔一下”的周期性顿挫，尤其在高码率、同机双端、开启预览/诊断面板时更明显。
+- 建议：默认关键帧间隔调到 `2s`，减少 IDR 突发密度；保留 `1s/0.5s/all-intra` 作为手动诊断或低延迟恢复选项。native stats 轮询从 2 秒放宽到 5 秒，避免诊断采样参与流畅度竞争。
+- 修改意见：按建议修改
+- 处理结果：已处理。默认 `qualitySettings.keyframePolicy`、media-agent `HostPipelineState/AgentRuntimeState` 默认值和 unknown policy fallback 均改为 `2s`；FFmpeg sender 对 `2s` 输出 `-g fps*2` 和 `force_key_frames expr:gte(t,n_forced*2)`；media manifest 的 `keyframeIntervalMs` 按当前策略输出 500/1000/2000；native host/viewer stats polling 改为 5000ms。已保留 UI 中 `1s`、`0.5s`、`All-Intra` 选项用于手动回退或诊断。

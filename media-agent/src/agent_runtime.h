@@ -184,7 +184,7 @@ struct HostPipelineState {
   std::string requested_video_encoder;
   std::string requested_preset = "balanced";
   std::string requested_tune;
-  std::string requested_keyframe_policy = "1s";
+  std::string requested_keyframe_policy = "2s";
   std::string selected_video_encoder;
   std::string video_encoder_backend = "none";
   std::string selected_audio_encoder;
@@ -309,7 +309,7 @@ struct AgentRuntimeState {
   std::string host_video_encoder_preference;
   std::string host_encoder_preset = "balanced";
   std::string host_encoder_tune;
-  std::string host_keyframe_policy = "1s";
+  std::string host_keyframe_policy = "2s";
   std::string host_capture_kind = "window";
   std::string host_capture_state = "normal";
   std::string host_capture_title;
