@@ -1403,14 +1403,11 @@ function getTopLevelWindowMetadataMapFromHelper() {
 
   const helperPath = path.join(__dirname, 'window-metadata-helper.js');
   const timeoutMs = Number(process.env.VDS_CAPTURE_TARGET_METADATA_TIMEOUT_MS || 1200);
-  const electronRunAsNode = process.execPath && /electron(?:\.exe)?$/i.test(path.basename(process.execPath));
   const env = {
     ...process.env,
+    ELECTRON_RUN_AS_NODE: '1',
     VDS_PARENT_PROCESS_ID: String(process.pid)
   };
-  if (electronRunAsNode) {
-    env.ELECTRON_RUN_AS_NODE = '1';
-  }
 
   return new Promise((resolve) => {
     let settled = false;

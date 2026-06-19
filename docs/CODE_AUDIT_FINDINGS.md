@@ -2438,3 +2438,12 @@
 - 建议：`getStats` 不走普通 invoke 级完整日志；保留 renderer `periodicStats` 轻量摘要。只有显式设置 `VDS_VERBOSE_MEDIA_LOGS=1` 时才允许完整 invoke 日志。
 - 修改意见：按建议修改
 - 处理结果：已处理。`shouldLogMediaInvoke()` 对 `getStats` 增加非 verbose 跳过逻辑，普通 mainProcess 调试不再打印完整 `getStats request/result`；需要极限排查时仍可用 `VDS_VERBOSE_MEDIA_LOGS=1` 打开。已通过 `node --check desktop\main.js`、`npm run check:logging`。
+
+### RUNTIME-FIX-P1-019 安装包无法枚举最小化窗口捕获目标
+
+- 位置：`desktop/main.js:1405`
+- 问题：开发环境下 `process.execPath` 是 `electron.exe`，最小化窗口元数据 helper 会设置 `ELECTRON_RUN_AS_NODE=1` 并正常执行 `desktop/window-metadata-helper.js`；安装包中 `process.execPath` 是 `VDS.exe`，旧判断未设置 `ELECTRON_RUN_AS_NODE`，导致子进程按应用入口启动而不是 Node helper，最终无法获得 minimized window metadata。
+- 影响：开发环境调起客户端可以看到最小化窗口捕获目标，安装包安装后的客户端看不到，表现为 dev/prod 行为不一致。
+- 建议：只要用 Electron 可执行文件启动 JS helper，就显式设置 `ELECTRON_RUN_AS_NODE=1`，不要依赖可执行文件名判断是否为 `electron.exe`。
+- 修改意见：按建议修改
+- 处理结果：已处理。`getTopLevelWindowMetadataMapFromHelper()` 现在对子进程 env 无条件设置 `ELECTRON_RUN_AS_NODE=1`，确保 packaged `VDS.exe` 也以 Node 模式执行 `window-metadata-helper.js`，恢复安装包枚举最小化窗口能力。

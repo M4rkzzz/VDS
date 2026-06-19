@@ -19,7 +19,7 @@
 
 最近一次对齐日期：`2026-04-26`
 
-当前发布版本：`1.6.7`
+当前发布版本：`1.6.8`
 
 ## 2. 未发布改动记录
 
@@ -27,11 +27,11 @@
 
 当前未发布改动：
 
-- 1.6.7 已完成发布构建：包含 P2P 连接稳健性、服务端拓扑后台、native surface 移动稳定性、WGC live preview 加固和诊断降噪。
+- 1.6.8 准备发布：修复安装包环境无法枚举最小化窗口捕获目标的问题，保持开发环境和安装包行为一致。
 
 当前未发布改动已验证：
 
-- `npm run build:release` 已通过；该命令已完成 VDS_web 构建、media-agent Release 构建/测试/smoke、Electron NSIS 打包、`server/updates` 刷新和发布门禁 `release:check`。
+- packaged helper 已用 `dist/win-unpacked/VDS.exe` + `ELECTRON_RUN_AS_NODE=1` 直接执行验证，可返回包含 `isMinimized:true` 的窗口元数据；完整 `npm run build:release` 待本次提交后执行。
 
 ## 3. 当前结论
 

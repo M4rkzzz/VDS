@@ -2,9 +2,9 @@
 
 VDS is an Electron desktop client plus a Node.js signaling server for cascade screen sharing.
 
-## 1.6.7 Overview
+## 1.6.8 Overview
 
-Version `1.6.7` focuses on native P2P connection robustness, media surface stability, server topology visibility, and release validation for mixed native/web relay flows.
+Version `1.6.8` focuses on packaged-client parity for minimized-window capture discovery while keeping the 1.6.7 native P2P, media surface, topology, and release-flow hardening.
 
 Highlights:
 
@@ -13,6 +13,7 @@ Highlights:
 - fixed host stop-share/re-share room lifecycle by fully unbinding destroyed room sockets
 - improved native viewer surface movement handling to avoid updateSurface storms during window dragging
 - restored WGC live preview as the default host preview path while hardening WGC source creation errors
+- fixed packaged Electron minimized-window capture discovery so installed clients match dev behavior
 - added a 3010 signal admin dashboard with graphical topology, node state, edge state, and live manifests
 - improved diagnostic density by moving high-frequency surface/getStats logs behind the debug high-frequency channel
 - kept native `H.264 / H.265` + encoded relay fanout and Web viewer relay as the production path
@@ -119,7 +120,7 @@ Viewer join mode currently behaves like this:
   - refuses dirty worktrees unless `ALLOW_DIRTY_GITHUB_RELEASE=1` is set
 - `server/` is the deployable server directory
 - desktop auto-update feed is served from `server/updates/`
-- `1.6.7` release assets are the installer, blockmap, and `latest.yml`
+- `1.6.8` release assets are the installer, blockmap, and `latest.yml`
 - release notes for recent versions are tracked in [CHANGELOG.md](CHANGELOG.md)
 
 ## Source Control Rules

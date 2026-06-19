@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.8
+
+- fixed packaged Electron minimized-window capture discovery by always launching `window-metadata-helper.js` with `ELECTRON_RUN_AS_NODE=1`, matching dev behavior where minimized windows are visible as capture targets
+- documented the packaged-only root cause in `CODE_AUDIT_FINDINGS`
+- refreshed installer, blockmap, update manifest, and GitHub Release assets for the patched desktop build
+
 ## 1.6.7
 
 - improved native P2P signaling robustness with attempt isolation, stale signal filtering, and cleaner peer teardown for reconnecting host/viewer/relay edges
