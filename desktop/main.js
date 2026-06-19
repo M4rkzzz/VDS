@@ -9,7 +9,7 @@ const { MediaAgentManager } = require('./media-agent-manager');
 const SERVER_URL = normalizeBaseUrl(process.env.SERVER_URL || 'https://boshan.s.3q.hair');
 const DISCONNECT_GRACE_MS = Number(process.env.DISCONNECT_GRACE_MS || 30000);
 const PREFERRED_AUDIO_BACKEND = String(process.env.VDS_PREFERRED_AUDIO_BACKEND || '').trim().toLowerCase();
-const ENABLE_NATIVE_HOST_SESSION_BRIDGE = true;
+const ENABLE_NATIVE_HOST_SESSION_BRIDGE = process.env.VDS_ENABLE_NATIVE_HOST_SESSION_BRIDGE !== '0';
 const VERBOSE_MEDIA_LOGS = process.env.VDS_VERBOSE_MEDIA_LOGS === '1';
 const ENABLE_AGENT_HOST_CAPTURE_PROCESS = process.env.VDS_ENABLE_AGENT_HOST_CAPTURE_PROCESS === '1';
 const ENABLE_NATIVE_HOST_PREVIEW_SURFACE = true;
@@ -20,7 +20,7 @@ const ENABLE_CAPTURE_TARGET_WINDOW_ICONS = process.env.VDS_ENABLE_CAPTURE_TARGET
 const CAPTURE_TARGET_LIST_TIMEOUT_MS = Number(process.env.VDS_CAPTURE_TARGET_LIST_TIMEOUT_MS || 2500);
 const DEBUG_PRESET = String(process.env.VDS_DEBUG_PRESET || '').trim();
 const DEBUG_CATEGORIES = ['connection', 'p2p', 'video', 'audio', 'update', 'misc'];
-const DEBUG_CHANNELS = ['renderer', 'nativeEvents', 'nativeSteps', 'periodicStats', 'mainProcess', 'agentBreadcrumbs', 'agentStderr'];
+const DEBUG_CHANNELS = ['renderer', 'nativeEvents', 'nativeSteps', 'periodicStats', 'mainProcess', 'highFrequency', 'agentBreadcrumbs', 'agentStderr'];
 
 let mainWindow = null;
 let tray = null;
@@ -35,11 +35,9 @@ let autoUpdaterConfigured = false;
 let rendererDebugConfig = buildDefaultRendererDebugConfig(false);
 const mainDebugRateLimitState = new Map();
 let quitInProgress = false;
+let quitCleanupComplete = false;
 let quitFinalizeTimer = null;
 let audioCapture = undefined;
-let audioCaptureLoadError = null;
-let audioBridgeAttached = false;
-const activeNatMappings = new Map();
 let emulatedFullscreenState = {
   active: false,
   bounds: null,
@@ -127,10 +125,8 @@ function getMediaEngineDebugCategory(method) {
     case 'detachSurface':
     case 'listCaptureTargets':
       return 'video';
-    case 'getAudioBackendStatus':
     case 'startAudioSession':
     case 'stopAudioSession':
-    case 'setViewerPlaybackMode':
     case 'setViewerAudioDelay':
     case 'setViewerVolume':
     case 'getViewerVolume':
@@ -157,28 +153,6 @@ if (process.env.HW_ACCEL === 'false') {
   app.commandLine.appendSwitch('disable-software-rasterizer');
 }
 
-ipcMain.handle('get-runtime-config', () => ({
-  serverUrl: SERVER_URL,
-  disconnectGraceMs: DISCONNECT_GRACE_MS,
-  preferredAudioBackend: PREFERRED_AUDIO_BACKEND,
-  enableNativeHostSessionBridge: ENABLE_NATIVE_HOST_SESSION_BRIDGE,
-  verboseMediaLogs: VERBOSE_MEDIA_LOGS,
-  enableAgentHostCaptureProcess: ENABLE_AGENT_HOST_CAPTURE_PROCESS,
-  enableNativeHostPreviewSurface: ENABLE_NATIVE_HOST_PREVIEW_SURFACE,
-  enableNativePeerTransport: ENABLE_NATIVE_PEER_TRANSPORT,
-  enableNativeSurfaceEmbedding: ENABLE_NATIVE_SURFACE_EMBEDDING,
-  debugPreset: DEBUG_PRESET
-}));
-
-ipcMain.handle('get-desktop-sources', async () => {
-  try {
-    return await listDesktopSources();
-  } catch (error) {
-    logMainProcessDebug('video', 'Error getting desktop sources:', error && error.message ? error.message : String(error));
-    return [];
-  }
-});
-
 ipcMain.handle('get-app-version', () => app.getVersion());
 ipcMain.handle('clipboard-write-text', (_event, text) => {
   const value = String(text || '');
@@ -192,9 +166,7 @@ ipcMain.handle('get-update-log-snapshot', () => ({
   path: getUpdateLogFilePath(),
   entries: updateLogEntries.slice()
 }));
-ipcMain.handle('media-engine-get-status', async () => getMediaAgentManager().getStatus());
 ipcMain.handle('media-engine-start', async () => getMediaAgentManager().start());
-ipcMain.handle('media-engine-stop', async () => getMediaAgentManager().stop());
 ipcMain.handle('media-engine-list-capture-targets', async () => {
   try {
     return await withTimeout(
@@ -209,24 +181,10 @@ ipcMain.handle('media-engine-list-capture-targets', async () => {
 });
 ipcMain.handle('media-engine-audio-is-platform-supported', () => invokeAudioCaptureOperation('isPlatformSupported'));
 ipcMain.handle('media-engine-audio-check-permission', () => invokeAudioCaptureOperation('checkPermission'));
-ipcMain.handle('media-engine-audio-request-permission', () => invokeAudioCaptureOperation('requestPermission'));
 ipcMain.handle('media-engine-audio-get-process-list', () => invokeAudioCaptureOperation('getProcessList'));
-ipcMain.handle('media-engine-audio-get-backend-status', () => getMediaEngineAudioBridgeStatus());
-ipcMain.handle('media-engine-audio-start-capture', (_event, pid) => invokeAudioCaptureOperation('startCapture', pid));
-ipcMain.handle('media-engine-audio-stop-capture', () => invokeAudioCaptureOperation('stopCapture'));
-ipcMain.handle('media-engine-audio-is-capturing', () => {
-  try {
-    const capture = getAudioCapture();
-    return Boolean(audioCapture && audioCapture.isCapturing);
-  } catch (error) {
-    logMainProcessDebug('audio', '[media-engine] Failed to read audio capture state:', error && error.message ? error.message : String(error));
-    return false;
-  }
-});
 ipcMain.handle('media-engine-start-host-session', async (_event, options) => invokeMediaEngineHostSessionBridge('startHostSession', options || {}));
 ipcMain.handle('media-engine-stop-host-session', async (_event, options) => invokeMediaEngineHostSessionBridge('stopHostSession', options || {}));
 ipcMain.handle('media-engine-prepare-obs-ingest', async (_event, options) => invokeMediaEngine('prepareObsIngest', options || {}));
-ipcMain.handle('media-engine-get-audio-backend-status', async () => invokeMediaEngine('getAudioBackendStatus'));
 ipcMain.handle('media-engine-start-audio-session', async (_event, options) => invokeMediaEngine('startAudioSession', options || {}));
 ipcMain.handle('media-engine-stop-audio-session', async (_event, options) => invokeMediaEngine('stopAudioSession', options || {}));
 ipcMain.handle('media-engine-create-peer', async (_event, options) => invokeMediaEngine('createPeer', options || {}));
@@ -238,7 +196,6 @@ ipcMain.handle('media-engine-detach-peer-media-source', async (_event, options) 
 ipcMain.handle('media-engine-attach-surface', async (_event, options) => invokeMediaEngine('attachSurface', enrichEmbeddedSurfaceOptions(options || {})));
 ipcMain.handle('media-engine-update-surface', async (_event, options) => invokeMediaEngine('updateSurface', enrichEmbeddedSurfaceOptions(options || {})));
 ipcMain.handle('media-engine-detach-surface', async (_event, options) => invokeMediaEngine('detachSurface', options || {}));
-ipcMain.handle('media-engine-set-viewer-playback-mode', async (_event, options) => invokeMediaEngine('setViewerPlaybackMode', options || {}));
 ipcMain.handle('media-engine-set-viewer-audio-delay', async (_event, options) => invokeMediaEngine('setViewerAudioDelay', options || {}));
 ipcMain.handle('media-engine-set-viewer-volume', async (_event, volume) => invokeMediaEngine('setViewerVolume', {
   pid: getRendererProcessId(),
@@ -318,10 +275,6 @@ ipcMain.on('renderer-debug-config-changed', (_event, config) => {
   rendererDebugConfig = normalizeRendererDebugConfig(config, false);
 });
 
-ipcMain.on('renderer-debug-mode-changed', (_event, enabled) => {
-  rendererDebugConfig = buildDefaultRendererDebugConfig(Boolean(enabled));
-});
-
 ipcMain.handle('check-for-updates', async () => {
   if (!app.isPackaged) {
     writeUpdateLog('info', 'Skip update check in dev mode because app.isPackaged is false.');
@@ -371,6 +324,14 @@ ipcMain.handle('quit-and-install', () => {
   }
 });
 
+function isAllowedExternalUrl(value) {
+  try {
+    return ['https:', 'http:', 'mailto:'].includes(new URL(value).protocol);
+  } catch {
+    return false;
+  }
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -390,7 +351,11 @@ function createWindow() {
   mainWindow.setMenu(null);
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url).catch(() => {});
+    if (isAllowedExternalUrl(url)) {
+      shell.openExternal(url).catch(() => {});
+    } else {
+      writeUpdateLog('warn', `[electron] blocked external url protocol: ${url}`);
+    }
     return { action: 'deny' };
   });
 
@@ -429,6 +394,7 @@ function createWindow() {
   mainWindow.on('close', (event) => {
     if (!app.isQuitting) {
       event.preventDefault();
+      sendToRenderer('request-close-confirmation');
     }
   });
 
@@ -658,6 +624,7 @@ function finalizeQuit() {
   }
 
   app.isQuitting = true;
+  quitCleanupComplete = true;
 
   if (tray) {
     try {
@@ -687,6 +654,7 @@ function requestAppQuit() {
 
   quitFinalizeTimer = setTimeout(() => {
     app.isQuitting = true;
+    quitCleanupComplete = true;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.destroy();
     }
@@ -712,7 +680,15 @@ function shouldLogMediaDebug(category = 'misc', channel = 'renderer') {
 }
 
 function shouldLogMediaInvoke(method, category = 'misc') {
+  if ((method === 'getStats' || method === 'updateSurface') && !shouldLogMediaDebug(category, 'highFrequency')) {
+    return false;
+  }
   return shouldLogMediaDebug(category, 'mainProcess');
+}
+
+function isMediaAgentPeerNotFoundError(error) {
+  const message = error && error.message ? String(error.message) : String(error || '');
+  return (error && error.code === 'PEER_NOT_FOUND') || message.includes('Peer has not been created');
 }
 
 function shouldEmitMainDebugLog(key, intervalMs = 1000) {
@@ -749,11 +725,11 @@ function logMainProcessWarning(category, ...args) {
 
 function enrichEmbeddedSurfaceOptions(options) {
   const normalized = { ...(options || {}) };
-  if (shouldLogMediaDebug('video', 'mainProcess')) {
+  if (shouldLogMediaDebug('video', 'highFrequency')) {
     logMainProcessDebug('video', '[media-engine surface] enrich input:', JSON.stringify(summarizeMediaEnginePayload(normalized)));
   }
   if (!normalized.embedded) {
-    if (shouldLogMediaDebug('video', 'mainProcess')) {
+    if (shouldLogMediaDebug('video', 'highFrequency')) {
       logMainProcessDebug('video', '[media-engine surface] non-embedded surface request');
     }
     return normalized;
@@ -764,7 +740,7 @@ function enrichEmbeddedSurfaceOptions(options) {
     throw new Error('main-window-handle-unavailable');
   }
   normalized.parentWindowHandle = parentWindowHandle;
-  if (shouldLogMediaDebug('video', 'mainProcess')) {
+  if (shouldLogMediaDebug('video', 'highFrequency')) {
     logMainProcessDebug('video', '[media-engine surface] enrich output:', JSON.stringify(summarizeMediaEnginePayload(normalized)));
   }
   return normalized;
@@ -791,22 +767,6 @@ function getMainWindowHandleValue() {
   return `0x${handleValue.toString(16)}`;
 }
 
-function attachMediaEngineAudioBridge() {
-  const capture = getAudioCapture();
-  if (!capture || typeof capture.on !== 'function' || audioBridgeAttached) {
-    return;
-  }
-
-  capture.on('audio-data', (audioData) => {
-    sendToRenderer('media-engine-audio-data', audioData);
-  });
-
-  capture.on('capturing', (capturing) => {
-    sendToRenderer('media-engine-audio-capturing', Boolean(capturing));
-  });
-  audioBridgeAttached = true;
-}
-
 function getAudioCapture() {
   if (audioCapture !== undefined) {
     return audioCapture;
@@ -815,16 +775,13 @@ function getAudioCapture() {
   try {
     const loaded = require('process-audio-capture/dist');
     audioCapture = loaded && loaded.audioCapture ? loaded.audioCapture : null;
-    audioCaptureLoadError = null;
     if (audioCapture) {
-      attachMediaEngineAudioBridge();
       if (shouldLogMediaDebug('audio')) {
-        logMainProcessDebug('audio', 'Media engine audio bridge ready');
+        logMainProcessDebug('audio', 'Media engine audio discovery ready');
       }
     }
   } catch (error) {
     audioCapture = null;
-    audioCaptureLoadError = error;
     logMainProcessDebug('audio', 'Failed to setup media engine audio bridge:', error && error.message ? error.message : String(error));
   }
 
@@ -902,10 +859,6 @@ function isValidIpv4(address) {
     const value = Number(part);
     return Number.isInteger(value) && value >= 0 && value <= 255;
   });
-}
-
-function ipv4ToBuffer(address) {
-  return Buffer.from(String(address || '').split('.').map((part) => Number(part) & 0xff));
 }
 
 function bufferToIpv4(buffer, offset = 0) {
@@ -1145,12 +1098,6 @@ async function openP2PNatMappings(options = {}) {
       const mappedCandidate = buildMappedIceCandidate(candidate, mapping, publicAddress);
       if (mappedCandidate) {
         mappedCandidates.push(mappedCandidate);
-        activeNatMappings.set(`${candidate.address}:${candidate.port}`, {
-          gateway,
-          internalPort: candidate.port,
-          protocol: mapping.protocol,
-          expiresAt: Date.now() + mapping.lifetimeSeconds * 1000
-        });
       }
     } catch (error) {
       errors.push(`${candidate.port}:${error && error.message ? error.message : String(error)}`);
@@ -1165,20 +1112,6 @@ async function openP2PNatMappings(options = {}) {
     errors,
     reason: mappedCandidates.length > 0 ? 'nat-mapping-ready' : 'nat-mapping-failed'
   };
-}
-
-function releaseActiveNatMappings() {
-  for (const mapping of activeNatMappings.values()) {
-    if (!mapping || !mapping.gateway || !mapping.internalPort) {
-      continue;
-    }
-    if (mapping.protocol === 'nat-pmp') {
-      requestNatPmpUdpMapping(mapping.gateway, mapping.internalPort, 0).catch(() => {});
-    } else if (mapping.protocol === 'pcp') {
-      requestPcpUdpMapping(mapping.gateway, mapping.internalPort, 0).catch(() => {});
-    }
-  }
-  activeNatMappings.clear();
 }
 
 async function listDesktopSources(options = {}) {
@@ -1223,54 +1156,6 @@ function createDeferredAudioDiscoverySnapshot() {
     permission: null,
     processes: [],
     error: null
-  };
-}
-
-function inspectAudioDiscovery(options = {}) {
-  const includeProcesses = options.includeProcesses === true;
-  const snapshot = {
-    supported: false,
-    permissionStatus: 'unsupported',
-    permission: null,
-    processes: [],
-    error: null
-  };
-
-  try {
-    const capture = getAudioCapture();
-    snapshot.supported = Boolean(capture && capture.isPlatformSupported && capture.isPlatformSupported());
-    if (!snapshot.supported) {
-      if (audioCaptureLoadError) {
-        snapshot.error = audioCaptureLoadError.message;
-      }
-      return snapshot;
-    }
-
-    snapshot.permission = capture.checkPermission ? capture.checkPermission() : { status: 'unknown' };
-    snapshot.permissionStatus = String(snapshot.permission && snapshot.permission.status ? snapshot.permission.status : 'unknown');
-
-    if (includeProcesses && snapshot.permissionStatus === 'authorized' && capture.getProcessList) {
-      const processes = capture.getProcessList();
-      snapshot.processes = Array.isArray(processes) ? processes : [];
-    }
-  } catch (error) {
-    snapshot.permissionStatus = 'error';
-    snapshot.error = error.message;
-  }
-
-  return snapshot;
-}
-
-function getMediaEngineAudioBridgeStatus() {
-  const discovery = inspectAudioDiscovery({ includeProcesses: false });
-  return {
-    implementation: 'main-process-process-audio-capture',
-    backendMode: 'renderer-web-audio-bridge',
-    supported: discovery.supported,
-    permissionStatus: discovery.permissionStatus,
-    isCapturing: Boolean(getAudioCapture() && getAudioCapture().isCapturing),
-    processCount: Array.isArray(discovery.processes) ? discovery.processes.length : 0,
-    error: discovery.error || null
   };
 }
 
@@ -1810,11 +1695,6 @@ function getMediaAgentManager() {
       sendToRenderer('media-engine-status', status);
     });
     mediaAgentManager.on('event', (event) => {
-      if (event && event.event === 'audio-data') {
-        sendToRenderer('media-engine-native-audio-data', event.params || null);
-        return;
-      }
-
       sendToRenderer('media-engine-event', event);
     });
   }
@@ -1845,6 +1725,13 @@ async function invokeMediaEngine(method, params) {
         implementation: 'media-agent-stopped'
       };
     }
+    if (method === 'detachPeerMediaSource' && isMediaAgentPeerNotFoundError(error)) {
+      logMainProcessDebug('video', '[media-agent] detachPeerMediaSource ignored because peer is already gone');
+      return {
+        detached: false,
+        implementation: 'peer-not-found'
+      };
+    }
     console.error(`[media-agent] ${method} failed:`, error);
     throw error;
   }
@@ -1860,36 +1747,6 @@ async function invokeMediaEngineHostSessionBridge(method, params) {
 
   try {
     const result = await invokeMediaEngine(method, params);
-    if (method === 'stopHostSession') {
-      const manager = getMediaAgentManager();
-      try {
-        await manager.stop();
-      } catch (restartStopError) {
-        const rate = shouldEmitMainDebugLog('host-session-bridge:stop-shutdown-failed', 5000);
-        if (rate.emit) {
-          logMainProcessWarning(
-            'connection',
-            '[media-agent bridge] stopHostSession agent shutdown failed:',
-            restartStopError,
-            rate.suppressed ? `suppressed=${rate.suppressed}` : ''
-          );
-        }
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      try {
-        await manager.start();
-      } catch (restartStartError) {
-        const rate = shouldEmitMainDebugLog('host-session-bridge:stop-restart-failed', 5000);
-        if (rate.emit) {
-          logMainProcessWarning(
-            'connection',
-            '[media-agent bridge] stopHostSession agent restart failed:',
-            restartStartError,
-            rate.suppressed ? `suppressed=${rate.suppressed}` : ''
-          );
-        }
-      }
-    }
     return result;
   } catch (error) {
     if (method === 'stopHostSession') {
@@ -2420,18 +2277,12 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', () => {
-  app.isQuitting = true;
-  releaseActiveNatMappings();
-  if (quitFinalizeTimer) {
-    clearTimeout(quitFinalizeTimer);
-    quitFinalizeTimer = null;
+app.on('before-quit', (event) => {
+  if (quitCleanupComplete) {
+    return;
   }
-  if (mediaAgentManager) {
-    mediaAgentManager.stop().catch((error) => {
-      console.error('[media-agent] Failed to stop before quit:', error);
-    });
-  }
+  event.preventDefault();
+  requestAppQuit();
 });
 
 app.on('window-all-closed', () => {

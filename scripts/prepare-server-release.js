@@ -155,7 +155,7 @@ function copyVersionedArtifacts(version, options = {}) {
 function parseLatestManifest(content) {
   const result = {};
   for (const line of String(content || '').split(/\r?\n/)) {
-    const match = /^([A-Za-z0-9_-]+):\s*(.+?)\s*$/.exec(line);
+    const match = /^-?\s*([A-Za-z0-9_-]+):\s*(.+?)\s*$/.exec(line.trimStart());
     if (match) {
       result[match[1]] = match[2].replace(/^['"]|['"]$/g, '');
     }
@@ -170,17 +170,22 @@ function validateLatestManifest(artifactsDir, version) {
   const manifest = parseLatestManifest(fs.readFileSync(latestPath, 'utf8'));
   const stat = fs.statSync(installerPath);
   const sha512 = crypto.createHash('sha512').update(fs.readFileSync(installerPath)).digest('base64');
+  for (const key of ['version', 'path', 'size', 'sha512']) {
+    if (!manifest[key]) {
+      throw new Error(`latest.yml missing required field: ${key}`);
+    }
+  }
 
-  if (manifest.version && manifest.version !== version) {
+  if (manifest.version !== version) {
     throw new Error(`latest.yml version mismatch: expected ${version}, got ${manifest.version}`);
   }
-  if (manifest.path && manifest.path !== installerName) {
+  if (manifest.path !== installerName) {
     throw new Error(`latest.yml path mismatch: expected ${installerName}, got ${manifest.path}`);
   }
-  if (manifest.size && Number(manifest.size) !== stat.size) {
+  if (Number(manifest.size) !== stat.size) {
     throw new Error(`latest.yml size mismatch: expected ${stat.size}, got ${manifest.size}`);
   }
-  if (manifest.sha512 && manifest.sha512 !== sha512) {
+  if (manifest.sha512 !== sha512) {
     throw new Error('latest.yml sha512 mismatch');
   }
 }
@@ -203,7 +208,7 @@ function pruneOldArtifacts(dirPath, currentVersion, oldVersions) {
 
     const match = installerPattern.exec(entry);
     if (!match) {
-      fs.rmSync(path.join(dirPath, entry), { recursive: true, force: true });
+      console.warn(`Leaving unknown update artifact untouched: ${entry}`);
       continue;
     }
 

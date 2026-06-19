@@ -19,6 +19,11 @@ extern "C" {
 #include <libavutil/samplefmt.h>
 }
 
+void dispatch_host_audio_capture_packet(
+  const WasapiSessionStatus& status,
+  const unsigned char* data,
+  unsigned int frames,
+  bool silent);
 void refresh_host_audio_senders(AgentRuntimeState& state);
 
 namespace {
@@ -260,6 +265,7 @@ bool send_host_audio_opus_frame_locked(
         PeerEncodedMediaDataChannelFrame encoded_frame;
         encoded_frame.stream_type = "audio";
         encoded_frame.codec = "opus";
+        encoded_frame.payload_format = "opus-raw";
         encoded_frame.timestamp_us = timestamp_us;
         encoded_frame.sequence = state.next_timestamp_samples;
         encoded_frame.payload = encoded;
@@ -744,7 +750,6 @@ void dispatch_host_audio_capture_packet(
     ensure_host_audio_dispatch_worker_running_locked(state);
     if (state.capture_queue.size() >= kMaxQueuedHostAudioCapturePackets) {
       state.capture_queue.pop_front();
-      state.dropped_capture_packets += 1;
     }
     state.capture_queue.push_back(std::move(packet));
   }
@@ -754,56 +759,17 @@ void dispatch_host_audio_capture_packet(
 std::string audio_session_json(const AudioSessionState& session) {
   std::ostringstream payload;
   payload
-    << "{\"ready\":" << (session.ready ? "true" : "false")
-    << ",\"running\":" << (session.running ? "true" : "false")
-    << ",\"captureActive\":" << (session.capture_active ? "true" : "false")
-    << ",\"platformSupported\":" << (session.platform_supported ? "true" : "false")
-    << ",\"deviceEnumeratorAvailable\":" << (session.device_enumerator_available ? "true" : "false")
-    << ",\"renderDeviceCount\":" << session.render_device_count
-    << ",\"pid\":" << session.pid
-    << ",\"processName\":\"" << vds::media_agent::json_escape(session.process_name) << "\""
-    << ",\"backendMode\":\"" << vds::media_agent::json_escape(session.backend_mode) << "\""
-    << ",\"implementation\":\"" << vds::media_agent::json_escape(session.implementation) << "\""
-    << ",\"lastError\":\"" << vds::media_agent::json_escape(session.last_error) << "\""
-    << ",\"reason\":\"" << vds::media_agent::json_escape(session.reason) << "\""
-    << ",\"sampleRate\":" << session.sample_rate
-    << ",\"channelCount\":" << session.channel_count
-    << ",\"bitsPerSample\":" << session.bits_per_sample
-    << ",\"blockAlign\":" << session.block_align
-    << ",\"bufferFrameCount\":" << session.buffer_frame_count
-    << ",\"lastBufferFrames\":" << session.last_buffer_frames
+    << "{\"captureActive\":" << (session.capture_active ? "true" : "false")
     << ",\"packetsCaptured\":" << session.packets_captured
     << ",\"framesCaptured\":" << session.frames_captured
-    << ",\"silentPackets\":" << session.silent_packets
-    << ",\"activationAttempts\":" << session.activation_attempts
-    << ",\"activationSuccesses\":" << session.activation_successes
     << "}";
   return payload.str();
-}
-
-AudioSessionState build_audio_session_state(const AudioBackendProbe& probe) {
-  AudioSessionState session;
-  session.ready = probe.ready;
-  session.running = false;
-  session.capture_active = false;
-  session.platform_supported = probe.platform_supported;
-  session.device_enumerator_available = probe.device_enumerator_available;
-  session.render_device_count = probe.render_device_count;
-  session.backend_mode = probe.backend_mode;
-  session.implementation = probe.implementation;
-  session.reason = probe.reason;
-  session.last_error = probe.last_error;
-  return session;
 }
 
 AudioSessionState build_audio_session_state(const WasapiSessionStatus& status) {
   AudioSessionState session;
   session.ready = status.ready;
-  session.running = status.running;
   session.capture_active = status.capture_active;
-  session.platform_supported = status.platform_supported;
-  session.device_enumerator_available = status.device_enumerator_available;
-  session.render_device_count = status.render_device_count;
   session.pid = status.pid;
   session.process_name = status.process_name;
   session.backend_mode = status.backend_mode;
@@ -812,27 +778,7 @@ AudioSessionState build_audio_session_state(const WasapiSessionStatus& status) {
   session.reason = status.reason;
   session.sample_rate = status.sample_rate;
   session.channel_count = status.channel_count;
-  session.bits_per_sample = status.bits_per_sample;
-  session.block_align = status.block_align;
-  session.buffer_frame_count = status.buffer_frame_count;
-  session.last_buffer_frames = status.last_buffer_frames;
   session.packets_captured = status.packets_captured;
   session.frames_captured = status.frames_captured;
-  session.silent_packets = status.silent_packets;
-  session.activation_attempts = status.activation_attempts;
-  session.activation_successes = status.activation_successes;
   return session;
-}
-
-AudioBackendProbe build_audio_backend_probe(const WasapiProbeResult& probe) {
-  AudioBackendProbe result;
-  result.ready = probe.platform_supported && probe.device_enumerator_available;
-  result.backend_mode = probe.backend_mode;
-  result.implementation = probe.implementation;
-  result.reason = probe.reason;
-  result.last_error = probe.last_error;
-  result.platform_supported = probe.platform_supported;
-  result.device_enumerator_available = probe.device_enumerator_available;
-  result.render_device_count = probe.render_device_count;
-  return result;
 }

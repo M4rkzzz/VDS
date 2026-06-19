@@ -21,7 +21,6 @@
 #include <utility>
 #include <vector>
 
-#include "native_surface_layout.h"
 #include "agent_diagnostics.h"
 #include "time_utils.h"
 
@@ -35,7 +34,6 @@
 namespace {
 
 using vds::media_agent::current_time_micros_steady;
-using vds::media_agent::current_time_millis;
 
 void emit_live_preview_breadcrumb(const std::string& step) {
   emit_agent_breadcrumb("nativeLivePreview:" + step);
@@ -273,30 +271,6 @@ bool get_window_capture_rect(HWND hwnd, RECT* rect) {
   return false;
 }
 
-bool resolve_placeholder_window_dimensions(
-  const std::string& window_handle,
-  int* width,
-  int* height
-) {
-  if (!width || !height) {
-    return false;
-  }
-
-  const HWND hwnd = parse_window_handle(window_handle);
-  if (!hwnd || !IsWindow(hwnd)) {
-    return false;
-  }
-
-  RECT capture_rect {};
-  if (!get_window_capture_rect(hwnd, &capture_rect)) {
-    return false;
-  }
-
-  *width = std::max(0, static_cast<int>(capture_rect.right - capture_rect.left));
-  *height = std::max(0, static_cast<int>(capture_rect.bottom - capture_rect.top));
-  return *width > 0 && *height > 0;
-}
-
 void activate_owner_window_for_popup(HWND hwnd) {
   if (!hwnd || !IsWindow(hwnd)) {
     return;
@@ -348,11 +322,6 @@ void activate_owner_window_for_popup(HWND hwnd) {
   if (attached_owner_thread) {
     AttachThreadInput(current_thread_id, owner_thread_id, FALSE);
   }
-}
-
-bool is_embedded_content_window_class(const std::string& class_name) {
-  const std::string normalized = to_lower_ascii(class_name);
-  return normalized.rfind("chrome_renderwidgethosthwnd", 0) == 0;
 }
 
 bool is_render_widget_window_class(const std::string& class_name) {
@@ -634,12 +603,7 @@ class NativeLivePreview::Impl {
  public:
   explicit Impl(NativeLivePreviewConfig config)
       : config_(std::move(config)) {
-    snapshot_.launch_attempted = true;
     snapshot_.window_title = config_.window_title;
-    snapshot_.media_path =
-      config_.target_kind == "window"
-        ? "wgc-window:" + config_.window_handle
-        : "wgc-display:" + (config_.display_id.empty() ? "0" : config_.display_id);
   }
 
   ~Impl() {
@@ -1547,18 +1511,6 @@ class NativeLivePreview::Impl {
       }
       last_frame_present_at_steady_us_ = now_steady_us;
       snapshot_.decoded_frames_rendered += 1;
-      if (snapshot_.decoded_frames_rendered > 0) {
-        const std::uint64_t rendered = snapshot_.decoded_frames_rendered;
-        snapshot_.avg_copy_resource_us =
-          ((snapshot_.avg_copy_resource_us * (rendered - 1)) + frame.copy_resource_us) / rendered;
-        snapshot_.avg_map_us =
-          ((snapshot_.avg_map_us * (rendered - 1)) + frame.map_us) / rendered;
-        snapshot_.avg_memcpy_us =
-          ((snapshot_.avg_memcpy_us * (rendered - 1)) + frame.memcpy_us) / rendered;
-        snapshot_.avg_total_readback_us =
-          ((snapshot_.avg_total_readback_us * (rendered - 1)) + frame.total_readback_us) / rendered;
-      }
-      snapshot_.last_decoded_frame_at_unix_ms = current_time_millis();
       snapshot_.decoder_ready = true;
       snapshot_.reason = "live-preview-frame-rendered";
       snapshot_.last_error.clear();

@@ -5,10 +5,11 @@ $targets = @(
   @{ Path = 'server\public'; Include = @('*.js') },
   @{ Path = 'server\server-core.js'; Include = @('*.js') },
   @{ Path = 'desktop'; Include = @('*.js') },
+  @{ Path = 'vds_web\src'; Include = @('*.ts') },
   @{ Path = 'media-agent\src'; Include = @('*.cpp', '*.h') }
 )
 
-$logPattern = 'console\.(log|warn|error|debug)\b|std::(cerr|cout)\b'
+$logPattern = 'console\.(log|info|warn|error|debug)\b|std::(cerr|cout)\b'
 $violations = New-Object System.Collections.Generic.List[string]
 
 function Get-RelativePath([string] $path) {
@@ -20,6 +21,10 @@ function Get-RelativePath([string] $path) {
 }
 
 function Test-AllowedLog([string] $relativePath, [string] $line, [string] $context) {
+  $lineNumber = 0
+  if ($context -match '__VDS_LINE_NUMBER__=(\d+)') {
+    $lineNumber = [int]$Matches[1]
+  }
   switch -Regex ($relativePath) {
     '^server/server-core\.js$' {
       return (
@@ -56,6 +61,9 @@ function Test-AllowedLog([string] $relativePath, [string] $line, [string] $conte
         $line -match 'console\.error\(`\[media-agent bridge\] \$\{method\} failed:`'
       )
     }
+    '^vds_web/src/main\.ts$' {
+      return ($lineNumber -gt 1 -and $line -match '^\s*console\.info\(message\);\s*$' -and $context -match "function logVdsWebInfo\(message: string\): void \{\s*`n\s*__VDS_LINE_NUMBER__=$lineNumber")
+    }
     '^media-agent/src/agent_events\.cpp$' {
       return $line -match 'std::cout'
     }
@@ -82,10 +90,14 @@ foreach ($target in $targets) {
 
   foreach ($file in $files) {
     $relativePath = Get-RelativePath $file.FullName
+    if ($relativePath -like 'server/public/vds_web/*') {
+      continue
+    }
     $matches = Select-String -Path $file.FullName -Pattern $logPattern -Context 30, 30
     foreach ($match in $matches) {
       $context = @(
         $match.Context.PreContext
+        "__VDS_LINE_NUMBER__=$($match.LineNumber)"
         $match.Line
         $match.Context.PostContext
       ) -join "`n"

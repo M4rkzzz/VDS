@@ -1,5 +1,5 @@
 #pragma once
 
-#include "agent_runtime.h"
+struct AgentRuntimeState;
 
 void run_agent_rpc_loop(AgentRuntimeState& runtime_state);

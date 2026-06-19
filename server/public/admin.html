@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VDS Signal Admin</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101214;
+      --panel: #171a1f;
+      --panel-2: #20262d;
+      --panel-3: #14181d;
+      --text: #eef2f6;
+      --muted: #9ba7b4;
+      --line: #2f3944;
+      --ok: #57c78b;
+      --warn: #e8b84d;
+      --bad: #f06b6b;
+      --info: #5ea1f2;
+      --host: #72b7ff;
+      --viewer: #68d391;
+      --pending: #e8b84d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", Arial, sans-serif;
+      letter-spacing: 0;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 20px;
+      background: rgba(16, 18, 20, 0.96);
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0; font-size: 18px; font-weight: 650; }
+    h2, h3 { margin: 0; }
+    main { padding: 16px 20px 28px; }
+    .toolbar { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
+    .toolbar button {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 7px 10px;
+      cursor: pointer;
+    }
+    .toolbar button:hover { border-color: #516070; }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .metric, .room {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .metric { padding: 12px; }
+    .metric .label { color: var(--muted); font-size: 12px; }
+    .metric .value { margin-top: 5px; font-size: 22px; font-weight: 700; }
+    .rooms { display: grid; gap: 14px; }
+    .room { overflow: hidden; }
+    .room-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-2);
+    }
+    .room-title { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
+    .room-id { font-size: 17px; font-weight: 700; font-family: Consolas, "Courier New", monospace; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .pill.ok { color: var(--ok); border-color: rgba(87, 199, 139, 0.45); }
+    .pill.warn { color: var(--warn); border-color: rgba(232, 184, 77, 0.45); }
+    .pill.bad { color: var(--bad); border-color: rgba(240, 107, 107, 0.45); }
+    .pill.info { color: var(--info); border-color: rgba(94, 161, 242, 0.45); }
+    .room-body {
+      display: grid;
+      grid-template-columns: minmax(520px, 1.35fr) minmax(320px, 0.65fr);
+      gap: 14px;
+      padding: 14px;
+    }
+    .section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    .legend { display: flex; gap: 6px; flex-wrap: wrap; text-transform: none; }
+    .graph-shell {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background:
+        linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px),
+        var(--panel-3);
+      background-size: 28px 28px;
+      overflow: auto;
+    }
+    .graph {
+      position: relative;
+      min-width: 620px;
+      min-height: 320px;
+    }
+    .graph svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      overflow: visible;
+      pointer-events: none;
+    }
+    .edge-path {
+      fill: none;
+      stroke: var(--line);
+      stroke-width: 2;
+    }
+    .edge-path.ready { stroke: var(--ok); }
+    .edge-path.pending { stroke: var(--pending); stroke-dasharray: 7 5; }
+    .edge-path.waiting { stroke: #778391; stroke-dasharray: 3 5; }
+    .edge-label {
+      fill: var(--muted);
+      font-size: 11px;
+      font-family: Consolas, "Courier New", monospace;
+    }
+    .graph-node {
+      position: absolute;
+      width: 190px;
+      min-height: 88px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(23, 26, 31, 0.96);
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.25);
+    }
+    .graph-node.host { border-color: rgba(114, 183, 255, 0.68); }
+    .graph-node.viewer { border-color: rgba(104, 211, 145, 0.55); }
+    .graph-node.offline { opacity: 0.72; }
+    .node-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .node-role { color: var(--muted); font-size: 12px; text-transform: uppercase; }
+    .node-id {
+      margin-top: 6px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 13px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .node-meta { margin-top: 8px; display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+    .node-status { margin-top: 8px; display: flex; gap: 5px; flex-wrap: wrap; }
+    .side-panel { display: grid; gap: 12px; align-content: start; }
+    .node-list {
+      display: grid;
+      gap: 7px;
+      max-height: 240px;
+      overflow: auto;
+    }
+    .node-row {
+      display: grid;
+      grid-template-columns: minmax(100px, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #13161a;
+      font-size: 12px;
+    }
+    .node-row-id { font-family: Consolas, "Courier New", monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    pre {
+      max-height: 360px;
+      overflow: auto;
+      margin: 0;
+      padding: 10px;
+      background: #0d0f12;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      color: #d6dde6;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .empty, .error {
+      padding: 28px;
+      text-align: center;
+      color: var(--muted);
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+    }
+    .error { color: var(--bad); }
+    @media (max-width: 1000px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .room-body { grid-template-columns: 1fr; }
+      .graph { min-width: 560px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>信令服务器后台</h1>
+    <div class="toolbar">
+      <span id="statusText">连接中</span>
+      <span id="updatedText">-</span>
+      <button id="refreshButton" type="button">刷新</button>
+    </div>
+  </header>
+  <main>
+    <section class="summary" id="summary"></section>
+    <section class="rooms" id="rooms"></section>
+  </main>
+  <script>
+    const summaryEl = document.getElementById('summary');
+    const roomsEl = document.getElementById('rooms');
+    const statusText = document.getElementById('statusText');
+    const updatedText = document.getElementById('updatedText');
+    const refreshButton = document.getElementById('refreshButton');
+    let refreshTimer = null;
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[char]));
+    }
+
+    function formatTime(value) {
+      const date = new Date(Number(value || 0));
+      return Number.isFinite(date.getTime()) ? date.toLocaleTimeString() : '-';
+    }
+
+    function metric(label, value) {
+      return `<div class="metric"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div></div>`;
+    }
+
+    function pill(text, type = '') {
+      return `<span class="pill ${type}">${escapeHtml(text)}</span>`;
+    }
+
+    function edgeState(edge) {
+      if (edge && edge.pending) return 'pending';
+      if (edge && edge.ready) return 'ready';
+      return 'waiting';
+    }
+
+    function renderSummary(snapshot) {
+      const limits = snapshot.limits || {};
+      summaryEl.innerHTML = [
+        metric('房间数', `${snapshot.roomCount || 0} / ${limits.maxRooms || '-'}`),
+        metric('WebSocket 连接', `${snapshot.activeConnections || 0} / ${limits.maxConnections || '-'}`),
+        metric('单房间 viewer 上限', limits.maxViewersPerRoom || '-'),
+        metric('默认单上游下游上限', limits.maxDownstreamsPerUpstream || '-')
+      ].join('');
+    }
+
+    function layoutTopology(room) {
+      const nodes = Array.isArray(room.nodes) ? room.nodes : [];
+      const nodeById = new Map(nodes.map((node) => [node.id, node]));
+      const childrenByParent = new Map();
+      nodes.forEach((node) => childrenByParent.set(node.id, []));
+      nodes.forEach((node) => {
+        if (node.upstreamPeerId && childrenByParent.has(node.upstreamPeerId)) {
+          childrenByParent.get(node.upstreamPeerId).push(node.id);
+        }
+      });
+
+      const host = nodes.find((node) => node.role === 'host') || nodes[0] || null;
+      const levels = new Map();
+      if (host) levels.set(host.id, 0);
+      const queue = host ? [host.id] : [];
+      while (queue.length) {
+        const currentId = queue.shift();
+        const currentLevel = levels.get(currentId) || 0;
+        for (const childId of childrenByParent.get(currentId) || []) {
+          if (!levels.has(childId)) {
+            levels.set(childId, currentLevel + 1);
+            queue.push(childId);
+          }
+        }
+      }
+      nodes.forEach((node) => {
+        if (!levels.has(node.id)) {
+          levels.set(node.id, Math.max(0, Number(node.chainPosition || 0) + 1));
+        }
+      });
+
+      const columns = new Map();
+      nodes
+        .slice()
+        .sort((left, right) => (Number(left.chainPosition) || 0) - (Number(right.chainPosition) || 0))
+        .forEach((node) => {
+          const level = levels.get(node.id) || 0;
+          if (!columns.has(level)) columns.set(level, []);
+          columns.get(level).push(node);
+        });
+
+      const nodeWidth = 190;
+      const nodeHeight = 88;
+      const xGap = 250;
+      const yGap = 126;
+      const marginX = 32;
+      const marginY = 26;
+      const maxColumnSize = Math.max(1, ...Array.from(columns.values()).map((entries) => entries.length));
+      const maxLevel = Math.max(0, ...Array.from(levels.values()));
+      const graphWidth = Math.max(620, marginX * 2 + nodeWidth + maxLevel * xGap);
+      const graphHeight = Math.max(320, marginY * 2 + nodeHeight + (maxColumnSize - 1) * yGap);
+      const positions = new Map();
+
+      for (const [level, entries] of columns.entries()) {
+        const columnHeight = nodeHeight + (entries.length - 1) * yGap;
+        const startY = Math.max(marginY, Math.round((graphHeight - columnHeight) / 2));
+        entries.forEach((node, index) => {
+          positions.set(node.id, {
+            x: marginX + level * xGap,
+            y: startY + index * yGap,
+            width: nodeWidth,
+            height: nodeHeight
+          });
+        });
+      }
+
+      return { nodes, nodeById, positions, width: graphWidth, height: graphHeight };
+    }
+
+    function renderGraphNode(node, position) {
+      const status = [];
+      status.push(pill(node.online ? 'online' : 'offline', node.online ? 'ok' : 'bad'));
+      if (node.role === 'viewer') {
+        status.push(pill(node.mediaReady ? 'media' : 'media wait', node.mediaReady ? 'ok' : 'warn'));
+        status.push(pill(node.relayEstablished ? 'relay' : 'relay wait', node.relayEstablished ? 'ok' : 'warn'));
+        if (node.connectRequestPending) status.push(pill('pending', 'warn'));
+        if (node.needsChainReconnect) status.push(pill('reconnect', 'bad'));
+      }
+      return `
+        <div class="graph-node ${escapeHtml(node.role)} ${node.online ? '' : 'offline'}" style="left:${position.x}px;top:${position.y}px">
+          <div class="node-top">
+            <span class="node-role">${escapeHtml(node.role)}</span>
+            ${pill(`pos ${node.chainPosition}`, node.role === 'host' ? 'info' : '')}
+          </div>
+          <div class="node-id" title="${escapeHtml(node.id)}">${escapeHtml(node.id)}</div>
+          <div class="node-meta">
+            <span>上游 ${escapeHtml(node.upstreamPeerId || '-')}</span>
+            <span>下游 ${escapeHtml(node.directDownstreamCount || 0)} / ${escapeHtml(node.maxDirectDownstreams || '-')}</span>
+          </div>
+          <div class="node-status">${status.join('')}</div>
+        </div>`;
+    }
+
+    function renderGraphEdges(room, layout) {
+      const edges = Array.isArray(room.edges) ? room.edges : [];
+      return edges.map((edge) => {
+        const from = layout.positions.get(edge.from);
+        const to = layout.positions.get(edge.to);
+        if (!from || !to) return '';
+        const startX = from.x + from.width;
+        const startY = from.y + Math.round(from.height / 2);
+        const endX = to.x;
+        const endY = to.y + Math.round(to.height / 2);
+        const midX = Math.round((startX + endX) / 2);
+        const state = edgeState(edge);
+        const labelX = Math.round((startX + endX) / 2) - 18;
+        const labelY = Math.round((startY + endY) / 2) - 8;
+        return `<path class="edge-path ${state}" d="M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}"></path><text class="edge-label" x="${labelX}" y="${labelY}">${state}</text>`;
+      }).join('');
+    }
+
+    function renderNodeRow(node) {
+      const state = node.role === 'host'
+        ? (node.online ? 'online' : 'offline')
+        : `${node.online ? 'online' : 'offline'} · ${node.mediaReady ? 'media' : 'wait'} · ${node.relayEstablished ? 'relay' : 'relay wait'}`;
+      return `<div class="node-row"><span class="node-row-id" title="${escapeHtml(node.id)}">${escapeHtml(node.id)}</span><span>${escapeHtml(state)}</span></div>`;
+    }
+
+    function renderRoom(room) {
+      const manifest = room.mediaManifest || null;
+      const manifestTitle = manifest
+        ? `${manifest.video?.codec || '-'} / ${manifest.audio?.codec || '-'}`
+        : '无 manifest';
+      const layout = layoutTopology(room);
+      const graphNodes = layout.nodes.map((node) => renderGraphNode(node, layout.positions.get(node.id))).join('');
+      const graphEdges = renderGraphEdges(room, layout);
+      return `
+        <article class="room">
+          <div class="room-head">
+            <div class="room-title">
+              <span class="room-id">${escapeHtml(room.roomId)}</span>
+              ${pill(`${room.viewerCount || 0} viewers`)}
+              ${pill(room.publicListing ? 'public' : 'private')}
+            </div>
+            <div>${pill(manifestTitle, manifest ? 'ok' : 'warn')} ${pill(formatTime(room.createdAt))}</div>
+          </div>
+          <div class="room-body">
+            <section>
+              <div class="section-title">
+                <span>实时拓扑图</span>
+                <span class="legend">${pill('ready', 'ok')}${pill('pending', 'warn')}${pill('offline', 'bad')}</span>
+              </div>
+              <div class="graph-shell">
+                <div class="graph" style="width:${layout.width}px;height:${layout.height}px">
+                  <svg viewBox="0 0 ${layout.width} ${layout.height}" aria-hidden="true">${graphEdges}</svg>
+                  ${graphNodes || '<div class="empty">暂无节点</div>'}
+                </div>
+              </div>
+            </section>
+            <aside class="side-panel">
+              <section>
+                <div class="section-title"><span>节点摘要</span></div>
+                <div class="node-list">${layout.nodes.map(renderNodeRow).join('') || '<div class="empty">暂无节点</div>'}</div>
+              </section>
+              <section>
+                <div class="section-title"><span>实时 Manifest</span></div>
+                <pre>${escapeHtml(JSON.stringify(manifest, null, 2))}</pre>
+              </section>
+            </aside>
+          </div>
+        </article>`;
+    }
+
+    function render(snapshot) {
+      renderSummary(snapshot);
+      const rooms = Array.isArray(snapshot.rooms) ? snapshot.rooms : [];
+      roomsEl.innerHTML = rooms.length ? rooms.map(renderRoom).join('') : '<div class="empty">当前没有房间</div>';
+      statusText.textContent = '实时轮询中';
+      updatedText.textContent = `更新：${formatTime(snapshot.generatedAt)}`;
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch('/api/rooms', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        render(await response.json());
+      } catch (error) {
+        statusText.textContent = '连接失败';
+        roomsEl.innerHTML = `<div class="error">${escapeHtml(error.message || error)}</div>`;
+      }
+    }
+
+    refreshButton.addEventListener('click', refresh);
+    refresh();
+    refreshTimer = window.setInterval(refresh, 1000);
+    window.addEventListener('beforeunload', () => {
+      if (refreshTimer) window.clearInterval(refreshTimer);
+    });
+  </script>
+</body>
+</html>

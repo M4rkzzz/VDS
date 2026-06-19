@@ -41,6 +41,8 @@ export class WebCodecsAudioPlayer {
   private delayMs = 0;
   private volume = 1;
   private nextPlaybackTime = 0;
+  private sampleRate = 48000;
+  private numberOfChannels = 2;
 
   constructor(private readonly diagnostics: AudioDiagnostics) {}
 
@@ -78,9 +80,10 @@ export class WebCodecsAudioPlayer {
     }
   }
 
-  async resume(): Promise<void> {
-    if (this.context && this.context.state === 'suspended') {
-      await this.context.resume().catch(() => {});
+  async resume(sampleRate = 48000): Promise<void> {
+    const context = this.ensureContext(sampleRate);
+    if (context.state === 'suspended') {
+      await context.resume().catch(() => {});
     }
   }
 
@@ -89,6 +92,9 @@ export class WebCodecsAudioPlayer {
     this.decoder = null;
     this.configuredCodec = '';
     this.nextPlaybackTime = 0;
+    this.gainNode = null;
+    void this.context?.close().catch(() => {});
+    this.context = null;
   }
 
   setDelayMs(value: number): void {
@@ -105,18 +111,23 @@ export class WebCodecsAudioPlayer {
     }
   }
 
+  setFormat(sampleRate: number, numberOfChannels: number): void {
+    const normalizedSampleRate = Number.isFinite(sampleRate) ? Math.trunc(sampleRate) : 48000;
+    const normalizedChannels = Number.isFinite(numberOfChannels) ? Math.trunc(numberOfChannels) : 2;
+    this.sampleRate = Math.max(8000, Math.min(192000, normalizedSampleRate));
+    this.numberOfChannels = Math.max(1, Math.min(8, normalizedChannels));
+  }
+
   private async configure(codec: string): Promise<boolean> {
     this.decoder?.close();
     this.nextPlaybackTime = 0;
-    this.decoder = new window.AudioDecoder!({
-      output: (data) => this.playAudioData(data),
-      error: (error) => this.diagnostics.onDroppedBlock(error.message || 'webcodecs-audio-decoder-error')
-    });
+    this.decoder = null;
+    this.configuredCodec = '';
 
     const config: AudioDecoderConfig = {
       codec,
-      sampleRate: 48000,
-      numberOfChannels: 2
+      sampleRate: this.sampleRate,
+      numberOfChannels: this.numberOfChannels
     };
     if (window.AudioDecoder?.isConfigSupported) {
       const support = await window.AudioDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
@@ -125,6 +136,10 @@ export class WebCodecsAudioPlayer {
       }
     }
 
+    this.decoder = new window.AudioDecoder!({
+      output: (data) => this.playAudioData(data),
+      error: (error) => this.diagnostics.onDroppedBlock(error.message || 'webcodecs-audio-decoder-error')
+    });
     const decoder = this.decoder;
     if (!decoder) {
       return false;

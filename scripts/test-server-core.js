@@ -72,7 +72,7 @@ function openWs(port) {
   });
 }
 
-async function withServer(testFn) {
+async function withServer(testFn, serverOptions = {}) {
   const server = http.createServer();
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
@@ -83,7 +83,8 @@ async function withServer(testFn) {
     publicDir: null,
     updatesDir: null,
     maxMessagesPerWindow: 20,
-    disconnectGraceMs: 80
+    disconnectGraceMs: 80,
+    ...serverOptions
   });
   try {
     await testFn(port);
@@ -359,6 +360,180 @@ async function testViewerReconnectReadyRenotifiesHost() {
   });
 }
 
+async function testViewerReconnectReselectsUpstreamWithFanoutLimit() {
+  await withServer(async (port) => {
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-fanout', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port);
+    viewerA.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-fanout-a' }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.upstreamPeerId, 'host-fanout');
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+    viewerA.send(JSON.stringify({ type: 'viewer-ready', roomId: created.roomId, clientId: 'viewer-fanout-a', chainPosition: 0 }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-fanout-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.upstreamPeerId, 'viewer-fanout-a');
+    const connectB = await onceMessage(viewerA);
+    assert.strictEqual(connectB.type, 'connect-to-next');
+    assert.strictEqual(connectB.nextViewerId, 'viewer-fanout-b');
+    viewerB.send(JSON.stringify({ type: 'viewer-ready', roomId: created.roomId, clientId: 'viewer-fanout-b', chainPosition: 1 }));
+
+    const viewerC = await openWs(port);
+    viewerC.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-fanout-c' }));
+    const joinedC = await onceMessage(viewerC);
+    assert.strictEqual(joinedC.upstreamPeerId, 'viewer-fanout-b');
+    const connectC = await onceMessage(viewerB);
+    assert.strictEqual(connectC.type, 'connect-to-next');
+    assert.strictEqual(connectC.nextViewerId, 'viewer-fanout-c');
+
+    viewerC.send(JSON.stringify({
+      type: 'viewer-reconnect-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-fanout-c',
+      chainPosition: 2,
+      upstreamPeerId: 'viewer-fanout-b',
+      failedUpstreamPeerId: 'viewer-fanout-b'
+    }));
+    const hostReconnect = await onceMessage(host);
+    assert.strictEqual(hostReconnect.type, 'viewer-joined');
+    assert.strictEqual(hostReconnect.viewerId, 'viewer-fanout-c');
+    assert.strictEqual(hostReconnect.reconnect, true);
+
+    const staleMessages = await collectMessages(viewerB, 80);
+    assert.ok(!staleMessages.some((message) => message.type === 'connect-to-next' && message.nextViewerId === 'viewer-fanout-c'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+    viewerC.close();
+  });
+}
+
+async function testViewerReconnectReportsUnavailableWhenFanoutIsFull() {
+  await withServer(async (port) => {
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-capacity', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port);
+    viewerA.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-capacity-a' }));
+    assert.strictEqual((await onceMessage(viewerA)).upstreamPeerId, 'host-capacity');
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+    viewerA.send(JSON.stringify({ type: 'viewer-ready', roomId: created.roomId, clientId: 'viewer-capacity-a', chainPosition: 0 }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-capacity-b' }));
+    assert.strictEqual((await onceMessage(viewerB)).upstreamPeerId, 'viewer-capacity-a');
+    assert.strictEqual((await onceMessage(viewerA)).type, 'connect-to-next');
+    viewerB.send(JSON.stringify({ type: 'viewer-ready', roomId: created.roomId, clientId: 'viewer-capacity-b', chainPosition: 1 }));
+
+    const viewerC = await openWs(port);
+    viewerC.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-capacity-c' }));
+    assert.strictEqual((await onceMessage(viewerC)).upstreamPeerId, 'viewer-capacity-b');
+    assert.strictEqual((await onceMessage(viewerB)).type, 'connect-to-next');
+
+    viewerC.send(JSON.stringify({
+      type: 'viewer-reconnect-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-capacity-c',
+      chainPosition: 2,
+      upstreamPeerId: 'viewer-capacity-b',
+      failedUpstreamPeerId: 'viewer-capacity-b'
+    }));
+    const unavailable = await onceMessage(viewerC);
+    assert.strictEqual(unavailable.type, 'error');
+    assert.strictEqual(unavailable.code, 'upstream-capacity-unavailable');
+
+    const hostMessages = await collectMessages(host, 80);
+    const viewerBMessages = await collectMessages(viewerB, 80);
+    assert.ok(!hostMessages.some((message) => message.type === 'viewer-joined' && message.viewerId === 'viewer-capacity-c'));
+    assert.ok(!viewerBMessages.some((message) => message.type === 'connect-to-next' && message.nextViewerId === 'viewer-capacity-c'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+    viewerC.close();
+  }, { maxDownstreamsPerUpstream: 1 });
+}
+
+async function testViewerCapabilityLimitsDirectDownstreams() {
+  await withServer(async (port) => {
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-capability', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port);
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-capability-a',
+      mediaCapabilities: {
+        webViewer: true,
+        maxDirectDownstreams: 1,
+        encodedMediaDataChannel: { protocol: 'vds-media-encoded-v1', protocolVersion: 1 }
+      }
+    }));
+    assert.strictEqual((await onceMessage(viewerA)).upstreamPeerId, 'host-capability');
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+    viewerA.send(JSON.stringify({ type: 'viewer-ready', roomId: created.roomId, clientId: 'viewer-capability-a', chainPosition: 0 }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-capability-b' }));
+    assert.strictEqual((await onceMessage(viewerB)).upstreamPeerId, 'viewer-capability-a');
+    assert.strictEqual((await onceMessage(viewerA)).type, 'connect-to-next');
+    viewerB.send(JSON.stringify({ type: 'viewer-ready', roomId: created.roomId, clientId: 'viewer-capability-b', chainPosition: 1 }));
+
+    const viewerC = await openWs(port);
+    viewerC.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-capability-c' }));
+    assert.strictEqual((await onceMessage(viewerC)).upstreamPeerId, 'viewer-capability-b');
+    assert.strictEqual((await onceMessage(viewerB)).type, 'connect-to-next');
+    viewerC.send(JSON.stringify({
+      type: 'viewer-reconnect-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-capability-c',
+      chainPosition: 2,
+      upstreamPeerId: 'viewer-capability-b',
+      failedUpstreamPeerId: 'viewer-capability-b'
+    }));
+    const hostReconnect = await onceMessage(host);
+    assert.strictEqual(hostReconnect.type, 'viewer-joined');
+    assert.strictEqual(hostReconnect.viewerId, 'viewer-capability-c');
+    viewerC.send(JSON.stringify({ type: 'viewer-ready', roomId: created.roomId, clientId: 'viewer-capability-c', chainPosition: 2 }));
+
+    const viewerD = await openWs(port);
+    viewerD.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-capability-d' }));
+    assert.strictEqual((await onceMessage(viewerD)).upstreamPeerId, 'viewer-capability-c');
+    assert.strictEqual((await onceMessage(viewerC)).type, 'connect-to-next');
+    viewerD.send(JSON.stringify({
+      type: 'viewer-reconnect-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-capability-d',
+      chainPosition: 3,
+      upstreamPeerId: 'viewer-capability-c',
+      failedUpstreamPeerId: 'viewer-capability-c'
+    }));
+    const fallbackToB = await onceMessage(viewerB);
+    assert.strictEqual(fallbackToB.type, 'connect-to-next');
+    assert.strictEqual(fallbackToB.nextViewerId, 'viewer-capability-d');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next' && message.nextViewerId === 'viewer-capability-d'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+    viewerC.close();
+    viewerD.close();
+  });
+}
+
 async function testJoinRequiresHostMediaManifest() {
   await withServer(async (port) => {
     const host = await openWs(port);
@@ -390,6 +565,111 @@ async function testJoinRequiresHostMediaManifest() {
     host.close();
     viewer.close();
   });
+}
+
+async function testOldHostSocketCannotForwardAfterResume() {
+  await withServer(async (port) => {
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-rebind', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewer = await openWs(port);
+    viewer.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-rebind' }));
+    const joined = await onceMessage(viewer);
+    assert.strictEqual(joined.type, 'room-joined');
+    await onceMessage(host);
+
+    const resumedHost = await openWs(port);
+    resumedHost.send(JSON.stringify({
+      type: 'resume-session',
+      roomId: created.roomId,
+      clientId: 'host-rebind',
+      role: 'host',
+      sessionToken: created.sessionToken
+    }));
+    const resumed = await onceMessage(resumedHost);
+    assert.strictEqual(resumed.type, 'session-resumed');
+
+    const viewerMessagesPromise = collectMessages(viewer, 120);
+    host.send(JSON.stringify({ type: 'offer', targetId: 'viewer-rebind', sdp: 'stale-offer' }));
+    resumedHost.send(JSON.stringify({ type: 'offer', targetId: 'viewer-rebind', sdp: 'fresh-offer' }));
+    const viewerMessages = await viewerMessagesPromise;
+    assert.ok(!viewerMessages.some((message) => message.sdp === 'stale-offer'));
+    assert.ok(viewerMessages.some((message) => message.sdp === 'fresh-offer'));
+
+    host.close();
+    viewer.close();
+    resumedHost.close();
+  });
+}
+
+async function testDuplicateCreateRoomOnSameSocketIsRejected() {
+  const instance = startServer({
+    port: 0,
+    publicDir: null,
+    updatesDir: null,
+    maxRooms: 2,
+    maxMessagesPerWindow: 20,
+    disconnectGraceMs: 80
+  });
+  await new Promise((resolve) => instance.server.once('listening', resolve));
+  const { port } = instance.server.address();
+  try {
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-duplicate-a', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+    assert.strictEqual(instance.rooms.size, 1);
+
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-duplicate-b', mediaManifest: testMediaManifest() }));
+    const rejected = await onceMessage(host);
+    assert.strictEqual(rejected.code, 'socket-already-bound');
+    assert.strictEqual(instance.rooms.size, 1);
+
+    host.close();
+  } finally {
+    for (const client of instance.wss.clients) {
+      client.close();
+    }
+    await new Promise((resolve) => instance.server.close(resolve));
+  }
+}
+
+async function testHostCanCreateNewRoomAfterLeavingPreviousRoom() {
+  await withServer(async (port) => {
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-recreate', mediaManifest: testMediaManifest({ mediaSessionId: 'media-first' }) }));
+    const firstCreated = await onceMessage(host);
+    assert.strictEqual(firstCreated.type, 'room-created');
+
+    host.send(JSON.stringify({ type: 'leave-room', roomId: firstCreated.roomId, clientId: 'host-recreate' }));
+    await wait(20);
+
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-recreate', mediaManifest: testMediaManifest({ mediaSessionId: 'media-second' }) }));
+    const secondCreated = await onceMessage(host);
+    assert.strictEqual(secondCreated.type, 'room-created');
+    assert.notStrictEqual(secondCreated.roomId, firstCreated.roomId);
+    assert.strictEqual(secondCreated.mediaManifest.mediaSessionId, 'media-second');
+
+    host.close();
+  });
+}
+
+async function testStartServerSupportsRandomPort() {
+  const instance = startServer({
+    port: 0,
+    publicDir: null,
+    updatesDir: null
+  });
+  try {
+    await new Promise((resolve) => instance.server.once('listening', resolve));
+    const address = instance.server.address();
+    assert.ok(address && typeof address === 'object');
+    assert.ok(address.port > 0);
+  } finally {
+    await new Promise((resolve) => instance.server.close(resolve));
+  }
 }
 
 function testGenerateRoomIdAvoidsCollision() {
@@ -450,8 +730,15 @@ async function testBrowserRootUsesVdsWebWhenBuilt() {
   await testBrowserRootUsesVdsWebWhenBuilt();
   await testResumeTokenProtection();
   await testJoinRequiresHostMediaManifest();
+  await testOldHostSocketCannotForwardAfterResume();
+  await testDuplicateCreateRoomOnSameSocketIsRejected();
+  await testHostCanCreateNewRoomAfterLeavingPreviousRoom();
+  await testStartServerSupportsRandomPort();
   await testViewerMediaCapabilitiesAreForwarded();
   await testViewerReconnectReadyRenotifiesHost();
+  await testViewerReconnectReselectsUpstreamWithFanoutLimit();
+  await testViewerReconnectReportsUnavailableWhenFanoutIsFull();
+  await testViewerCapabilityLimitsDirectDownstreams();
   await testHostGraceResumeKeepsRoom();
   await testHostGraceExpiryDestroysRoomAndToken();
   console.log('server-core tests passed');

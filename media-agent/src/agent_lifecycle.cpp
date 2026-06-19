@@ -14,15 +14,18 @@
 #include <cstdint>
 #include <string>
 
+#include "agent_runtime.h"
 #include "agent_status_json.h"
 #include "ffmpeg_probe.h"
 #include "host_capture_plan.h"
 #include "host_capture_process.h"
 #include "host_pipeline.h"
+#include "host_session_controller.h"
 #include "media_audio.h"
 #include "obs_ingest_runtime.h"
 #include "peer_media_binding_runtime.h"
 #include "peer_receiver_runtime.h"
+#include "relay_dispatch.h"
 #include "peer_transport.h"
 #include "surface_attachment_runtime.h"
 #include "surface_target.h"
@@ -147,7 +150,6 @@ void refresh_host_capture_runtime(AgentRuntimeState& state) {
     if (surface.running) {
       stop_surface_attachment(surface, "surface-auto-restart");
     }
-    surface.restart_count += 1;
     surface = start_surface_attachment(
       state.ffmpeg,
       state.host_capture_plan,
@@ -171,7 +173,6 @@ void initialize_agent_runtime(AgentRuntimeState& state, const std::string& agent
   state.peer_transport_backend = get_peer_transport_backend_info();
   state.ffmpeg = vds::media_agent::probe_ffmpeg(agent_binary_path);
   state.wgc_capture_backend = probe_wgc_capture_backend();
-  state.audio_backend_probe = build_audio_backend_probe(probe_wasapi_backend());
   state.audio_session = build_audio_session_state(get_wasapi_process_loopback_session_status());
   state.host_capture_process = build_host_capture_process_state();
   state.host_pipeline = select_and_validate_host_pipeline(
@@ -186,7 +187,6 @@ void initialize_agent_runtime(AgentRuntimeState& state, const std::string& agent
     state.ffmpeg,
     state.wgc_capture_backend,
     state.host_pipeline,
-    state.host_capture_process,
     state.host_capture_kind,
     state.host_capture_state,
     state.host_capture_title,
@@ -218,7 +218,6 @@ void restart_host_capture_surface_attachments(AgentRuntimeState& state) {
       continue;
     }
     stop_surface_attachment(surface, "host-capture-surface-restart");
-    surface.restart_count += 1;
     surface = start_surface_attachment(
       state.ffmpeg,
       state.host_capture_plan,
@@ -230,6 +229,7 @@ void restart_host_capture_surface_attachments(AgentRuntimeState& state) {
 }
 
 void shutdown_agent_runtime(AgentRuntimeState& state) {
+  stop_wasapi_process_loopback_session();
   stop_all_surface_attachments(state, "agent-shutdown");
   for (auto& entry : state.peers) {
     if (entry.second.receiver_runtime) {
@@ -241,7 +241,8 @@ void shutdown_agent_runtime(AgentRuntimeState& state) {
   for (auto& entry : state.peers) {
     close_peer_transport_session(entry.second.transport_session);
   }
-  stop_obs_ingest_runtime(state, "agent-shutdown");
+  stop_obs_ingest_runtime(state);
+  shutdown_relay_dispatch_runtime();
   stop_host_capture_process(
     state.host_capture_process,
     state.host_pipeline,
@@ -264,11 +265,6 @@ AgentLifecycleCommandResult get_capabilities_result(AgentRuntimeState& state) {
 AgentLifecycleCommandResult get_stats_result(AgentRuntimeState& state) {
   refresh_agent_runtime_state(state);
   return {true, build_stats_json(state), {}, {}};
-}
-
-AgentLifecycleCommandResult get_audio_backend_status_result(AgentRuntimeState& state) {
-  state.audio_session = build_audio_session_state(get_wasapi_process_loopback_session_status());
-  return {true, audio_session_json(state.audio_session), {}, {}};
 }
 
 HostSessionControllerCallbacks make_start_host_session_callbacks(AgentRuntimeState& state) {

@@ -7,6 +7,7 @@
 #include <thread>
 #include <vector>
 
+#include "agent_runtime.h"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -156,18 +157,9 @@ void clear_obs_ingest_prepared_session(AgentRuntimeState& state) {
   state.obs_ingest.audio_sample_rate = 48000;
   state.obs_ingest.audio_channel_count = 2;
   state.obs_ingest.video_packets_received = 0;
-  state.obs_ingest.audio_packets_received = 0;
-  state.obs_ingest.video_access_units_emitted = 0;
-  state.obs_ingest.audio_frames_forwarded = 0;
   state.obs_ingest.video_codec = "h264";
   state.obs_ingest.audio_codec = "aac";
-  state.obs_ingest.reason = "obs-ingest-idle";
-  state.obs_ingest.last_error.clear();
   state.obs_ingest.pending_video_annexb_bytes.clear();
-  state.obs_ingest.started_at_unix_ms = 0;
-  state.obs_ingest.connected_at_unix_ms = 0;
-  state.obs_ingest.last_packet_at_unix_ms = 0;
-  state.obs_ingest.ended_at_unix_ms = 0;
 }
 
 bool prepare_obs_ingest_session(AgentRuntimeState& state, bool force_refresh, int requested_port, std::string* error) {
@@ -203,12 +195,9 @@ bool prepare_obs_ingest_session(AgentRuntimeState& state, bool force_refresh, in
   {
     std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
     state.obs_ingest.prepared = true;
-    state.obs_ingest.local_only = true;
     state.obs_ingest.port = port;
     state.obs_ingest.url = publish_url;
     state.obs_ingest.listen_url = listen_url;
-    state.obs_ingest.reason = "obs-ingest-prepared";
-    state.obs_ingest.last_error.clear();
   }
 
   if (error) {
@@ -221,7 +210,7 @@ bool is_obs_ingest_backend(const AgentRuntimeState& state) {
   return vds::media_agent::to_lower_copy(state.host_backend) == "obs-ingest";
 }
 
-void stop_obs_ingest_runtime(AgentRuntimeState& state, const std::string& reason) {
+void stop_obs_ingest_runtime(AgentRuntimeState& state) {
   state.obs_ingest.stop_requested.store(true);
   if (state.obs_ingest.worker.joinable()) {
     state.obs_ingest.worker.join();
@@ -231,10 +220,6 @@ void stop_obs_ingest_runtime(AgentRuntimeState& state, const std::string& reason
     state.obs_ingest.waiting = false;
     state.obs_ingest.ingest_connected = false;
     state.obs_ingest.stream_running = false;
-    state.obs_ingest.video_ready = false;
-    state.obs_ingest.audio_ready = false;
-    state.obs_ingest.listener_active = false;
-    state.obs_ingest.reason = reason;
     state.obs_ingest.pending_video_annexb_bytes.clear();
   }
   clear_relay_upstream_bootstrap_state(kObsIngestVirtualUpstreamPeerId);
@@ -252,26 +237,12 @@ void obs_ingest_worker(AgentRuntimeState* state_ptr) {
       state.obs_ingest.waiting = true;
       state.obs_ingest.ingest_connected = false;
       state.obs_ingest.stream_running = false;
-      state.obs_ingest.video_ready = false;
-      state.obs_ingest.audio_ready = false;
-      state.obs_ingest.listener_active = true;
-      state.obs_ingest.reason = "waiting-for-obs-ingest";
-      state.obs_ingest.last_error.clear();
       state.obs_ingest.pending_video_annexb_bytes.clear();
-      state.obs_ingest.started_at_unix_ms = vds::media_agent::current_time_millis();
-      state.obs_ingest.connected_at_unix_ms = 0;
-      state.obs_ingest.last_packet_at_unix_ms = 0;
-      state.obs_ingest.ended_at_unix_ms = 0;
     }
     emit_event("media-state", obs_ingest_media_state_payload("obs-ingest-waiting", state));
 
     AVFormatContext* format_context = avformat_alloc_context();
     if (!format_context) {
-      {
-        std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
-        state.obs_ingest.last_error = "obs-ingest-format-context-allocation-failed";
-        state.obs_ingest.reason = "obs-ingest-open-failed";
-      }
       emit_event("warning", "{\"scope\":\"obs-ingest\",\"message\":\"OBS ingest format context allocation failed.\"}");
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
       continue;
@@ -306,11 +277,6 @@ void obs_ingest_worker(AgentRuntimeState* state_ptr) {
 
     if (avformat_find_stream_info(format_context, nullptr) < 0) {
       avformat_close_input(&format_context);
-      {
-        std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
-        state.obs_ingest.reason = "obs-ingest-stream-info-failed";
-        state.obs_ingest.last_error = "obs-ingest-stream-info-failed";
-      }
       emit_event("warning", "{\"scope\":\"obs-ingest\",\"message\":\"OBS ingest stream info probe failed.\"}");
       if (state.obs_ingest.stop_requested.load()) {
         break;
@@ -345,11 +311,6 @@ void obs_ingest_worker(AgentRuntimeState* state_ptr) {
 
     if (video_stream_index < 0) {
       avformat_close_input(&format_context);
-      {
-        std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
-        state.obs_ingest.reason = "obs-ingest-video-codec-unsupported";
-        state.obs_ingest.last_error = "obs-ingest-video-codec-unsupported";
-      }
       emit_event("warning", "{\"scope\":\"obs-ingest\",\"message\":\"OBS ingest did not expose a supported H.264/H.265 video stream.\"}");
       if (state.obs_ingest.stop_requested.load()) {
         break;
@@ -360,11 +321,6 @@ void obs_ingest_worker(AgentRuntimeState* state_ptr) {
 
     if (audio_stream_index >= 0 && aac_config.sample_rate != 48000) {
       avformat_close_input(&format_context);
-      {
-        std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
-        state.obs_ingest.reason = "obs-ingest-aac-sample-rate-unsupported";
-        state.obs_ingest.last_error = "obs-ingest-aac-sample-rate-unsupported";
-      }
       emit_event("warning", "{\"scope\":\"obs-ingest\",\"message\":\"OBS ingest AAC sample rate must be 48 kHz.\"}");
       if (state.obs_ingest.stop_requested.load()) {
         break;
@@ -390,9 +346,6 @@ void obs_ingest_worker(AgentRuntimeState* state_ptr) {
       std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
       state.obs_ingest.waiting = false;
       state.obs_ingest.ingest_connected = true;
-      state.obs_ingest.video_ready = false;
-      state.obs_ingest.audio_ready = audio_stream_index >= 0;
-      state.obs_ingest.connected_at_unix_ms = vds::media_agent::current_time_millis();
       state.obs_ingest.video_codec = video_codec;
       state.obs_ingest.audio_codec = audio_stream_index >= 0 ? "aac" : "";
       state.obs_ingest.audio_sample_rate = aac_config.sample_rate;
@@ -406,7 +359,6 @@ void obs_ingest_worker(AgentRuntimeState* state_ptr) {
       state.obs_ingest.frame_rate = fps.num > 0 && fps.den > 0
         ? static_cast<int>(av_q2d(fps) + 0.5)
         : 60;
-      state.obs_ingest.reason = "obs-ingest-connected";
     }
     emit_event("media-state", obs_ingest_media_state_payload("obs-ingest-connected", state));
 
@@ -417,11 +369,6 @@ void obs_ingest_worker(AgentRuntimeState* state_ptr) {
       const int read_result = av_read_frame(format_context, &packet);
       if (read_result < 0) {
         break;
-      }
-
-      {
-        std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
-        state.obs_ingest.last_packet_at_unix_ms = vds::media_agent::current_time_millis();
       }
 
       if (packet.stream_index == video_stream_index) {
@@ -459,10 +406,8 @@ void obs_ingest_worker(AgentRuntimeState* state_ptr) {
           fanout_relay_video_units(kObsIngestVirtualUpstreamPeerId, video_codec, units, rtp_timestamp);
           {
             std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
-            state.obs_ingest.video_ready = true;
             state.obs_ingest.stream_running = true;
             state.obs_ingest.video_packets_received += 1;
-            state.obs_ingest.video_access_units_emitted += units.size();
             state.host_codec = video_codec;
           }
           if (!stream_running_emitted) {
@@ -500,9 +445,6 @@ void obs_ingest_worker(AgentRuntimeState* state_ptr) {
             48000
           );
           fanout_relay_audio_frame(kObsIngestVirtualUpstreamPeerId, framed, "aac", rtp_timestamp);
-          std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
-          state.obs_ingest.audio_packets_received += 1;
-          state.obs_ingest.audio_frames_forwarded += 1;
         }
       }
 
@@ -524,11 +466,6 @@ void obs_ingest_worker(AgentRuntimeState* state_ptr) {
       std::lock_guard<std::mutex> lock(state.obs_ingest.mutex);
       state.obs_ingest.ingest_connected = false;
       state.obs_ingest.stream_running = false;
-      state.obs_ingest.video_ready = false;
-      state.obs_ingest.audio_ready = false;
-      state.obs_ingest.listener_active = false;
-      state.obs_ingest.ended_at_unix_ms = vds::media_agent::current_time_millis();
-      state.obs_ingest.reason = "obs-ingest-ended";
       state.obs_ingest.pending_video_annexb_bytes.clear();
     }
     emit_event("media-state", obs_ingest_media_state_payload("obs-ingest-ended", state));

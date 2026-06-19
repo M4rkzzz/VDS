@@ -46,7 +46,7 @@ PeerControlCommandResult error_result(const std::string& code, const std::string
 
 std::string peer_ok_json(const PeerState& peer) {
   return std::string("{\"ok\":true,\"implementation\":\"") +
-    json_escape(peer.transport.transport_ready ? "libdatachannel" : "stub") + "\"}";
+    json_escape(peer.transport.transport_ready ? "libdatachannel" : "native-media-agent-no-transport") + "\"}";
 }
 
 std::uint32_t datachannel_timestamp_to_rtp(
@@ -129,8 +129,6 @@ void apply_media_manifest_to_peer(PeerState& peer, const std::string& request_js
   const std::string audio_json = extract_object_slice(manifest_json, "audio");
   peer.expected_video_codec = normalize_manifest_codec(extract_string_value(video_json, "codec"));
   peer.expected_audio_codec = normalize_manifest_codec(extract_string_value(audio_json, "codec"));
-  peer.expected_video_payload_format = to_lower_ascii_copy(extract_string_value(video_json, "payloadFormat"));
-  peer.expected_audio_payload_format = to_lower_ascii_copy(extract_string_value(audio_json, "payloadFormat"));
   if (peer.receiver_runtime && !peer.expected_video_codec.empty()) {
     std::lock_guard<std::mutex> lock(peer.receiver_runtime->mutex);
     peer.receiver_runtime->codec_path = peer.expected_video_codec;
@@ -153,27 +151,6 @@ void apply_media_manifest_to_peer(PeerState& peer, const std::string& request_js
   }
 }
 
-bool validate_encoded_frame_against_manifest(
-  const PeerState& peer,
-  const PeerEncodedMediaDataChannelFrame& encoded_frame,
-  std::string* reason) {
-  const std::string default_codec = encoded_frame.stream_type == "audio" ? "opus" : "h264";
-  const std::string frame_codec = normalize_manifest_codec(encoded_frame.codec.empty() ? default_codec : encoded_frame.codec);
-  if (encoded_frame.stream_type == "video" && !peer.expected_video_codec.empty() && frame_codec != peer.expected_video_codec) {
-    if (reason) {
-      *reason = "media-manifest-video-codec-mismatch";
-    }
-    return false;
-  }
-  if (encoded_frame.stream_type == "audio" && !peer.expected_audio_codec.empty() && frame_codec != peer.expected_audio_codec) {
-    if (reason) {
-      *reason = "media-manifest-audio-codec-mismatch";
-    }
-    return false;
-  }
-  return true;
-}
-
 }  // namespace
 
 PeerControlCommandResult create_peer_from_request(AgentRuntimeState& state, const std::string& request_json) {
@@ -190,7 +167,6 @@ PeerControlCommandResult create_peer_from_request(AgentRuntimeState& state, cons
     return error_result("BAD_REQUEST", "peerId is required");
   }
 
-  peer.transport.available = state.peer_transport_backend.available;
   peer.transport.transport_ready = state.peer_transport_backend.transport_ready;
   peer.transport.reason = state.peer_transport_backend.reason;
   peer.receiver_runtime = std::make_shared<PeerState::PeerVideoReceiverRuntime>();
@@ -266,30 +242,36 @@ PeerControlCommandResult create_peer_from_request(AgentRuntimeState& state, cons
     callbacks.on_encoded_media_data_channel_frame = [
       &state,
       peer_id = peer.peer_id,
+      expected_video_codec = peer.expected_video_codec,
+      expected_audio_codec = peer.expected_audio_codec,
       receiver_runtime,
       transport_session_holder
     ](const PeerEncodedMediaDataChannelFrame& encoded_frame) {
-      auto peer_it = state.peers.find(peer_id);
-      if (peer_it != state.peers.end()) {
-        std::string manifest_error;
-        if (!validate_encoded_frame_against_manifest(peer_it->second, encoded_frame, &manifest_error)) {
-          {
-            std::lock_guard<std::mutex> lock(receiver_runtime->mutex);
-            receiver_runtime->last_error = manifest_error;
-            receiver_runtime->reason = manifest_error;
-            if (encoded_frame.stream_type == "video") {
-              receiver_runtime->dropped_video_units += 1;
-            } else if (encoded_frame.stream_type == "audio") {
-              receiver_runtime->dropped_audio_blocks += 1;
-            }
+      const std::string default_codec = encoded_frame.stream_type == "audio" ? "opus" : "h264";
+      const std::string frame_codec = normalize_manifest_codec(encoded_frame.codec.empty() ? default_codec : encoded_frame.codec);
+      std::string manifest_error;
+      if (encoded_frame.stream_type == "video" && !expected_video_codec.empty() && frame_codec != expected_video_codec) {
+        manifest_error = "media-manifest-video-codec-mismatch";
+      } else if (encoded_frame.stream_type == "audio" && !expected_audio_codec.empty() && frame_codec != expected_audio_codec) {
+        manifest_error = "media-manifest-audio-codec-mismatch";
+      }
+      if (!manifest_error.empty()) {
+        {
+          std::lock_guard<std::mutex> lock(receiver_runtime->mutex);
+          receiver_runtime->last_error = manifest_error;
+          receiver_runtime->reason = manifest_error;
+          if (encoded_frame.stream_type == "video") {
+            receiver_runtime->dropped_video_units += 1;
+          } else if (encoded_frame.stream_type == "audio") {
+            receiver_runtime->dropped_audio_blocks += 1;
           }
-          emit_event(
-            "warning",
-            std::string("{\"scope\":\"peer\",\"peerId\":\"") + json_escape(peer_id) +
-              "\",\"message\":\"" + json_escape(manifest_error) + "\"}"
-          );
-          return;
         }
+        emit_event(
+          "warning",
+          std::string("{\"scope\":\"peer\",\"peerId\":\"") + json_escape(peer_id) +
+            "\",\"message\":\"" + json_escape(manifest_error) + "\"}"
+        );
+        return;
       }
       const std::string codec = encoded_frame.codec.empty()
         ? (encoded_frame.stream_type == "audio" ? "opus" : "h264")
@@ -331,6 +313,7 @@ PeerControlCommandResult create_peer_from_request(AgentRuntimeState& state, cons
     );
     *transport_session_holder = peer.transport_session;
     if (peer.transport_session) {
+      apply_media_manifest_to_peer(peer, request_json);
       peer.transport = get_peer_transport_snapshot(peer.transport_session);
       emit_peer_control_breadcrumb(std::string("createPeer:after-create-transport peer=") + peer.peer_id);
     } else {
@@ -344,11 +327,9 @@ PeerControlCommandResult create_peer_from_request(AgentRuntimeState& state, cons
     std::string attach_error;
     if (!attach_host_video_media_binding(state, peer, &attach_error)) {
       peer.media_binding.attached = false;
-      peer.media_binding.sender_configured = false;
       peer.media_binding.active = false;
       peer.media_binding.reason = "peer-media-attach-failed";
       peer.media_binding.last_error = attach_error;
-      peer.media_binding.updated_at_unix_ms = current_time_millis();
     }
   }
 
@@ -366,7 +347,6 @@ PeerControlCommandResult create_peer_from_request(AgentRuntimeState& state, cons
       if (peer.media_binding.reason == "peer-media-not-attached") {
         peer.media_binding.reason = "peer-local-description-failed";
         peer.media_binding.last_error = negotiate_error;
-        peer.media_binding.updated_at_unix_ms = current_time_millis();
       }
     }
   }
@@ -427,13 +407,10 @@ PeerControlCommandResult close_peer_from_request(AgentRuntimeState& state, const
       stop_viewer_audio_playback_runtime(state.viewer_audio_playback);
     }
     emit_peer_control_breadcrumb(std::string("closePeer:after-stop-viewer-audio peer=") + peer_id);
-    it->second.transport.closed = true;
-    it->second.transport.data_channel_open = false;
     it->second.transport.connection_state = "closed";
     it->second.transport.ice_state = "closed";
     it->second.transport.signaling_state = "closed";
     it->second.transport.reason = "peer-closed";
-    it->second.transport.updated_at_unix_ms = current_time_millis();
     emit_event("peer-state", build_peer_state_json(it->second, "closed"));
     state.peers.erase(it);
     emit_peer_control_breadcrumb(std::string("closePeer:after-erase peer=") + peer_id);
@@ -441,7 +418,7 @@ PeerControlCommandResult close_peer_from_request(AgentRuntimeState& state, const
 
   return ok_result(
     std::string("{\"closed\":true,\"implementation\":\"") +
-    json_escape(state.peer_transport_backend.transport_ready ? "libdatachannel" : "stub") +
+    json_escape(state.peer_transport_backend.transport_ready ? "libdatachannel" : "native-media-agent-no-transport") +
     "\"}"
   );
 }
@@ -470,7 +447,6 @@ PeerControlCommandResult set_peer_remote_description_from_request(
     it->second.transport = get_peer_transport_snapshot(it->second.transport_session);
   }
 
-  it->second.has_remote_description = true;
   if (!it->second.transport_session) {
     emit_event("peer-state", build_peer_state_json(it->second, "remote-description-set"));
   }
@@ -500,7 +476,6 @@ PeerControlCommandResult add_peer_remote_ice_candidate_from_request(
     it->second.transport = get_peer_transport_snapshot(it->second.transport_session);
   }
 
-  it->second.remote_candidate_count += 1;
   if (!it->second.transport_session) {
     emit_event("peer-state", build_peer_state_json(it->second, "remote-candidate-added"));
   }

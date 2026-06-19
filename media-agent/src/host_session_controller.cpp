@@ -3,6 +3,7 @@
 #include <thread>
 #include <utility>
 
+#include "agent_runtime.h"
 #include "agent_diagnostics.h"
 #include "agent_events.h"
 #include "agent_status_json.h"
@@ -63,7 +64,6 @@ void refresh_default_native_host_plan(AgentRuntimeState& state) {
     state.ffmpeg,
     state.wgc_capture_backend,
     state.host_pipeline,
-    state.host_capture_process,
     state.host_capture_kind,
     state.host_capture_state,
     state.host_capture_title,
@@ -90,11 +90,9 @@ void emit_host_downstream_peer_attach_events(
     if (!callbacks.attach_host_video_media_binding ||
         !callbacks.attach_host_video_media_binding(peer, &attach_error)) {
       peer.media_binding.attached = false;
-      peer.media_binding.sender_configured = false;
       peer.media_binding.active = false;
       peer.media_binding.reason = "peer-media-attach-failed";
       peer.media_binding.last_error = attach_error;
-      peer.media_binding.updated_at_unix_ms = current_time_millis();
     } else if (peer.initiator && peer.transport_session) {
       std::string negotiate_error;
       if (!ensure_peer_transport_local_description(peer.transport_session, &negotiate_error)) {
@@ -103,7 +101,6 @@ void emit_host_downstream_peer_attach_events(
         peer.transport.reason = "peer-local-description-failed";
         peer.media_binding.reason = "peer-local-description-failed";
         peer.media_binding.last_error = negotiate_error;
-        peer.media_binding.updated_at_unix_ms = current_time_millis();
       }
     } else {
       emit_event("peer-state", build_peer_state_json(peer, "media-source-attached"));
@@ -125,7 +122,6 @@ void detach_host_downstream_peers(
         !callbacks.detach_peer_media_binding(peer, &detach_error)) {
       peer.media_binding.reason = "peer-media-detach-failed";
       peer.media_binding.last_error = detach_error;
-      peer.media_binding.updated_at_unix_ms = current_time_millis();
     } else if (peer.initiator && peer.transport_session) {
       std::string negotiate_error;
       if (!ensure_peer_transport_local_description(peer.transport_session, &negotiate_error)) {
@@ -134,7 +130,6 @@ void detach_host_downstream_peers(
         peer.transport.reason = "peer-local-description-failed";
         peer.media_binding.reason = "peer-local-description-failed";
         peer.media_binding.last_error = negotiate_error;
-        peer.media_binding.updated_at_unix_ms = current_time_millis();
       }
     }
   }
@@ -159,7 +154,7 @@ HostSessionCommandResult start_host_session_from_request(
     "host-session-restart"
   );
   emit_host_session_breadcrumb("startHostSession:after-stop-host-capture-process");
-  stop_obs_ingest_runtime(state, "host-session-restart");
+  stop_obs_ingest_runtime(state);
   emit_host_session_breadcrumb("startHostSession:after-stop-obs-ingest-runtime");
 
   state.host_session_running = true;
@@ -168,15 +163,12 @@ HostSessionCommandResult start_host_session_from_request(
       ? "obs-ingest"
       : "native";
   state.host_capture_target_id = extract_string_value(request_json, "captureTargetId");
-  state.host_capture_source_id = extract_string_value(request_json, "sourceId");
   state.host_capture_kind = extract_string_value(request_json, "captureKind");
   state.host_capture_state = extract_string_value(request_json, "captureState");
   state.host_capture_title = extract_string_value(request_json, "captureTitle");
   state.host_capture_hwnd = extract_string_value(request_json, "captureHwnd");
   state.host_capture_display_id = extract_string_value(request_json, "displayId");
   state.host_window_restore_placeholder_active = false;
-  state.host_video_sender_refresh_requested = false;
-  state.host_video_sender_refresh_reason.clear();
   state.host_requested_codec = normalize_video_codec(
     extract_string_value(request_json, "requestedCodec"),
     normalize_video_codec(extract_string_value(request_json, "codec"))
@@ -197,7 +189,6 @@ HostSessionCommandResult start_host_session_from_request(
 
   if (is_obs_ingest_backend(state)) {
     state.host_capture_target_id = "obs-ingest";
-    state.host_capture_source_id.clear();
     state.host_capture_kind = "obs-ingest";
     state.host_capture_state = "waiting-for-obs-ingest";
     state.host_capture_title = "OBS ingest";
@@ -273,7 +264,6 @@ HostSessionCommandResult start_host_session_from_request(
     state.ffmpeg,
     state.wgc_capture_backend,
     state.host_pipeline,
-    state.host_capture_process,
     state.host_capture_kind,
     state.host_capture_state,
     state.host_capture_title,
@@ -312,11 +302,10 @@ HostSessionCommandResult start_host_session_from_request(
       "\",\"requestedCodec\":\"" + json_escape(state.host_requested_codec) +
       "\",\"codec\":\"" + json_escape(state.host_codec) +
       "\",\"effectiveCodec\":\"" + json_escape(state.host_codec) +
-      "\",\"downgradeReason\":\"" +
       "\",\"pipeline\":" + host_pipeline_json(state.host_pipeline) +
       ",\"capturePlan\":" + host_capture_plan_json(state.host_capture_plan) +
       ",\"captureProcess\":" + host_capture_process_json(state.host_capture_process) +
-      ",\"implementation\":\"stub\",\"transportReady\":" +
+      ",\"implementation\":\"native-media-agent\",\"transportReady\":" +
       std::string(state.peer_transport_backend.transport_ready ? "true" : "false") + "}"
   );
 
@@ -350,7 +339,7 @@ HostSessionCommandResult stop_host_session(
     callbacks.stop_all_surface_attachments("host-session-stopped");
   }
   emit_host_session_breadcrumb("stopHostSession:after-stop-all-surfaces");
-  stop_obs_ingest_runtime(state, "host-session-stopped");
+  stop_obs_ingest_runtime(state);
   emit_host_session_breadcrumb("stopHostSession:after-stop-obs-ingest-runtime");
   detach_host_downstream_peers(state, callbacks);
   emit_host_session_breadcrumb("stopHostSession:after-detach-host-downstream-peers");
@@ -366,13 +355,10 @@ HostSessionCommandResult stop_host_session(
   state.host_session_running = false;
   state.host_backend = "native";
   state.host_capture_target_id.clear();
-  state.host_capture_source_id.clear();
   state.host_capture_title.clear();
   state.host_capture_hwnd.clear();
   state.host_capture_display_id.clear();
   state.host_window_restore_placeholder_active = false;
-  state.host_video_sender_refresh_requested = false;
-  state.host_video_sender_refresh_reason.clear();
   state.host_requested_codec = "h264";
   state.host_codec = "h264";
   state.host_hardware_acceleration = true;
@@ -391,7 +377,7 @@ HostSessionCommandResult stop_host_session(
     "media-state",
     std::string("{\"state\":\"host-session-stopped\",\"captureProcess\":") +
       host_capture_process_json(state.host_capture_process) +
-      ",\"implementation\":\"stub\",\"transportReady\":" +
+      ",\"implementation\":\"native-media-agent\",\"transportReady\":" +
       std::string(state.peer_transport_backend.transport_ready ? "true" : "false") + "}"
   );
   return ok_result(build_host_session_json(state));

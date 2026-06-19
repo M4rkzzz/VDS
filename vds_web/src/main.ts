@@ -1,5 +1,5 @@
 import './styles.css';
-import { detectCapabilities, type CapabilityReport } from './capabilities';
+import { detectCapabilities, detectCapabilitiesAsync, type CapabilityReport } from './capabilities';
 import {
   DATA_CHANNEL_HELLO_ACK_TIMEOUT_MS,
   DATA_CHANNEL_OPEN_TIMEOUT_MS,
@@ -7,6 +7,7 @@ import {
   ENCODED_MEDIA_PROTOCOL,
   ENCODED_MEDIA_PROTOCOL_VERSION,
   EncodedFrameReassembler,
+  type EncodedFrameHeader,
   encodeFrameMessages,
   helloAckMessage,
   helloMessage,
@@ -28,29 +29,36 @@ type SessionState = {
 };
 
 const clientId = getClientId();
-const capability = detectCapabilities();
+let capability = detectCapabilities();
 const diagnostics = new DiagnosticsStore(capability, clientId);
 const signaling = new VdsWebSignaling();
 
 let serverConfig: { iceServers: RTCIceServer[]; version?: string } = { iceServers: [] };
-let session: SessionState | null = null;
+let session: SessionState | null = readStoredSession(clientId);
+let restoringStoredSession = Boolean(session);
 let upstreamPc: RTCPeerConnection | null = null;
 let downstreamPc: RTCPeerConnection | null = null;
 let downstreamDataChannel: RTCDataChannel | null = null;
 let downstreamDataChannelReady = false;
 let downstreamCloseExpected = false;
 let relayHelloAckTimer: number | null = null;
+let webEdgeAttemptSeq = 0;
+let upstreamEdgeAttemptId: number | null = null;
+let downstreamEdgeAttemptId: number | null = null;
 let downstreamPeerId = '';
 let viewerReadySent = false;
 const pendingIceCandidates = new Map<string, RTCIceCandidateInit[]>();
 const inboundFrameReassembler = new EncodedFrameReassembler();
 const DATA_CHANNEL_MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
+const DATA_CHANNEL_BUFFERED_LOW_BYTES = 2 * 1024 * 1024;
+const VIDEO_DECODE_DELAY_MS = 20;
+const MAX_PENDING_VIDEO_DECODE_TIMERS = 12;
+const pendingVideoDecodeTimers = new Map<number, { keyframe: boolean }>();
 let lastVideoKeyframeForRelay: {
   timestampUs: number;
   sequence: number;
   payload: ArrayBuffer;
-  payloadFormat: 'annexb' | 'avcc' | 'raw' | 'unknown';
-  capturedAt: number;
+  payloadFormat: 'annexb' | 'avcc' | 'raw' | 'opus-raw' | 'aac-adts' | 'unknown';
 } | null = null;
 let lastBootstrapFrameId = '';
 let lastConsoleDiagnosticsAt = 0;
@@ -87,7 +95,7 @@ const audioDelayIncrease = getElement<HTMLButtonElement>('audioDelayIncrease');
 const dataChannelCanvas = getElement<HTMLCanvasElement>('dataChannelCanvas');
 const dataChannelVideoPlayer = new WebCodecsVideoPlayer(dataChannelCanvas, {
   onState: (state) => {
-    console.info(`[vds-web][webcodecs-state] ${state}`);
+    logVdsWebInfo(`[vds-web][webcodecs-state] ${state}`);
     diagnostics.update({ relayProtocolState: state });
   },
   onDecodedFrame: () => {
@@ -95,7 +103,7 @@ const dataChannelVideoPlayer = new WebCodecsVideoPlayer(dataChannelCanvas, {
     waitingMessage.classList.add('hidden');
   },
   onDroppedFrame: (reason) => {
-    console.info(`[vds-web][webcodecs-video-drop] ${toConsoleJson({
+    logVdsWebInfo(`[vds-web][webcodecs-video-drop] ${toConsoleJson({
       reason,
       snapshot: diagnostics.getSnapshot()
     })}`);
@@ -105,7 +113,7 @@ const dataChannelVideoPlayer = new WebCodecsVideoPlayer(dataChannelCanvas, {
   onPayloadFormat: (format) => diagnostics.update({ h264PayloadFormat: format }),
   onVideoFrameInfo: (info) => {
     const snapshot = diagnostics.getSnapshot();
-    console.info(`[vds-web][video-frame] ${toConsoleJson({
+    logVdsWebInfo(`[vds-web][video-frame] ${toConsoleJson({
       ...info,
       mediaManifestVideo: (snapshot.mediaManifest as { video?: unknown } | undefined)?.video,
       decodedFrames: snapshot.webDecodedVideoFrames,
@@ -117,12 +125,12 @@ const dataChannelVideoPlayer = new WebCodecsVideoPlayer(dataChannelCanvas, {
 });
 const dataChannelAudioPlayer = new WebCodecsAudioPlayer({
   onState: (state) => {
-    console.info(`[vds-web][webcodecs-audio-state] ${state}`);
+    logVdsWebInfo(`[vds-web][webcodecs-audio-state] ${state}`);
     diagnostics.update({ relayProtocolState: state });
   },
   onDecodedBlock: () => diagnostics.incrementCounter('webDecodedAudioBlocks'),
   onDroppedBlock: (reason) => {
-    console.info(`[vds-web][webcodecs-audio-drop] ${reason}`);
+    logVdsWebInfo(`[vds-web][webcodecs-audio-drop] ${reason}`);
     diagnostics.incrementCounter('webDroppedAudioBlocks');
     diagnostics.update({ relayFailureReason: reason });
   }
@@ -154,14 +162,19 @@ document.addEventListener('fullscreenchange', syncFullscreenButton);
 audioDelayInput.addEventListener('change', () => setAudioDelay(Number(audioDelayInput.value)));
 audioDelayDecrease.addEventListener('click', () => setAudioDelay(Number(audioDelayInput.value) - 10));
 audioDelayIncrease.addEventListener('click', () => setAudioDelay(Number(audioDelayInput.value) + 10));
-window.addEventListener('pagehide', () => leaveCurrentRoom());
-window.addEventListener('beforeunload', () => leaveCurrentRoom());
-
 void bootstrap();
 
 async function bootstrap(): Promise<void> {
   renderCapability(capability);
   renderDiagnostics();
+
+  try {
+    capability = await detectCapabilitiesAsync();
+    renderCapability(capability);
+  } catch (error) {
+    capability = { ...capability, ok: false, reasons: [...capability.reasons, errorToMessage(error)] };
+    renderCapability(capability);
+  }
 
   if (!capability.ok) {
     joinButton.disabled = true;
@@ -172,8 +185,16 @@ async function bootstrap(): Promise<void> {
   try {
     serverConfig = await fetchServerConfig();
     await refreshRooms(false);
+    if (session?.roomId && session.sessionToken) {
+      const restoreRoomId = session.roomId;
+      roomIdInput.value = restoreRoomId;
+      setStatus('恢复连接中');
+      await joinRoom(restoreRoomId);
+      return;
+    }
     setStatus('等待加入');
   } catch (error) {
+    restoringStoredSession = false;
     setError(errorToMessage(error));
   }
 }
@@ -201,11 +222,13 @@ async function joinRoom(roomId: string): Promise<void> {
       encodedRelayRequired: true,
       mediaCapabilities: {
         webViewer: true,
-        encodedMediaDataChannel: webEncodedMediaCapabilities()
+        maxDirectDownstreams: 1,
+        encodedMediaDataChannel: getWebEncodedMediaCapabilities()
       }
     });
     setStatus('等待上游');
   } catch (error) {
+    restoringStoredSession = false;
     setError(errorToMessage(error));
   }
 }
@@ -240,6 +263,11 @@ async function handleSignal(message: SignalMessage): Promise<void> {
       setError('主持端已断开。');
       break;
     case 'error':
+      if (message.code === 'session-token-invalid') {
+        clearStoredSession();
+        session = null;
+      }
+      restoringStoredSession = false;
       setError(`${String(message.code || 'error')}: ${String(message.message || '')}`);
       break;
   }
@@ -260,11 +288,13 @@ function handleJoined(message: SignalMessage): void {
     chainPosition: Number(message.chainPosition || 0)
   };
   sessionStorage.setItem('vds-web-session', JSON.stringify(session));
+  restoringStoredSession = false;
   viewerReadySent = false;
+  clearPendingVideoDecodeTimers();
   joinCard.classList.add('hidden');
   leaveButton.classList.remove('hidden');
   viewerRoomId.textContent = session.roomId || '-';
-  chainPositionText.textContent = String(session.chainPosition);
+  chainPositionText.textContent = formatChainPosition(session.chainPosition);
   diagnostics.update({
     status: '等待上游',
     roomId: session.roomId,
@@ -298,6 +328,14 @@ async function handleOffer(message: SignalMessage): Promise<void> {
     markRelayUnsupported(manifestFailure);
     return;
   }
+  const remoteAttemptId = getSignalAttemptId(message);
+  if (remoteAttemptId && upstreamEdgeAttemptId && remoteAttemptId < upstreamEdgeAttemptId) {
+    diagnostics.update({ relayFailureReason: 'stale-upstream-offer-ignored' });
+    return;
+  }
+  if (remoteAttemptId) {
+    upstreamEdgeAttemptId = remoteAttemptId;
+  }
   diagnostics.update({ mediaManifest: message.mediaManifest });
 
   const pc = ensureUpstreamPeer(sourceId);
@@ -310,7 +348,8 @@ async function handleOffer(message: SignalMessage): Promise<void> {
     type: 'answer',
     roomId: session.roomId,
     targetId: sourceId,
-    sdp: pc.localDescription || answer
+    sdp: pc.localDescription || answer,
+    attemptId: upstreamEdgeAttemptId || undefined
   });
   clearError();
   diagnostics.update({
@@ -323,6 +362,11 @@ async function handleOffer(message: SignalMessage): Promise<void> {
 async function handleAnswer(message: SignalMessage): Promise<void> {
   const sdp = normalizeDescription(message);
   if (!downstreamPc || !sdp) {
+    return;
+  }
+  const remoteAttemptId = getSignalAttemptId(message);
+  if (downstreamEdgeAttemptId && remoteAttemptId && remoteAttemptId !== downstreamEdgeAttemptId) {
+    diagnostics.update({ relayFailureReason: 'stale-downstream-answer-ignored' });
     return;
   }
   await downstreamPc.setRemoteDescription(sdp);
@@ -338,6 +382,12 @@ async function handleIceCandidate(message: SignalMessage): Promise<void> {
   const peerId = String(message.fromClientId || message.sourceId || message.targetId || '');
   const pc = peerId && peerId === downstreamPeerId ? downstreamPc : upstreamPc;
   if (!pc) {
+    return;
+  }
+  const remoteAttemptId = getSignalAttemptId(message);
+  const expectedAttemptId = peerId && peerId === downstreamPeerId ? downstreamEdgeAttemptId : upstreamEdgeAttemptId;
+  if (expectedAttemptId && remoteAttemptId && remoteAttemptId !== expectedAttemptId) {
+    diagnostics.update({ relayFailureReason: 'stale-ice-candidate-ignored' });
     return;
   }
 
@@ -370,10 +420,11 @@ async function handleConnectToNext(message: SignalMessage): Promise<void> {
   downstreamDataChannelReady = false;
   downstreamCloseExpected = false;
   clearRelayHelloAckTimer();
+  downstreamEdgeAttemptId = ++webEdgeAttemptSeq;
   downstreamPc = new RTCPeerConnection({ iceServers: serverConfig.iceServers });
   wirePeerEvents(downstreamPc, downstreamPeerId);
   downstreamDataChannel = downstreamPc.createDataChannel(ENCODED_MEDIA_CHANNEL_LABEL, {
-    ordered: true
+    ordered: false
   });
   attachOutboundDataChannel(downstreamDataChannel, downstreamPeerId);
 
@@ -384,8 +435,9 @@ async function handleConnectToNext(message: SignalMessage): Promise<void> {
     roomId: session.roomId,
     targetId: downstreamPeerId,
     sdp: downstreamPc.localDescription || offer,
+    attemptId: downstreamEdgeAttemptId || undefined,
     mediaCapabilities: {
-      encodedMediaDataChannel: webEncodedMediaCapabilities()
+      encodedMediaDataChannel: getWebEncodedMediaCapabilities()
     }
   });
 }
@@ -418,6 +470,8 @@ async function handleChainReconnect(message: SignalMessage): Promise<void> {
   pendingIceCandidates.delete(nextUpstreamPeerId);
   viewerReadySent = false;
   lastBootstrapFrameId = '';
+  upstreamEdgeAttemptId = null;
+  clearPendingVideoDecodeTimers();
   clearError();
 
   session = {
@@ -426,7 +480,7 @@ async function handleChainReconnect(message: SignalMessage): Promise<void> {
     chainPosition: nextChainPosition
   };
   sessionStorage.setItem('vds-web-session', JSON.stringify(session));
-  chainPositionText.textContent = String(nextChainPosition);
+  chainPositionText.textContent = formatChainPosition(nextChainPosition);
   diagnostics.update({
     status: '等待上游重连',
     upstreamPeerId: nextUpstreamPeerId,
@@ -471,7 +525,8 @@ function wirePeerEvents(pc: RTCPeerConnection, peerId: string): void {
       type: 'ice-candidate',
       roomId: session.roomId,
       targetId: peerId,
-      candidate: event.candidate.toJSON()
+      candidate: event.candidate.toJSON(),
+      attemptId: peerId === downstreamPeerId ? downstreamEdgeAttemptId || undefined : upstreamEdgeAttemptId || undefined
     });
   };
   pc.oniceconnectionstatechange = () => {
@@ -529,6 +584,11 @@ function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): voi
     if (typeof event.data === 'string') {
       const control = parseControlMessage(event.data);
       if (control?.type === 'hello-ack') {
+        if (control.protocolVersion !== ENCODED_MEDIA_PROTOCOL_VERSION) {
+          markRelayUnsupported('datachannel-version-mismatch');
+          channel.close();
+          return;
+        }
         const sessionFailure = getControlManifestFailure(control);
         if (sessionFailure) {
           markRelayUnsupported(sessionFailure);
@@ -547,6 +607,7 @@ function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): voi
     handleInboundEncodedFrame(event.data, peerId);
   };
   channel.onerror = () => {
+    window.clearTimeout(openTimer);
     if (downstreamCloseExpected || downstreamDataChannelReady || channel.readyState === 'closing' || channel.readyState === 'closed') {
       handleDownstreamChannelClosed();
       return;
@@ -554,6 +615,7 @@ function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): voi
     markRelayUnsupported('datachannel-error');
   };
   channel.onclose = () => {
+    window.clearTimeout(openTimer);
     clearRelayHelloAckTimer();
     handleDownstreamChannelClosed();
   };
@@ -644,6 +706,9 @@ function sendRelayBootstrapKeyframe(): void {
       config: true
     }, lastVideoKeyframeForRelay.payload);
     for (const message of messages) {
+      if (!canSendDataChannelMessage('relay-bootstrap-buffered-amount-high')) {
+        return;
+      }
       downstreamDataChannel.send(message);
     }
     lastBootstrapFrameId = bootstrapFrameId;
@@ -670,6 +735,7 @@ function handleViewerLeft(message: SignalMessage): void {
   downstreamPc?.close();
   downstreamDataChannel = null;
   downstreamPc = null;
+  downstreamEdgeAttemptId = null;
   downstreamPeerId = '';
   errorText.textContent = '';
   diagnostics.update({
@@ -744,6 +810,10 @@ function leaveCurrentRoom(): void {
   downstreamDataChannelReady = false;
   downstreamCloseExpected = true;
   clearRelayHelloAckTimer();
+  clearPendingVideoDecodeTimers();
+  inboundFrameReassembler.clear();
+  dataChannelAudioPlayer.close();
+  dataChannelVideoPlayer.close();
   downstreamDataChannel?.close();
   downstreamPc?.close();
   upstreamPc?.close();
@@ -751,7 +821,10 @@ function leaveCurrentRoom(): void {
   downstreamDataChannel = null;
   downstreamPc = null;
   upstreamPc = null;
+  upstreamEdgeAttemptId = null;
+  downstreamEdgeAttemptId = null;
   session = null;
+  clearStoredSession();
   downstreamCloseExpected = false;
   joinCard.classList.remove('hidden');
   leaveButton.classList.add('hidden');
@@ -777,7 +850,7 @@ function handleInboundEncodedFrame(data: unknown, peerId: string): void {
       diagnostics.incrementCounter('encodedFramesReceived');
       diagnostics.update({ h264PayloadFormat: decoded.header.payloadFormat || 'unknown' });
       if (decoded.header.keyframe) {
-        console.info(`[vds-web][video-keyframe] ${toConsoleJson({
+        logVdsWebInfo(`[vds-web][video-keyframe] ${toConsoleJson({
           codec: decoded.header.codec,
           payloadFormat: decoded.header.payloadFormat,
           timestampUs: decoded.header.timestampUs,
@@ -790,14 +863,13 @@ function handleInboundEncodedFrame(data: unknown, peerId: string): void {
           timestampUs: decoded.header.timestampUs,
           sequence: decoded.header.sequence,
           payload: decoded.payload.slice(0),
-          payloadFormat: decoded.header.payloadFormat || 'unknown',
-          capturedAt: Date.now()
+          payloadFormat: decoded.header.payloadFormat || 'unknown'
         };
         sendRelayBootstrapKeyframe();
       }
       const received = diagnostics.getSnapshot().encodedFramesReceived;
       if (received === 1 || received % 120 === 0) {
-        console.info(`[vds-web][video-frame-received] ${toConsoleJson({
+        logVdsWebInfo(`[vds-web][video-frame-received] ${toConsoleJson({
           codec: decoded.header.codec,
           keyframe: decoded.header.keyframe,
           payloadFormat: decoded.header.payloadFormat,
@@ -816,7 +888,7 @@ function handleInboundEncodedFrame(data: unknown, peerId: string): void {
     if (decoded.header.streamType === 'audio') {
       void dataChannelAudioPlayer.pushFrame(decoded.header, decoded.payload);
     } else {
-      void dataChannelVideoPlayer.pushFrame(decoded.header, decoded.payload);
+      scheduleVideoFrameDecode(decoded.header, decoded.payload);
     }
     forwardDecodedDataChannelFrame(decoded.header, decoded.payload);
   } catch (error) {
@@ -824,10 +896,47 @@ function handleInboundEncodedFrame(data: unknown, peerId: string): void {
   }
 }
 
+function scheduleVideoFrameDecode(header: EncodedFrameHeader, payload: ArrayBuffer): void {
+  trimPendingVideoDecodeTimers(header.keyframe);
+  const timerId = window.setTimeout(() => {
+    pendingVideoDecodeTimers.delete(timerId);
+    void dataChannelVideoPlayer.pushFrame(header, payload);
+  }, VIDEO_DECODE_DELAY_MS);
+  pendingVideoDecodeTimers.set(timerId, {
+    keyframe: Boolean(header.keyframe)
+  });
+}
+
+function trimPendingVideoDecodeTimers(incomingKeyframe: boolean): void {
+  while (pendingVideoDecodeTimers.size >= MAX_PENDING_VIDEO_DECODE_TIMERS) {
+    let dropTimerId: number | null = null;
+    for (const [timerId, entry] of pendingVideoDecodeTimers) {
+      if (!entry.keyframe || incomingKeyframe) {
+        dropTimerId = timerId;
+        break;
+      }
+    }
+    if (dropTimerId === null) {
+      break;
+    }
+    window.clearTimeout(dropTimerId);
+    pendingVideoDecodeTimers.delete(dropTimerId);
+    diagnostics.incrementCounter('webDroppedVideoFrames');
+    diagnostics.update({ relayFailureReason: 'web-video-decode-queue-trimmed' });
+  }
+}
+
+function clearPendingVideoDecodeTimers(): void {
+  for (const timerId of pendingVideoDecodeTimers.keys()) {
+    window.clearTimeout(timerId);
+  }
+  pendingVideoDecodeTimers.clear();
+}
+
 function forwardDecodedDataChannelFrame(header: {
   streamType: 'video' | 'audio';
   codec: string;
-  payloadFormat?: 'annexb' | 'avcc' | 'raw' | 'unknown';
+  payloadFormat?: 'annexb' | 'avcc' | 'raw' | 'opus-raw' | 'aac-adts' | 'unknown';
   timestampUs: number;
   sequence: number;
   keyframe: boolean;
@@ -853,6 +962,10 @@ function forwardDecodedDataChannelFrame(header: {
       config: header.config
     }, payload);
     for (const message of messages) {
+      if (!canSendDataChannelMessage('relay-buffered-amount-high')) {
+        diagnostics.incrementCounter('dataChannelFramesDropped');
+        return;
+      }
       downstreamDataChannel.send(message);
     }
     if (header.streamType === 'video') {
@@ -862,6 +975,18 @@ function forwardDecodedDataChannelFrame(header: {
   } catch (error) {
     markRelayUnsupported(errorToMessage(error));
   }
+}
+
+function canSendDataChannelMessage(dropReason: string): boolean {
+  if (!downstreamDataChannel || downstreamDataChannel.readyState !== 'open') {
+    return false;
+  }
+  downstreamDataChannel.bufferedAmountLowThreshold = DATA_CHANNEL_BUFFERED_LOW_BYTES;
+  if (downstreamDataChannel.bufferedAmount <= DATA_CHANNEL_MAX_BUFFERED_BYTES) {
+    return true;
+  }
+  diagnostics.update({ relayFailureReason: dropReason });
+  return false;
 }
 
 function clearRelayHelloAckTimer(): void {
@@ -878,7 +1003,7 @@ async function refreshRooms(manual: boolean): Promise<void> {
       const item = document.createElement('button');
       item.className = 'room-item';
       item.type = 'button';
-      item.disabled = Boolean(session);
+      item.disabled = Boolean(session && !restoringStoredSession);
       item.addEventListener('click', () => void joinRoom(room.roomId));
       const roomCode = document.createElement('span');
       roomCode.className = 'room-code';
@@ -901,6 +1026,13 @@ async function refreshRooms(manual: boolean): Promise<void> {
   }
 }
 
+function getWebEncodedMediaCapabilities() {
+  return webEncodedMediaCapabilities({
+    supportedVideoCodecs: capability.supportedVideoCodecs,
+    supportedAudioCodecs: capability.supportedAudioCodecs
+  });
+}
+
 function renderCapability(report: CapabilityReport): void {
   diagnostics.update({ capability: report, status: report.ok ? '等待加入' : '能力不足' });
 }
@@ -908,6 +1040,7 @@ function renderCapability(report: CapabilityReport): void {
 function renderDiagnostics(): void {
   const snapshot = diagnostics.getSnapshot();
   applyVideoManifestDisplaySize(snapshot.mediaManifest);
+  applyAudioManifestFormat(snapshot.mediaManifest);
   const now = Date.now();
   if (
     snapshot.mediaManifest &&
@@ -916,11 +1049,11 @@ function renderDiagnostics(): void {
     now - lastConsoleDiagnosticsAt > 1000
   ) {
     lastConsoleDiagnosticsAt = now;
-    console.info(`[vds-web][diagnostics] ${toConsoleJson(snapshot)}`);
+    logVdsWebInfo(`[vds-web][diagnostics] ${toConsoleJson(snapshot)}`);
   }
   diagnosticsOutput.value = diagnostics.format();
   viewerRoomId.textContent = snapshot.roomId || '-';
-  chainPositionText.textContent = Number.isFinite(snapshot.chainPosition) ? String(snapshot.chainPosition) : '-';
+  chainPositionText.textContent = formatChainPosition(snapshot.chainPosition);
   decodedVideoText.textContent = String(snapshot.webDecodedVideoFrames || 0);
   decodedAudioText.textContent = String(snapshot.webDecodedAudioBlocks || 0);
 }
@@ -1003,6 +1136,11 @@ function normalizeDescription(message: SignalMessage): RTCSessionDescriptionInit
   };
 }
 
+function getSignalAttemptId(message: SignalMessage): number | null {
+  const attemptId = Number(message.attemptId);
+  return Number.isInteger(attemptId) && attemptId > 0 ? attemptId : null;
+}
+
 function isEncodedDataChannelOffer(sdp: string): boolean {
   return sdp.includes('m=application') && sdp.includes('webrtc-datachannel');
 }
@@ -1020,12 +1158,14 @@ function getManifestCompatibilityFailure(mediaManifest: unknown): string {
     return 'host-media-manifest-protocol-unsupported';
   }
   const videoCodec = String(manifest.video?.codec || '').toLowerCase();
-  if (videoCodec !== 'h264' && videoCodec !== 'h265' && videoCodec !== 'hevc') {
-    return `web-video-codec-unsupported:${videoCodec || 'unknown'}`;
+  const normalizedVideoCodec = videoCodec === 'hevc' ? 'h265' : videoCodec;
+  if (!capability.supportedVideoCodecs.includes(normalizedVideoCodec)) {
+    return `web-video-codec-unsupported:${normalizedVideoCodec || 'unknown'}`;
   }
   const audioCodec = String(manifest.audio?.codec || 'opus').toLowerCase();
-  if (audioCodec !== 'opus' && audioCodec !== 'aac') {
-    return `web-audio-codec-unsupported:${audioCodec || 'unknown'}`;
+  const normalizedAudioCodec = audioCodec === 'mp4a.40.2' ? 'aac' : audioCodec;
+  if (!capability.supportedAudioCodecs.includes(normalizedAudioCodec)) {
+    return `web-audio-codec-unsupported:${normalizedAudioCodec || 'unknown'}`;
   }
   return '';
 }
@@ -1061,6 +1201,14 @@ function getManifestVideoCodec(): string {
   return codec === 'hevc' ? 'h265' : codec;
 }
 
+function applyAudioManifestFormat(mediaManifest: unknown): void {
+  if (!mediaManifest || typeof mediaManifest !== 'object') {
+    return;
+  }
+  const audio = (mediaManifest as { audio?: { sampleRate?: unknown; channels?: unknown } }).audio;
+  dataChannelAudioPlayer.setFormat(Number(audio?.sampleRate || 48000), Number(audio?.channels || 2));
+}
+
 function applyVideoManifestDisplaySize(mediaManifest: unknown): void {
   if (!mediaManifest || typeof mediaManifest !== 'object') {
     return;
@@ -1089,6 +1237,48 @@ function getClientId(): string {
   return value;
 }
 
+function readStoredSession(expectedClientId: string): SessionState | null {
+  try {
+    const raw = sessionStorage.getItem('vds-web-session');
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as Partial<SessionState>;
+    if (
+      typeof parsed.roomId !== 'string' ||
+      parsed.roomId.trim() === '' ||
+      parsed.clientId !== expectedClientId ||
+      typeof parsed.sessionToken !== 'string' ||
+      parsed.sessionToken.trim() === ''
+    ) {
+      clearStoredSession();
+      return null;
+    }
+    const chainPosition = Number(parsed.chainPosition);
+    return {
+      roomId: parsed.roomId,
+      clientId: expectedClientId,
+      sessionToken: parsed.sessionToken,
+      hostId: typeof parsed.hostId === 'string' ? parsed.hostId : undefined,
+      upstreamPeerId: typeof parsed.upstreamPeerId === 'string' ? parsed.upstreamPeerId : undefined,
+      chainPosition: Number.isFinite(chainPosition) ? chainPosition : 0
+    };
+  } catch {
+    clearStoredSession();
+    return null;
+  }
+}
+
+function clearStoredSession(): void {
+  sessionStorage.removeItem('vds-web-session');
+  restoringStoredSession = false;
+}
+
+function formatChainPosition(value: unknown): string {
+  const position = Number(value);
+  return Number.isFinite(position) ? String(position + 1) : '-';
+}
+
 function errorToMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -1099,4 +1289,8 @@ function toConsoleJson(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function logVdsWebInfo(message: string): void {
+  console.info(message);
 }

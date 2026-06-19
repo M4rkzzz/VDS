@@ -56,8 +56,6 @@ set(VDS_MEDIA_AGENT_FFMPEG_ROOT "" CACHE PATH "FFmpeg SDK root that contains inc
 if(NOT VDS_MEDIA_AGENT_FFMPEG_ROOT)
   if(DEFINED ENV{VDS_FFMPEG_SOURCE} AND EXISTS "$ENV{VDS_FFMPEG_SOURCE}/include/libavcodec/avcodec.h")
     set(VDS_MEDIA_AGENT_FFMPEG_ROOT "$ENV{VDS_FFMPEG_SOURCE}")
-  elseif(EXISTS "D:/project/publicresource/ffmpeg-master-latest-win64-gpl-shared/include/libavcodec/avcodec.h")
-    set(VDS_MEDIA_AGENT_FFMPEG_ROOT "D:/project/publicresource/ffmpeg-master-latest-win64-gpl-shared")
   endif()
 endif()
 

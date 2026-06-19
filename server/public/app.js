@@ -68,6 +68,10 @@ const DEBUG_CHANNEL_DEFINITIONS = Object.freeze({
     label: '主进程桥接',
     description: 'IPC 调用、surface enrich、主进程媒体桥'
   },
+  highFrequency: {
+    label: '高频明细',
+    description: 'audio-data、updateSurface、getStats 等高频对象，只在短时复现时打开'
+  },
   agentBreadcrumbs: {
     label: 'Agent Breadcrumb',
     description: 'native agent stderr breadcrumb 轨迹，主进程会按内容归并'
@@ -96,6 +100,7 @@ const DEBUG_PRESET_DEFINITIONS = Object.freeze({
         nativeSteps: false,
         periodicStats: false,
         mainProcess: false,
+        highFrequency: false,
         agentBreadcrumbs: false,
         agentStderr: false
       }
@@ -119,6 +124,7 @@ const DEBUG_PRESET_DEFINITIONS = Object.freeze({
         nativeSteps: false,
         periodicStats: false,
         mainProcess: true,
+        highFrequency: false,
         agentBreadcrumbs: false,
         agentStderr: false
       }
@@ -142,6 +148,7 @@ const DEBUG_PRESET_DEFINITIONS = Object.freeze({
         nativeSteps: true,
         periodicStats: true,
         mainProcess: true,
+        highFrequency: false,
         agentBreadcrumbs: true,
         agentStderr: false
       }
@@ -165,6 +172,7 @@ const DEBUG_PRESET_DEFINITIONS = Object.freeze({
         nativeSteps: true,
         periodicStats: true,
         mainProcess: true,
+        highFrequency: true,
         agentBreadcrumbs: true,
         agentStderr: true
       }
@@ -174,10 +182,6 @@ const DEBUG_PRESET_DEFINITIONS = Object.freeze({
 const DEBUG_CATEGORY_KEYS = Object.keys(DEBUG_CATEGORY_DEFINITIONS);
 const DEBUG_CHANNEL_KEYS = Object.keys(DEBUG_CHANNEL_DEFINITIONS);
 let debugConfig = readDebugConfig();
-
-const VIEWER_PLAYBACK_MODES = Object.freeze({
-  PASSTHROUGH: 'passthrough'
-});
 
 const DEFAULT_OBS_INGEST_PORT = 61080;
 const OBS_INGEST_PORT_MIN = 1024;
@@ -208,6 +212,8 @@ let hostId = null; // Host的clientId
 let viewerJoinMode = 'lobby';
 let viewerJoinPending = false;
 let viewerPendingJoinSource = null;
+let viewerJoinPendingTimer = null;
+const VIEWER_JOIN_PENDING_TIMEOUT_MS = 10000;
 let publicRooms = [];
 let publicRoomsRefreshInFlight = false;
 let publicRoomsManualRefreshInFlight = false;
@@ -503,37 +509,15 @@ function syncDebugUi() {
 }
 
 function propagateDebugConfig(config) {
-  if (window.__vdsSetDebugModeState) {
-    window.__vdsSetDebugModeState(isAnyDebugEnabled(config));
-  }
-  if (window.__vdsSetDebugConfigState) {
-    window.__vdsSetDebugConfigState(config);
-  }
   if (window.electronAPI) {
     if (typeof window.electronAPI.setDebugConfig === 'function') {
       window.electronAPI.setDebugConfig(config);
-    } else if (typeof window.electronAPI.setDebugMode === 'function') {
-      window.electronAPI.setDebugMode(isAnyDebugEnabled(config));
     }
   }
 }
 
 function isDebugModeEnabled() {
   return isAnyDebugPathEnabled();
-}
-
-function isDebugCategoryEnabled(category = 'misc') {
-  if (!Object.prototype.hasOwnProperty.call(DEBUG_CATEGORY_DEFINITIONS, category)) {
-    return false;
-  }
-  return Boolean(debugConfig.categories[category]);
-}
-
-function isDebugChannelEnabled(channel = 'renderer') {
-  if (!Object.prototype.hasOwnProperty.call(DEBUG_CHANNEL_DEFINITIONS, channel)) {
-    return false;
-  }
-  return Boolean(debugConfig.channels[channel]);
 }
 
 function isDebugLogEnabled(category = 'misc', channel = 'renderer', config = debugConfig) {
@@ -601,7 +585,6 @@ function setDebugConfig(nextConfig, options = {}) {
 
 function readViewerPlaybackPrefs() {
   const fallback = {
-    mode: VIEWER_PLAYBACK_MODES.PASSTHROUGH,
     audioDelayMs: 0
   };
   try {
@@ -616,11 +599,9 @@ function readViewerPlaybackPrefs() {
 }
 
 function normalizeViewerPlaybackPrefs(nextPrefs) {
-  const normalizedMode = VIEWER_PLAYBACK_MODES.PASSTHROUGH;
   const numericDelay = Number(nextPrefs && nextPrefs.audioDelayMs);
   const normalizedDelay = Math.max(0, Math.min(300, Number.isFinite(numericDelay) ? Math.round(numericDelay) : 0));
   return {
-    mode: normalizedMode,
     audioDelayMs: normalizedDelay
   };
 }
@@ -680,19 +661,7 @@ function persistObsIngestPrefs() {
   }
 }
 
-function isViewerPlaybackPassthroughMode() {
-  return true;
-}
-
-function isViewerJoinLocked() {
-  return sessionRole === 'viewer' && Boolean(currentRoomId);
-}
-
 function renderViewerPlaybackPrefsUi() {
-  if (elements.viewerPlaybackModeToggle) {
-    elements.viewerPlaybackModeToggle.checked = true;
-    elements.viewerPlaybackModeToggle.disabled = true;
-  }
   if (elements.viewerAudioDelayControl) {
     elements.viewerAudioDelayControl.classList.remove('hidden');
   }
@@ -708,25 +677,11 @@ function renderViewerPlaybackPrefsUi() {
   }
 }
 
-function setViewerPlaybackMode(mode) {
-  viewerPlaybackPrefs = normalizeViewerPlaybackPrefs({
-    ...viewerPlaybackPrefs,
-    mode: VIEWER_PLAYBACK_MODES.PASSTHROUGH
-  });
-  persistViewerPlaybackPrefs();
-  renderViewerPlaybackPrefsUi();
-}
-
-async function applyNativeViewerPlaybackPrefs({ includeMode = false } = {}) {
+async function applyNativeViewerPlaybackPrefs() {
   if (!window.isElectron || !window.electronAPI || !window.electronAPI.mediaEngine) {
     return;
   }
   const mediaEngine = window.electronAPI.mediaEngine;
-  if (includeMode && typeof mediaEngine.setViewerPlaybackMode === 'function') {
-    await mediaEngine.setViewerPlaybackMode({
-      mode: viewerPlaybackPrefs.mode
-    });
-  }
   if (typeof mediaEngine.setViewerAudioDelay === 'function') {
     await mediaEngine.setViewerAudioDelay({
       delayMs: viewerPlaybackPrefs.audioDelayMs
@@ -742,7 +697,7 @@ function setViewerAudioDelayMs(nextDelayMs, { applyNative = false } = {}) {
   persistViewerPlaybackPrefs();
   renderViewerPlaybackPrefsUi();
   if (applyNative && sessionRole === 'viewer' && currentRoomId) {
-    applyNativeViewerPlaybackPrefs({ includeMode: false }).catch((error) => {
+    applyNativeViewerPlaybackPrefs().catch((error) => {
       debugLog('audio', '[media-engine] setViewerAudioDelay failed:', error && error.message ? error.message : String(error));
     });
   }
@@ -778,8 +733,24 @@ function renderHostPublicListingUi() {
 }
 
 function setViewerJoinPending(pending, { source = null } = {}) {
+  if (viewerJoinPendingTimer) {
+    clearTimeout(viewerJoinPendingTimer);
+    viewerJoinPendingTimer = null;
+  }
   viewerJoinPending = Boolean(pending);
   viewerPendingJoinSource = viewerJoinPending ? source : null;
+  if (viewerJoinPending) {
+    viewerJoinPendingTimer = setTimeout(() => {
+      viewerJoinPendingTimer = null;
+      if (!viewerJoinPending) {
+        return;
+      }
+      handleViewerJoinFailure('加入房间超时，请检查信令服务器连接后重试。').catch((error) => {
+        setViewerJoinPending(false);
+        showError(error && error.message ? error.message : '加入房间超时');
+      });
+    }, VIEWER_JOIN_PENDING_TIMEOUT_MS);
+  }
   renderViewerJoinUi();
 }
 
@@ -962,7 +933,6 @@ window.__vdsHandleViewerJoinError = async (data) => {
 };
 
 window.__vdsRenderHostPublicListingUi = renderHostPublicListingUi;
-window.__vdsUpdatePublicRoomsPollingState = updatePublicRoomsPollingState;
 window.__vdsHandleViewerJoinSucceeded = () => {
   setViewerJoinPending(false);
   updatePublicRoomsPollingState();
@@ -1068,20 +1038,8 @@ function debugLog(category, ...args) {
 }
 
 window.__vdsIsDebugModeEnabled = isDebugModeEnabled;
-window.__vdsDebugCategoryDefinitions = DEBUG_CATEGORY_DEFINITIONS;
-window.__vdsDebugChannelDefinitions = DEBUG_CHANNEL_DEFINITIONS;
 window.__vdsShouldDebugLog = (category = 'misc', channel = 'renderer') => isDebugLogEnabled(category, channel);
-window.__vdsGetDebugConfig = () => JSON.parse(JSON.stringify(debugConfig));
-window.__vdsGetViewerPlaybackPrefs = () => ({ ...viewerPlaybackPrefs });
 window.__vdsRenderViewerPlaybackPrefsUi = renderViewerPlaybackPrefsUi;
-window.__vdsSetDebugConfigState = (config) => {
-  debugConfig = normalizeDebugConfig(config, false);
-  syncDebugUi();
-};
-window.__vdsSetDebugModeState = (enabled) => {
-  debugConfig = buildDefaultDebugConfig(Boolean(enabled));
-  syncDebugUi();
-};
 
 function openDebugMenu() {
   if (!elements || !elements.debugMenu) {
@@ -1406,23 +1364,6 @@ function setViewerConnectionState(message) {
   return requireNativeAuthorityOverride('setViewerConnectionState', setViewerConnectionState)(message);
 }
 
-async function resetViewerMediaPipeline(message = '等待重新连接...') {
-  upstreamConnected = false;
-  viewerReadySent = false;
-  videoStarted = false;
-  relayStream = null;
-  relayPc = null;
-  await clearAllPeerConnections({ clearRetryState: true });
-  elements.remoteVideo.srcObject = null;
-  if (elements.viewerReceiveFps) {
-    elements.viewerReceiveFps.textContent = '-';
-  }
-  if (elements.viewerRenderFps) {
-    elements.viewerRenderFps.textContent = '-';
-  }
-  setViewerConnectionState(message);
-}
-
 // DOM元素
 const elements = {
   btnDebugToggle: document.getElementById('btn-debug-toggle'),
@@ -1456,7 +1397,6 @@ const elements = {
   viewerDirectJoinPanel: document.getElementById('viewer-direct-join-panel'),
   viewerPublicRoomsStatus: document.getElementById('viewer-public-rooms-status'),
   viewerPublicRoomsList: document.getElementById('viewer-public-rooms-list'),
-  viewerPlaybackModeToggle: document.getElementById('viewer-playback-mode-toggle'),
   viewerAudioDelayControl: document.getElementById('viewer-audio-delay-control'),
   viewerAudioDelayInput: document.getElementById('viewer-audio-delay-input'),
   viewerAudioDelayDecrease: document.getElementById('viewer-audio-delay-decrease'),
@@ -1480,12 +1420,9 @@ const elements = {
   hostSendFps: document.getElementById('host-send-fps'),
   localVideo: document.getElementById('local-video'),
   remoteVideo: document.getElementById('remote-video'),
-  remoteVideoContainer: document.getElementById('remote-video-container'),
   waitingMessage: document.getElementById('waiting-message'),
   errorToast: document.getElementById('error-toast'),
   joinForm: document.getElementById('join-form'),
-  sourceModal: document.getElementById('source-modal'),
-  sourceList: document.getElementById('source-list'),
   btnConfirmSource: document.getElementById('btn-confirm-source'),
   btnCancelSource: document.getElementById('btn-cancel-source'),
   btnRefreshSources: document.getElementById('btn-refresh-sources'),
@@ -2731,6 +2668,13 @@ elements.btnClose.addEventListener('click', () => {
   elements.closeModal.classList.remove('hidden');
 });
 
+if (window.electronAPI && typeof window.electronAPI.onCloseConfirmation === 'function') {
+  window.electronAPI.onCloseConfirmation(() => {
+    setCloseModalState('open');
+    elements.closeModal.classList.remove('hidden');
+  });
+}
+
 document.addEventListener('click', () => {
   closeDebugMenu();
 });
@@ -3773,10 +3717,6 @@ async function confirmSourceAndShare() {
 
 // 显示音频进程选择弹窗
 
-// 确认音频进程选择
-
-// 跳过音频捕获
-
 // Active source-audio path: one modal only, no secondary audio modal.
 async function showAudioProcessSelection() {
   const selectedItem = getSelectedSourceItem();
@@ -3807,14 +3747,6 @@ async function showAudioProcessSelection() {
   }
 
   await startScreenShareWithAudio(currentCaptureSource, Number(audioCandidate.pid));
-}
-
-async function confirmAudioProcess() {
-  await showAudioProcessSelection();
-}
-
-async function skipAudioCapture() {
-  await startScreenShareWithSource(currentCaptureSource);
 }
 
 // 取消选择
@@ -3863,9 +3795,7 @@ async function joinRoomById(roomId, { source = 'direct' } = {}) {
   }
 
   try {
-    await applyNativeViewerPlaybackPrefs({
-      includeMode: true
-    });
+    await applyNativeViewerPlaybackPrefs();
   } catch (error) {
     debugLog('audio', '[media-engine] apply viewer playback prefs before join failed:', error && error.message ? error.message : String(error));
   }
@@ -3879,7 +3809,6 @@ async function joinRoomById(roomId, { source = 'direct' } = {}) {
     roomId: normalizedRoomId,
     clientId: clientId,
     sessionToken: currentSessionToken || '',
-    viewerPlaybackMode: viewerPlaybackPrefs.mode,
     viewerAudioDelayMs: viewerPlaybackPrefs.audioDelayMs
   });
   renderViewerPlaybackPrefsUi();
@@ -3995,7 +3924,7 @@ function showError(message) {
 // Native mainline only
 
 // 版本检查和自动更新
-let currentVersion = '1.6.2'; // 默认版本（Electron环境会动态获取）
+let currentVersion = '1.6.6'; // 默认版本（Electron环境会动态获取）
 
 // 初始化版本号（从 Electron app 获取）
 async function initVersion() {

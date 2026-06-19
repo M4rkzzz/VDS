@@ -5,8 +5,8 @@
 #include <string>
 #include <vector>
 
-#include "agent_runtime.h"
-#include "peer_transport.h"
+class PeerTransportSession;
+struct RelaySubscriberState;
 
 void register_relay_subscriber(
   const std::string& upstream_peer_id,
@@ -16,6 +16,7 @@ void register_relay_subscriber(
 
 void unregister_relay_subscriber(const std::string& peer_id);
 void clear_relay_upstream_bootstrap_state(const std::string& upstream_peer_id);
+void shutdown_relay_dispatch_runtime();
 
 bool query_relay_subscriber_state(
   const std::string& peer_id,

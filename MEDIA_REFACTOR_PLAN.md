@@ -19,7 +19,7 @@
 
 最近一次对齐日期：`2026-04-26`
 
-当前发布版本：`1.6.6`
+当前发布版本：`1.6.7`
 
 ## 2. 未发布改动记录
 
@@ -27,11 +27,11 @@
 
 当前未发布改动：
 
-- 暂无。1.6.6 已发布条目已迁移到 `CHANGELOG.md`。
+- 1.6.7 已完成发布构建：包含 P2P 连接稳健性、服务端拓扑后台、native surface 移动稳定性、WGC live preview 加固和诊断降噪。
 
 当前未发布改动已验证：
 
-- 待下一轮未发布改动产生后记录。
+- `npm run build:release` 已通过；该命令已完成 VDS_web 构建、media-agent Release 构建/测试/smoke、Electron NSIS 打包、`server/updates` 刷新和发布门禁 `release:check`。
 
 ## 3. 当前结论
 
@@ -502,9 +502,9 @@ server 单元测试覆盖：
 1. 发布前先确认工作区变更都已记录到 `## 2. 未发布改动记录`，并确认 `package.json` 版本号是目标版本。
 2. 如需要升级版本，先同步更新 `package.json`、`package-lock.json`、本文档 `当前发布版本` 和相关 changelog 草稿。
 3. 运行 `npm run release:check`。该命令会执行 syntax check、VDS_web TypeScript check、VDS_web build、server tests、logging check、media-agent verify、production audit，并校验当前 `dist` 与 `server/updates` 里的 installer、blockmap、`latest.yml` 一致性。
-4. 如果只是检查当前已有产物，`npm run release:check` 通过即可进入人工验收；如果需要重新出包，先运行 `npm run build:release`。
-5. `npm run build:release` 会先构建 VDS_web 静态产物，再执行 Electron 打包，最后运行 `npm run prepare-server-release`，把当前版本 installer、blockmap 和 `latest.yml` 准备到 `server/updates`。
-6. 出包后必须再次运行 `npm run release:check`，确认新产物的 version、path、sha512、size 与 installer 一致，且 `dist` 与 `server/updates` 当前 installer 元数据一致。
+4. 如果只是检查当前已有产物，`npm run release:check` 通过即可进入人工验收；如果需要重新出包并发布 GitHub Release，先确认 `gh auth status` 通过，再运行 `npm run build:release`。
+5. `npm run build:release` 会先构建 VDS_web 静态产物，再执行 Electron 打包，运行 `npm run prepare-server-release` 把当前版本 installer、blockmap 和 `latest.yml` 准备到 `server/updates`，随后执行 `npm run release:check` 和 `npm run release:github`。
+6. `npm run release:github` 会使用 tag `v<version>`、标题 `VDS <version>`、`CHANGELOG.md` 对应版本内容创建 GitHub Release，并上传 `dist/VDS-Setup-<version>.exe`、`dist/VDS-Setup-<version>.exe.blockmap`、`dist/latest.yml`。
 7. 做发布手测：安装当前 `dist/VDS-Setup-<version>.exe`，确认应用可启动；如涉及更新链路，确认客户端能读取 `server/updates/latest.yml` 并识别目标版本。
 8. 发布前不要删除旧版本 blockmap；`prepare-server-release` 会按保留策略保留旧 blockmap，用于提高差分更新成功率。
 9. 正式发布后，把 `## 2. 未发布改动记录` 中已发布条目迁移到 `CHANGELOG.md`，清空或重建未发布区域，并更新当前发布版本。
@@ -513,13 +513,13 @@ server 单元测试覆盖：
 GitHub 更新流程：
 
 1. 发布前检查文档版本：`README.md`、`CHANGELOG.md`、`MEDIA_REFACTOR_PLAN.md` 和 `docs/` 不应残留上一版本的主介绍文案。
-2. 确认本地门禁已通过：至少包括 `npm run build:release` 和发布后的 `npm run release:check`。
+2. 确认本地门禁已通过：至少包括 `npm run release:check`；完整发布现在由 `npm run build:release` 自动串联 GitHub Release。
 3. 检查工作区：`git status -sb`，确认本次发布需要的源码、文档、脚本改动都已纳入提交范围；不要提交 `dist/`、`runtime/`、`server/updates/` 等被 `.gitignore` 排除的产物目录。
 4. 提交源码：`git add <本次发布相关文件>`，然后 `git commit -m "Release <version>"`。如发布后只修正文档，可用独立提交并把 tag 更新到该提交。
-5. 创建或更新 tag：`git tag -a v<version> -m "Release <version>"`；如果需要让 tag 指向修正文档后的新提交，使用 `git tag -fa v<version> -m "Release <version>"`。
-6. 推送源码和 tag：`git push origin master`，然后 `git push origin v<version>`；如果 tag 被修正过，使用 `git push --force origin v<version>`。
-7. 创建 GitHub Release，tag 使用 `v<version>`，标题使用 `VDS <version>`，正文从 `CHANGELOG.md` 对应版本摘取。
-8. 上传 release assets：`dist/VDS-Setup-<version>.exe`、`dist/VDS-Setup-<version>.exe.blockmap`、`dist/latest.yml`。
+5. 推送源码：`git push origin master`。
+6. 运行 `npm run build:release`。该命令会在 GitHub 发布阶段创建缺失的 `v<version>` tag、推送 tag、创建 Release，并上传 assets。
+7. 如果 Release 已存在，默认失败；确认需要覆盖时设置 `GITHUB_RELEASE_REPLACE=1` 后重新运行 `npm run release:github`。
+8. 如果必须在未提交工作区发布，设置 `ALLOW_DIRTY_GITHUB_RELEASE=1`；常规正式发布不要使用该开关。
 9. 发布后复核：确认 GitHub Release 不是 draft/prerelease，确认 assets 的文件名和 size 与本地一致，确认 GitHub README 显示当前版本。
 10. 如果 `gh` 指向非官方 CLI 或未登录，可用 GitHub 网页创建 release；本机 Git credential helper 能推送代码不等于 `gh release` 可用。
 

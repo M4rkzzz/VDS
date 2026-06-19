@@ -1,8 +1,8 @@
 #include "surface_attachment_runtime.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
-#include <limits>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -22,7 +22,6 @@
 #include "platform_utils.h"
 #include "surface_target.h"
 #include "string_utils.h"
-#include "time_utils.h"
 
 namespace fs = std::filesystem;
 
@@ -51,6 +50,15 @@ bool wait_for_path_to_exist(const std::string& path, int timeout_ms = 2000) {
   }
 }
 
+bool is_wgc_live_preview_enabled() {
+  const char* disable_value = std::getenv("VDS_DISABLE_WGC_LIVE_PREVIEW");
+  if (disable_value && std::string(disable_value) == "1") {
+    return false;
+  }
+  const char* enable_value = std::getenv("VDS_ENABLE_WGC_LIVE_PREVIEW");
+  return !enable_value || std::string(enable_value) != "0";
+}
+
 #ifdef _WIN32
 void close_surface_attachment_handles(SurfaceAttachmentState& state) {
   if (state.thread_handle) {
@@ -68,10 +76,8 @@ void close_surface_attachment_handles(SurfaceAttachmentState& state) {
 
 #ifdef _WIN32
 bool start_peer_video_surface_attachment(
-  const FfmpegProbeResult& ffmpeg,
   PeerState::PeerVideoReceiverRuntime& runtime,
   std::string* error) {
-  (void)ffmpeg;
   refresh_peer_video_receiver_runtime(runtime);
 
   std::string window_title;
@@ -81,13 +87,10 @@ bool start_peer_video_surface_attachment(
     window_title = "VDS Native Viewer - " + (runtime.surface_id.empty() ? "peer-video" : runtime.surface_id);
     codec_path = runtime.codec_path.empty() ? "h264" : runtime.codec_path;
     runtime.window_title = window_title;
-    runtime.command_line.clear();
     runtime.closing = false;
     runtime.pending_video_annexb_bytes.clear();
     runtime.startup_video_decoder_config_au.clear();
     runtime.startup_waiting_for_random_access = true;
-    runtime.launch_attempted = true;
-    runtime.last_start_attempt_at_unix_ms = vds::media_agent::current_time_millis();
     runtime.last_error.clear();
     runtime.reason = "peer-video-surface-starting";
   }
@@ -116,7 +119,6 @@ bool start_peer_video_surface_attachment(
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
     runtime.surface = surface;
-    runtime.last_start_success_at_unix_ms = vds::media_agent::current_time_millis();
   }
 
   refresh_peer_video_receiver_runtime(runtime);
@@ -137,8 +139,7 @@ bool is_peer_video_surface_shutdown_reason(const std::string& reason) {
 
 bool restart_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& runtime, std::string* error) {
   stop_peer_video_surface_attachment(runtime, "peer-video-surface-auto-restart");
-  const FfmpegProbeResult unused_ffmpeg;
-  return start_peer_video_surface_attachment(unused_ffmpeg, runtime, error);
+  return start_peer_video_surface_attachment(runtime, error);
 }
 
 void stop_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& runtime, const std::string& reason) {
@@ -161,7 +162,6 @@ void stop_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& run
   runtime.startup_video_decoder_config_au.clear();
   runtime.startup_waiting_for_random_access = true;
   runtime.reason = reason;
-  runtime.last_stop_at_unix_ms = vds::media_agent::current_time_millis();
 }
 
 bool update_peer_video_surface_layout(
@@ -189,48 +189,36 @@ void refresh_surface_attachment_state(SurfaceAttachmentState& state) {
   if (state.live_preview_runtime) {
     const NativeLivePreviewSnapshot snapshot = state.live_preview_runtime->snapshot();
     state.attached = snapshot.attached;
-    state.launch_attempted = snapshot.launch_attempted;
     state.running = snapshot.running;
     state.waiting_for_artifact = snapshot.waiting_for_artifact;
     state.decoder_ready = snapshot.decoder_ready;
     state.decoded_frames_rendered = snapshot.decoded_frames_rendered;
     state.frame_interval_stddev_ms = snapshot.frame_interval_stddev_ms;
-    state.last_decoded_frame_at_unix_ms = snapshot.last_decoded_frame_at_unix_ms;
     state.process_id = snapshot.process_id;
-    state.preview_surface_backend = snapshot.preview_surface_backend;
-    state.decoder_backend = snapshot.decoder_backend;
     state.codec_path = snapshot.codec_path;
     state.implementation = snapshot.implementation;
-    state.media_path = snapshot.media_path;
     state.window_title = snapshot.window_title;
     state.embedded_parent_debug = snapshot.embedded_parent_debug;
     state.surface_window_debug = snapshot.surface_window_debug;
     state.reason = snapshot.reason;
     state.last_error = snapshot.last_error;
-    state.command_line.clear();
     return;
   }
 
   if (state.preview_runtime) {
     const NativeArtifactPreviewSnapshot snapshot = state.preview_runtime->snapshot();
     state.attached = snapshot.attached;
-    state.launch_attempted = snapshot.launch_attempted;
     state.running = snapshot.running;
     state.waiting_for_artifact = snapshot.waiting_for_artifact;
     state.decoder_ready = snapshot.decoder_ready;
     state.decoded_frames_rendered = snapshot.decoded_frames_rendered;
     state.frame_interval_stddev_ms = 0.0;
-    state.last_decoded_frame_at_unix_ms = snapshot.last_decoded_frame_at_unix_ms;
     state.process_id = snapshot.process_id;
-    state.preview_surface_backend = snapshot.preview_surface_backend;
-    state.decoder_backend = snapshot.decoder_backend;
     state.codec_path = snapshot.codec_path;
     state.implementation = snapshot.implementation;
-    state.media_path = snapshot.media_path;
     state.window_title = snapshot.window_title;
     state.reason = snapshot.reason;
     state.last_error = snapshot.last_error;
-    state.command_line.clear();
     return;
   }
 
@@ -254,7 +242,6 @@ void refresh_surface_attachment_state(SurfaceAttachmentState& state) {
   }
 
   state.running = false;
-  state.last_exit_code = static_cast<int>(exit_code);
   state.reason = "surface-process-exited";
   close_surface_attachment_handles(state);
   state.process_id = 0;
@@ -271,17 +258,12 @@ void sync_surface_attachment_from_peer_runtime(
 
   std::lock_guard<std::mutex> lock(runtime->mutex);
   state.attached = runtime->surface_attached;
-  state.launch_attempted = runtime->launch_attempted;
   state.running = runtime->running;
   state.waiting_for_artifact = false;
   state.decoder_ready = runtime->decoder_ready;
   state.decoded_frames_rendered = runtime->decoded_frames_rendered;
   state.frame_interval_stddev_ms = runtime->frame_interval_stddev_ms;
-  state.last_decoded_frame_at_unix_ms = runtime->last_decoded_frame_at_unix_ms;
   state.process_id = runtime->process_id;
-  state.last_exit_code = runtime->last_exit_code;
-  state.preview_surface_backend = runtime->preview_surface_backend;
-  state.decoder_backend = runtime->decoder_backend;
   state.codec_path = runtime->codec_path;
   state.implementation = runtime->implementation;
   state.window_title = runtime->window_title;
@@ -289,11 +271,7 @@ void sync_surface_attachment_from_peer_runtime(
   state.surface_window_debug = runtime->surface_window_debug;
   state.reason = runtime->reason;
   state.last_error = runtime->last_error;
-  state.command_line = runtime->command_line;
   state.surface_layout = runtime->surface_layout;
-  state.last_start_attempt_at_unix_ms = runtime->last_start_attempt_at_unix_ms;
-  state.last_start_success_at_unix_ms = runtime->last_start_success_at_unix_ms;
-  state.last_stop_at_unix_ms = runtime->last_stop_at_unix_ms;
 }
 
 SurfaceAttachmentState start_surface_attachment(
@@ -306,25 +284,21 @@ SurfaceAttachmentState start_surface_attachment(
   state.attached = true;
   state.preview_runtime.reset();
   state.live_preview_runtime.reset();
-  state.preview_surface_backend = "native-win32-gdi";
-  state.decoder_backend = "none";
   state.decoder_ready = false;
   state.decoded_frames_rendered = 0;
   state.frame_interval_stddev_ms = 0.0;
-  state.last_decoded_frame_at_unix_ms = -1;
   state.codec_path = host_capture_artifact.video_codec.empty()
     ? "h264"
     : vds::media_agent::to_lower_copy(host_capture_artifact.video_codec);
-  state.implementation = host_capture_plan.capture_backend == "wgc"
+  const bool use_wgc_live_preview =
+    host_capture_plan.capture_backend == "wgc" && is_wgc_live_preview_enabled();
+  state.implementation = use_wgc_live_preview
     ? "wgc-live-preview"
     : "ffmpeg-native-artifact-preview";
-  state.media_path = host_capture_plan.capture_backend == "wgc"
+  state.media_path = use_wgc_live_preview
     ? host_capture_plan.input_target
     : host_capture_process.output_path;
-  state.manifest_path = host_capture_process.manifest_path;
   state.window_title = "VDS Native Preview - " + (state.surface_id.empty() ? "surface" : state.surface_id);
-  state.command_line.clear();
-  state.last_start_attempt_at_unix_ms = vds::media_agent::current_time_millis();
   state.waiting_for_artifact = false;
 
   if (!is_host_capture_surface_target(state.target)) {
@@ -333,8 +307,7 @@ SurfaceAttachmentState start_surface_attachment(
     return state;
   }
 
-  if (host_capture_plan.capture_backend == "wgc") {
-    state.launch_attempted = true;
+  if (use_wgc_live_preview) {
     NativeLivePreviewConfig config;
     config.surface_id = state.surface_id;
     config.window_title = state.window_title;
@@ -354,7 +327,6 @@ SurfaceAttachmentState start_surface_attachment(
 
     state.running = true;
     state.waiting_for_artifact = false;
-    state.last_start_success_at_unix_ms = vds::media_agent::current_time_millis();
     refresh_surface_attachment_state(state);
     return state;
   }
@@ -375,7 +347,6 @@ SurfaceAttachmentState start_surface_attachment(
     return state;
   }
 
-  state.launch_attempted = true;
   wait_for_path_to_exist(host_capture_process.output_path, 2000);
   NativeArtifactPreviewConfig config;
   config.surface_id = state.surface_id;
@@ -394,7 +365,6 @@ SurfaceAttachmentState start_surface_attachment(
 
   state.running = true;
   state.waiting_for_artifact = false;
-  state.last_start_success_at_unix_ms = vds::media_agent::current_time_millis();
   refresh_surface_attachment_state(state);
   return state;
 }
@@ -408,7 +378,6 @@ void stop_surface_attachment(SurfaceAttachmentState& state, const std::string& r
     state.waiting_for_artifact = false;
     state.process_id = 0;
     state.reason = reason;
-    state.last_stop_at_unix_ms = vds::media_agent::current_time_millis();
     return;
   }
   if (state.preview_runtime) {
@@ -418,7 +387,6 @@ void stop_surface_attachment(SurfaceAttachmentState& state, const std::string& r
     state.waiting_for_artifact = false;
     state.process_id = 0;
     state.reason = reason;
-    state.last_stop_at_unix_ms = vds::media_agent::current_time_millis();
     return;
   }
 
@@ -432,7 +400,6 @@ void stop_surface_attachment(SurfaceAttachmentState& state, const std::string& r
   state.waiting_for_artifact = false;
   state.process_id = 0;
   state.reason = reason;
-  state.last_stop_at_unix_ms = vds::media_agent::current_time_millis();
 }
 
 bool update_surface_attachment_layout(
@@ -475,11 +442,8 @@ SurfaceAttachmentState start_surface_attachment(
   const HostCaptureArtifactProbe&,
   SurfaceAttachmentState state) {
   state.attached = true;
-  state.preview_surface_backend = "native-window-embedding";
-  state.decoder_backend = "none";
   state.decoder_ready = false;
   state.decoded_frames_rendered = 0;
-  state.last_decoded_frame_at_unix_ms = -1;
   state.reason = "surface-unsupported-platform";
   state.last_error = "Native preview surfaces are only implemented on Windows.";
   return state;
@@ -503,7 +467,6 @@ bool update_surface_attachment_layout(
 }
 
 bool start_peer_video_surface_attachment(
-  const FfmpegProbeResult&,
   PeerState::PeerVideoReceiverRuntime&,
   std::string* error) {
   if (error) {
@@ -514,8 +477,7 @@ bool start_peer_video_surface_attachment(
 
 bool restart_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& runtime, std::string* error) {
   stop_peer_video_surface_attachment(runtime, "peer-video-surface-auto-restart");
-  const FfmpegProbeResult unused_ffmpeg;
-  return start_peer_video_surface_attachment(unused_ffmpeg, runtime, error);
+  return start_peer_video_surface_attachment(runtime, error);
 }
 
 void stop_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& runtime, const std::string& reason) {
@@ -557,60 +519,24 @@ std::string surface_attachment_json(SurfaceAttachmentState& state) {
     refresh_surface_attachment_state(state);
   }
 
-  NativeLivePreviewSnapshot live_preview_snapshot;
-  const bool has_live_preview_snapshot = static_cast<bool>(state.live_preview_runtime);
-  if (has_live_preview_snapshot) {
-    live_preview_snapshot = state.live_preview_runtime->snapshot();
-  }
-
   std::ostringstream payload;
   payload
     << "{\"attached\":" << (state.attached ? "true" : "false")
-    << ",\"launchAttempted\":" << (state.launch_attempted ? "true" : "false")
     << ",\"running\":" << (state.running ? "true" : "false")
-    << ",\"waitingForArtifact\":" << (state.waiting_for_artifact ? "true" : "false")
     << ",\"decoderReady\":" << (state.decoder_ready ? "true" : "false")
-    << ",\"restartCount\":" << state.restart_count
     << ",\"decodedFramesRendered\":" << state.decoded_frames_rendered
     << ",\"frameIntervalStddevMs\":" << state.frame_interval_stddev_ms
-    << ",\"avgCopyResourceUs\":" << (has_live_preview_snapshot ? live_preview_snapshot.avg_copy_resource_us : 0)
-    << ",\"avgMapUs\":" << (has_live_preview_snapshot ? live_preview_snapshot.avg_map_us : 0)
-    << ",\"avgMemcpyUs\":" << (has_live_preview_snapshot ? live_preview_snapshot.avg_memcpy_us : 0)
-    << ",\"avgTotalReadbackUs\":" << (has_live_preview_snapshot ? live_preview_snapshot.avg_total_readback_us : 0)
     << ",\"surface\":\"" << vds::media_agent::json_escape(state.surface_id) << "\""
     << ",\"target\":\"" << vds::media_agent::json_escape(state.target) << "\""
     << ",\"processId\":" << state.process_id
-    << ",\"lastExitCode\":";
-
-  if (state.last_exit_code == std::numeric_limits<int>::min()) {
-    payload << "null";
-  } else {
-    payload << state.last_exit_code;
-  }
-
-  payload
-    << ",\"previewSurfaceBackend\":\"" << vds::media_agent::json_escape(state.preview_surface_backend) << "\""
-    << ",\"decoderBackend\":\"" << vds::media_agent::json_escape(state.decoder_backend) << "\""
-    << ",\"codecPath\":\"" << vds::media_agent::json_escape(state.codec_path) << "\""
     << ",\"implementation\":\"" << vds::media_agent::json_escape(state.implementation) << "\""
     << ",\"layout\":" << surface_layout_json(state.surface_layout)
-    << ",\"mediaPath\":\"" << vds::media_agent::json_escape(state.media_path) << "\""
-    << ",\"manifestPath\":\"" << vds::media_agent::json_escape(state.manifest_path) << "\""
     << ",\"windowTitle\":\"" << vds::media_agent::json_escape(state.window_title) << "\""
     << ",\"embeddedParentDebug\":\"" << vds::media_agent::json_escape(state.embedded_parent_debug) << "\""
     << ",\"surfaceWindowDebug\":\"" << vds::media_agent::json_escape(state.surface_window_debug) << "\""
     << ",\"reason\":\"" << vds::media_agent::json_escape(state.reason) << "\""
     << ",\"lastError\":\"" << vds::media_agent::json_escape(state.last_error) << "\""
-    << ",\"commandLine\":\"" << vds::media_agent::json_escape(state.command_line) << "\""
-    << ",\"lastStartAttemptAtMs\":";
-  vds::media_agent::append_nullable_int64(payload, state.last_start_attempt_at_unix_ms);
-  payload << ",\"lastStartSuccessAtMs\":";
-  vds::media_agent::append_nullable_int64(payload, state.last_start_success_at_unix_ms);
-  payload << ",\"lastStopAtMs\":";
-  vds::media_agent::append_nullable_int64(payload, state.last_stop_at_unix_ms);
-  payload << ",\"lastDecodedFrameAtMs\":";
-  vds::media_agent::append_nullable_int64(payload, state.last_decoded_frame_at_unix_ms);
-  payload << "}";
+    << "}";
   return payload.str();
 }
 

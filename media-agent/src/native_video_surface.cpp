@@ -18,7 +18,6 @@
 #include <utility>
 #include <vector>
 
-#include "native_surface_layout.h"
 #include "time_utils.h"
 
 #ifdef _WIN32
@@ -39,7 +38,6 @@ extern "C" {
 namespace {
 
 using vds::media_agent::current_time_micros_steady;
-using vds::media_agent::current_time_millis;
 
 std::string to_lower_ascii(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
@@ -597,7 +595,6 @@ class NativeVideoSurface::Impl {
  public:
   explicit Impl(NativeVideoSurfaceConfig config)
       : config_(std::move(config)) {
-    snapshot_.launch_attempted = true;
     snapshot_.codec_path = to_lower_ascii(config_.codec.empty() ? "h264" : config_.codec);
     snapshot_.window_title = config_.window_title;
   }
@@ -836,7 +833,6 @@ class NativeVideoSurface::Impl {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       snapshot_.process_id = static_cast<unsigned long>(GetCurrentProcessId());
-      snapshot_.thread_id = 0;
     }
 
     const std::string initial_codec = snapshot().codec_path;
@@ -858,7 +854,6 @@ class NativeVideoSurface::Impl {
       snapshot_.attached = true;
       snapshot_.running = true;
       snapshot_.decoder_ready = true;
-      snapshot_.preview_surface_backend = "native-win32-gdi";
       snapshot_.implementation = "ffmpeg-native-video-surface";
       snapshot_.reason = "native-surface-running";
       start_complete_ = true;
@@ -1167,7 +1162,6 @@ class NativeVideoSurface::Impl {
 
     std::lock_guard<std::mutex> lock(mutex_);
     snapshot_.window_title = config_.window_title;
-    snapshot_.thread_id = static_cast<unsigned long>(GetCurrentThreadId());
     snapshot_.surface_window_debug = describe_window_debug(
       "create-window-succeeded",
       hwnd,
@@ -1494,7 +1488,6 @@ class NativeVideoSurface::Impl {
     codec_context_->thread_count = 0;
     codec_context_->thread_type = FF_THREAD_FRAME;
 
-    decoder_backend_ = "software";
     hw_pixel_format_ = AV_PIX_FMT_NONE;
 
     static constexpr AVHWDeviceType preferred_hw_types[] = {
@@ -1518,7 +1511,6 @@ class NativeVideoSurface::Impl {
       av_buffer_unref(&device_ref);
       codec_context_->get_format = &NativeVideoSurface::Impl::ffmpeg_get_format;
       hw_pixel_format_ = hw_pixel_format;
-      decoder_backend_ = av_hwdevice_get_type_name(device_type);
       break;
     }
 
@@ -1527,7 +1519,6 @@ class NativeVideoSurface::Impl {
       av_buffer_unref(&codec_context_->hw_device_ctx);
       codec_context_->get_format = nullptr;
       hw_pixel_format_ = AV_PIX_FMT_NONE;
-      decoder_backend_ = "software";
       open_result = avcodec_open2(codec_context_, codec, nullptr);
     }
 
@@ -1550,7 +1541,6 @@ class NativeVideoSurface::Impl {
       std::lock_guard<std::mutex> lock(mutex_);
       snapshot_.codec_path = normalized_codec;
       snapshot_.decoder_ready = true;
-      snapshot_.decoder_backend = decoder_backend_;
       snapshot_.last_error.clear();
       snapshot_.reason = "native-decoder-ready";
     }
@@ -1576,7 +1566,6 @@ class NativeVideoSurface::Impl {
     frame_height_ = 0;
     frame_sample_aspect_ratio_ = AVRational{1, 1};
     active_codec_.clear();
-    decoder_backend_ = "none";
     hw_pixel_format_ = AV_PIX_FMT_NONE;
   }
 
@@ -1584,7 +1573,6 @@ class NativeVideoSurface::Impl {
     const std::lock_guard<std::mutex> lock(mutex_);
     snapshot_.codec_path = codec_name;
     snapshot_.decoder_ready = false;
-    snapshot_.decoder_backend = "none";
     snapshot_.last_error = error_message;
     snapshot_.reason = "native-decoder-open-failed";
     if (!start_complete_) {
@@ -1735,9 +1723,7 @@ class NativeVideoSurface::Impl {
       }
       last_frame_present_at_steady_us_ = now_steady_us;
       snapshot_.decoded_frames_rendered += 1;
-      snapshot_.last_decoded_frame_at_unix_ms = current_time_millis();
       snapshot_.decoder_ready = true;
-      snapshot_.decoder_backend = decoder_backend_;
       snapshot_.last_error.clear();
       snapshot_.reason = "native-frame-rendered";
     }
@@ -1779,7 +1765,6 @@ class NativeVideoSurface::Impl {
   SwsContext* sws_context_ = nullptr;
   AVPixelFormat hw_pixel_format_ = AV_PIX_FMT_NONE;
   std::string active_codec_;
-  std::string decoder_backend_ = "none";
   int frame_width_ = 0;
   int frame_height_ = 0;
   AVRational frame_sample_aspect_ratio_ { 1, 1 };

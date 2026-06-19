@@ -158,19 +158,6 @@ std::string to_ice_state_string(rtc::PeerConnection::IceState state) {
   }
 }
 
-std::string to_gathering_state_string(rtc::PeerConnection::GatheringState state) {
-  switch (state) {
-    case rtc::PeerConnection::GatheringState::New:
-      return "new";
-    case rtc::PeerConnection::GatheringState::InProgress:
-      return "in-progress";
-    case rtc::PeerConnection::GatheringState::Complete:
-      return "complete";
-    default:
-      return "unknown";
-  }
-}
-
 std::string to_signaling_state_string(rtc::PeerConnection::SignalingState state) {
   switch (state) {
     case rtc::PeerConnection::SignalingState::Stable:
@@ -280,6 +267,18 @@ bool is_encoded_media_data_channel_label(const std::string& label) {
   return label == kEncodedMediaDataChannelLabel;
 }
 
+std::string encoded_frame_payload_format(const PeerEncodedMediaDataChannelFrame& frame) {
+  if (!frame.payload_format.empty()) {
+    return frame.payload_format;
+  }
+  const std::string stream_type = to_lower_ascii(frame.stream_type);
+  const std::string codec = to_lower_ascii(frame.codec);
+  if (stream_type == "audio") {
+    return codec == "aac" || codec == "mp4a.40.2" ? "aac-adts" : "opus-raw";
+  }
+  return "annexb";
+}
+
 std::uint64_t extract_uint64_json_value(const std::string& json, const std::string& key, std::uint64_t fallback = 0) {
   const std::string pattern = "\"" + key + "\"";
   const std::size_t key_pos = json.find(pattern);
@@ -337,6 +336,39 @@ std::string build_encoded_media_error(const std::string& reason) {
     vds::media_agent::json_escape(reason) + "\"}";
 }
 
+struct EncodedMediaControlMessage {
+  bool valid = false;
+  std::string protocol;
+  std::string type;
+  int protocol_version = 0;
+  std::string media_session_id;
+  int manifest_version = 0;
+  std::string reason;
+};
+
+EncodedMediaControlMessage parse_encoded_media_control_message(const std::string& text) {
+  EncodedMediaControlMessage message;
+  const std::string trimmed = vds::media_agent::trim_copy(text);
+  if (trimmed.size() < 2 || trimmed.front() != '{' || trimmed.back() != '}') {
+    return message;
+  }
+
+  message.protocol = vds::media_agent::extract_string_value(trimmed, "protocol");
+  message.type = vds::media_agent::extract_string_value(trimmed, "type");
+  message.protocol_version = vds::media_agent::extract_int_value(trimmed, "protocolVersion", -1);
+  if (message.protocol != kEncodedMediaProtocol ||
+      message.protocol_version != 1 ||
+      (message.type != "hello" && message.type != "hello-ack" && message.type != "error")) {
+    return message;
+  }
+
+  message.media_session_id = vds::media_agent::extract_string_value(trimmed, "mediaSessionId");
+  message.manifest_version = vds::media_agent::extract_int_value(trimmed, "manifestVersion", 0);
+  message.reason = vds::media_agent::extract_string_value(trimmed, "reason");
+  message.valid = true;
+  return message;
+}
+
 bool decode_encoded_media_frame_message(
   const rtc::binary& payload,
   PeerEncodedMediaDataChannelFrame* decoded_frame,
@@ -388,6 +420,7 @@ bool decode_encoded_media_frame_message(
     decoded_frame->message_type = message_type;
     decoded_frame->stream_type = vds::media_agent::extract_string_value(header, "streamType");
     decoded_frame->codec = to_lower_ascii(vds::media_agent::extract_string_value(header, "codec"));
+    decoded_frame->payload_format = to_lower_ascii(vds::media_agent::extract_string_value(header, "payloadFormat"));
     decoded_frame->timestamp_us = extract_uint64_json_value(header, "timestampUs", 0);
     decoded_frame->sequence = extract_uint64_json_value(header, "sequence", 0);
     decoded_frame->keyframe = vds::media_agent::extract_bool_value(header, "keyframe", false);
@@ -444,19 +477,13 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       initiator(initiator_value),
       callbacks(std::move(callbacks_value)),
       encoded_media_data_channel_requested(encoded_media_data_channel_value) {
-    snapshot.available = true;
     snapshot.transport_ready = true;
-    snapshot.video_track_support = true;
-    snapshot.audio_track_support = true;
-    snapshot.data_channel_requested = initiator;
     snapshot.encoded_media_data_channel_requested = encoded_media_data_channel_requested;
     if (encoded_media_data_channel_requested) {
       snapshot.data_channel_label = kEncodedMediaDataChannelLabel;
       snapshot.encoded_media_data_channel_supported = true;
       snapshot.encoded_media_data_channel_state = "requested";
     }
-    snapshot.created_at_unix_ms = current_time_millis();
-    snapshot.updated_at_unix_ms = snapshot.created_at_unix_ms;
     snapshot.reason = initiator ? "awaiting-local-offer" : "awaiting-remote-offer";
   }
 
@@ -473,8 +500,10 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     pc = std::make_shared<rtc::PeerConnection>(config);
     install_callbacks();
 
-    if (initiator || encoded_media_data_channel_requested) {
-      data_channel = pc->createDataChannel(snapshot.data_channel_label);
+    if (initiator && encoded_media_data_channel_requested) {
+      rtc::DataChannelInit data_channel_init;
+      data_channel_init.reliability.unordered = true;
+      data_channel = pc->createDataChannel(snapshot.data_channel_label, data_channel_init);
       install_data_channel_callbacks(data_channel);
     }
 
@@ -545,6 +574,24 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     }
   }
 
+  void send_data_channel_text(const std::string& text) {
+    std::shared_ptr<rtc::DataChannel> channel;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (closed || !data_channel) {
+        return;
+      }
+      channel = data_channel;
+    }
+    if (channel && channel->isOpen()) {
+      channel->send(text);
+    }
+  }
+
+  void send_encoded_media_error(const std::string& reason) {
+    send_data_channel_text(build_encoded_media_error(reason));
+  }
+
   void close() {
     std::shared_ptr<rtc::PeerConnection> local_pc;
     std::shared_ptr<rtc::DataChannel> local_data_channel;
@@ -560,13 +607,10 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
 
       closed = true;
-      snapshot.closed = true;
-      snapshot.data_channel_open = false;
       snapshot.connection_state = "closed";
       snapshot.ice_state = "closed";
       snapshot.signaling_state = "closed";
       snapshot.reason = "peer-closed";
-      snapshot.updated_at_unix_ms = current_time_millis();
 
       local_pc = std::move(pc);
       local_data_channel = std::move(data_channel);
@@ -581,6 +625,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     }
 
     if (local_data_channel) {
+      local_data_channel->resetCallbacks();
       local_data_channel->close();
     }
     if (local_pc) {
@@ -626,7 +671,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       description.addH264Codec(config.payload_type > 0 ? config.payload_type : 96);
     }
 
-    const std::uint32_t ssrc = config.ssrc != 0 ? config.ssrc : g_next_video_ssrc.fetch_add(1);
+    const std::uint32_t ssrc = g_next_video_ssrc.fetch_add(1);
     const std::string cname = peer_id + "-video";
     description.addSSRC(
       ssrc,
@@ -657,7 +702,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       std::lock_guard<std::mutex> lock(self->mutex);
       self->snapshot.nack_retransmissions += count;
       self->snapshot.reason = "nack-retransmit";
-      self->snapshot.updated_at_unix_ms = current_time_millis();
     });
     auto pli_handler = std::make_shared<rtc::PliHandler>([weak_self]() {
       auto self = weak_self.lock();
@@ -667,7 +711,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       std::lock_guard<std::mutex> lock(self->mutex);
       self->snapshot.pli_requests_received += 1;
       self->snapshot.reason = "pli-received";
-      self->snapshot.updated_at_unix_ms = current_time_millis();
     });
     if (use_h265) {
       auto packetizer = std::make_shared<rtc::H265RtpPacketizer>(
@@ -695,7 +738,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       std::lock_guard<std::mutex> lock(self->mutex);
       self->snapshot.video_track_open = true;
       self->snapshot.reason = "video-track-open";
-      self->snapshot.updated_at_unix_ms = current_time_millis();
       self->snapshot.media_plane_ready = self->snapshot.decoder_ready && self->snapshot.decoded_frames_rendered > 0;
     });
     new_track->onClosed([weak_self]() {
@@ -706,7 +748,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
       std::lock_guard<std::mutex> lock(self->mutex);
       self->snapshot.video_track_open = false;
-      self->snapshot.updated_at_unix_ms = current_time_millis();
       self->snapshot.media_plane_ready = self->snapshot.decoder_ready && self->snapshot.decoded_frames_rendered > 0;
     });
 
@@ -717,11 +758,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     video_track = std::move(new_track);
     video_rtp_config = std::move(rtp_config);
     snapshot.video_track_configured = true;
-    snapshot.video_mid = config.mid.empty() ? "video" : config.mid;
     snapshot.video_codec = normalized_codec;
     snapshot.codec_path = normalized_codec;
-    snapshot.video_decoder_backend = "none";
-    snapshot.video_source = config.source;
     snapshot.reason = "video-track-configured";
     snapshot.media_plane_ready = snapshot.decoder_ready && snapshot.decoded_frames_rendered > 0;
     refresh_from_peer_connection_locked();
@@ -736,9 +774,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       video_rtp_config.reset();
       snapshot.video_track_configured = false;
       snapshot.video_track_open = false;
-      snapshot.video_source.clear();
       snapshot.reason = "video-track-cleared";
-      snapshot.updated_at_unix_ms = current_time_millis();
       snapshot.media_plane_ready = snapshot.decoder_ready && snapshot.decoded_frames_rendered > 0;
     }
 
@@ -772,7 +808,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       description.addPCMUCodec(config.payload_type >= 0 ? config.payload_type : 0);
     }
 
-    const std::uint32_t ssrc = config.ssrc != 0 ? config.ssrc : g_next_audio_ssrc.fetch_add(1);
+    const std::uint32_t ssrc = g_next_audio_ssrc.fetch_add(1);
     const std::string cname = peer_id + "-audio";
     description.addSSRC(
       ssrc,
@@ -821,7 +857,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       std::lock_guard<std::mutex> lock(self->mutex);
       self->snapshot.audio_track_open = true;
       self->snapshot.reason = "audio-track-open";
-      self->snapshot.updated_at_unix_ms = current_time_millis();
     });
     new_track->onClosed([weak_self]() {
       auto self = weak_self.lock();
@@ -831,7 +866,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
       std::lock_guard<std::mutex> lock(self->mutex);
       self->snapshot.audio_track_open = false;
-      self->snapshot.updated_at_unix_ms = current_time_millis();
     });
 
     std::lock_guard<std::mutex> lock(mutex);
@@ -841,7 +875,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     audio_track = std::move(new_track);
     audio_rtp_config = std::move(rtp_config);
     snapshot.audio_track_configured = true;
-    snapshot.audio_mid = config.mid.empty() ? "audio" : config.mid;
     snapshot.audio_codec = config.codec;
     snapshot.reason = "audio-track-configured";
     refresh_from_peer_connection_locked();
@@ -857,7 +890,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       snapshot.audio_track_configured = false;
       snapshot.audio_track_open = false;
       snapshot.reason = "audio-track-cleared";
-      snapshot.updated_at_unix_ms = current_time_millis();
     }
 
     if (local_audio_track) {
@@ -898,8 +930,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
     std::lock_guard<std::mutex> lock(mutex);
     snapshot.video_frames_sent += 1;
-    snapshot.video_bytes_sent += static_cast<std::uint64_t>(frame.size());
-    snapshot.last_video_frame_at_unix_ms = current_time_millis();
     snapshot.reason = "video-frame-sent";
     refresh_from_peer_connection_locked();
   }
@@ -928,7 +958,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
     std::lock_guard<std::mutex> lock(mutex);
     snapshot.audio_frames_sent += 1;
-    snapshot.audio_bytes_sent += static_cast<std::uint64_t>(frame.size());
     snapshot.reason = "audio-frame-sent";
     refresh_from_peer_connection_locked();
   }
@@ -959,7 +988,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       "\",\"type\":\"" + message_type +
       "\",\"streamType\":\"" + vds::media_agent::json_escape(frame.stream_type) +
       "\",\"codec\":\"" + vds::media_agent::json_escape(frame.codec) +
-      "\",\"payloadFormat\":\"annexb\",\"timestampUs\":" + std::to_string(frame.timestamp_us) +
+      "\",\"payloadFormat\":\"" + vds::media_agent::json_escape(encoded_frame_payload_format(frame)) +
+      "\",\"timestampUs\":" + std::to_string(frame.timestamp_us) +
       ",\"sequence\":" + std::to_string(sequence) +
       ",\"keyframe\":" + (frame.keyframe ? "true" : "false") +
       ",\"config\":" + (frame.config ? "true" : "false");
@@ -1017,7 +1047,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
     std::lock_guard<std::mutex> lock(mutex);
     snapshot.encoded_media_data_channel_frames_sent += 1;
-    snapshot.encoded_media_data_channel_bytes_sent += static_cast<std::uint64_t>(frame.payload.size());
     snapshot.encoded_media_data_channel_state = "frame-sent";
     snapshot.reason = "encoded-media-datachannel-frame-sent";
     refresh_from_peer_connection_locked();
@@ -1025,15 +1054,10 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
   void set_decoder_state(
     bool decoder_ready,
-    std::uint64_t decoded_frames_rendered,
-    std::int64_t last_decoded_frame_at_unix_ms,
-    const std::string& video_decoder_backend) {
+    std::uint64_t decoded_frames_rendered) {
     std::lock_guard<std::mutex> lock(mutex);
     snapshot.decoder_ready = decoder_ready;
     snapshot.decoded_frames_rendered = decoded_frames_rendered;
-    snapshot.last_decoded_frame_at_unix_ms = last_decoded_frame_at_unix_ms;
-    snapshot.video_decoder_backend = video_decoder_backend;
-    snapshot.updated_at_unix_ms = current_time_millis();
     snapshot.media_plane_ready = snapshot.decoder_ready && snapshot.decoded_frames_rendered > 0;
     if (snapshot.media_plane_ready) {
       snapshot.reason = "native-render-active";
@@ -1044,7 +1068,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     std::lock_guard<std::mutex> lock(mutex);
     snapshot.media_session_id = std::move(media_session_id);
     snapshot.media_manifest_version = manifest_version;
-    snapshot.updated_at_unix_ms = current_time_millis();
   }
 
   void request_keyframe(const std::string& reason) {
@@ -1057,7 +1080,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         snapshot.decoder_recovery_count += 1;
       }
       snapshot.reason = reason.empty() ? "keyframe-requested" : reason;
-      snapshot.updated_at_unix_ms = current_time_millis();
     }
     if (local_inbound_video_track) {
       local_inbound_video_track->requestKeyframe();
@@ -1070,7 +1092,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     }
     std::lock_guard<std::mutex> lock(mutex);
     snapshot.dropped_video_units += count;
-    snapshot.updated_at_unix_ms = current_time_millis();
   }
 
  private:
@@ -1193,12 +1214,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       if (self->closed) {
         return;
       }
-      self->snapshot.remote_video_track_attached = true;
-      if (self->snapshot.remote_track_count < 1) {
-        self->snapshot.remote_track_count = 1;
-      }
       self->snapshot.reason = "remote-video-track-open";
-      self->snapshot.updated_at_unix_ms = current_time_millis();
       self->snapshot.media_plane_ready = self->snapshot.decoder_ready && self->snapshot.decoded_frames_rendered > 0;
     });
     track->onClosed([weak_self]() {
@@ -1211,8 +1227,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       if (self->closed) {
         return;
       }
-      self->snapshot.remote_video_track_attached = false;
-      self->snapshot.updated_at_unix_ms = current_time_millis();
       self->snapshot.media_plane_ready = self->snapshot.decoder_ready && self->snapshot.decoded_frames_rendered > 0;
     });
     track->onFrame([weak_self](rtc::binary frame, rtc::FrameInfo info) {
@@ -1234,15 +1248,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         if (self->closed) {
           return;
         }
-        self->snapshot.remote_video_track_attached = true;
-        if (self->snapshot.remote_track_count < 1) {
-          self->snapshot.remote_track_count = 1;
-        }
         self->snapshot.remote_video_frames_received += 1;
-        self->snapshot.remote_video_bytes_received += static_cast<std::uint64_t>(frame.size());
-        self->snapshot.last_remote_video_frame_at_unix_ms = current_time_millis();
         self->snapshot.reason = "remote-video-frame-received";
-        self->snapshot.updated_at_unix_ms = self->snapshot.last_remote_video_frame_at_unix_ms;
         self->snapshot.media_plane_ready = self->snapshot.decoder_ready && self->snapshot.decoded_frames_rendered > 0;
         codec_copy = self->snapshot.video_codec;
       }
@@ -1269,9 +1276,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       if (self->closed) {
         return;
       }
-      self->snapshot.remote_audio_track_attached = true;
       self->snapshot.reason = "remote-audio-track-open";
-      self->snapshot.updated_at_unix_ms = current_time_millis();
     });
     track->onClosed([weak_self]() {
       auto self = weak_self.lock();
@@ -1283,8 +1288,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       if (self->closed) {
         return;
       }
-      self->snapshot.remote_audio_track_attached = false;
-      self->snapshot.updated_at_unix_ms = current_time_millis();
     });
     track->onFrame([weak_self](rtc::binary frame, rtc::FrameInfo info) {
       auto self = weak_self.lock();
@@ -1305,11 +1308,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         if (self->closed) {
           return;
         }
-        self->snapshot.remote_audio_track_attached = true;
         self->snapshot.remote_audio_frames_received += 1;
-        self->snapshot.remote_audio_bytes_received += static_cast<std::uint64_t>(frame.size());
         self->snapshot.reason = "remote-audio-frame-received";
-        self->snapshot.updated_at_unix_ms = current_time_millis();
         codec_copy = self->snapshot.audio_codec;
       }
 
@@ -1385,16 +1385,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       inbound_video_depacketizer = std::move(depacketizer);
       inbound_video_rtcp_session = std::move(receiver_rtcp_session);
       snapshot.video_receiver_configured = true;
-      snapshot.remote_video_track_attached = true;
-      if (snapshot.remote_track_count < 1) {
-        snapshot.remote_track_count = 1;
-      }
-      snapshot.video_mid = media.mid().empty() ? "video" : media.mid();
       snapshot.video_codec = negotiated_codec;
       snapshot.codec_path = negotiated_codec;
-      snapshot.video_decoder_backend = "none";
       snapshot.reason = "remote-video-track-configured";
-      snapshot.updated_at_unix_ms = current_time_millis();
       snapshot.media_plane_ready = snapshot.decoder_ready && snapshot.decoded_frames_rendered > 0;
       return;
     }
@@ -1475,11 +1468,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       inbound_audio_depacketizer = std::move(depacketizer);
       inbound_audio_rtcp_session = std::move(receiver_rtcp_session);
       snapshot.audio_receiver_configured = true;
-      snapshot.remote_audio_track_attached = true;
-      snapshot.audio_mid = media.mid().empty() ? "audio" : media.mid();
       snapshot.audio_codec = negotiated_codec;
       snapshot.reason = "remote-audio-track-configured";
-      snapshot.updated_at_unix_ms = current_time_millis();
       return;
     }
   }
@@ -1493,14 +1483,13 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         return;
       }
 
+      const std::string description_type = to_description_type_string(description.type());
       PeerTransportSnapshot snapshot_copy;
       {
         std::lock_guard<std::mutex> lock(self->mutex);
         if (self->closed) {
           return;
         }
-        self->snapshot.local_description_created = true;
-        self->snapshot.local_description_type = to_description_type_string(description.type());
         self->snapshot.reason = "local-description-created";
         self->snapshot.last_error.clear();
         self->refresh_from_peer_connection_locked();
@@ -1509,7 +1498,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
       if (self->callbacks.on_local_description) {
         self->callbacks.on_local_description(
-          snapshot_copy.local_description_type,
+          description_type,
           ensure_video_rtcp_feedback_lines(std::string(description))
         );
       }
@@ -1530,7 +1519,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         if (self->closed) {
           return;
         }
-        self->snapshot.local_candidate_count += 1;
         self->snapshot.reason = "local-candidate-gathered";
         self->refresh_from_peer_connection_locked();
         candidate_mid = candidate.mid();
@@ -1575,7 +1563,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         return;
       }
       self->snapshot.ice_state = to_ice_state_string(state);
-      self->snapshot.updated_at_unix_ms = current_time_millis();
     });
 
     pc->onGatheringStateChange([weak_self](rtc::PeerConnection::GatheringState state) {
@@ -1588,8 +1575,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       if (self->closed) {
         return;
       }
-      self->snapshot.gathering_state = to_gathering_state_string(state);
-      self->snapshot.updated_at_unix_ms = current_time_millis();
     });
 
     pc->onSignalingStateChange([weak_self](rtc::PeerConnection::SignalingState state) {
@@ -1603,7 +1588,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         return;
       }
       self->snapshot.signaling_state = to_signaling_state_string(state);
-      self->snapshot.updated_at_unix_ms = current_time_millis();
     });
 
     pc->onDataChannel([weak_self](std::shared_ptr<rtc::DataChannel> data_channel_value) {
@@ -1618,14 +1602,12 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
           return;
         }
         self->data_channel = data_channel_value;
-        self->snapshot.data_channel_requested = true;
         self->snapshot.data_channel_label = data_channel_value ? data_channel_value->label() : "vds-control";
         if (data_channel_value && is_encoded_media_data_channel_label(data_channel_value->label())) {
           self->snapshot.encoded_media_data_channel_supported = true;
           self->snapshot.encoded_media_data_channel_state = "attached";
         }
         self->snapshot.reason = "data-channel-attached";
-        self->snapshot.updated_at_unix_ms = current_time_millis();
       }
 
       self->install_data_channel_callbacks(data_channel_value);
@@ -1651,28 +1633,18 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         if (self->closed) {
           return;
         }
-        self->snapshot.remote_track_count += 1;
         if (track) {
           if (track_type == "audio") {
             self->inbound_audio_track = track;
-            self->snapshot.remote_audio_track_attached = true;
             self->snapshot.audio_receiver_configured = true;
-            if (!track_mid.empty()) {
-              self->snapshot.audio_mid = track_mid;
-            }
             install_audio_callbacks = true;
           } else {
             self->inbound_video_track = track;
-            self->snapshot.remote_video_track_attached = true;
             self->snapshot.video_receiver_configured = true;
-            if (!track_mid.empty()) {
-              self->snapshot.video_mid = track_mid;
-            }
             install_video_callbacks = true;
           }
         }
         self->snapshot.reason = "remote-track-attached";
-        self->snapshot.updated_at_unix_ms = current_time_millis();
       }
 
       if (install_video_callbacks) {
@@ -1691,7 +1663,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
     auto weak_self = weak_from_this();
 
-    data_channel_value->onOpen([weak_self, data_channel_value]() {
+    data_channel_value->onOpen([weak_self]() {
       auto self = weak_self.lock();
       if (!self) {
         return;
@@ -1703,7 +1675,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         if (self->closed) {
           return;
         }
-        self->snapshot.data_channel_open = true;
         if (is_encoded_media_data_channel_label(self->snapshot.data_channel_label)) {
           self->snapshot.encoded_media_data_channel_open = true;
           self->snapshot.encoded_media_data_channel_supported = true;
@@ -1717,8 +1688,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       if (self->callbacks.on_state_change) {
         self->callbacks.on_state_change(snapshot_copy, "connected");
       }
-      if (is_encoded_media_data_channel_label(snapshot_copy.data_channel_label) && data_channel_value && data_channel_value->isOpen()) {
-        data_channel_value->send(build_encoded_media_hello(snapshot_copy));
+      if (is_encoded_media_data_channel_label(snapshot_copy.data_channel_label)) {
+        self->send_data_channel_text(build_encoded_media_hello(snapshot_copy));
       }
     });
 
@@ -1734,7 +1705,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         if (self->closed) {
           return;
         }
-        self->snapshot.data_channel_open = false;
         if (is_encoded_media_data_channel_label(self->snapshot.data_channel_label)) {
           self->snapshot.encoded_media_data_channel_open = false;
           self->snapshot.encoded_media_data_channel_ready = false;
@@ -1746,26 +1716,28 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
 
       if (self->callbacks.on_state_change) {
-        self->callbacks.on_state_change(snapshot_copy, "disconnected");
+        self->callbacks.on_state_change(snapshot_copy, "datachannel-closed");
       }
     });
 
-    data_channel_value->onMessage([weak_self, data_channel_value](rtc::message_variant message) {
+    const std::string data_channel_label = data_channel_value ? data_channel_value->label() : "";
+    data_channel_value->onMessage([weak_self, data_channel_label](rtc::message_variant message) {
       auto self = weak_self.lock();
       if (!self) {
         return;
       }
 
-      const std::string label = data_channel_value ? data_channel_value->label() : "";
-      if (!is_encoded_media_data_channel_label(label)) {
+      if (!is_encoded_media_data_channel_label(data_channel_label)) {
         return;
       }
 
       if (std::holds_alternative<std::string>(message)) {
         const std::string text = std::get<std::string>(message);
+        const EncodedMediaControlMessage control = parse_encoded_media_control_message(text);
         bool send_ack = false;
         bool send_version_error = false;
         bool send_session_error = false;
+        bool invalid_control = false;
         std::string session_error;
         PeerTransportSnapshot snapshot_copy;
         {
@@ -1773,43 +1745,22 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
           if (self->closed) {
             return;
           }
-          self->snapshot.encoded_media_data_channel_messages_received += 1;
           self->snapshot.encoded_media_data_channel_supported = true;
           self->snapshot.encoded_media_data_channel_open = true;
-          if (string_contains(text, "\"protocol\":\"vds-media-encoded-v1\"") &&
-              string_contains(text, "\"type\":\"hello\"")) {
-            if (string_contains(text, "\"protocolVersion\":1")) {
-              const std::string remote_session_id = vds::media_agent::extract_string_value(text, "mediaSessionId");
-              const int remote_manifest_version = vds::media_agent::extract_int_value(text, "manifestVersion", 0);
-              if (!self->snapshot.media_session_id.empty() &&
-                  !remote_session_id.empty() &&
-                  remote_session_id != self->snapshot.media_session_id) {
-                session_error = "datachannel-media-session-mismatch";
-                send_session_error = true;
-              } else if (self->snapshot.media_manifest_version > 0 &&
-                         remote_manifest_version > 0 &&
-                         remote_manifest_version != self->snapshot.media_manifest_version) {
-                session_error = "datachannel-media-manifest-version-mismatch";
-                send_session_error = true;
-              }
-              if (send_session_error) {
-                self->snapshot.encoded_media_data_channel_ready = false;
-                self->snapshot.encoded_media_data_channel_state = session_error;
-                self->snapshot.last_error = session_error;
-              } else {
-                self->snapshot.encoded_media_data_channel_ready = true;
-                self->snapshot.encoded_media_data_channel_state = "hello-ack";
-                self->snapshot.reason = "encoded-media-datachannel-ready";
-                send_ack = true;
-              }
-            } else {
+          if (!control.valid) {
+            invalid_control = true;
+            if (vds::media_agent::extract_string_value(text, "protocol") == kEncodedMediaProtocol &&
+                vds::media_agent::extract_int_value(text, "protocolVersion", -1) != 1) {
               self->snapshot.encoded_media_data_channel_state = "version-mismatch";
               self->snapshot.last_error = "datachannel-version-mismatch";
               send_version_error = true;
+            } else {
+              self->snapshot.encoded_media_data_channel_state = "invalid-control";
+              self->snapshot.last_error = "datachannel-control-invalid";
             }
-          } else if (string_contains(text, "\"type\":\"hello-ack\"")) {
-            const std::string remote_session_id = vds::media_agent::extract_string_value(text, "mediaSessionId");
-            const int remote_manifest_version = vds::media_agent::extract_int_value(text, "manifestVersion", 0);
+          } else if (control.type == "hello" || control.type == "hello-ack") {
+            const std::string remote_session_id = control.media_session_id;
+            const int remote_manifest_version = control.manifest_version;
             if (!self->snapshot.media_session_id.empty() &&
                 !remote_session_id.empty() &&
                 remote_session_id != self->snapshot.media_session_id) {
@@ -1827,23 +1778,25 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
               self->snapshot.last_error = session_error;
             } else {
               self->snapshot.encoded_media_data_channel_ready = true;
-              self->snapshot.encoded_media_data_channel_state = "ready";
+              self->snapshot.encoded_media_data_channel_state = control.type == "hello" ? "hello-ack" : "ready";
               self->snapshot.reason = "encoded-media-datachannel-ready";
+              send_ack = control.type == "hello";
             }
-          } else if (string_contains(text, "\"type\":\"error\"")) {
+          } else if (control.type == "error") {
             self->snapshot.encoded_media_data_channel_state = "remote-error";
-            self->snapshot.last_error = "datachannel-remote-error";
+            self->snapshot.last_error = control.reason.empty() ? "datachannel-remote-error" : control.reason;
           }
-          self->snapshot.updated_at_unix_ms = current_time_millis();
           snapshot_copy = self->snapshot;
         }
 
-        if (send_ack && data_channel_value && data_channel_value->isOpen()) {
-          data_channel_value->send(build_encoded_media_hello_ack(snapshot_copy));
-        } else if (send_version_error && data_channel_value && data_channel_value->isOpen()) {
-          data_channel_value->send(build_encoded_media_error("datachannel-version-mismatch"));
-        } else if (send_session_error && data_channel_value && data_channel_value->isOpen()) {
-          data_channel_value->send(build_encoded_media_error(session_error));
+        if (send_ack) {
+          self->send_data_channel_text(build_encoded_media_hello_ack(snapshot_copy));
+        } else if (send_version_error) {
+          self->send_encoded_media_error("datachannel-version-mismatch");
+        } else if (send_session_error) {
+          self->send_encoded_media_error(session_error);
+        } else if (invalid_control) {
+          self->send_encoded_media_error("datachannel-control-invalid");
         }
         if (self->callbacks.on_state_change) {
           self->callbacks.on_state_change(snapshot_copy, snapshot_copy.encoded_media_data_channel_state);
@@ -1855,26 +1808,24 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         const rtc::binary& payload = std::get<rtc::binary>(message);
         std::string invalid_reason;
         PeerEncodedMediaDataChannelFrame decoded_frame;
-        const bool valid_frame = self->decode_or_reassemble_encoded_media_frame(payload, &decoded_frame, &invalid_reason);
-        const bool chunk_pending = invalid_reason == "datachannel-chunk-pending";
+        bool valid_frame = false;
+        bool chunk_pending = false;
         PeerTransportSnapshot snapshot_copy;
         {
           std::lock_guard<std::mutex> lock(self->mutex);
           if (self->closed) {
             return;
           }
-          self->snapshot.encoded_media_data_channel_messages_received += 1;
-          self->snapshot.encoded_media_data_channel_bytes_received += static_cast<std::uint64_t>(payload.size());
+          valid_frame = self->decode_or_reassemble_encoded_media_frame(payload, &decoded_frame, &invalid_reason);
+          chunk_pending = invalid_reason == "datachannel-chunk-pending";
           self->snapshot.encoded_media_data_channel_supported = true;
           self->snapshot.encoded_media_data_channel_open = true;
           if (valid_frame) {
             self->snapshot.encoded_media_data_channel_frames_received += 1;
             if (decoded_frame.stream_type == "video") {
               self->snapshot.remote_video_frames_received += 1;
-              self->snapshot.remote_video_bytes_received += static_cast<std::uint64_t>(decoded_frame.payload.size());
             } else if (decoded_frame.stream_type == "audio") {
               self->snapshot.remote_audio_frames_received += 1;
-              self->snapshot.remote_audio_bytes_received += static_cast<std::uint64_t>(decoded_frame.payload.size());
             }
             self->snapshot.encoded_media_data_channel_state = "frame-received";
             self->snapshot.reason = "encoded-media-datachannel-frame-received";
@@ -1886,12 +1837,11 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
             self->snapshot.encoded_media_data_channel_state = invalid_reason;
             self->snapshot.last_error = invalid_reason;
           }
-          self->snapshot.updated_at_unix_ms = current_time_millis();
           snapshot_copy = self->snapshot;
         }
 
-        if (!valid_frame && !chunk_pending && data_channel_value && data_channel_value->isOpen()) {
-          data_channel_value->send(build_encoded_media_error(invalid_reason));
+        if (!valid_frame && !chunk_pending) {
+          self->send_encoded_media_error(invalid_reason);
         }
         if (valid_frame && self->callbacks.on_encoded_media_data_channel_frame) {
           self->callbacks.on_encoded_media_data_channel_frame(decoded_frame);
@@ -1909,17 +1859,13 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
   }
 
   void refresh_from_peer_connection_locked() {
-    snapshot.updated_at_unix_ms = current_time_millis();
     if (!pc) {
       return;
     }
 
     snapshot.connection_state = to_connection_state_string(pc->state());
     snapshot.ice_state = to_ice_state_string(pc->iceState());
-    snapshot.gathering_state = to_gathering_state_string(pc->gatheringState());
     snapshot.signaling_state = to_signaling_state_string(pc->signalingState());
-    snapshot.bytes_sent = static_cast<std::uint64_t>(pc->bytesSent());
-    snapshot.bytes_received = static_cast<std::uint64_t>(pc->bytesReceived());
 
     const auto round_trip_time = pc->rtt();
     snapshot.round_trip_time_ms = round_trip_time.has_value()
@@ -1934,7 +1880,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     }
 
     if (data_channel) {
-      snapshot.data_channel_open = data_channel->isOpen();
       snapshot.data_channel_label = data_channel->label();
       if (is_encoded_media_data_channel_label(snapshot.data_channel_label)) {
         snapshot.encoded_media_data_channel_supported = true;
@@ -1974,9 +1919,6 @@ PeerTransportBackendInfo get_peer_transport_backend_info() {
 #ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
   info.available = true;
   info.transport_ready = true;
-  info.media_plane_ready = false;
-  info.video_track_support = true;
-  info.audio_track_support = true;
   info.backend = "libdatachannel";
   info.implementation = "libdatachannel-native-webrtc";
   info.mode = "manual-negotiation+h264-h265-sendrecv+opus-aac-sendrecv+pcmu-fallback-recv+native-viewer-surface+native-preview-surface";
@@ -1984,9 +1926,6 @@ PeerTransportBackendInfo get_peer_transport_backend_info() {
 #else
   info.available = false;
   info.transport_ready = false;
-  info.media_plane_ready = false;
-  info.video_track_support = false;
-  info.audio_track_support = false;
   info.backend = "stub";
   info.implementation = "stub-native-media-agent";
   info.mode = "disabled";
@@ -2353,8 +2292,6 @@ bool set_peer_transport_decoder_state(
   const std::shared_ptr<PeerTransportSession>& session,
   bool decoder_ready,
   std::uint64_t decoded_frames_rendered,
-  std::int64_t last_decoded_frame_at_unix_ms,
-  const std::string& video_decoder_backend,
   std::string* error
 ) {
 #ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
@@ -2368,9 +2305,7 @@ bool set_peer_transport_decoder_state(
   try {
     session->set_decoder_state(
       decoder_ready,
-      decoded_frames_rendered,
-      last_decoded_frame_at_unix_ms,
-      video_decoder_backend
+      decoded_frames_rendered
     );
     return true;
   } catch (const std::exception& ex) {
@@ -2383,8 +2318,6 @@ bool set_peer_transport_decoder_state(
   (void)session;
   (void)decoder_ready;
   (void)decoded_frames_rendered;
-  (void)last_decoded_frame_at_unix_ms;
-  (void)video_decoder_backend;
   if (error) {
     *error = "libdatachannel backend is not compiled into this media-agent build";
   }
@@ -2481,9 +2414,6 @@ std::string peer_transport_backend_json(const PeerTransportBackendInfo& backend)
   payload
     << "{\"available\":" << (backend.available ? "true" : "false")
     << ",\"transportReady\":" << (backend.transport_ready ? "true" : "false")
-    << ",\"mediaPlaneReady\":" << (backend.media_plane_ready ? "true" : "false")
-    << ",\"videoTrackSupport\":" << (backend.video_track_support ? "true" : "false")
-    << ",\"audioTrackSupport\":" << (backend.audio_track_support ? "true" : "false")
     << ",\"backend\":\"" << vds::media_agent::json_escape(backend.backend) << "\""
     << ",\"implementation\":\"" << vds::media_agent::json_escape(backend.implementation) << "\""
     << ",\"mode\":\"" << vds::media_agent::json_escape(backend.mode) << "\""
@@ -2497,47 +2427,20 @@ std::string peer_transport_backend_json(const PeerTransportBackendInfo& backend)
 std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot) {
   std::ostringstream payload;
   payload
-    << "{\"available\":" << (snapshot.available ? "true" : "false")
-    << ",\"transportReady\":" << (snapshot.transport_ready ? "true" : "false")
-    << ",\"mediaPlaneReady\":" << (snapshot.media_plane_ready ? "true" : "false")
-    << ",\"videoTrackSupport\":" << (snapshot.video_track_support ? "true" : "false")
-    << ",\"audioTrackSupport\":" << (snapshot.audio_track_support ? "true" : "false")
-    << ",\"videoTrackConfigured\":" << (snapshot.video_track_configured ? "true" : "false")
-    << ",\"audioTrackConfigured\":" << (snapshot.audio_track_configured ? "true" : "false")
+    << "{\"mediaPlaneReady\":" << (snapshot.media_plane_ready ? "true" : "false")
     << ",\"videoReceiverConfigured\":" << (snapshot.video_receiver_configured ? "true" : "false")
     << ",\"audioReceiverConfigured\":" << (snapshot.audio_receiver_configured ? "true" : "false")
-    << ",\"videoTrackOpen\":" << (snapshot.video_track_open ? "true" : "false")
-    << ",\"audioTrackOpen\":" << (snapshot.audio_track_open ? "true" : "false")
     << ",\"decoderReady\":" << (snapshot.decoder_ready ? "true" : "false")
-    << ",\"remoteVideoTrackAttached\":" << (snapshot.remote_video_track_attached ? "true" : "false")
-    << ",\"remoteAudioTrackAttached\":" << (snapshot.remote_audio_track_attached ? "true" : "false")
-    << ",\"localDescriptionCreated\":" << (snapshot.local_description_created ? "true" : "false")
-    << ",\"remoteDescriptionSet\":" << (snapshot.remote_description_set ? "true" : "false")
-    << ",\"dataChannelRequested\":" << (snapshot.data_channel_requested ? "true" : "false")
-    << ",\"dataChannelOpen\":" << (snapshot.data_channel_open ? "true" : "false")
     << ",\"encodedMediaDataChannelRequested\":" << (snapshot.encoded_media_data_channel_requested ? "true" : "false")
-    << ",\"encodedMediaDataChannelSupported\":" << (snapshot.encoded_media_data_channel_supported ? "true" : "false")
     << ",\"encodedMediaDataChannelOpen\":" << (snapshot.encoded_media_data_channel_open ? "true" : "false")
     << ",\"encodedMediaDataChannelReady\":" << (snapshot.encoded_media_data_channel_ready ? "true" : "false")
-    << ",\"closed\":" << (snapshot.closed ? "true" : "false")
-    << ",\"localCandidateCount\":" << snapshot.local_candidate_count
     << ",\"remoteCandidateCount\":" << snapshot.remote_candidate_count
-    << ",\"remoteTrackCount\":" << snapshot.remote_track_count
-    << ",\"bytesSent\":" << snapshot.bytes_sent
-    << ",\"bytesReceived\":" << snapshot.bytes_received
     << ",\"videoFramesSent\":" << snapshot.video_frames_sent
-    << ",\"videoBytesSent\":" << snapshot.video_bytes_sent
     << ",\"audioFramesSent\":" << snapshot.audio_frames_sent
-    << ",\"audioBytesSent\":" << snapshot.audio_bytes_sent
     << ",\"remoteVideoFramesReceived\":" << snapshot.remote_video_frames_received
-    << ",\"remoteVideoBytesReceived\":" << snapshot.remote_video_bytes_received
     << ",\"remoteAudioFramesReceived\":" << snapshot.remote_audio_frames_received
-    << ",\"remoteAudioBytesReceived\":" << snapshot.remote_audio_bytes_received
-    << ",\"encodedMediaDataChannelMessagesReceived\":" << snapshot.encoded_media_data_channel_messages_received
     << ",\"encodedMediaDataChannelFramesSent\":" << snapshot.encoded_media_data_channel_frames_sent
-    << ",\"encodedMediaDataChannelBytesSent\":" << snapshot.encoded_media_data_channel_bytes_sent
     << ",\"encodedMediaDataChannelFramesReceived\":" << snapshot.encoded_media_data_channel_frames_received
-    << ",\"encodedMediaDataChannelBytesReceived\":" << snapshot.encoded_media_data_channel_bytes_received
     << ",\"encodedMediaDataChannelInvalidFrames\":" << snapshot.encoded_media_data_channel_invalid_frames
     << ",\"decodedFramesRendered\":" << snapshot.decoded_frames_rendered
     << ",\"nackRetransmissions\":" << snapshot.nack_retransmissions
@@ -2547,21 +2450,8 @@ std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot) 
     << ",\"droppedVideoUnits\":" << snapshot.dropped_video_units
     << ",\"connectionState\":\"" << vds::media_agent::json_escape(snapshot.connection_state) << "\""
     << ",\"iceState\":\"" << vds::media_agent::json_escape(snapshot.ice_state) << "\""
-    << ",\"gatheringState\":\"" << vds::media_agent::json_escape(snapshot.gathering_state) << "\""
     << ",\"signalingState\":\"" << vds::media_agent::json_escape(snapshot.signaling_state) << "\""
-    << ",\"localDescriptionType\":\"" << vds::media_agent::json_escape(snapshot.local_description_type) << "\""
-    << ",\"dataChannelLabel\":\"" << vds::media_agent::json_escape(snapshot.data_channel_label) << "\""
-    << ",\"encodedMediaDataChannelProtocol\":\"" << vds::media_agent::json_escape(snapshot.encoded_media_data_channel_protocol) << "\""
     << ",\"encodedMediaDataChannelState\":\"" << vds::media_agent::json_escape(snapshot.encoded_media_data_channel_state) << "\""
-    << ",\"mediaSessionId\":\"" << vds::media_agent::json_escape(snapshot.media_session_id) << "\""
-    << ",\"mediaManifestVersion\":" << snapshot.media_manifest_version
-    << ",\"videoMid\":\"" << vds::media_agent::json_escape(snapshot.video_mid) << "\""
-    << ",\"audioMid\":\"" << vds::media_agent::json_escape(snapshot.audio_mid) << "\""
-    << ",\"videoCodec\":\"" << vds::media_agent::json_escape(snapshot.video_codec) << "\""
-    << ",\"audioCodec\":\"" << vds::media_agent::json_escape(snapshot.audio_codec) << "\""
-    << ",\"codecPath\":\"" << vds::media_agent::json_escape(snapshot.codec_path) << "\""
-    << ",\"videoDecoderBackend\":\"" << vds::media_agent::json_escape(snapshot.video_decoder_backend) << "\""
-    << ",\"videoSource\":\"" << vds::media_agent::json_escape(snapshot.video_source) << "\""
     << ",\"selectedLocalCandidate\":\"" << vds::media_agent::json_escape(snapshot.selected_local_candidate) << "\""
     << ",\"selectedRemoteCandidate\":\"" << vds::media_agent::json_escape(snapshot.selected_remote_candidate) << "\""
     << ",\"reason\":\"" << vds::media_agent::json_escape(snapshot.reason) << "\""
@@ -2569,16 +2459,6 @@ std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot) 
     << ",\"roundTripTimeMs\":";
 
   vds::media_agent::append_nullable_int64(payload, snapshot.round_trip_time_ms);
-  payload << ",\"createdAtMs\":";
-  vds::media_agent::append_nullable_int64(payload, snapshot.created_at_unix_ms);
-  payload << ",\"updatedAtMs\":";
-  vds::media_agent::append_nullable_int64(payload, snapshot.updated_at_unix_ms);
-  payload << ",\"lastVideoFrameAtMs\":";
-  vds::media_agent::append_nullable_int64(payload, snapshot.last_video_frame_at_unix_ms);
-  payload << ",\"lastRemoteVideoFrameAtMs\":";
-  vds::media_agent::append_nullable_int64(payload, snapshot.last_remote_video_frame_at_unix_ms);
-  payload << ",\"lastDecodedFrameAtMs\":";
-  vds::media_agent::append_nullable_int64(payload, snapshot.last_decoded_frame_at_unix_ms);
   payload << "}";
   return payload.str();
 }

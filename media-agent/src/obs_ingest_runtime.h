@@ -2,15 +2,7 @@
 
 #include <string>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#endif
-
-#include "agent_runtime.h"
+struct AgentRuntimeState;
 
 inline constexpr const char* kObsIngestVirtualUpstreamPeerId = "__obs_ingest_host__";
 
@@ -27,5 +19,5 @@ ObsIngestCommandResult prepare_obs_ingest_from_request(
 bool prepare_obs_ingest_session(AgentRuntimeState& state, bool force_refresh, int requested_port, std::string* error);
 void clear_obs_ingest_prepared_session(AgentRuntimeState& state);
 bool is_obs_ingest_backend(const AgentRuntimeState& state);
-void stop_obs_ingest_runtime(AgentRuntimeState& state, const std::string& reason);
+void stop_obs_ingest_runtime(AgentRuntimeState& state);
 void obs_ingest_worker(AgentRuntimeState* state_ptr);

@@ -16,13 +16,11 @@
 #include "relay_dispatch.h"
 #include "string_utils.h"
 #include "surface_target.h"
-#include "time_utils.h"
 #include "video_access_unit.h"
 
 namespace {
 
 using vds::media_agent::extract_string_value;
-using vds::media_agent::current_time_millis;
 using vds::media_agent::normalize_video_codec;
 using vds::media_agent::to_lower_copy;
 
@@ -32,7 +30,11 @@ void emit_peer_media_binding_breadcrumb(const std::string& step) {
 
 }  // namespace
 
-bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, std::string* error, bool force_restart);
+bool attach_relay_video_media_binding(
+  AgentRuntimeState& state,
+  PeerState& peer,
+  const std::string& source,
+  std::string* error);
 bool configure_host_audio_sender(AgentRuntimeState& state, PeerState& peer, std::string* error);
 
 void perform_host_video_sender_soft_refresh(AgentRuntimeState& state) {
@@ -40,8 +42,6 @@ void perform_host_video_sender_soft_refresh(AgentRuntimeState& state) {
     return;
   }
 
-  bool attempted = false;
-  bool all_succeeded = true;
   for (auto& entry : state.peers) {
     PeerState& peer = entry.second;
     if (peer.role != "host-downstream" || !peer.transport_session) {
@@ -51,24 +51,18 @@ void perform_host_video_sender_soft_refresh(AgentRuntimeState& state) {
       continue;
     }
 
-    attempted = true;
     state.host_capture_plan = validate_host_capture_plan(state.ffmpeg, state.host_capture_plan);
     if (!state.host_capture_plan.ready || !state.host_capture_plan.validated) {
-      all_succeeded = false;
       peer.media_binding.reason = "peer-media-soft-refresh-waiting-for-valid-plan";
       peer.media_binding.last_error = state.host_capture_plan.last_error;
-      peer.media_binding.updated_at_unix_ms = current_time_millis();
       continue;
     }
     std::string refresh_error;
     if (!attach_host_video_media_binding(state, peer, &refresh_error, true)) {
       peer.media_binding.attached = false;
-      peer.media_binding.sender_configured = false;
       peer.media_binding.active = false;
       peer.media_binding.reason = "peer-media-soft-refresh-failed";
       peer.media_binding.last_error = refresh_error;
-      peer.media_binding.updated_at_unix_ms = current_time_millis();
-      all_succeeded = false;
       emit_peer_media_binding_breadcrumb(
         std::string("hostVideoSenderRefresh:failed peer=") + peer.peer_id +
         " error=" + refresh_error);
@@ -77,10 +71,6 @@ void perform_host_video_sender_soft_refresh(AgentRuntimeState& state) {
     }
   }
 
-  if (!attempted || all_succeeded) {
-    state.host_video_sender_refresh_requested = false;
-    state.host_video_sender_refresh_reason.clear();
-  }
 }
 
 void refresh_peer_transport_runtime(AgentRuntimeState& state) {
@@ -98,12 +88,8 @@ void refresh_peer_transport_runtime(AgentRuntimeState& state) {
     }
     if (peer.transport_session) {
       peer.transport = get_peer_transport_snapshot(peer.transport_session);
-      peer.has_remote_description = peer.transport.remote_description_set;
-      peer.remote_candidate_count = peer.transport.remote_candidate_count;
     } else {
-      peer.transport.available = state.peer_transport_backend.available;
       peer.transport.transport_ready = state.peer_transport_backend.transport_ready;
-      peer.transport.media_plane_ready = state.peer_transport_backend.media_plane_ready;
       if (peer.transport.reason.empty()) {
         peer.transport.reason = state.peer_transport_backend.reason;
       }
@@ -111,9 +97,6 @@ void refresh_peer_transport_runtime(AgentRuntimeState& state) {
     const bool use_encoded_data_channel =
       peer.transport.encoded_media_data_channel_requested ||
       peer.transport.encoded_media_data_channel_supported;
-    peer.media_binding.sender_configured = use_encoded_data_channel
-      ? true
-      : peer.transport.video_track_configured;
     peer.media_binding.active = use_encoded_data_channel
       ? peer.transport.encoded_media_data_channel_open
       : peer.transport.video_track_open;
@@ -127,7 +110,6 @@ void refresh_peer_transport_runtime(AgentRuntimeState& state) {
       }
     }
     refresh_peer_media_binding(peer);
-    peer.media_binding.updated_at_unix_ms = current_time_millis();
   }
 }
 
@@ -173,11 +155,9 @@ PeerMediaBindingCommandResult attach_peer_media_source_from_request(
     : attach_host_video_media_binding(state, it->second, &attach_error);
   if (!attach_ok) {
     it->second.media_binding.attached = false;
-    it->second.media_binding.sender_configured = false;
     it->second.media_binding.active = false;
     it->second.media_binding.reason = "peer-media-attach-failed";
     it->second.media_binding.last_error = attach_error;
-    it->second.media_binding.updated_at_unix_ms = current_time_millis();
     return {false, {}, "MEDIA_SOURCE_ATTACH_FAILED", attach_error};
   }
 
@@ -202,7 +182,6 @@ PeerMediaBindingCommandResult attach_peer_media_source_from_request(
       it->second.transport.reason = "peer-local-description-failed";
       it->second.media_binding.reason = "peer-local-description-failed";
       it->second.media_binding.last_error = negotiate_error;
-      it->second.media_binding.updated_at_unix_ms = current_time_millis();
       return {false, {}, "MEDIA_SOURCE_ATTACH_FAILED", negotiate_error};
     }
   }
@@ -228,7 +207,7 @@ bool attach_obs_ingest_media_binding(AgentRuntimeState& state, PeerState& peer, 
     return false;
   }
 
-  if (!state.obs_ingest.stream_running || !state.obs_ingest.video_ready) {
+  if (!state.obs_ingest.stream_running) {
     if (error) {
       *error = "obs-ingest-not-ready-for-video-binding";
     }
@@ -241,19 +220,18 @@ bool attach_obs_ingest_media_binding(AgentRuntimeState& state, PeerState& peer, 
   );
 
   PeerVideoTrackConfig video_config;
-  video_config.enabled = true;
   video_config.codec = video_codec;
   video_config.mid = "video";
   video_config.stream_id = "vds-host-stream";
   video_config.track_id = peer.peer_id + "-video";
-  video_config.source = std::string("peer-video:") + kObsIngestVirtualUpstreamPeerId;
-  video_config.width = state.obs_ingest.width > 0 ? state.obs_ingest.width : std::max(1, state.host_width);
-  video_config.height = state.obs_ingest.height > 0 ? state.obs_ingest.height : std::max(1, state.host_height);
-  video_config.frame_rate = state.obs_ingest.frame_rate > 0 ? state.obs_ingest.frame_rate : std::max(1, state.host_frame_rate);
   video_config.bitrate_kbps = state.host_bitrate_kbps > 0 ? state.host_bitrate_kbps : 10000;
+  const std::string video_source = std::string("peer-video:") + kObsIngestVirtualUpstreamPeerId;
+  const int video_width = state.obs_ingest.width > 0 ? state.obs_ingest.width : std::max(1, state.host_width);
+  const int video_height = state.obs_ingest.height > 0 ? state.obs_ingest.height : std::max(1, state.host_height);
+  const int video_frame_rate = state.obs_ingest.frame_rate > 0 ? state.obs_ingest.frame_rate : std::max(1, state.host_frame_rate);
 
   const std::string audio_codec = to_lower_copy(state.obs_ingest.audio_codec);
-  const bool audio_enabled = state.obs_ingest.audio_ready && audio_codec == "aac";
+  const bool audio_enabled = audio_codec == "aac";
   peer.transport = get_peer_transport_snapshot(peer.transport_session);
   const bool use_encoded_data_channel =
     peer.transport.encoded_media_data_channel_requested ||
@@ -264,28 +242,20 @@ bool attach_obs_ingest_media_binding(AgentRuntimeState& state, PeerState& peer, 
     register_relay_subscriber(kObsIngestVirtualUpstreamPeerId, peer.peer_id, peer.transport_session, audio_enabled);
     peer.transport = get_peer_transport_snapshot(peer.transport_session);
     peer.media_binding.attached = true;
-    peer.media_binding.sender_configured = true;
     peer.media_binding.active = peer.transport.encoded_media_data_channel_open;
-    peer.media_binding.width = video_config.width;
-    peer.media_binding.height = video_config.height;
-    peer.media_binding.frame_rate = video_config.frame_rate;
+    peer.media_binding.width = video_width;
+    peer.media_binding.height = video_height;
+    peer.media_binding.frame_rate = video_frame_rate;
     peer.media_binding.bitrate_kbps = video_config.bitrate_kbps;
     peer.media_binding.kind = "video";
-    peer.media_binding.source = video_config.source;
+    peer.media_binding.source = video_source;
     peer.media_binding.codec = video_config.codec;
     peer.media_binding.video_encoder_backend = "obs-ingest-relay";
-    peer.media_binding.implementation = "obs-ingest-relay-datachannel";
     peer.media_binding.reason = peer.transport.encoded_media_data_channel_ready
       ? "obs-ingest-datachannel-media-attached"
       : "obs-ingest-datachannel-waiting-for-ready";
     peer.media_binding.last_error.clear();
-    peer.media_binding.command_line.clear();
-    peer.media_binding.process_id = 0;
     peer.media_binding.frames_sent = 0;
-    peer.media_binding.bytes_sent = 0;
-    peer.media_binding.attached_at_unix_ms = current_time_millis();
-    peer.media_binding.updated_at_unix_ms = peer.media_binding.attached_at_unix_ms;
-    peer.media_binding.detached_at_unix_ms = 0;
     if (error) {
       error->clear();
     }
@@ -296,25 +266,22 @@ bool attach_obs_ingest_media_binding(AgentRuntimeState& state, PeerState& peer, 
     peer.media_binding.attached &&
     peer.transport.video_track_configured &&
     peer.media_binding.kind == "video" &&
-    peer.media_binding.source == video_config.source &&
+    peer.media_binding.source == video_source &&
     peer.media_binding.codec == video_config.codec &&
-    peer.media_binding.width == video_config.width &&
-    peer.media_binding.height == video_config.height &&
-    peer.media_binding.frame_rate == video_config.frame_rate &&
+    peer.media_binding.width == video_width &&
+    peer.media_binding.height == video_height &&
+    peer.media_binding.frame_rate == video_frame_rate &&
     peer.media_binding.bitrate_kbps == video_config.bitrate_kbps &&
     peer.transport.audio_track_configured == audio_enabled;
 
   if (already_attached) {
     register_relay_subscriber(kObsIngestVirtualUpstreamPeerId, peer.peer_id, peer.transport_session, audio_enabled);
     peer.transport = get_peer_transport_snapshot(peer.transport_session);
-    peer.media_binding.sender_configured = peer.transport.video_track_configured;
     peer.media_binding.active = peer.transport.video_track_open;
     peer.media_binding.video_encoder_backend = "obs-ingest-relay";
-    peer.media_binding.implementation = "obs-ingest-relay-track";
     peer.media_binding.reason = peer.transport.video_track_open
       ? "obs-ingest-media-attached"
       : "obs-ingest-waiting-for-video-track-open";
-    peer.media_binding.updated_at_unix_ms = current_time_millis();
     if (error) {
       error->clear();
     }
@@ -327,14 +294,11 @@ bool attach_obs_ingest_media_binding(AgentRuntimeState& state, PeerState& peer, 
 
   if (audio_enabled) {
     PeerAudioTrackConfig audio_config;
-    audio_config.enabled = true;
     audio_config.codec = "aac";
     audio_config.mid = "audio";
     audio_config.stream_id = "vds-host-stream";
     audio_config.track_id = peer.peer_id + "-audio";
-    audio_config.source = video_config.source;
     audio_config.sample_rate = state.obs_ingest.audio_sample_rate > 0 ? state.obs_ingest.audio_sample_rate : static_cast<int>(kTransportAudioSampleRate);
-    audio_config.channel_count = state.obs_ingest.audio_channel_count > 0 ? state.obs_ingest.audio_channel_count : static_cast<int>(kTransportAudioChannelCount);
     audio_config.payload_type = 97;
     audio_config.bitrate_kbps = static_cast<int>(kTransportAudioBitrateKbps);
     if (!configure_peer_transport_audio_sender(peer.transport_session, audio_config, error)) {
@@ -349,26 +313,18 @@ bool attach_obs_ingest_media_binding(AgentRuntimeState& state, PeerState& peer, 
   register_relay_subscriber(kObsIngestVirtualUpstreamPeerId, peer.peer_id, peer.transport_session, audio_enabled);
   peer.transport = get_peer_transport_snapshot(peer.transport_session);
   peer.media_binding.attached = true;
-  peer.media_binding.sender_configured = peer.transport.video_track_configured;
   peer.media_binding.active = peer.transport.video_track_open;
-  peer.media_binding.width = video_config.width;
-  peer.media_binding.height = video_config.height;
-  peer.media_binding.frame_rate = video_config.frame_rate;
+  peer.media_binding.width = video_width;
+  peer.media_binding.height = video_height;
+  peer.media_binding.frame_rate = video_frame_rate;
   peer.media_binding.bitrate_kbps = video_config.bitrate_kbps;
   peer.media_binding.kind = "video";
-  peer.media_binding.source = video_config.source;
+  peer.media_binding.source = video_source;
   peer.media_binding.codec = video_config.codec;
   peer.media_binding.video_encoder_backend = "obs-ingest-relay";
-  peer.media_binding.implementation = "obs-ingest-relay-track";
   peer.media_binding.reason = "obs-ingest-media-attached";
   peer.media_binding.last_error.clear();
-  peer.media_binding.command_line.clear();
-  peer.media_binding.process_id = 0;
   peer.media_binding.frames_sent = 0;
-  peer.media_binding.bytes_sent = 0;
-  peer.media_binding.attached_at_unix_ms = current_time_millis();
-  peer.media_binding.updated_at_unix_ms = peer.media_binding.attached_at_unix_ms;
-  peer.media_binding.detached_at_unix_ms = 0;
   if (error) {
     error->clear();
   }
@@ -400,27 +356,26 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
   }
 
   PeerVideoTrackConfig config;
-  config.enabled = true;
   config.codec = normalize_video_codec(state.host_codec);
   config.mid = "video";
   config.stream_id = "vds-host-stream";
   config.track_id = peer.peer_id + "-video";
-  config.source = state.host_capture_plan.capture_backend == "wgc"
+  const std::string video_source = state.host_capture_plan.capture_backend == "wgc"
     ? "host-session-video"
     : (state.host_capture_artifact.ready ? "host-capture-artifact" : "host-capture-plan");
-  config.width = state.host_width;
-  config.height = state.host_height;
-  config.frame_rate = state.host_frame_rate;
   config.bitrate_kbps = state.host_bitrate_kbps;
+  const int video_width = state.host_width;
+  const int video_height = state.host_height;
+  const int video_frame_rate = state.host_frame_rate;
 
   const bool config_matches_current =
     peer.media_binding.attached &&
     peer.media_binding.kind == "video" &&
-    peer.media_binding.source == config.source &&
+    peer.media_binding.source == video_source &&
     peer.media_binding.codec == config.codec &&
-    peer.media_binding.width == config.width &&
-    peer.media_binding.height == config.height &&
-    peer.media_binding.frame_rate == config.frame_rate &&
+    peer.media_binding.width == video_width &&
+    peer.media_binding.height == video_height &&
+    peer.media_binding.frame_rate == video_frame_rate &&
     peer.media_binding.bitrate_kbps == config.bitrate_kbps;
 
   const bool already_attached =
@@ -436,14 +391,10 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
 
   if (already_attached) {
     peer.transport = get_peer_transport_snapshot(peer.transport_session);
-    peer.media_binding.sender_configured = use_encoded_data_channel ? true : peer.transport.video_track_configured;
     peer.media_binding.active = use_encoded_data_channel
       ? peer.transport.encoded_media_data_channel_open
       : peer.transport.video_track_open;
     peer.media_binding.video_encoder_backend = state.host_pipeline.video_encoder_backend;
-    peer.media_binding.implementation = use_encoded_data_channel
-      ? "wgc-ffmpeg-libdatachannel-datachannel"
-      : "wgc-ffmpeg-libdatachannel-video-track";
     peer.media_binding.reason = use_encoded_data_channel
       ? (peer.transport.encoded_media_data_channel_ready
           ? "peer-datachannel-media-attached"
@@ -451,7 +402,6 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
       : (peer.transport.video_track_open
           ? "peer-media-attached"
           : "peer-video-sender-waiting-for-video-track-open");
-    peer.media_binding.updated_at_unix_ms = current_time_millis();
     if (error) {
       error->clear();
     }
@@ -488,28 +438,21 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
 
   peer.transport = get_peer_transport_snapshot(peer.transport_session);
   peer.media_binding.attached = true;
-  peer.media_binding.sender_configured = use_encoded_data_channel ? true : peer.transport.video_track_configured;
   peer.media_binding.active = use_encoded_data_channel
     ? peer.transport.encoded_media_data_channel_open
     : peer.transport.video_track_open;
-  peer.media_binding.width = config.width;
-  peer.media_binding.height = config.height;
-  peer.media_binding.frame_rate = config.frame_rate;
+  peer.media_binding.width = video_width;
+  peer.media_binding.height = video_height;
+  peer.media_binding.frame_rate = video_frame_rate;
   peer.media_binding.bitrate_kbps = config.bitrate_kbps;
   peer.media_binding.kind = "video";
-  peer.media_binding.source = config.source;
+  peer.media_binding.source = video_source;
   peer.media_binding.codec = config.codec;
   peer.media_binding.video_encoder_backend = state.host_pipeline.video_encoder_backend;
-  peer.media_binding.implementation = use_encoded_data_channel
-    ? "wgc-ffmpeg-libdatachannel-datachannel"
-    : "wgc-ffmpeg-libdatachannel-video-track";
   peer.media_binding.reason = use_encoded_data_channel
     ? "peer-datachannel-media-configured"
     : "peer-media-configured";
   peer.media_binding.last_error.clear();
-  peer.media_binding.attached_at_unix_ms = current_time_millis();
-  peer.media_binding.updated_at_unix_ms = peer.media_binding.attached_at_unix_ms;
-  peer.media_binding.detached_at_unix_ms = 0;
 
   if (!start_peer_video_sender(state.ffmpeg, state.host_pipeline, state.host_capture_plan, peer, &attach_error)) {
     peer.media_binding.reason = "peer-video-sender-start-failed";
@@ -519,7 +462,6 @@ bool attach_host_video_media_binding(AgentRuntimeState& state, PeerState& peer, 
     }
     peer.transport = get_peer_transport_snapshot(peer.transport_session);
     peer.media_binding.attached = false;
-    peer.media_binding.sender_configured = false;
     peer.media_binding.active = false;
     if (error) {
       *error = attach_error;
@@ -559,14 +501,10 @@ bool configure_host_audio_sender(AgentRuntimeState& state, PeerState& peer, std:
   }
 
   PeerAudioTrackConfig config;
-  config.enabled = true;
   config.codec = "opus";
   config.mid = "audio";
   config.stream_id = "vds-host-stream";
   config.track_id = peer.peer_id + "-audio";
-  config.source = "host-process-loopback";
-  config.sample_rate = kTransportAudioSampleRate;
-  config.channel_count = kTransportAudioChannelCount;
   config.payload_type = 111;
   config.bitrate_kbps = kTransportAudioBitrateKbps;
 
@@ -623,7 +561,17 @@ bool attach_relay_video_media_binding(
   }
 
   PeerState& upstream_peer = upstream_it->second;
-  if (!upstream_peer.transport_session || !upstream_peer.transport.video_receiver_configured) {
+  const bool upstream_uses_encoded_data_channel =
+    upstream_peer.transport.encoded_media_data_channel_requested ||
+    upstream_peer.transport.encoded_media_data_channel_supported;
+  const bool upstream_encoded_data_channel_ready =
+    upstream_uses_encoded_data_channel &&
+    (upstream_peer.transport.encoded_media_data_channel_ready ||
+     upstream_peer.transport.encoded_media_data_channel_frames_received > 0 ||
+     upstream_peer.transport.remote_video_frames_received > 0 ||
+     upstream_peer.transport.decoded_frames_rendered > 0);
+  if (!upstream_peer.transport_session ||
+      (!upstream_peer.transport.video_receiver_configured && !upstream_encoded_data_channel_ready)) {
     if (error) {
       *error = "relay-upstream-not-ready";
     }
@@ -641,21 +589,19 @@ bool attach_relay_video_media_binding(
   }
 
   PeerVideoTrackConfig video_config;
-  video_config.enabled = true;
   video_config.codec = normalize_video_codec(upstream_video_codec);
   video_config.mid = "video";
   video_config.stream_id = "vds-relay-stream";
   video_config.track_id = peer.peer_id + "-video";
-  video_config.source = source;
-  video_config.width = upstream_peer.media_binding.width > 0 ? upstream_peer.media_binding.width : 1920;
-  video_config.height = upstream_peer.media_binding.height > 0 ? upstream_peer.media_binding.height : 1080;
-  video_config.frame_rate = upstream_peer.media_binding.frame_rate > 0 ? upstream_peer.media_binding.frame_rate : 60;
   video_config.bitrate_kbps =
     upstream_peer.media_binding.bitrate_kbps > 0 ? upstream_peer.media_binding.bitrate_kbps : 10000;
+  const int video_width = upstream_peer.media_binding.width > 0 ? upstream_peer.media_binding.width : 1920;
+  const int video_height = upstream_peer.media_binding.height > 0 ? upstream_peer.media_binding.height : 1080;
+  const int video_frame_rate = upstream_peer.media_binding.frame_rate > 0 ? upstream_peer.media_binding.frame_rate : 60;
 
   const std::string upstream_audio_codec = to_lower_copy(upstream_peer.transport.audio_codec);
   const bool audio_enabled =
-    upstream_peer.transport.audio_receiver_configured &&
+    (upstream_peer.transport.audio_receiver_configured || upstream_encoded_data_channel_ready) &&
     (upstream_audio_codec == "opus" || upstream_audio_codec == "pcmu" || upstream_audio_codec == "aac");
 
   peer.transport = get_peer_transport_snapshot(peer.transport_session);
@@ -667,28 +613,20 @@ bool attach_relay_video_media_binding(
     register_relay_subscriber(upstream_peer_id, peer.peer_id, peer.transport_session, audio_enabled);
     peer.transport = get_peer_transport_snapshot(peer.transport_session);
     peer.media_binding.attached = true;
-    peer.media_binding.sender_configured = true;
     peer.media_binding.active = peer.transport.encoded_media_data_channel_open;
-    peer.media_binding.width = video_config.width;
-    peer.media_binding.height = video_config.height;
-    peer.media_binding.frame_rate = video_config.frame_rate;
+    peer.media_binding.width = video_width;
+    peer.media_binding.height = video_height;
+    peer.media_binding.frame_rate = video_frame_rate;
     peer.media_binding.bitrate_kbps = video_config.bitrate_kbps;
     peer.media_binding.kind = "video";
     peer.media_binding.source = source;
     peer.media_binding.codec = video_config.codec;
     peer.media_binding.video_encoder_backend = "relay-copy";
-    peer.media_binding.implementation = "peer-transport-relay-datachannel";
     peer.media_binding.reason = peer.transport.encoded_media_data_channel_ready
       ? "relay-datachannel-media-attached"
       : "relay-datachannel-waiting-for-ready";
     peer.media_binding.last_error.clear();
-    peer.media_binding.command_line.clear();
-    peer.media_binding.process_id = 0;
     peer.media_binding.frames_sent = 0;
-    peer.media_binding.bytes_sent = 0;
-    peer.media_binding.attached_at_unix_ms = current_time_millis();
-    peer.media_binding.updated_at_unix_ms = peer.media_binding.attached_at_unix_ms;
-    peer.media_binding.detached_at_unix_ms = 0;
     if (error) {
       error->clear();
     }
@@ -701,23 +639,20 @@ bool attach_relay_video_media_binding(
     peer.media_binding.kind == "video" &&
     peer.media_binding.source == source &&
     peer.media_binding.codec == video_config.codec &&
-    peer.media_binding.width == video_config.width &&
-    peer.media_binding.height == video_config.height &&
-    peer.media_binding.frame_rate == video_config.frame_rate &&
+    peer.media_binding.width == video_width &&
+    peer.media_binding.height == video_height &&
+    peer.media_binding.frame_rate == video_frame_rate &&
     peer.media_binding.bitrate_kbps == video_config.bitrate_kbps &&
     peer.transport.audio_track_configured == audio_enabled;
 
   if (already_attached) {
     register_relay_subscriber(upstream_peer_id, peer.peer_id, peer.transport_session, audio_enabled);
     peer.transport = get_peer_transport_snapshot(peer.transport_session);
-    peer.media_binding.sender_configured = peer.transport.video_track_configured;
     peer.media_binding.active = peer.transport.video_track_open;
     peer.media_binding.video_encoder_backend = "relay-copy";
-    peer.media_binding.implementation = "peer-transport-relay-track";
     peer.media_binding.reason = peer.transport.video_track_open
       ? "relay-media-attached"
       : "relay-video-sender-waiting-for-video-track-open";
-    peer.media_binding.updated_at_unix_ms = current_time_millis();
     if (error) {
       error->clear();
     }
@@ -730,14 +665,10 @@ bool attach_relay_video_media_binding(
 
   if (audio_enabled) {
     PeerAudioTrackConfig audio_config;
-    audio_config.enabled = true;
     audio_config.codec = upstream_audio_codec;
     audio_config.mid = "audio";
     audio_config.stream_id = "vds-relay-stream";
     audio_config.track_id = peer.peer_id + "-audio";
-    audio_config.source = source;
-    audio_config.sample_rate = upstream_audio_codec == "pcmu" ? 8000 : static_cast<int>(kTransportAudioSampleRate);
-    audio_config.channel_count = upstream_audio_codec == "pcmu" ? 1 : static_cast<int>(kTransportAudioChannelCount);
     audio_config.payload_type =
       upstream_audio_codec == "opus" ? 111 :
       (upstream_audio_codec == "aac" ? 97 : 0);
@@ -755,26 +686,18 @@ bool attach_relay_video_media_binding(
   register_relay_subscriber(upstream_peer_id, peer.peer_id, peer.transport_session, audio_enabled);
   peer.transport = get_peer_transport_snapshot(peer.transport_session);
   peer.media_binding.attached = true;
-  peer.media_binding.sender_configured = peer.transport.video_track_configured;
   peer.media_binding.active = peer.transport.video_track_open;
-  peer.media_binding.width = video_config.width;
-  peer.media_binding.height = video_config.height;
-  peer.media_binding.frame_rate = video_config.frame_rate;
+  peer.media_binding.width = video_width;
+  peer.media_binding.height = video_height;
+  peer.media_binding.frame_rate = video_frame_rate;
   peer.media_binding.bitrate_kbps = video_config.bitrate_kbps;
   peer.media_binding.kind = "video";
   peer.media_binding.source = source;
   peer.media_binding.codec = video_config.codec;
   peer.media_binding.video_encoder_backend = "relay-copy";
-  peer.media_binding.implementation = "peer-transport-relay-track";
   peer.media_binding.reason = "relay-media-attached";
   peer.media_binding.last_error.clear();
-  peer.media_binding.command_line.clear();
-  peer.media_binding.process_id = 0;
   peer.media_binding.frames_sent = 0;
-  peer.media_binding.bytes_sent = 0;
-  peer.media_binding.attached_at_unix_ms = current_time_millis();
-  peer.media_binding.updated_at_unix_ms = peer.media_binding.attached_at_unix_ms;
-  peer.media_binding.detached_at_unix_ms = 0;
   return true;
 }
 
@@ -833,11 +756,8 @@ bool detach_peer_media_binding(PeerState& peer, std::string* error) {
 
   if (!peer.transport_session) {
     peer.media_binding.attached = false;
-    peer.media_binding.sender_configured = false;
     peer.media_binding.active = false;
     peer.media_binding.reason = "peer-media-detached";
-    peer.media_binding.updated_at_unix_ms = current_time_millis();
-    peer.media_binding.detached_at_unix_ms = peer.media_binding.updated_at_unix_ms;
     return true;
   }
 
@@ -852,14 +772,9 @@ bool detach_peer_media_binding(PeerState& peer, std::string* error) {
 
   peer.transport = get_peer_transport_snapshot(peer.transport_session);
   peer.media_binding.attached = false;
-  peer.media_binding.sender_configured = false;
   peer.media_binding.active = false;
   peer.media_binding.reason = "peer-media-detached";
   peer.media_binding.last_error.clear();
-  peer.media_binding.command_line.clear();
-  peer.media_binding.process_id = 0;
-  peer.media_binding.updated_at_unix_ms = current_time_millis();
-  peer.media_binding.detached_at_unix_ms = peer.media_binding.updated_at_unix_ms;
   return true;
 }
 
@@ -876,7 +791,6 @@ PeerMediaBindingCommandResult detach_peer_media_source_from_request(
   if (!detach_peer_media_binding(it->second, &detach_error)) {
     it->second.media_binding.reason = "peer-media-detach-failed";
     it->second.media_binding.last_error = detach_error;
-    it->second.media_binding.updated_at_unix_ms = current_time_millis();
     return {false, {}, "MEDIA_SOURCE_DETACH_FAILED", detach_error};
   }
 
@@ -888,7 +802,6 @@ PeerMediaBindingCommandResult detach_peer_media_source_from_request(
       it->second.transport.reason = "peer-local-description-failed";
       it->second.media_binding.reason = "peer-local-description-failed";
       it->second.media_binding.last_error = negotiate_error;
-      it->second.media_binding.updated_at_unix_ms = current_time_millis();
     }
   }
 
@@ -916,14 +829,9 @@ bool prepare_peer_media_binding_for_transport_close(PeerState& peer, std::string
   }
 
   peer.media_binding.attached = false;
-  peer.media_binding.sender_configured = false;
   peer.media_binding.active = false;
   peer.media_binding.reason = "peer-closing";
   peer.media_binding.last_error.clear();
-  peer.media_binding.command_line.clear();
-  peer.media_binding.process_id = 0;
-  peer.media_binding.updated_at_unix_ms = current_time_millis();
-  peer.media_binding.detached_at_unix_ms = peer.media_binding.updated_at_unix_ms;
   emit_peer_media_binding_breadcrumb(std::string("preparePeerMediaBinding:done peer=") + peer.peer_id);
   if (error) {
     error->clear();

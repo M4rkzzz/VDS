@@ -3,16 +3,16 @@ export const ENCODED_MEDIA_CHANNEL_LABEL = 'vds-media-encoded-v1';
 export const ENCODED_MEDIA_PROTOCOL_VERSION = 1;
 export const DATA_CHANNEL_OPEN_TIMEOUT_MS = 3000;
 export const DATA_CHANNEL_HELLO_ACK_TIMEOUT_MS = 3000;
-export const DATA_CHANNEL_BOOTSTRAP_TIMEOUT_MS = 5000;
 export const MAX_ENCODED_FRAME_BYTES = 2 * 1024 * 1024;
 export const DATA_CHANNEL_CHUNK_PAYLOAD_BYTES = 12 * 1024;
+const MAX_PENDING_CHUNKED_FRAMES = 64;
 
 const MAGIC = 'VDS1';
 const HEADER_LIMIT_BYTES = 16 * 1024;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-export type EncodedMediaCapabilities = {
+type EncodedMediaCapabilities = {
   protocol: typeof ENCODED_MEDIA_PROTOCOL;
   protocolVersion: number;
   supportedVideoCodecs: string[];
@@ -21,7 +21,7 @@ export type EncodedMediaCapabilities = {
   bootstrapRequired: boolean;
 };
 
-export type EncodedMediaControlMessage = {
+type EncodedMediaControlMessage = {
   protocol: typeof ENCODED_MEDIA_PROTOCOL;
   type: 'hello' | 'hello-ack' | 'keyframe-request' | 'bootstrap' | 'stats' | 'error' | 'close';
   protocolVersion: number;
@@ -41,7 +41,7 @@ export type EncodedFrameHeader = {
   type: 'frame' | 'chunk';
   streamType: 'video' | 'audio';
   codec: string;
-  payloadFormat?: 'annexb' | 'avcc' | 'raw' | 'unknown';
+  payloadFormat?: 'annexb' | 'avcc' | 'raw' | 'opus-raw' | 'aac-adts' | 'unknown';
   timestampUs: number;
   sequence: number;
   keyframe: boolean;
@@ -52,12 +52,15 @@ export type EncodedFrameHeader = {
   framePayloadBytes?: number;
 };
 
-export function webEncodedMediaCapabilities(): EncodedMediaCapabilities {
+export function webEncodedMediaCapabilities(options: {
+  supportedVideoCodecs?: string[];
+  supportedAudioCodecs?: string[];
+} = {}): EncodedMediaCapabilities {
   return {
     protocol: ENCODED_MEDIA_PROTOCOL,
     protocolVersion: ENCODED_MEDIA_PROTOCOL_VERSION,
-    supportedVideoCodecs: ['h264', 'h265'],
-    supportedAudioCodecs: ['opus', 'aac'],
+    supportedVideoCodecs: sanitizeCodecList(options.supportedVideoCodecs, ['h264']),
+    supportedAudioCodecs: sanitizeCodecList(options.supportedAudioCodecs, ['opus']),
     maxFrameBytes: MAX_ENCODED_FRAME_BYTES,
     bootstrapRequired: true
   };
@@ -176,6 +179,10 @@ export class EncodedFrameReassembler {
     createdAt: number;
   }>();
 
+  clear(): void {
+    this.pending.clear();
+  }
+
   push(buffer: ArrayBuffer): { header: EncodedFrameHeader; payload: ArrayBuffer } | null {
     const decoded = decodeFrameMessage(buffer);
     if (decoded.header.type === 'frame') {
@@ -198,7 +205,10 @@ export class EncodedFrameReassembler {
       chunkCount <= 0 ||
       chunkIndex >= chunkCount ||
       payloadBytes <= 0 ||
-      payloadBytes > MAX_ENCODED_FRAME_BYTES
+      payloadBytes > MAX_ENCODED_FRAME_BYTES ||
+      chunkCount > Math.ceil(MAX_ENCODED_FRAME_BYTES / DATA_CHANNEL_CHUNK_PAYLOAD_BYTES) ||
+      decoded.payload.byteLength > DATA_CHANNEL_CHUNK_PAYLOAD_BYTES ||
+      (chunkIndex < chunkCount - 1 && decoded.payload.byteLength !== DATA_CHANNEL_CHUNK_PAYLOAD_BYTES)
     ) {
       throw new Error('datachannel-chunk-invalid-header');
     }
@@ -224,6 +234,12 @@ export class EncodedFrameReassembler {
       delete entry.header.chunkCount;
       delete entry.header.framePayloadBytes;
       this.pending.set(frameId, entry);
+      if (this.pending.size > MAX_PENDING_CHUNKED_FRAMES) {
+        const oldest = this.pending.keys().next().value;
+        if (oldest) {
+          this.pending.delete(oldest);
+        }
+      }
     }
 
     if (!entry.chunks[chunkIndex]) {
@@ -241,6 +257,10 @@ export class EncodedFrameReassembler {
         return null;
       }
       const chunkBytes = new Uint8Array(chunk);
+      if (offset + chunkBytes.byteLength > output.byteLength) {
+        this.pending.delete(frameId);
+        throw new Error('datachannel-chunk-payload-overflow');
+      }
       output.set(chunkBytes, offset);
       offset += chunkBytes.byteLength;
     }
@@ -250,6 +270,13 @@ export class EncodedFrameReassembler {
       payload: output.buffer
     };
   }
+}
+
+function sanitizeCodecList(value: string[] | undefined, fallback: string[]): string[] {
+  const list = Array.isArray(value)
+    ? value.map((codec) => String(codec || '').toLowerCase()).filter(Boolean)
+    : [];
+  return Array.from(new Set(list.length ? list : fallback));
 }
 
 export function parseControlMessage(raw: string): EncodedMediaControlMessage | null {

@@ -6,7 +6,6 @@
 #include <vector>
 
 #include "agent_runtime.h"
-#include "peer_transport.h"
 #include "wasapi_backend.h"
 
 inline constexpr unsigned int kTransportAudioSampleRate = 48000;
@@ -37,13 +36,6 @@ void reset_peer_audio_decoder_runtime(PeerState::PeerVideoReceiverRuntime& runti
 void register_host_audio_transport_session(const std::shared_ptr<PeerTransportSession>& session);
 void unregister_host_audio_transport_session(const std::shared_ptr<PeerTransportSession>& session);
 void reset_host_audio_transport_sessions();
-void dispatch_host_audio_capture_packet(
-  const WasapiSessionStatus& status,
-  const unsigned char* data,
-  unsigned int frames,
-  bool silent);
 
 std::string audio_session_json(const AudioSessionState& session);
-AudioSessionState build_audio_session_state(const AudioBackendProbe& probe);
 AudioSessionState build_audio_session_state(const WasapiSessionStatus& status);
-AudioBackendProbe build_audio_backend_probe(const WasapiProbeResult& probe);

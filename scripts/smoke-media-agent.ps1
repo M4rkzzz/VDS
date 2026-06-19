@@ -1,5 +1,7 @@
 param(
-  [string]$AgentPath = ''
+  [string]$AgentPath = '',
+  [int]$TimeoutSeconds = 15,
+  [switch]$RequireTransportReady
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,15 +48,30 @@ $startInfo.CreateNoWindow = $true
 $process = [System.Diagnostics.Process]::new()
 $process.StartInfo = $startInfo
 $null = $process.Start()
+$stdoutTask = $process.StandardOutput.ReadToEndAsync()
+$stderrTask = $process.StandardError.ReadToEndAsync()
 
-foreach ($request in $requests) {
-  $process.StandardInput.WriteLine($request)
+try {
+  foreach ($request in $requests) {
+    $process.StandardInput.WriteLine($request)
+  }
+  $process.StandardInput.Close()
+
+  if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+    try { $process.Kill($true) } catch { try { $process.Kill() } catch {} }
+    throw "media-agent smoke test timed out after $TimeoutSeconds seconds."
+  }
+  $process.WaitForExit()
+  [void]$stdoutTask.Wait(5000)
+  [void]$stderrTask.Wait(5000)
+} finally {
+  if (-not $process.HasExited) {
+    try { $process.Kill($true) } catch { try { $process.Kill() } catch {} }
+  }
 }
-$process.StandardInput.Close()
 
-$stdoutText = $process.StandardOutput.ReadToEnd()
-$stderrText = $process.StandardError.ReadToEnd()
-$process.WaitForExit()
+$stdoutText = $stdoutTask.Result
+$stderrText = $stderrTask.Result
 
 if ($process.ExitCode -ne 0) {
   throw "media-agent smoke test process failed with exit code $($process.ExitCode). $stderrText"
@@ -77,6 +94,19 @@ foreach ($line in $stdoutLines) {
 $ready = $messages | Where-Object { $_.event -eq 'agent-ready' } | Select-Object -First 1
 if (-not $ready) {
   throw 'media-agent smoke test did not receive agent-ready event.'
+}
+if ($RequireTransportReady) {
+  $capabilitiesResponse = $messages | Where-Object { $_.id -eq 2 } | Select-Object -First 1
+  $transportReady = $false
+  if ($capabilitiesResponse -and $capabilitiesResponse.result) {
+    $transportReady = [bool]($capabilitiesResponse.result.peerTransport -and $capabilitiesResponse.result.peerTransport.transportReady)
+    if (-not $transportReady) {
+      $transportReady = [bool]($capabilitiesResponse.result.transportReady)
+    }
+  }
+  if (-not $transportReady) {
+    throw "media-agent smoke test expected libdatachannel transportReady capability. Capabilities: $($capabilitiesResponse.result | ConvertTo-Json -Compress -Depth 8)"
+  }
 }
 
 foreach ($id in 1..4) {

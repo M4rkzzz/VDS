@@ -1,4 +1,4 @@
-FROM node:22-alpine
+FROM node:22.20.0-alpine3.22
 
 WORKDIR /app
 
@@ -10,6 +10,9 @@ COPY index.js ./index.js
 COPY server-core.js ./server-core.js
 COPY public/ ./public/
 COPY updates/ ./updates/
+
+RUN chown -R node:node /app
+USER node
 
 EXPOSE 3000
 

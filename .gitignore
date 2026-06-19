@@ -9,6 +9,8 @@ media-agent/build/
 server/updates/
 server/public/vds_web/
 tmp/
+tools/**/bin/
+tools/**/obj/
 SKILL.md
 *.pem
 *.key

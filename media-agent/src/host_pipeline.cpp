@@ -4,6 +4,7 @@
 #include <sstream>
 #include <vector>
 
+#include "agent_runtime.h"
 #include "ffmpeg_probe.h"
 #include "json_protocol.h"
 #include "platform_utils.h"

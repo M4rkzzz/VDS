@@ -1,11 +1,11 @@
 import type { CapabilityReport } from './capabilities';
 
-export type IceCounters = {
+type IceCounters = {
   local: number;
   remote: number;
 };
 
-export type DiagnosticsSnapshot = {
+type DiagnosticsSnapshot = {
   status: string;
   roomId?: string;
   clientId: string;

@@ -30,7 +30,7 @@
   const verboseNativeLogs = Boolean(runtimeConfig.verboseMediaLogs);
 
   if (!window.isElectron || !mediaEngine) {
-    throw new Error('native-media-engine-unavailable');
+    return;
   }
 
   const hostVideoContainer = document.getElementById('video-container');
@@ -49,6 +49,11 @@
   const nativePeerHandles = new Map();
   const nativePeerSignalBacklog = new Map();
   const nativePeerSignalWaiters = new Map();
+  let nativePeerAttemptSeq = 0;
+  const NATIVE_PEER_SIGNAL_MAX_BACKLOG_PER_PEER = 32;
+  const NATIVE_PEER_SIGNAL_MAX_BACKLOG_TOTAL = 256;
+  const NATIVE_PEER_SIGNAL_MAX_WAITERS_PER_KEY = 8;
+  const NATIVE_PEER_SIGNAL_TTL_MS = 30000;
   const attachedEmbeddedSurfaces = new Map();
   const nativeDebugRateLimitState = new Map();
   const P2P_UI_STATE_LABELS = Object.freeze({
@@ -64,6 +69,8 @@
     'nat-mapping': '端口映射'
   });
   const VIEWER_MEDIA_WAIT_TIMEOUT_MS = 7000;
+  const VIEWER_UPSTREAM_OFFER_WAIT_TIMEOUT_MS = 6000;
+  const NATIVE_DISCONNECTED_RECOVERY_GRACE_MS = 4000;
   const P2P_NAT_MAPPING_TIMEOUT_MS = 6000;
   const P2P_NAT_MAPPING_CONNECT_WAIT_MS = 7000;
   const P2P_NAT_MAPPING_MAX_CANDIDATES = 4;
@@ -84,6 +91,8 @@
   let embeddedSurfaceTrackingRafId = 0;
   let wheelDrivenSyncRafId = 0;
   let wheelDrivenSyncFramesRemaining = 0;
+  let windowBoundsSurfaceSyncRafId = 0;
+  let windowBoundsSurfaceSyncFinalTimerId = 0;
   const embeddedSurfaceTrackingIntervalMs = 180;
   let currentWindowBounds = null;
   let hostPreviewRequested = true;
@@ -102,6 +111,8 @@
   let currentMediaManifest = null;
   let obsRoomCreatePending = false;
   let viewerMediaWaitTimerId = null;
+  let viewerUpstreamOfferWaitTimerId = null;
+  let viewerUpstreamOfferReconnectSentForPeerId = '';
   let latestP2pStatsSnapshot = null;
   let latestHostCaptureDiagnosticReport = '等待采集数据...';
   let obsIngestStreamActive = false;
@@ -127,10 +138,6 @@
     } catch (_error) {
       return false;
     }
-  }
-
-  function shouldShowDebugLogs() {
-    return shouldShowDebugLogsFor('misc', 'renderer');
   }
 
   function isBlockingModalVisible() {
@@ -460,18 +467,18 @@
 
   function buildHostMediaManifestFromStats(stats) {
     const obsIngest = stats && stats.obsIngest ? stats.obsIngest : null;
-    const hostPipeline = stats && stats.hostPipeline ? stats.hostPipeline : null;
+    const hostCapturePlan = stats && stats.hostCapturePlan ? stats.hostCapturePlan : null;
     return buildHostMediaManifest({
       backend: currentHostBackend,
       videoCodec: obsIngest && obsIngest.videoCodec ? obsIngest.videoCodec : nativeHostEffectiveCodec,
       audioCodec: obsIngest && obsIngest.audioCodec ? obsIngest.audioCodec : undefined,
       width: obsIngest
         ? resolveObsManifestVideoDimension(obsIngest.width, 'width')
-        : resolveManifestVideoDimension(hostPipeline && hostPipeline.width, 0, 'width'),
+        : resolveManifestVideoDimension(hostCapturePlan && hostCapturePlan.width, 0, 'width'),
       height: obsIngest
         ? resolveObsManifestVideoDimension(obsIngest.height, 'height')
-        : resolveManifestVideoDimension(hostPipeline && hostPipeline.height, 0, 'height'),
-      frameRate: obsIngest && obsIngest.frameRate ? obsIngest.frameRate : (hostPipeline && hostPipeline.frameRate),
+        : resolveManifestVideoDimension(hostCapturePlan && hostCapturePlan.height, 0, 'height'),
+      frameRate: obsIngest && obsIngest.frameRate ? obsIngest.frameRate : (hostCapturePlan && hostCapturePlan.frameRate),
       audioSampleRate: obsIngest && obsIngest.audioSampleRate,
       audioChannels: obsIngest && obsIngest.audioChannelCount
     });
@@ -957,7 +964,10 @@
         stateName === 'surface-detached'
       );
 
-    if (isHighFrequencySurfaceEvent && !isVerboseMediaLoggingEnabled()) {
+    if (isHighFrequencySurfaceEvent && !shouldShowDebugLogsFor(debugCategory, 'highFrequency')) {
+      return;
+    }
+    if (eventName === 'audio-data' && !shouldShowDebugLogsFor(debugCategory, 'highFrequency')) {
       return;
     }
 
@@ -998,11 +1008,109 @@
     }
   }
 
+  function pruneNativePeerSignalBacklog(now = Date.now()) {
+    let total = 0;
+    nativePeerSignalBacklog.forEach((entries, peerId) => {
+      const filtered = Array.isArray(entries)
+        ? entries.filter((entry) => !entry.__queuedAt || now - entry.__queuedAt <= NATIVE_PEER_SIGNAL_TTL_MS)
+        : [];
+      const trimmed = filtered.slice(-NATIVE_PEER_SIGNAL_MAX_BACKLOG_PER_PEER);
+      if (trimmed.length > 0) {
+        nativePeerSignalBacklog.set(peerId, trimmed);
+        total += trimmed.length;
+      } else {
+        nativePeerSignalBacklog.delete(peerId);
+      }
+    });
+
+    while (total > NATIVE_PEER_SIGNAL_MAX_BACKLOG_TOTAL && nativePeerSignalBacklog.size > 0) {
+      let oldestPeerId = null;
+      let oldestQueuedAt = Number.POSITIVE_INFINITY;
+      nativePeerSignalBacklog.forEach((entries, peerId) => {
+        const queuedAt = Number(entries && entries[0] && entries[0].__queuedAt) || 0;
+        if (queuedAt < oldestQueuedAt) {
+          oldestQueuedAt = queuedAt;
+          oldestPeerId = peerId;
+        }
+      });
+      if (!oldestPeerId) {
+        break;
+      }
+      const entries = nativePeerSignalBacklog.get(oldestPeerId) || [];
+      entries.shift();
+      total -= 1;
+      if (entries.length > 0) {
+        nativePeerSignalBacklog.set(oldestPeerId, entries);
+      } else {
+        nativePeerSignalBacklog.delete(oldestPeerId);
+      }
+    }
+  }
+
+  function sanitizeNativePeerSignalPayload(payload) {
+    if (!payload || typeof payload !== 'object') {
+      return payload;
+    }
+    const { __queuedAt, ...publicPayload } = payload;
+    return publicPayload;
+  }
+
+  function isStaleNativePeerError(error) {
+    const message = error && error.message ? String(error.message) : String(error || '');
+    return message.includes('native-peer-stale:') ||
+      message.includes('Peer has not been created') ||
+      error && error.code === 'PEER_NOT_FOUND';
+  }
+
+  function getSignalAttemptId(data) {
+    const value = data && data.attemptId;
+    const attemptId = Number(value);
+    return Number.isInteger(attemptId) && attemptId > 0 ? attemptId : null;
+  }
+
+  function getCurrentPeerAttemptId(peerId) {
+    const meta = peerConnectionMeta.get(peerId);
+    return meta && Number.isInteger(meta.attemptId) && meta.attemptId > 0 ? meta.attemptId : null;
+  }
+
+  function getCurrentPeerEdgeAttemptId(peerId) {
+    const meta = peerConnectionMeta.get(peerId);
+    if (meta && Number.isInteger(meta.edgeAttemptId) && meta.edgeAttemptId > 0) {
+      return meta.edgeAttemptId;
+    }
+    return getCurrentPeerAttemptId(peerId);
+  }
+
+  function isCurrentPeerAttempt(peerId, attemptId) {
+    if (!attemptId) {
+      return true;
+    }
+    return getCurrentPeerEdgeAttemptId(peerId) === attemptId;
+  }
+
+  function appendPeerAttempt(payload, peerId) {
+    const attemptId = getCurrentPeerEdgeAttemptId(peerId);
+    if (attemptId) {
+      payload.attemptId = attemptId;
+    }
+    return payload;
+  }
+
+  function clearNativePeerSignalState(peerId) {
+    nativePeerSignalBacklog.delete(peerId);
+    Array.from(nativePeerSignalWaiters.keys()).forEach((key) => {
+      if (key === `${peerId}:*` || key.startsWith(`${peerId}:`)) {
+        nativePeerSignalWaiters.delete(key);
+      }
+    });
+  }
+
   function enqueueNativePeerSignal(params) {
     const peerId = getNativeSignalPeerId(params);
     if (!peerId) {
       return;
     }
+    pruneNativePeerSignalBacklog();
 
     const waiterKey = `${peerId}:${params.type || '*'}`;
     const waiters = nativePeerSignalWaiters.get(waiterKey);
@@ -1011,18 +1119,25 @@
       if (waiters.length === 0) {
         nativePeerSignalWaiters.delete(waiterKey);
       }
-      resolve(params);
+      resolve(sanitizeNativePeerSignalPayload(params));
       return;
     }
 
     if (!nativePeerSignalBacklog.has(peerId)) {
       nativePeerSignalBacklog.set(peerId, []);
     }
-    nativePeerSignalBacklog.get(peerId).push(params);
+    const backlogEntry = { ...params, __queuedAt: Date.now() };
+    const backlog = nativePeerSignalBacklog.get(peerId);
+    backlog.push(backlogEntry);
+    if (backlog.length > NATIVE_PEER_SIGNAL_MAX_BACKLOG_PER_PEER) {
+      backlog.splice(0, backlog.length - NATIVE_PEER_SIGNAL_MAX_BACKLOG_PER_PEER);
+    }
+    pruneNativePeerSignalBacklog();
   }
 
   function waitForNativePeerSignal(peerId, type, timeoutMs = 15000) {
     return new Promise((resolve, reject) => {
+      pruneNativePeerSignalBacklog();
       const key = `${peerId}:${type || '*'}`;
       const backlog = nativePeerSignalBacklog.get(peerId) || [];
       const backlogIndex = backlog.findIndex((entry) => !type || type === '*' || entry.type === type);
@@ -1033,7 +1148,7 @@
         } else {
           nativePeerSignalBacklog.delete(peerId);
         }
-        resolve(payload);
+        resolve(sanitizeNativePeerSignalPayload(payload));
         return;
       }
 
@@ -1056,7 +1171,13 @@
       if (!nativePeerSignalWaiters.has(key)) {
         nativePeerSignalWaiters.set(key, []);
       }
-      nativePeerSignalWaiters.get(key).push(resolver);
+      const waitersForKey = nativePeerSignalWaiters.get(key);
+      if (waitersForKey.length >= NATIVE_PEER_SIGNAL_MAX_WAITERS_PER_KEY) {
+        clearTimeout(timerId);
+        reject(new Error(`native-peer-signal-waiter-limit:${peerId}:${type || '*'}`));
+        return;
+      }
+      waitersForKey.push(resolver);
     });
   }
 
@@ -1197,6 +1318,8 @@
       value: JSON.stringify({
         embedded: true,
         visible,
+        x: Math.round(windowX + clippedLeft),
+        y: Math.round(windowY + clippedTop),
         relativeLeft: Math.round(clippedLeft),
         relativeTop: Math.round(clippedTop),
         width: Math.max(1, cssWidth),
@@ -1425,6 +1548,30 @@
     window.setTimeout(forceEmbeddedSurfaceResync, 260);
   }
 
+  function scheduleWindowBoundsSurfaceSync(bounds) {
+    currentWindowBounds = bounds || null;
+    if (!nativeSurfaceEmbeddingEnabled || attachedEmbeddedSurfaces.size === 0) {
+      return;
+    }
+
+    invalidateEmbeddedSurfaceLayouts();
+    if (!windowBoundsSurfaceSyncRafId) {
+      windowBoundsSurfaceSyncRafId = window.requestAnimationFrame(() => {
+        windowBoundsSurfaceSyncRafId = 0;
+        scheduleEmbeddedSurfaceSync();
+      });
+    }
+
+    if (windowBoundsSurfaceSyncFinalTimerId) {
+      window.clearTimeout(windowBoundsSurfaceSyncFinalTimerId);
+    }
+    windowBoundsSurfaceSyncFinalTimerId = window.setTimeout(() => {
+      windowBoundsSurfaceSyncFinalTimerId = 0;
+      invalidateEmbeddedSurfaceLayouts();
+      scheduleEmbeddedSurfaceSync();
+    }, 120);
+  }
+
   function stopEmbeddedSurfaceTrackingLoop() {
     if (embeddedSurfaceTrackingRafId) {
       window.clearTimeout(embeddedSurfaceTrackingRafId);
@@ -1594,7 +1741,11 @@
     }
 
     mediaEngineStartPromise = (async () => {
-      await mediaEngine.start();
+      const status = await mediaEngine.start();
+      if (!status || status.available === false || status.running !== true) {
+        const reason = status && status.reason ? String(status.reason) : 'media-engine-not-running';
+        throw new Error(`native-media-engine-unavailable:${reason}`);
+      }
       mediaEngineStarted = true;
       if (typeof mediaEngine.getCapabilities === 'function') {
         logNativeMediaCapabilities(await mediaEngine.getCapabilities());
@@ -1710,6 +1861,8 @@
       meta = {
         isInitiator: Boolean(isInitiator),
         kind,
+        attemptId: 0,
+        edgeAttemptId: null,
         hasConnected: false,
         connectTimeoutId: null,
         disconnectTimerId: null,
@@ -1794,6 +1947,46 @@
       clearTimeout(viewerMediaWaitTimerId);
       viewerMediaWaitTimerId = null;
     }
+  }
+
+  function clearViewerUpstreamOfferWaitTimer() {
+    if (viewerUpstreamOfferWaitTimerId) {
+      clearTimeout(viewerUpstreamOfferWaitTimerId);
+      viewerUpstreamOfferWaitTimerId = null;
+    }
+  }
+
+  function armViewerUpstreamOfferWaitTimer(peerId) {
+    clearViewerUpstreamOfferWaitTimer();
+    if (!peerId || !currentRoomId || sessionRole !== 'viewer') {
+      return;
+    }
+    if (viewerUpstreamOfferReconnectSentForPeerId && viewerUpstreamOfferReconnectSentForPeerId !== peerId) {
+      viewerUpstreamOfferReconnectSentForPeerId = '';
+    }
+    viewerUpstreamOfferWaitTimerId = window.setTimeout(() => {
+      viewerUpstreamOfferWaitTimerId = null;
+      if (sessionRole !== 'viewer' || !currentRoomId || upstreamPeerId !== peerId || peerConnections.has(peerId)) {
+        return;
+      }
+      if (viewerUpstreamOfferReconnectSentForPeerId === peerId) {
+        return;
+      }
+      viewerUpstreamOfferReconnectSentForPeerId = peerId;
+      logNativeStep('viewer:upstream-offer-timeout', {
+        peerId,
+        roomId: currentRoomId,
+        chainPosition: myChainPosition
+      }, 'connection');
+      sendMessage({
+        type: 'viewer-reconnect-ready',
+        roomId: currentRoomId,
+        clientId,
+        chainPosition: myChainPosition,
+        upstreamPeerId: peerId,
+        failedUpstreamPeerId: peerId
+      });
+    }, VIEWER_UPSTREAM_OFFER_WAIT_TIMEOUT_MS);
   }
 
   function armViewerMediaWaitTimer(peerId) {
@@ -1930,7 +2123,30 @@
       const receiverRuntime = statsPeer && statsPeer.receiverRuntime ? statsPeer.receiverRuntime : {};
       const selectedLocalCandidate = peerTransport.selectedLocalCandidate || '';
       const selectedRemoteCandidate = peerTransport.selectedRemoteCandidate || '';
-      lines.push(`- peerId: ${peerId}`);
+      const encodedDataChannelReady = Boolean(peerTransport.encodedMediaDataChannelReady);
+      const encodedDataChannelOpen = Boolean(peerTransport.encodedMediaDataChannelOpen);
+      const framesSent = peerTransport.videoFramesSent || peerTransport.encodedMediaDataChannelFramesSent || (statsPeer && statsPeer.mediaBinding && statsPeer.mediaBinding.framesSent) || 0;
+      const framesReceived = peerTransport.remoteVideoFramesReceived || peerTransport.encodedMediaDataChannelFramesReceived || 0;
+      const framesDecoded = peerTransport.decodedFramesRendered || 0;
+      const droppedVideoUnits = receiverRuntime.droppedVideoUnits || 0;
+      const droppedAudioBlocks = receiverRuntime.droppedAudioBlocks || 0;
+      const invalidDataChannelFrames = peerTransport.encodedMediaDataChannelInvalidFrames || 0;
+      const receiverError = receiverRuntime.lastError || '';
+      const healthyPeer =
+        handle.connectionState === 'connected' &&
+        handle.iceConnectionState === 'connected' &&
+        encodedDataChannelOpen &&
+        encodedDataChannelReady &&
+        invalidDataChannelFrames === 0 &&
+        droppedVideoUnits === 0 &&
+        !receiverError &&
+        (framesSent > 0 || framesReceived > 0 || framesDecoded > 0);
+      const showPeerDetails = !healthyPeer || shouldShowDebugLogsFor('p2p', 'periodicStats') || isVerboseMediaLoggingEnabled();
+      lines.push(`- ${peerId} ${formatDiagnosticValue(handle.role)}/${formatDiagnosticValue(handle.kind)} ${formatDiagnosticValue(handle.connectionState)}/${formatDiagnosticValue(handle.iceConnectionState)} dc=${encodedDataChannelReady ? 'ready' : formatDiagnosticValue(peerTransport.encodedMediaDataChannelState)} pair=${summarizeSelectedCandidate(selectedLocalCandidate)}>${summarizeSelectedCandidate(selectedRemoteCandidate)} rtt=${normalizeDiagnosticNumber(peerTransport.roundTripTimeMs)}ms v=${formatDiagnosticValue(framesSent)}/${formatDiagnosticValue(framesReceived)}/${formatDiagnosticValue(framesDecoded)} a=${formatDiagnosticValue(peerTransport.audioFramesSent || 0)}/${formatDiagnosticValue(peerTransport.remoteAudioFramesReceived || 0)} drop=${formatDiagnosticValue(droppedVideoUnits)}/${formatDiagnosticValue(droppedAudioBlocks)} attempt=${formatDiagnosticValue(meta && meta.edgeAttemptId)}`);
+      if (!showPeerDetails) {
+        continue;
+      }
+      lines.push(`  peerId: ${peerId}`);
       lines.push(`  role: ${formatDiagnosticValue(handle.role)}`);
       lines.push(`  kind: ${formatDiagnosticValue(handle.kind)}`);
       lines.push(`  connectionState: ${formatDiagnosticValue(handle.connectionState)}`);
@@ -1960,25 +2176,25 @@
       lines.push(`  expectedVideoCodec: ${formatDiagnosticValue(statsPeer && statsPeer.expectedVideoCodec)}`);
       lines.push(`  expectedAudioCodec: ${formatDiagnosticValue(statsPeer && statsPeer.expectedAudioCodec)}`);
       lines.push(`  encodedDataChannelRequested: ${formatDiagnosticValue(Boolean(peerTransport.encodedMediaDataChannelRequested))}`);
-      lines.push(`  encodedDataChannelOpen: ${formatDiagnosticValue(Boolean(peerTransport.encodedMediaDataChannelOpen))}`);
-      lines.push(`  encodedDataChannelReady: ${formatDiagnosticValue(Boolean(peerTransport.encodedMediaDataChannelReady))}`);
+      lines.push(`  encodedDataChannelOpen: ${formatDiagnosticValue(encodedDataChannelOpen)}`);
+      lines.push(`  encodedDataChannelReady: ${formatDiagnosticValue(encodedDataChannelReady)}`);
       lines.push(`  encodedDataChannelState: ${formatDiagnosticValue(peerTransport.encodedMediaDataChannelState)}`);
       lines.push(`  encodedDataChannelFramesSent: ${formatDiagnosticValue(peerTransport.encodedMediaDataChannelFramesSent || 0)}`);
       lines.push(`  encodedDataChannelFramesReceived: ${formatDiagnosticValue(peerTransport.encodedMediaDataChannelFramesReceived || 0)}`);
-      lines.push(`  encodedDataChannelInvalidFrames: ${formatDiagnosticValue(peerTransport.encodedMediaDataChannelInvalidFrames || 0)}`);
-      lines.push(`  videoSent: ${formatDiagnosticValue(peerTransport.videoFramesSent || peerTransport.encodedMediaDataChannelFramesSent || (statsPeer && statsPeer.mediaBinding && statsPeer.mediaBinding.framesSent) || 0)}`);
-      lines.push(`  videoReceived: ${formatDiagnosticValue(peerTransport.remoteVideoFramesReceived || peerTransport.encodedMediaDataChannelFramesReceived || 0)}`);
-      lines.push(`  videoDecoded: ${formatDiagnosticValue(peerTransport.decodedFramesRendered || 0)}`);
+      lines.push(`  encodedDataChannelInvalidFrames: ${formatDiagnosticValue(invalidDataChannelFrames)}`);
+      lines.push(`  videoSent: ${formatDiagnosticValue(framesSent)}`);
+      lines.push(`  videoReceived: ${formatDiagnosticValue(framesReceived)}`);
+      lines.push(`  videoDecoded: ${formatDiagnosticValue(framesDecoded)}`);
       lines.push(`  audioSent: ${formatDiagnosticValue(peerTransport.audioFramesSent || 0)}`);
       lines.push(`  audioReceived: ${formatDiagnosticValue(peerTransport.remoteAudioFramesReceived || 0)}`);
       lines.push(`  nackRetransmissions: ${formatDiagnosticValue(peerTransport.nackRetransmissions || 0)}`);
       lines.push(`  pliRequestsReceived: ${formatDiagnosticValue(peerTransport.pliRequestsReceived || 0)}`);
       lines.push(`  keyframeRequestsSent: ${formatDiagnosticValue(peerTransport.keyframeRequestsSent || 0)}`);
       lines.push(`  decoderRecoveryCount: ${formatDiagnosticValue(peerTransport.decoderRecoveryCount || 0)}`);
-      lines.push(`  droppedVideoUnits: ${formatDiagnosticValue(receiverRuntime.droppedVideoUnits || 0)}`);
-      lines.push(`  droppedAudioBlocks: ${formatDiagnosticValue(receiverRuntime.droppedAudioBlocks || 0)}`);
+      lines.push(`  droppedVideoUnits: ${formatDiagnosticValue(droppedVideoUnits)}`);
+      lines.push(`  droppedAudioBlocks: ${formatDiagnosticValue(droppedAudioBlocks)}`);
       lines.push(`  receiverReason: ${formatDiagnosticValue(receiverRuntime.reason)}`);
-      lines.push(`  receiverError: ${formatDiagnosticValue(receiverRuntime.lastError)}`);
+      lines.push(`  receiverError: ${formatDiagnosticValue(receiverError)}`);
     }
 
     return lines.join('\n');
@@ -2022,7 +2238,6 @@
       `sourceFramesCaptured: ${formatDiagnosticValue(mediaBinding.sourceFramesCaptured || 0)}`,
       `framesSent: ${formatDiagnosticValue(mediaBinding.framesSent || peerTransport.videoFramesSent || 0)}`,
       `droppedVideoUnits: ${formatDiagnosticValue(peerTransport.droppedVideoUnits || 0)}`,
-      `encodeQueueDepth: ${formatDiagnosticValue(mediaBinding.encodeQueueDepth)}`,
       `avgCopyResourceUs: ${formatDiagnosticValue(mediaBinding.avgSourceCopyResourceUs || 0)}`,
       `avgMapUs: ${formatDiagnosticValue(mediaBinding.avgSourceMapUs || 0)}`,
       `avgMemcpyUs: ${formatDiagnosticValue(mediaBinding.avgSourceMemcpyUs || 0)}`,
@@ -2266,7 +2481,9 @@
   }
 
   function createNativePeerConnectionImpl(peerId, isInitiator, kind = 'direct', options = {}) {
+    clearNativePeerSignalState(peerId);
     const encodedMediaDataChannel = options.encodedMediaDataChannel !== false;
+    const attemptId = ++nativePeerAttemptSeq;
     const role = isHost
       ? 'host-downstream'
       : (kind === 'relay-viewer' ? 'relay-downstream' : 'viewer-upstream');
@@ -2276,6 +2493,7 @@
       role,
       kind,
       initiator: Boolean(isInitiator),
+      attemptId,
       encodedMediaDataChannel,
       relaySourcePeerId: null,
       connectionState: 'new',
@@ -2295,7 +2513,9 @@
 
     peerConnections.set(peerId, handle);
     nativePeerHandles.set(peerId, handle);
-    ensurePeerMeta(peerId, isInitiator, kind);
+    const meta = ensurePeerMeta(peerId, isInitiator, kind);
+    meta.attemptId = attemptId;
+    meta.edgeAttemptId = Boolean(isInitiator) ? attemptId : null;
     setP2pStateForPeer(peerId, 'gathering');
     armPeerConnectFailfast(peerId);
     return handle;
@@ -2303,8 +2523,14 @@
 
   async function ensureNativePeerConnectionReady(peerId, handle) {
     if (isNativePeerHandle(handle)) {
+      if (handle.closed || nativePeerHandles.get(peerId) !== handle) {
+        throw new Error(`native-peer-stale:${peerId}`);
+      }
       logNativeStep('createPeer:awaitReady', { peerId, role: handle.role, kind: handle.kind });
       await handle.__readyPromise;
+      if (handle.closed || nativePeerHandles.get(peerId) !== handle) {
+        throw new Error(`native-peer-stale:${peerId}`);
+      }
       logNativeStep('createPeer:ready', { peerId, role: handle.role, kind: handle.kind });
     }
   }
@@ -2321,6 +2547,9 @@
       }
 
       await ensureNativePeerConnectionReady(peerId, handle);
+      if (handle.closed || nativePeerHandles.get(peerId) !== handle) {
+        throw new Error(`native-peer-stale:${peerId}`);
+      }
       return mediaEngine.attachPeerMediaSource({
         peerId,
         source: `peer-video:${relaySourcePeerId}`
@@ -2336,6 +2565,9 @@
     }
 
     await ensureNativePeerConnectionReady(peerId, handle);
+    if (handle.closed || nativePeerHandles.get(peerId) !== handle) {
+      throw new Error(`native-peer-stale:${peerId}`);
+    }
     return mediaEngine.attachPeerMediaSource({
       peerId,
       source: 'host-session-video'
@@ -2415,6 +2647,115 @@
     }
   }
 
+  function getPeerEdgeState(peerId) {
+    const handle = nativePeerHandles.get(peerId) || null;
+    const meta = peerConnectionMeta.get(peerId) || null;
+    return {
+      peerId,
+      handle,
+      meta,
+      attemptId: handle && Number.isInteger(handle.attemptId) ? handle.attemptId : getCurrentPeerAttemptId(peerId),
+      edgeAttemptId: getCurrentPeerEdgeAttemptId(peerId),
+      role: handle && handle.role ? handle.role : '',
+      kind: handle && handle.kind ? handle.kind : '',
+      connectionState: handle && handle.connectionState ? handle.connectionState : 'none',
+      closed: Boolean(handle && handle.closed),
+      hasConnected: Boolean(meta && meta.hasConnected),
+      restartInProgress: Boolean(meta && meta.restartInProgress)
+    };
+  }
+
+  async function requestPeerRecovery(peerId, reason, options = {}) {
+    const edge = getPeerEdgeState(peerId);
+    const handle = edge.handle;
+    const meta = edge.meta;
+    if (!peerId || !handle || edge.closed || !meta) {
+      return false;
+    }
+    if (Number.isInteger(options.attemptId) && edge.attemptId !== options.attemptId) {
+      return false;
+    }
+    logNativeStep('peer:recovery-requested', {
+      peerId,
+      reason,
+      role: edge.role,
+      kind: edge.kind,
+      attemptId: edge.attemptId,
+      edgeAttemptId: edge.edgeAttemptId,
+      source: options.source || ''
+    }, 'connection');
+    if (handle.role === 'host-downstream') {
+      await createOffer(peerId, { force: true, reconnect: true });
+      return true;
+    }
+    if (handle.role === 'viewer-upstream' && currentRoomId && sessionRole === 'viewer') {
+      await closeNativePeerConnectionImpl(peerId, { clearRetryState: false }).catch(() => {});
+      sendMessage({
+        type: 'viewer-reconnect-ready',
+        roomId: currentRoomId,
+        clientId,
+        chainPosition: myChainPosition,
+        upstreamPeerId: peerId,
+        failedUpstreamPeerId: peerId,
+        reason
+      });
+      return true;
+    }
+    return false;
+  }
+
+  function scheduleDisconnectedPeerRecovery(peerId, handle) {
+    if (!peerId || !handle || handle.closed) {
+      return;
+    }
+    const meta = peerConnectionMeta.get(peerId);
+    if (!meta || !meta.hasConnected || meta.restartInProgress || meta.disconnectTimerId) {
+      return;
+    }
+    const attemptId = handle.attemptId;
+    const delays = [NATIVE_DISCONNECTED_RECOVERY_GRACE_MS].concat(
+      Array.isArray(P2P_RECONNECT_DELAYS_MS) && P2P_RECONNECT_DELAYS_MS.length
+        ? P2P_RECONNECT_DELAYS_MS
+        : [750, 1500]
+    );
+    const nextAttempt = Math.min(Number(meta.restartAttempts || 0) + 1, delays.length);
+    const delayMs = delays[Math.max(0, nextAttempt - 1)];
+    meta.restartAttempts = nextAttempt;
+    meta.restartInProgress = true;
+    meta.disconnectTimerId = window.setTimeout(async () => {
+      meta.disconnectTimerId = null;
+      const currentHandle = nativePeerHandles.get(peerId);
+      if (!currentHandle || currentHandle.closed || currentHandle.attemptId !== attemptId || currentHandle.connectionState === 'connected') {
+        meta.restartInProgress = false;
+        return;
+      }
+      try {
+        logNativeStep('peer:disconnected-recovery', {
+          peerId,
+          role: currentHandle.role,
+          kind: currentHandle.kind,
+          attempt: nextAttempt
+        }, 'connection');
+        const recovered = await requestPeerRecovery(peerId, 'ice-disconnected', {
+          attemptId,
+          source: 'disconnected-recovery'
+        });
+        if (recovered) {
+          return;
+        }
+        meta.restartInProgress = false;
+      } catch (error) {
+        meta.restartInProgress = false;
+        logRecoverableNativeWarning('peer:disconnected-recovery-failed', error, {
+          key: `peer-disconnected-recovery:${peerId}`,
+          category: 'connection',
+          channel: 'nativeSteps',
+          fallbackLabel: `[media-engine] disconnected recovery failed: ${peerId}`
+        });
+      }
+    }, delayMs);
+  }
+
   function handleNativePeerStateEvent(params) {
     if (!params || !params.peerId) {
       return;
@@ -2453,7 +2794,9 @@
     if (params.state === 'disconnected') {
       handle.connectionState = 'disconnected';
       handle.iceConnectionState = 'disconnected';
-      setP2pStateForPeer(params.peerId, 'restart-attempting');
+      scheduleDisconnectedPeerRecovery(params.peerId, handle);
+      const meta = peerConnectionMeta.get(params.peerId);
+      setP2pStateForPeer(params.peerId, meta && meta.hasConnected ? 'restart-attempting' : 'checking');
       return;
     }
 
@@ -2489,6 +2832,7 @@
       roomId: currentRoomId,
       trickle: true
     };
+    appendPeerAttempt(payload, payload.targetId);
 
     if (params.sdp) {
       payload.sdp = params.sdp;
@@ -2634,6 +2978,7 @@
       return null;
     }
 
+    handle.closed = true;
     try {
       await detachNativePeerVideoSurface(peerId).catch(() => {});
       await mediaEngine.detachPeerMediaSource({ peerId }).catch(() => {});
@@ -2643,7 +2988,7 @@
       peerConnections.delete(peerId);
       peerConnectionMeta.delete(peerId);
       pendingRemoteCandidates.delete(peerId);
-      nativePeerSignalBacklog.delete(peerId);
+      clearNativePeerSignalState(peerId);
       clearPeerConnectionTimeout(peerId);
       clearPeerDisconnectTimer(peerId);
       if (options.clearRetryState) {
@@ -2669,16 +3014,8 @@
     // native peer has a chance to emit its fresh local description.
     dropQueuedNativePeerSignals(peerId, (entry) => entry && entry.type === 'offer');
     await ensureNativePeerConnectionReady(peerId, pc);
-    const attachResult = await attachNativePeerMediaSources(peerId, pc);
+    await attachNativePeerMediaSources(peerId, pc);
     const encodedDataChannelRequested = pc.encodedMediaDataChannel === true;
-    if (
-      attachResult &&
-      attachResult.peerTransport &&
-      attachResult.peerTransport.videoTrackConfigured !== true &&
-      !encodedDataChannelRequested
-    ) {
-      throw new Error(`native-peer-video-track-not-configured:${peerId}`);
-    }
 
     let signal = null;
     if (
@@ -2710,7 +3047,7 @@
       setP2pStateForPeer(peerId, 'gathering');
     }
 
-    sendMessage({
+    sendMessage(appendPeerAttempt({
       type: 'offer',
       targetId: peerId,
       sdp: signal.sdp,
@@ -2718,7 +3055,7 @@
       ...(options.isRelay ? { isRelay: true } : {}),
       ...(options.reconnect ? { reconnect: true } : {}),
       ...(options.iceRestart ? { iceRestart: true } : {})
-    });
+    }, peerId));
 
     return signal.sdp;
   }
@@ -2732,12 +3069,12 @@
     const signal = await waitForNativePeerSignal(peerId, 'answer');
     updateNativePeerSignalState(peerId, signal);
 
-    sendMessage({
+    sendMessage(appendPeerAttempt({
       type: 'answer',
       targetId: peerId,
       sdp: signal.sdp,
       roomId: currentRoomId
-    });
+    }, peerId));
 
     return signal.sdp;
   }
@@ -3001,6 +3338,8 @@
     viewerReadySent = false;
     videoStarted = false;
     clearViewerMediaWaitTimer();
+    clearViewerUpstreamOfferWaitTimer();
+    viewerUpstreamOfferReconnectSentForPeerId = '';
     obsRoomCreatePending = false;
     obsIngestStreamActive = false;
 
@@ -3206,13 +3545,10 @@
             `encodedDataChannelFramesReceived=${peer.peerTransport.encodedMediaDataChannelFramesReceived || 0}`,
             `framesRendered=${peer.peerTransport.decodedFramesRendered || 0}`,
             `surfaceFrameStddevMs=${surface && typeof surface.frameIntervalStddevMs === 'number' ? surface.frameIntervalStddevMs.toFixed(3) : '0.000'}`,
-            `queuedVideo=${peer.receiverRuntime && peer.receiverRuntime.queuedVideoUnits ? peer.receiverRuntime.queuedVideoUnits : 0}`,
-            `queuedAudio=${peer.receiverRuntime && peer.receiverRuntime.queuedAudioBlocks ? peer.receiverRuntime.queuedAudioBlocks : 0}`,
             `submittedVideo=${peer.receiverRuntime && peer.receiverRuntime.submittedVideoUnits ? peer.receiverRuntime.submittedVideoUnits : 0}`,
             `dispatchedAudio=${peer.receiverRuntime && peer.receiverRuntime.dispatchedAudioBlocks ? peer.receiverRuntime.dispatchedAudioBlocks : 0}`,
             `droppedVideo=${peer.receiverRuntime && peer.receiverRuntime.droppedVideoUnits ? peer.receiverRuntime.droppedVideoUnits : 0}`,
             `droppedAudio=${peer.receiverRuntime && peer.receiverRuntime.droppedAudioBlocks ? peer.receiverRuntime.droppedAudioBlocks : 0}`,
-            `lastVideoLatenessMs=${peer.receiverRuntime && typeof peer.receiverRuntime.lastVideoLatenessMs === 'number' ? peer.receiverRuntime.lastVideoLatenessMs : 0}`,
             `receiverReason=${peer.receiverRuntime && peer.receiverRuntime.reason ? peer.receiverRuntime.reason : 'n/a'}`,
             `receiverError=${peer.receiverRuntime && peer.receiverRuntime.lastError ? peer.receiverRuntime.lastError : ''}`,
             `mediaReady=${Boolean(peer.peerTransport.mediaPlaneReady)}`,
@@ -3406,9 +3742,9 @@
         const mediaManifest = buildHostMediaManifest({
           backend: 'native',
           videoCodec: effectiveCodec,
-          width: session && session.pipeline && session.pipeline.width,
-          height: session && session.pipeline && session.pipeline.height,
-          frameRate: session && session.pipeline && session.pipeline.frameRate,
+          width: session && session.capturePlan && session.capturePlan.width,
+          height: session && session.capturePlan && session.capturePlan.height,
+          frameRate: session && session.capturePlan && session.capturePlan.frameRate,
           audioCodec: 'opus'
         });
         rememberMediaManifest(mediaManifest);
@@ -3567,6 +3903,8 @@
       viewerReadySent = false;
       videoStarted = false;
       clearViewerMediaWaitTimer();
+      clearViewerUpstreamOfferWaitTimer();
+      viewerUpstreamOfferReconnectSentForPeerId = '';
 
       elements.roomInfo.classList.add('hidden');
       elements.viewerCount.textContent = '0';
@@ -3681,7 +4019,7 @@
 
     const pc = createPeerConnection(
       nextViewerId,
-      false,
+      true,
       'relay-viewer',
       { encodedMediaDataChannel: useEncodedDataChannel, mediaManifest: currentMediaManifest }
     );
@@ -3761,7 +4099,12 @@
 
   async function handleOffer(data) {
     const fromId = data.fromClientId;
+    const remoteAttemptId = getSignalAttemptId(data);
     const remoteDescription = normalizeNativeSessionDescription(data.sdp);
+    clearViewerUpstreamOfferWaitTimer();
+    if (viewerUpstreamOfferReconnectSentForPeerId === fromId) {
+      viewerUpstreamOfferReconnectSentForPeerId = '';
+    }
     logNativeStep('signal:offer', {
       fromId,
       isHost,
@@ -3778,17 +4121,29 @@
         viewerReadySent = false;
         videoStarted = false;
         clearViewerMediaWaitTimer();
+        clearViewerUpstreamOfferWaitTimer();
         setViewerConnectionState('正在切换上游连接...');
       }
     }
 
     let pc = peerConnections.get(fromId);
+    const currentMeta = peerConnectionMeta.get(fromId);
+    if (
+      remoteAttemptId &&
+      currentMeta &&
+      Number.isInteger(currentMeta.edgeAttemptId) &&
+      currentMeta.edgeAttemptId > remoteAttemptId
+    ) {
+      logNativeStep('signal:offer:ignored', { fromId, attemptId: remoteAttemptId, reason: 'stale-attempt' }, 'connection');
+      return;
+    }
     const shouldRecreatePeer =
       pc &&
       isNativePeerHandle(pc) &&
       pc.remoteDescription &&
       pc.remoteDescription.type &&
-      pc.connectionState !== 'connected';
+      (pc.connectionState !== 'connected' ||
+        (remoteAttemptId && currentMeta && currentMeta.edgeAttemptId && remoteAttemptId > currentMeta.edgeAttemptId));
 
     if (!pc || !isNativePeerHandle(pc) || shouldRecreatePeer) {
       if (pc) {
@@ -3801,6 +4156,10 @@
         startNativeViewerStatsPolling();
       }
       return;
+    }
+    const meta = ensurePeerMeta(fromId, false, 'upstream');
+    if (remoteAttemptId) {
+      meta.edgeAttemptId = remoteAttemptId;
     }
 
     await setPeerRemoteDescription(fromId, pc, remoteDescription);
@@ -3838,6 +4197,7 @@
 
   async function handleAnswer(data) {
     const fromId = data.fromClientId || data.targetId;
+    const remoteAttemptId = getSignalAttemptId(data);
     const remoteDescription = normalizeNativeSessionDescription(data.sdp);
     logNativeStep('signal:answer', {
       fromId,
@@ -3847,6 +4207,10 @@
     const peerId = peerConnections.has(fromId) ? fromId : data.targetId;
     const pc = peerConnections.get(peerId);
     if (!pc) {
+      return;
+    }
+    if (!isCurrentPeerAttempt(peerId, remoteAttemptId)) {
+      logNativeStep('signal:answer:ignored', { peerId, attemptId: remoteAttemptId, reason: 'stale-attempt' }, 'connection');
       return;
     }
     if (!pc.localDescription || pc.localDescription.type !== 'offer') {
@@ -3864,6 +4228,7 @@
 
   async function handleIceCandidate(data) {
     const peerId = data.fromClientId;
+    const remoteAttemptId = getSignalAttemptId(data);
     if (!data.candidate) {
       return;
     }
@@ -3874,6 +4239,10 @@
     });
 
     const pc = peerConnections.get(peerId);
+    if (pc && !isCurrentPeerAttempt(peerId, remoteAttemptId)) {
+      logNativeStep('signal:ice-candidate:ignored', { peerId, attemptId: remoteAttemptId, reason: 'stale-attempt' }, 'connection');
+      return;
+    }
     if (!pc) {
       queueRemoteCandidate(peerId, data.candidate);
       return;
@@ -3971,6 +4340,7 @@
         videoStarted = false;
         upstreamConnected = false;
         clearViewerMediaWaitTimer();
+        armViewerUpstreamOfferWaitTimer(upstreamPeerId);
         if (typeof window.__vdsHandleViewerJoinSucceeded === 'function') {
           window.__vdsHandleViewerJoinSucceeded();
         }
@@ -4023,6 +4393,7 @@
         upstreamPeerId = data.upstreamPeerId || hostId;
         myChainPosition = data.chainPosition;
         clearViewerMediaWaitTimer();
+        armViewerUpstreamOfferWaitTimer(upstreamPeerId);
         if (typeof window.__vdsHandleViewerJoinSucceeded === 'function') {
           window.__vdsHandleViewerJoinSucceeded();
         }
@@ -4065,10 +4436,20 @@
             updateViewerCount(data.viewerId);
           }
         }
-        await createOffer(data.viewerId, {
-          force: Boolean(data.reconnect),
-          viewerMediaCapabilities: data.viewerMediaCapabilities
-        });
+        try {
+          await createOffer(data.viewerId, {
+            force: Boolean(data.reconnect),
+            viewerMediaCapabilities: data.viewerMediaCapabilities
+          });
+        } catch (error) {
+          if (!isStaleNativePeerError(error)) {
+            throw error;
+          }
+          logNativeStep('viewer-joined:stale-offer-ignored', {
+            viewerId: data.viewerId,
+            message: error && error.message ? error.message : String(error)
+          }, 'connection');
+        }
         return;
 
       case 'viewer-count-updated':
@@ -4092,7 +4473,17 @@
         return;
 
       case 'offer':
-        await handleOffer(data);
+        try {
+          await handleOffer(data);
+        } catch (error) {
+          if (!isStaleNativePeerError(error)) {
+            throw error;
+          }
+          logNativeStep('signal:offer:stale-ignored', {
+            fromId: data.fromClientId,
+            message: error && error.message ? error.message : String(error)
+          }, 'connection');
+        }
         return;
 
       case 'answer':
@@ -4105,6 +4496,7 @@
 
       case 'host-disconnected':
         showError('分享者已断开连接');
+        clearViewerUpstreamOfferWaitTimer();
         await resetViewerState();
         return;
 
@@ -4135,6 +4527,7 @@
             viewerReadySent = false;
             videoStarted = false;
             clearViewerMediaWaitTimer();
+            clearViewerUpstreamOfferWaitTimer();
             setViewerConnectionState('正在重建上游连接...');
           }
           if (currentRoomId && nextUpstreamPeerId) {
@@ -4373,8 +4766,7 @@
 
     if (typeof electronApi.onWindowBoundsChange === 'function') {
       electronApi.onWindowBoundsChange((bounds) => {
-        currentWindowBounds = bounds || null;
-        forceEmbeddedSurfaceResyncBurst();
+        scheduleWindowBoundsSurfaceSync(bounds);
       });
     }
     if (typeof electronApi.onMaximizedChange === 'function') {

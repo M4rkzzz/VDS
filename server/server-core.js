@@ -11,6 +11,7 @@ const DEFAULT_MAX_WS_PAYLOAD_BYTES = 64 * 1024;
 const DEFAULT_MAX_CONNECTIONS = 256;
 const DEFAULT_MAX_ROOMS = 128;
 const DEFAULT_MAX_VIEWERS_PER_ROOM = 16;
+const DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM = 2;
 const DEFAULT_MAX_MESSAGES_PER_WINDOW = 120;
 const DEFAULT_MESSAGE_RATE_WINDOW_MS = 10000;
 const MAX_ID_LENGTH = 128;
@@ -67,14 +68,24 @@ const DEFAULT_ICE_SERVERS = [
 
 function startServer(options = {}) {
   const baseDir = options.baseDir || __dirname;
-  const port = Number(options.port || process.env.PORT || 3000);
+  const port = Number(options.port ?? process.env.PORT ?? 3000);
   const disconnectGraceMs = normalizePositiveInt(options.disconnectGraceMs || process.env.DISCONNECT_GRACE_MS, 30000);
+  const hostDisconnectGraceMs = normalizePositiveInt(
+    options.hostDisconnectGraceMs || process.env.HOST_DISCONNECT_GRACE_MS,
+    Math.min(disconnectGraceMs, 3000)
+  );
+  const viewerDisconnectGraceMs = normalizePositiveInt(
+    options.viewerDisconnectGraceMs || process.env.VIEWER_DISCONNECT_GRACE_MS,
+    Math.min(disconnectGraceMs, 3000)
+  );
   const maxPayload = normalizePositiveInt(options.maxPayload || process.env.WS_MAX_PAYLOAD_BYTES, DEFAULT_MAX_WS_PAYLOAD_BYTES);
   const maxConnections = normalizePositiveInt(options.maxConnections || process.env.WS_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS);
   const maxRooms = normalizePositiveInt(options.maxRooms || process.env.WS_MAX_ROOMS, DEFAULT_MAX_ROOMS);
   const maxViewersPerRoom = normalizePositiveInt(options.maxViewersPerRoom || process.env.WS_MAX_VIEWERS_PER_ROOM, DEFAULT_MAX_VIEWERS_PER_ROOM);
+  const maxDownstreamsPerUpstream = normalizePositiveInt(options.maxDownstreamsPerUpstream || process.env.MAX_DOWNSTREAMS_PER_UPSTREAM, DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM);
   const maxMessagesPerWindow = normalizePositiveInt(options.maxMessagesPerWindow || process.env.WS_MAX_MESSAGES_PER_WINDOW, DEFAULT_MAX_MESSAGES_PER_WINDOW);
   const messageRateWindowMs = normalizePositiveInt(options.messageRateWindowMs || process.env.WS_MESSAGE_RATE_WINDOW_MS, DEFAULT_MESSAGE_RATE_WINDOW_MS);
+  const adminPort = options.adminPort === undefined ? 0 : normalizePositiveInt(options.adminPort, 0);
   const appVersion = resolveAppVersion(baseDir);
   const iceServers = buildIceServers();
   const publicDir = resolveExistingPath([
@@ -91,6 +102,7 @@ function startServer(options = {}) {
   const app = express();
   const server = http.createServer(app);
   const wss = new WebSocket.Server({ server, maxPayload });
+  let adminServer = null;
   const rooms = new Map();
   let activeConnections = 0;
 
@@ -99,9 +111,13 @@ function startServer(options = {}) {
     maxConnections,
     maxRooms,
     maxViewersPerRoom,
+    maxDownstreamsPerUpstream,
     maxMessagesPerWindow,
     messageRateWindowMs,
-    disconnectGraceMs
+    disconnectGraceMs,
+    hostDisconnectGraceMs,
+    viewerDisconnectGraceMs,
+    adminPort
   });
 
   app.use((req, res, next) => {
@@ -126,6 +142,14 @@ function startServer(options = {}) {
       }
       next();
     });
+    app.get('/admin', (_req, res, next) => {
+      const adminEntry = path.join(publicDir, 'admin.html');
+      if (fs.existsSync(adminEntry)) {
+        res.sendFile(adminEntry);
+        return;
+      }
+      next();
+    });
     app.use(express.static(publicDir));
   }
 
@@ -137,20 +161,38 @@ function startServer(options = {}) {
     res.json({
       version: appVersion,
       iceServers,
-      disconnectGraceMs
+      disconnectGraceMs,
+      hostDisconnectGraceMs,
+      viewerDisconnectGraceMs
     });
   });
 
   app.get('/api/version', (_req, res) => {
     res.json({
       version: appVersion,
-      disconnectGraceMs
+      disconnectGraceMs,
+      hostDisconnectGraceMs,
+      viewerDisconnectGraceMs
     });
   });
 
   app.get('/api/public-rooms', (_req, res) => {
     res.json({
       rooms: buildPublicRoomSummaryList(rooms)
+    });
+  });
+
+  app.get('/api/admin/rooms', (_req, res) => {
+    res.json({
+      generatedAt: Date.now(),
+      activeConnections,
+      limits: {
+        maxRooms,
+        maxViewersPerRoom,
+        maxDownstreamsPerUpstream,
+        maxConnections
+      },
+      rooms: buildAdminRoomSnapshotList(rooms, maxDownstreamsPerUpstream)
     });
   });
 
@@ -223,6 +265,15 @@ function startServer(options = {}) {
   }
 
   function handleCreateRoom(ws, data) {
+    if (ws.roomId || ws.role) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'socket-already-bound',
+        message: 'This connection is already bound to a room'
+      });
+      return;
+    }
+
     if (rooms.size >= maxRooms) {
       sendJson(ws, {
         type: 'error',
@@ -298,10 +349,12 @@ function startServer(options = {}) {
       }
 
       const rebindRequired = existingViewer.ws !== ws;
+      const previousWs = existingViewer.ws;
       clearDisconnectTimer(existingViewer);
       existingViewer.ws = ws;
       existingViewer.mediaCapabilities = sanitizeMediaCapabilities(data.mediaCapabilities) || existingViewer.mediaCapabilities;
       attachSocketMetadata(ws, roomId, clientId, 'viewer');
+      retireSocket(previousWs, 'viewer-rebound', ws);
 
       if (rebindRequired) {
         sendJson(ws, {
@@ -310,7 +363,7 @@ function startServer(options = {}) {
           clientId,
           sessionToken: existingViewer.sessionToken,
           hostId: room.host.clientId,
-          upstreamPeerId: resolveViewerUpstreamId(room, existingViewer.chainPosition),
+          upstreamPeerId: getViewerUpstreamId(room, existingViewer),
           chainPosition: existingViewer.chainPosition,
           isFirstViewer: existingViewer.chainPosition === 0,
           mediaCapabilities: existingViewer.mediaCapabilities,
@@ -335,12 +388,22 @@ function startServer(options = {}) {
 
     const chainPosition = room.viewers.length;
     const viewerToken = generateSessionToken();
+    const upstreamPeerId = selectViewerUpstream(room, chainPosition, maxDownstreamsPerUpstream);
+    if (!upstreamPeerId) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'upstream-capacity-unavailable',
+        message: 'No upstream peer is currently available for this viewer'
+      });
+      return;
+    }
     const viewer = {
       clientId,
       sessionToken: viewerToken,
       ws,
       mediaCapabilities: sanitizeMediaCapabilities(data.mediaCapabilities),
       chainPosition,
+      upstreamPeerId,
       mediaReady: false,
       relayEstablished: false,
       connectRequestPending: false,
@@ -356,7 +419,7 @@ function startServer(options = {}) {
       clientId,
       sessionToken: viewerToken,
       hostId: room.host.clientId,
-      upstreamPeerId: resolveViewerUpstreamId(room, chainPosition),
+      upstreamPeerId,
       chainPosition,
       isFirstViewer: chainPosition === 0,
       mediaCapabilities: viewer.mediaCapabilities,
@@ -370,10 +433,7 @@ function startServer(options = {}) {
 
     notifyHostViewerCount(room);
 
-    const previousViewer = room.viewers[chainPosition - 1];
-    if (previousViewer && previousViewer.mediaReady && isSocketOpen(previousViewer.ws)) {
-      notifyViewerToConnectNext(room, previousViewer, viewer);
-    }
+    requestViewerReconnect(room, viewer, maxDownstreamsPerUpstream);
   }
 
   function handleResumeSession(ws, data) {
@@ -398,8 +458,10 @@ function startServer(options = {}) {
       }
 
       clearDisconnectTimer(room.host);
+      const previousWs = room.host.ws;
       room.host.ws = ws;
       attachSocketMetadata(ws, room.id, data.clientId, 'host');
+      retireSocket(previousWs, 'host-session-resumed', ws);
       sendJson(ws, {
         type: 'session-resumed',
         role: 'host',
@@ -430,19 +492,21 @@ function startServer(options = {}) {
     }
 
     clearDisconnectTimer(viewer);
+    const previousWs = viewer.ws;
     viewer.ws = ws;
     if (data.needsMediaReconnect) {
       viewer.mediaReady = false;
       viewer.relayEstablished = false;
     }
     attachSocketMetadata(ws, room.id, data.clientId, 'viewer');
+    retireSocket(previousWs, 'viewer-session-resumed', ws);
     sendJson(ws, {
       type: 'session-resumed',
       role: 'viewer',
       roomId: room.id,
       sessionToken: viewer.sessionToken,
       hostId: room.host.clientId,
-      upstreamPeerId: resolveViewerUpstreamId(room, viewer.chainPosition),
+      upstreamPeerId: getViewerUpstreamId(room, viewer),
       chainPosition: viewer.chainPosition,
       viewerCount: room.viewers.length,
       mediaCapabilities: viewer.mediaCapabilities,
@@ -455,6 +519,9 @@ function startServer(options = {}) {
   }
 
   function handleViewerReady(ws, data) {
+    if (!isAuthoritativeSocket(ws, rooms)) {
+      return;
+    }
     const room = rooms.get(ws.roomId);
     if (!room) {
       return;
@@ -476,13 +543,13 @@ function startServer(options = {}) {
     viewer.relayEstablished = true;
     viewer.connectRequestPending = false;
 
-    const nextViewer = room.viewers[data.chainPosition + 1];
-    if (nextViewer && isSocketOpen(ws)) {
-      notifyViewerToConnectNext(room, viewer, nextViewer);
-    }
+    notifyPendingDownstreams(room, viewer);
   }
 
   function handleViewerReconnectReady(ws, data) {
+    if (!isAuthoritativeSocket(ws, rooms)) {
+      return;
+    }
     const room = rooms.get(ws.roomId);
     if (!room) {
       return;
@@ -500,15 +567,7 @@ function startServer(options = {}) {
     viewer.relayEstablished = false;
     viewer.connectRequestPending = false;
 
-    if (viewer.chainPosition === 0) {
-      notifyHostToConnectViewer(room, viewer, true);
-      return;
-    }
-
-    const previousViewer = room.viewers[viewer.chainPosition - 1];
-    if (previousViewer && previousViewer.mediaReady && isSocketOpen(previousViewer.ws)) {
-      notifyViewerToConnectNext(room, previousViewer, viewer);
-    }
+    requestViewerReconnect(room, viewer, maxDownstreamsPerUpstream, String(data.failedUpstreamPeerId || ''));
   }
 
   function notifyHostViewerCount(room) {
@@ -522,6 +581,9 @@ function startServer(options = {}) {
   }
 
   function forwardMessage(ws, data) {
+    if (!isAuthoritativeSocket(ws, rooms)) {
+      return;
+    }
     const room = rooms.get(ws.roomId);
     if (!room) {
       return;
@@ -538,17 +600,14 @@ function startServer(options = {}) {
       }
 
       if (data.targetId === 'host' || data.targetId === room.host.clientId || data.toHost) {
-        const expectedUpstreamId = resolveViewerUpstreamId(room, viewer.chainPosition);
+        const expectedUpstreamId = getViewerUpstreamId(room, viewer);
         if (expectedUpstreamId !== room.host.clientId) {
           return;
         }
         targetWs = room.host.ws;
       } else {
-        const expectedUpstreamId = resolveViewerUpstreamId(room, viewer.chainPosition);
-        const nextViewer = room.viewers[viewer.chainPosition + 1];
-        const isAllowedTarget =
-          data.targetId === expectedUpstreamId ||
-          (nextViewer && data.targetId === nextViewer.clientId);
+        const expectedUpstreamId = getViewerUpstreamId(room, viewer);
+        const isAllowedTarget = data.targetId === expectedUpstreamId || isViewerDirectDownstream(room, viewer.clientId, data.targetId);
         if (!isAllowedTarget) {
           return;
         }
@@ -562,9 +621,7 @@ function startServer(options = {}) {
       return;
     }
 
-    if (!data.fromClientId) {
-      data.fromClientId = ws.clientId;
-    }
+    data.fromClientId = ws.clientId;
     if (!data.mediaManifest && room.mediaManifest) {
       data.mediaManifest = room.mediaManifest;
     }
@@ -573,6 +630,14 @@ function startServer(options = {}) {
   }
 
   function handleHostMediaManifest(ws, data) {
+    if (!isAuthoritativeSocket(ws, rooms)) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'session-not-found',
+        message: 'Session not found'
+      });
+      return;
+    }
     const room = rooms.get(data.roomId || ws.roomId);
     if (!room || ws.role !== 'host' || room.host.clientId !== ws.clientId) {
       sendJson(ws, {
@@ -633,7 +698,7 @@ function startServer(options = {}) {
       room.host.ws = null;
       scheduleDisconnectTimer(room.host, () => {
         finalizeHostDisconnect(room);
-      }, disconnectGraceMs);
+      }, hostDisconnectGraceMs);
       return;
     }
 
@@ -651,7 +716,7 @@ function startServer(options = {}) {
       viewer.ws = null;
       scheduleDisconnectTimer(viewer, () => {
         finalizeViewerDisconnect(room, viewer.clientId);
-      }, disconnectGraceMs);
+      }, viewerDisconnectGraceMs);
     }
   }
 
@@ -670,10 +735,6 @@ function startServer(options = {}) {
       return;
     }
 
-    const upstreamViewer =
-      viewerIndex > 0 && viewerIndex - 1 < room.viewers.length
-        ? room.viewers[viewerIndex - 1]
-        : null;
     const [viewer] = room.viewers.splice(viewerIndex, 1);
     clearDisconnectTimer(viewer);
     notifyHostViewerCount(room);
@@ -693,45 +754,17 @@ function startServer(options = {}) {
       });
     }
 
-    if (upstreamViewer && isSocketOpen(upstreamViewer.ws)) {
-      sendJson(upstreamViewer.ws, {
-        type: 'viewer-left',
-        viewerId: clientId,
-        leftPosition
-      });
-    }
-
-    for (let index = leftPosition; index < room.viewers.length; index += 1) {
-      const candidate = room.viewers[index];
-      candidate.mediaReady = false;
-      candidate.relayEstablished = false;
-      candidate.connectRequestPending = true;
-      if (isSocketOpen(candidate.ws)) {
-        sendJson(candidate.ws, {
-          type: 'chain-reconnect',
-          newChainPosition: index,
-          upstreamPeerId: resolveViewerUpstreamId(room, index),
-          mediaManifest: room.mediaManifest
-        });
-      }
-    }
+    rebalanceViewerUpstreams(room, {
+      maxDownstreamsPerUpstream,
+      forceFromIndex: leftPosition,
+      failedUpstreamId: clientId
+    });
 
     if (room.viewers.length === 0) {
       return;
     }
 
-    if (leftPosition === 0) {
-      notifyHostToConnectViewer(room, room.viewers[0], true);
-      return;
-    }
-
-    if (leftPosition < room.viewers.length) {
-      const previousViewer = room.viewers[leftPosition - 1];
-      const nextViewer = room.viewers[leftPosition];
-      if (previousViewer && nextViewer && previousViewer.mediaReady && isSocketOpen(previousViewer.ws)) {
-        notifyViewerToConnectNext(room, previousViewer, nextViewer);
-      }
-    }
+    notifyReconnectTargets(room);
   }
 
   function destroyRoom(room, reason) {
@@ -740,10 +773,12 @@ function startServer(options = {}) {
     }
 
     clearDisconnectTimer(room.host);
+    clearSocketMetadata(room.host.ws);
     room.host.sessionToken = null;
     room.host.ws = null;
     room.viewers.forEach((viewer) => {
       clearDisconnectTimer(viewer);
+      clearSocketMetadata(viewer.ws);
       viewer.sessionToken = null;
       viewer.ws = null;
       viewer.mediaReady = false;
@@ -751,14 +786,69 @@ function startServer(options = {}) {
       viewer.connectRequestPending = false;
     });
     room.viewers = [];
-    room.destroyedAt = Date.now();
     room.destroyReason = reason || 'room-destroyed';
     rooms.delete(room.id);
     logServerDebug(`Room destroyed: ${room.id} (${room.destroyReason})`);
   }
 
+  function handleListenError(error) {
+    if (handleListenError.handled) {
+      return;
+    }
+    handleListenError.handled = true;
+    if (typeof options.onError === 'function') {
+      options.onError(error);
+      return;
+    }
+    logServerWarning('server-listen-error', 'Server listen error:', error, 0);
+  }
+
+  server.on('error', handleListenError);
+  wss.on('error', handleListenError);
+
+  server.listen(port, () => {
+    const address = server.address();
+    const actualPort = address && typeof address === 'object' ? address.port : port;
+    console.log(`Server running on http://localhost:${actualPort}`);
+  });
+
+  if (adminPort > 0) {
+    const adminApp = express();
+    adminApp.get('/api/rooms', (_req, res) => {
+      res.json(buildAdminSnapshot(rooms, maxDownstreamsPerUpstream, activeConnections, {
+        maxRooms,
+        maxViewersPerRoom,
+        maxDownstreamsPerUpstream,
+        maxConnections
+      }));
+    });
+    if (publicDir) {
+      adminApp.get('/', (_req, res, next) => {
+        const adminEntry = path.join(publicDir, 'admin.html');
+        if (fs.existsSync(adminEntry)) {
+          res.sendFile(adminEntry);
+          return;
+        }
+        next();
+      });
+    }
+    adminApp.use((_req, res) => {
+      res.status(404).send('admin page not found');
+    });
+    adminServer = http.createServer(adminApp);
+    adminServer.on('error', handleListenError);
+    adminServer.listen(adminPort, () => {
+      const address = adminServer.address();
+      const actualPort = address && typeof address === 'object' ? address.port : adminPort;
+      logServerInfo(`Admin dashboard running on http://localhost:${actualPort}`);
+    });
+  }
+
+  return { app, server, wss, rooms, adminServer };
+}
+
 function notifyHostToConnectViewer(room, viewer, reconnect) {
-  if (!isSocketOpen(room.host.ws) || !viewer) {
+  if (!room || !viewer || !isSocketOpen(room.host && room.host.ws)) {
     return;
   }
 
@@ -778,14 +868,7 @@ function notifyHostToConnectViewer(room, viewer, reconnect) {
   });
 }
 
-  server.listen(port, () => {
-    console.log(`Server running on http://localhost:${port}`);
-  });
-
-  return { app, server, wss, rooms };
-}
-
-function requestViewerReconnect(room, viewer) {
+function requestViewerReconnect(room, viewer, maxDownstreamsPerUpstream = DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM, failedUpstreamId = '') {
   if (!viewer) {
     return;
   }
@@ -793,16 +876,20 @@ function requestViewerReconnect(room, viewer) {
   viewer.mediaReady = false;
   viewer.relayEstablished = false;
   viewer.connectRequestPending = false;
-
-  if (viewer.chainPosition === 0) {
-    notifyHostToConnectViewer(room, viewer, true);
+  const upstreamPeerId = selectViewerUpstream(room, viewer.chainPosition, maxDownstreamsPerUpstream, viewer.clientId, failedUpstreamId);
+  viewer.upstreamPeerId = upstreamPeerId;
+  if (!upstreamPeerId) {
+    viewer.needsChainReconnect = true;
+    if (isSocketOpen(viewer.ws)) {
+      sendJson(viewer.ws, {
+        type: 'error',
+        code: 'upstream-capacity-unavailable',
+        message: 'No upstream peer is currently available for reconnect'
+      });
+    }
     return;
   }
-
-  const previousViewer = room.viewers[viewer.chainPosition - 1];
-  if (previousViewer && previousViewer.mediaReady && isSocketOpen(previousViewer.ws)) {
-    notifyViewerToConnectNext(room, previousViewer, viewer);
-  }
+  notifyViewerCurrentUpstream(room, viewer, true);
 }
 
 function notifyViewerToConnectNext(room, previousViewer, nextViewer) {
@@ -813,21 +900,80 @@ function notifyViewerToConnectNext(room, previousViewer, nextViewer) {
   if (nextViewer.mediaReady || nextViewer.relayEstablished || nextViewer.connectRequestPending) {
     return;
   }
+  if (getViewerUpstreamId(room, nextViewer) !== previousViewer.clientId) {
+    return;
+  }
 
   nextViewer.connectRequestPending = true;
   sendJson(previousViewer.ws, {
     type: 'connect-to-next',
     nextViewerId: nextViewer.clientId,
     nextViewerChainPosition: nextViewer.chainPosition,
+    upstreamPeerId: previousViewer.clientId,
     nextViewerMediaCapabilities: nextViewer.mediaCapabilities,
     mediaManifest: room.mediaManifest
   });
+}
+
+function notifyViewerCurrentUpstream(room, viewer, reconnect) {
+  if (!room || !viewer) {
+    return;
+  }
+  const upstreamPeerId = getViewerUpstreamId(room, viewer);
+  if (!upstreamPeerId) {
+    return;
+  }
+  if (upstreamPeerId === room.host.clientId) {
+    notifyHostToConnectViewer(room, viewer, reconnect);
+    return;
+  }
+  const upstreamViewer = findViewerById(room, upstreamPeerId);
+  if (upstreamViewer && upstreamViewer.mediaReady && isSocketOpen(upstreamViewer.ws)) {
+    notifyViewerToConnectNext(room, upstreamViewer, viewer);
+  }
 }
 
 function attachSocketMetadata(ws, roomId, clientId, role) {
   ws.roomId = roomId;
   ws.clientId = clientId;
   ws.role = role;
+}
+
+function clearSocketMetadata(ws) {
+  if (!ws) {
+    return;
+  }
+  ws.roomId = null;
+  ws.clientId = null;
+  ws.role = null;
+}
+
+function retireSocket(ws, reason, replacementWs) {
+  if (!ws || ws === replacementWs) {
+    return;
+  }
+  clearSocketMetadata(ws);
+  if (isSocketOpen(ws)) {
+    ws.close(4000, reason || 'socket-retired');
+  }
+}
+
+function isAuthoritativeSocket(ws, rooms) {
+  if (!ws || !ws.roomId || !ws.role || !ws.clientId || !(rooms instanceof Map)) {
+    return false;
+  }
+  const room = rooms.get(ws.roomId);
+  if (!room) {
+    return false;
+  }
+  if (ws.role === 'host') {
+    return Boolean(room.host && room.host.clientId === ws.clientId && room.host.ws === ws);
+  }
+  if (ws.role === 'viewer') {
+    const viewer = room.viewers.find((candidate) => candidate.clientId === ws.clientId);
+    return Boolean(viewer && viewer.ws === ws);
+  }
+  return false;
 }
 
 function buildPublicRoomSummaryList(rooms) {
@@ -845,6 +991,77 @@ function buildPublicRoomSummaryList(rooms) {
     }));
 }
 
+function buildAdminSnapshot(rooms, maxDownstreamsPerUpstream, activeConnections, limits) {
+  const roomList = buildAdminRoomSnapshotList(rooms, maxDownstreamsPerUpstream);
+  return {
+    generatedAt: Date.now(),
+    activeConnections: Number(activeConnections || 0),
+    roomCount: roomList.length,
+    limits: limits || {},
+    rooms: roomList
+  };
+}
+
+function buildAdminRoomSnapshotList(rooms, maxDownstreamsPerUpstream) {
+  if (!(rooms instanceof Map)) {
+    return [];
+  }
+  return Array.from(rooms.values())
+    .sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0))
+    .map((room) => buildAdminRoomSnapshot(room, maxDownstreamsPerUpstream));
+}
+
+function buildAdminRoomSnapshot(room, maxDownstreamsPerUpstream) {
+  const viewers = Array.isArray(room && room.viewers) ? room.viewers : [];
+  const hostId = room && room.host ? room.host.clientId : '';
+  const nodes = [];
+  if (hostId) {
+    nodes.push({
+      id: hostId,
+      role: 'host',
+      online: isSocketOpen(room.host.ws),
+      chainPosition: -1,
+      upstreamPeerId: '',
+      directDownstreamCount: countDirectDownstreams(room, hostId),
+      maxDirectDownstreams: getUpstreamDirectDownstreamLimit(room, hostId, maxDownstreamsPerUpstream),
+      mediaReady: true,
+      relayEstablished: true,
+      connectRequestPending: false
+    });
+  }
+  viewers.forEach((viewer) => {
+    const upstreamPeerId = getViewerUpstreamId(room, viewer);
+    nodes.push({
+      id: viewer.clientId,
+      role: 'viewer',
+      online: isSocketOpen(viewer.ws),
+      chainPosition: viewer.chainPosition,
+      upstreamPeerId,
+      directDownstreamCount: countDirectDownstreams(room, viewer.clientId),
+      maxDirectDownstreams: getUpstreamDirectDownstreamLimit(room, viewer.clientId, maxDownstreamsPerUpstream),
+      mediaReady: viewer.mediaReady === true,
+      relayEstablished: viewer.relayEstablished === true,
+      connectRequestPending: viewer.connectRequestPending === true,
+      needsChainReconnect: viewer.needsChainReconnect === true,
+      mediaCapabilities: viewer.mediaCapabilities || null
+    });
+  });
+  return {
+    roomId: room.id,
+    publicListing: room.publicListing === true,
+    createdAt: Number(room.createdAt || 0),
+    viewerCount: viewers.length,
+    mediaManifest: room.mediaManifest || null,
+    nodes,
+    edges: viewers.map((viewer) => ({
+      from: getViewerUpstreamId(room, viewer),
+      to: viewer.clientId,
+      ready: viewer.mediaReady === true && viewer.relayEstablished === true,
+      pending: viewer.connectRequestPending === true || viewer.needsChainReconnect === true
+    })).filter((edge) => edge.from && edge.to)
+  };
+}
+
 function isElectronUserAgent(req) {
   const userAgent = String((req && req.headers && req.headers['user-agent']) || '');
   return /\bElectron\//i.test(userAgent);
@@ -859,12 +1076,14 @@ function sanitizeMediaCapabilities(value) {
   if (!encoded || typeof encoded !== 'object' || Array.isArray(encoded)) {
     return {
       webViewer: value.webViewer === true,
+      maxDirectDownstreams: normalizePositiveInt(value.maxDirectDownstreams, DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM),
       encodedMediaDataChannel: null
     };
   }
 
   return {
     webViewer: value.webViewer === true,
+    maxDirectDownstreams: normalizePositiveInt(value.maxDirectDownstreams, DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM),
     encodedMediaDataChannel: {
       protocol: String(encoded.protocol || '').slice(0, 64),
       protocolVersion: Number(encoded.protocolVersion || 0),
@@ -1200,13 +1419,193 @@ function resolveExistingPath(candidates) {
   return null;
 }
 
-function resolveViewerUpstreamId(room, chainPosition) {
-  if (chainPosition <= 0) {
+function getViewerUpstreamId(room, viewer) {
+  if (!room || !viewer || !viewer.upstreamPeerId) {
+    return '';
+  }
+  if (viewer.upstreamPeerId === room.host.clientId) {
     return room.host.clientId;
   }
+  const upstreamViewer = findViewerById(room, viewer.upstreamPeerId);
+  if (!upstreamViewer || upstreamViewer.clientId === viewer.clientId) {
+    return '';
+  }
+  return upstreamViewer.clientId;
+}
 
-  const previousViewer = room.viewers[chainPosition - 1];
-  return previousViewer ? previousViewer.clientId : room.host.clientId;
+function findViewerById(room, clientId) {
+  return room && Array.isArray(room.viewers)
+    ? room.viewers.find((viewer) => viewer.clientId === clientId) || null
+    : null;
+}
+
+function countDirectDownstreams(room, upstreamPeerId, excludeViewerId) {
+  if (!room || !Array.isArray(room.viewers) || !upstreamPeerId) {
+    return 0;
+  }
+  return room.viewers.filter((viewer) =>
+    viewer.clientId !== excludeViewerId && getViewerUpstreamId(room, viewer) === upstreamPeerId
+  ).length;
+}
+
+function getUpstreamDirectDownstreamLimit(room, upstreamPeerId, globalLimit) {
+  const limit = Math.max(1, Number(globalLimit) || DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM);
+  if (!room || !upstreamPeerId || upstreamPeerId === room.host.clientId) {
+    return limit;
+  }
+  const upstreamViewer = findViewerById(room, upstreamPeerId);
+  const capabilityLimit = upstreamViewer && upstreamViewer.mediaCapabilities
+    ? normalizePositiveInt(upstreamViewer.mediaCapabilities.maxDirectDownstreams, limit)
+    : limit;
+  return Math.max(1, Math.min(limit, capabilityLimit));
+}
+
+function isUpstreamCandidateReady(room, upstreamPeerId) {
+  if (!room || !upstreamPeerId) {
+    return false;
+  }
+  if (upstreamPeerId === room.host.clientId) {
+    return isSocketOpen(room.host.ws);
+  }
+  const upstreamViewer = findViewerById(room, upstreamPeerId);
+  return Boolean(upstreamViewer && upstreamViewer.mediaReady && isSocketOpen(upstreamViewer.ws));
+}
+
+function wouldCreateUpstreamCycle(room, viewerId, upstreamPeerId) {
+  let currentId = upstreamPeerId;
+  const visited = new Set([viewerId]);
+  while (currentId && room && currentId !== room.host.clientId) {
+    if (visited.has(currentId)) {
+      return true;
+    }
+    visited.add(currentId);
+    const currentViewer = findViewerById(room, currentId);
+    if (!currentViewer) {
+      return false;
+    }
+    currentId = getViewerUpstreamId(room, currentViewer);
+  }
+  return false;
+}
+
+function selectViewerUpstream(room, chainPosition, maxDownstreamsPerUpstream, viewerId, excludeUpstreamId = '') {
+  if (!room || !Array.isArray(room.viewers)) {
+    return room && room.host ? room.host.clientId : '';
+  }
+  const limit = Math.max(1, Number(maxDownstreamsPerUpstream) || DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM);
+  const preferredViewer = chainPosition > 0 ? room.viewers[chainPosition - 1] : null;
+  const candidates = [];
+  if (preferredViewer) {
+    candidates.push(preferredViewer.clientId);
+  }
+  candidates.push(room.host.clientId);
+  for (let index = chainPosition - 2; index >= 0; index -= 1) {
+    const fallback = room.viewers[index];
+    if (fallback) {
+      candidates.push(fallback.clientId);
+    }
+  }
+
+  for (const candidateId of Array.from(new Set(candidates))) {
+    if (candidateId === excludeUpstreamId) {
+      continue;
+    }
+    if (candidateId === viewerId || !isUpstreamCandidateReady(room, candidateId)) {
+      continue;
+    }
+    if (countDirectDownstreams(room, candidateId, viewerId) >= getUpstreamDirectDownstreamLimit(room, candidateId, limit)) {
+      continue;
+    }
+    if (wouldCreateUpstreamCycle(room, viewerId, candidateId)) {
+      continue;
+    }
+    return candidateId;
+  }
+
+  if (
+    preferredViewer &&
+    preferredViewer.clientId !== excludeUpstreamId &&
+    preferredViewer.clientId !== viewerId &&
+    countDirectDownstreams(room, preferredViewer.clientId, viewerId) < getUpstreamDirectDownstreamLimit(room, preferredViewer.clientId, limit) &&
+    !wouldCreateUpstreamCycle(room, viewerId, preferredViewer.clientId)
+  ) {
+    return preferredViewer.clientId;
+  }
+
+  return '';
+}
+
+function isViewerDirectDownstream(room, upstreamPeerId, downstreamPeerId) {
+  const downstream = findViewerById(room, downstreamPeerId);
+  return Boolean(downstream && getViewerUpstreamId(room, downstream) === upstreamPeerId);
+}
+
+function markViewerForReconnect(viewer, upstreamPeerId) {
+  if (!viewer) {
+    return;
+  }
+  viewer.upstreamPeerId = upstreamPeerId;
+  viewer.mediaReady = false;
+  viewer.relayEstablished = false;
+  viewer.connectRequestPending = false;
+  viewer.needsChainReconnect = true;
+}
+
+function rebalanceViewerUpstreams(room, options = {}) {
+  const forceFromIndex = Number.isInteger(options.forceFromIndex) ? options.forceFromIndex : 0;
+  const failedUpstreamId = options.failedUpstreamId || '';
+  const limit = Math.max(1, Number(options.maxDownstreamsPerUpstream) || DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM);
+  if (!room || !Array.isArray(room.viewers)) {
+    return;
+  }
+  room.viewers.forEach((viewer, index) => {
+    viewer.chainPosition = index;
+    const currentUpstreamId = getViewerUpstreamId(room, viewer);
+    const mustReassign =
+      index >= forceFromIndex ||
+      currentUpstreamId === failedUpstreamId ||
+      !isUpstreamCandidateReady(room, currentUpstreamId) ||
+      countDirectDownstreams(room, currentUpstreamId, viewer.clientId) >= getUpstreamDirectDownstreamLimit(room, currentUpstreamId, limit) ||
+      wouldCreateUpstreamCycle(room, viewer.clientId, currentUpstreamId);
+    if (!mustReassign) {
+      return;
+    }
+    const nextUpstreamId = selectViewerUpstream(room, index, limit, viewer.clientId, failedUpstreamId);
+    markViewerForReconnect(viewer, nextUpstreamId);
+  });
+}
+
+function notifyReconnectTargets(room) {
+  if (!room || !Array.isArray(room.viewers)) {
+    return;
+  }
+  room.viewers.forEach((viewer) => {
+    if (!viewer.needsChainReconnect) {
+      return;
+    }
+    const upstreamPeerId = getViewerUpstreamId(room, viewer);
+    if (!upstreamPeerId) {
+      return;
+    }
+    viewer.needsChainReconnect = false;
+    if (isSocketOpen(viewer.ws)) {
+      sendJson(viewer.ws, {
+        type: 'chain-reconnect',
+        newChainPosition: viewer.chainPosition,
+        upstreamPeerId,
+        mediaManifest: room.mediaManifest
+      });
+    }
+  });
+}
+
+function notifyPendingDownstreams(room, upstreamViewer) {
+  if (!room || !upstreamViewer || !upstreamViewer.mediaReady || !isSocketOpen(upstreamViewer.ws)) {
+    return;
+  }
+  room.viewers
+    .filter((viewer) => getViewerUpstreamId(room, viewer) === upstreamViewer.clientId)
+    .forEach((viewer) => notifyViewerToConnectNext(room, upstreamViewer, viewer));
 }
 
 function generateRoomId(existingRooms) {

@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "agent_runtime.h"
 #include "json_protocol.h"
 #include "host_pipeline.h"
 #include "obs_ingest_state.h"

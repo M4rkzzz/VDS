@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "agent_runtime.h"
+struct ObsIngestState;
 
 inline constexpr int kDefaultObsIngestPort = 61080;
 inline constexpr int kMinObsIngestPort = 1024;

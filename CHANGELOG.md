@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.6.7
+
+- improved native P2P signaling robustness with attempt isolation, stale signal filtering, and cleaner peer teardown for reconnecting host/viewer/relay edges
+- added server-side upstream reselection with per-upstream downstream limits, including web relay capacity awareness and topology cleanup after viewer exits
+- fixed host stop-share/re-share lifecycle so stopping share destroys the room and the same socket can create a fresh room without stale binding
+- restored WGC live preview as the default native host preview path and hardened WGC source creation against WinRT creation failures
+- improved native viewer surface stability while moving the window by coalescing bounds-driven surface sync and tracking final screen coordinates
+- added a signal admin dashboard on port 3010 with graphical topology, node state, edge state, capacity, and live media manifests
+- reduced diagnostic log noise by moving high-frequency surface, stats, and native event details behind the high-frequency debug channel
+- integrated GitHub Release publishing into the full release build flow with `gh` asset upload, tag creation, and dirty-worktree protection
+- expanded release and runtime validation around server topology, VDS_web protocol behavior, logging policy, and media-agent verification
+
 ## 1.6.6
 
 - improved Web H.265 playback sizing by configuring WebCodecs from the media manifest with codec-aware coded/display dimensions and safe fallback when unsupported

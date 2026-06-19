@@ -2,22 +2,20 @@
 
 VDS is an Electron desktop client plus a Node.js signaling server for cascade screen sharing.
 
-## 1.6.6 Overview
+## 1.6.7 Overview
 
-Version `1.6.6` focuses on Web H.265 playback correctness across native capture and OBS ingest, with WebCodecs decoder sizing driven by media manifests and actual decoded frame dimensions.
+Version `1.6.7` focuses on native P2P connection robustness, media surface stability, server topology visibility, and release validation for mixed native/web relay flows.
 
 Highlights:
 
-- added the Chrome/Edge VDS_web viewer with WebCodecs video/audio playback
-- unified native and web relay around `vds-media-encoded-v1` DataChannel encoded media
-- added media manifest sync, DataChannel session/version handshake checks, chunked large-frame delivery, and bootstrap keyframe forwarding
-- improved Native-Web-Native and Native-Web-Web reconnect behavior when a middle relay node exits
-- added Web viewer fullscreen playback, volume control, manual audio delay, and a Windows-app-aligned interface
-- kept debug-only P2P diagnostics and native capture diagnostics for deeper troubleshooting
-- added VDS_web TypeScript, build, and protocol tests to the release validation path
-- kept native `H.264 / H.265` + encoded relay fanout as the core production path
-- kept OBS local ingest and public-room lobby behavior from the 1.6.x mainline
-- fixed H.265 Web viewer display sizing for native capture and OBS ingest across 720p, 1080p, 2K, 4K, and non-standard source dimensions
+- improved native offer/answer attempt isolation and reconnect behavior for host/viewer/relay edges
+- added server-side upstream reselection with per-upstream downstream capacity limits
+- fixed host stop-share/re-share room lifecycle by fully unbinding destroyed room sockets
+- improved native viewer surface movement handling to avoid updateSurface storms during window dragging
+- restored WGC live preview as the default host preview path while hardening WGC source creation errors
+- added a 3010 signal admin dashboard with graphical topology, node state, edge state, and live manifests
+- improved diagnostic density by moving high-frequency surface/getStats logs behind the debug high-frequency channel
+- kept native `H.264 / H.265` + encoded relay fanout and Web viewer relay as the production path
 
 Current media path:
 
@@ -114,9 +112,14 @@ Viewer join mode currently behaves like this:
   - builds Electron installer
   - refreshes `server/updates/`
   - prepares `server/` for Docker upload
+  - publishes the GitHub Release through `gh`
+- `npm run release:github`
+  - requires GitHub CLI `gh` and an authenticated session
+  - creates tag `v<version>` if needed, pushes it, and uploads installer, blockmap, and `latest.yml`
+  - refuses dirty worktrees unless `ALLOW_DIRTY_GITHUB_RELEASE=1` is set
 - `server/` is the deployable server directory
 - desktop auto-update feed is served from `server/updates/`
-- `1.6.6` release assets are the installer, blockmap, and `latest.yml`
+- `1.6.7` release assets are the installer, blockmap, and `latest.yml`
 - release notes for recent versions are tracked in [CHANGELOG.md](CHANGELOG.md)
 
 ## Source Control Rules

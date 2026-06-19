@@ -38,12 +38,6 @@ std::string json_object_from_video_encoder_probe(const VideoEncoderProbeResult& 
     << "{\"name\":\"" << json_escape(probe.name) << "\""
     << ",\"exists\":" << (probe.exists ? "true" : "false")
     << ",\"hardware\":" << (probe.hardware ? "true" : "false")
-    << ",\"supportsLowLatency\":" << (probe.supports_low_latency ? "true" : "false")
-    << ",\"requiresHwDevice\":" << (probe.requires_hw_device ? "true" : "false")
-    << ",\"hwDeviceType\":\"" << json_escape(probe.hw_device_type) << "\""
-    << ",\"hwDeviceReady\":" << (probe.hw_device_ready ? "true" : "false")
-    << ",\"openSucceeded\":" << (probe.open_succeeded ? "true" : "false")
-    << ",\"outputSucceeded\":" << (probe.output_succeeded ? "true" : "false")
     << ",\"validated\":" << (probe.validated ? "true" : "false")
     << ",\"priority\":" << probe.priority
     << ",\"reason\":\"" << json_escape(probe.reason) << "\""
@@ -63,31 +57,6 @@ std::string json_array_from_video_encoder_probes(const std::vector<VideoEncoderP
   }
   payload << "]";
   return payload.str();
-}
-
-std::vector<std::string> collect_flag_list(const std::string& output) {
-  std::vector<std::string> values;
-  std::set<std::string> seen;
-  for (const std::string& raw_line : split_lines(output)) {
-    const std::string line = trim_copy(raw_line);
-    if (line.empty()) {
-      continue;
-    }
-
-    const std::string lowered = to_lower_copy(line);
-    if (lowered == "hardware acceleration methods:" || lowered.rfind("ffmpeg version", 0) == 0) {
-      continue;
-    }
-
-    if (line.find(' ') != std::string::npos || line.find('\t') != std::string::npos) {
-      continue;
-    }
-
-    if (seen.insert(line).second) {
-      values.push_back(line);
-    }
-  }
-  return values;
 }
 
 std::vector<std::string> collect_codec_names(
@@ -141,14 +110,6 @@ int video_encoder_probe_priority(const std::string& encoder) {
     return 95;
   }
   return 100;
-}
-
-bool encoder_supports_low_latency(const std::string& encoder) {
-  const std::string normalized = to_lower_copy(trim_copy(encoder));
-  return is_hardware_video_encoder(normalized) ||
-    normalized == "libx264" ||
-    normalized == "libx265" ||
-    normalized == "libopenh264";
 }
 
 AVHWDeviceType required_hw_device_type_for_encoder(const std::string& encoder) {
@@ -255,48 +216,6 @@ bool fill_probe_test_frame(AVFrame* frame, std::string* error) {
 
 VideoEncoderProbeResult run_video_encoder_probe(const std::string& video_encoder);
 
-std::vector<std::string> collect_ffmpeg_devices(const std::string& output, bool demuxing_supported) {
-  std::vector<std::string> values;
-  std::set<std::string> seen;
-  bool in_device_table = false;
-
-  for (const std::string& raw_line : split_lines(output)) {
-    const std::string trimmed = trim_copy(raw_line);
-    if (trimmed == "---") {
-      in_device_table = true;
-      continue;
-    }
-
-    if (!in_device_table) {
-      continue;
-    }
-
-    std::stringstream line_stream(trimmed);
-    std::string flags;
-    std::string name;
-    line_stream >> flags >> name;
-    if (flags.empty() || name.empty()) {
-      continue;
-    }
-
-    const bool supports_demuxing = flags.find('D') != std::string::npos;
-    const bool supports_muxing = flags.find('E') != std::string::npos;
-    if ((demuxing_supported && !supports_demuxing) || (!demuxing_supported && !supports_muxing)) {
-      continue;
-    }
-
-    if (name == "=") {
-      continue;
-    }
-
-    if (seen.insert(name).second) {
-      values.push_back(name);
-    }
-  }
-
-  return values;
-}
-
 std::vector<std::string> build_ffmpeg_candidates(const std::string& agent_binary_path) {
   std::vector<std::string> candidates;
   std::set<std::string> seen;
@@ -375,7 +294,6 @@ VideoEncoderProbeResult run_video_encoder_probe(const std::string& video_encoder
   VideoEncoderProbeResult probe;
   probe.name = trim_copy(video_encoder);
   probe.hardware = is_hardware_video_encoder(probe.name);
-  probe.supports_low_latency = encoder_supports_low_latency(probe.name);
   probe.priority = video_encoder_probe_priority(probe.name);
 
   const AVCodec* codec = avcodec_find_encoder_by_name(probe.name.c_str());
@@ -394,9 +312,6 @@ VideoEncoderProbeResult run_video_encoder_probe(const std::string& video_encoder
 
   const AVHWDeviceType device_type = required_hw_device_type_for_encoder(probe.name);
   if (device_type != AV_HWDEVICE_TYPE_NONE) {
-    probe.requires_hw_device = true;
-    probe.hw_device_type = av_hwdevice_get_type_name(device_type);
-
     if (!codec_supports_hw_device(codec, device_type)) {
       probe.reason = "encoder-hw-device-unsupported";
       probe.error = "encoder-does-not-support-hw-device-context";
@@ -413,7 +328,6 @@ VideoEncoderProbeResult run_video_encoder_probe(const std::string& video_encoder
       return probe;
     }
 
-    probe.hw_device_ready = true;
   }
 
   codec_context = avcodec_alloc_context3(codec);
@@ -461,8 +375,6 @@ VideoEncoderProbeResult run_video_encoder_probe(const std::string& video_encoder
     av_buffer_unref(&device_ref);
     return probe;
   }
-
-  probe.open_succeeded = true;
 
   frame = av_frame_alloc();
   packet = av_packet_alloc();
@@ -540,7 +452,6 @@ VideoEncoderProbeResult run_video_encoder_probe(const std::string& video_encoder
     const int receive_result = avcodec_receive_packet(codec_context, packet);
     if (receive_result == 0) {
       if (packet->size > 0) {
-        probe.output_succeeded = true;
         probe.validated = true;
         probe.reason = "encoder-self-test-passed";
         probe.error.clear();
@@ -625,25 +536,6 @@ FfmpegProbeResult probe_ffmpeg(const std::string& agent_binary_path) {
     probe.path = candidate;
     probe.version = parsed_version;
 
-    const CommandResult hwaccels_result = run_command_capture(command_target + " -hide_banner -hwaccels 2>&1");
-    if (hwaccels_result.launched && hwaccels_result.exit_code == 0) {
-      probe.hwaccels = collect_flag_list(hwaccels_result.output);
-    }
-
-    const CommandResult bsfs_result = run_command_capture(command_target + " -hide_banner -bsfs 2>&1");
-    if (bsfs_result.launched && bsfs_result.exit_code == 0) {
-      probe.bitstream_filters = collect_flag_list(bsfs_result.output);
-      probe.h264_metadata_bsf_available =
-        std::find(probe.bitstream_filters.begin(), probe.bitstream_filters.end(), "h264_metadata") != probe.bitstream_filters.end();
-      probe.hevc_metadata_bsf_available =
-        std::find(probe.bitstream_filters.begin(), probe.bitstream_filters.end(), "hevc_metadata") != probe.bitstream_filters.end();
-    }
-
-    const CommandResult devices_result = run_command_capture(command_target + " -hide_banner -devices 2>&1");
-    if (devices_result.launched && !trim_copy(devices_result.output).empty()) {
-      probe.input_devices = collect_ffmpeg_devices(devices_result.output, true);
-    }
-
     const std::vector<std::string> capability_probe_encoders = {
       "h264_nvenc",
       "h264_amf",
@@ -674,12 +566,6 @@ FfmpegProbeResult probe_ffmpeg(const std::string& agent_binary_path) {
       }
     }
 
-    const CommandResult decoders_result = run_command_capture(command_target + " -hide_banner -decoders 2>&1");
-    if (decoders_result.launched && decoders_result.exit_code == 0) {
-      probe.video_decoders = collect_codec_names(decoders_result.output, { "264", "265", "hevc" });
-      probe.audio_decoders = collect_codec_names(decoders_result.output, { "opus" });
-    }
-
     probe.error.clear();
     return probe;
   }
@@ -697,17 +583,10 @@ std::string ffmpeg_probe_json(const FfmpegProbeResult& probe) {
     << "{\"available\":" << (probe.available ? "true" : "false")
     << ",\"path\":\"" << json_escape(probe.path) << "\""
     << ",\"version\":\"" << json_escape(probe.version) << "\""
-    << ",\"hwaccels\":" << json_array_from_strings(probe.hwaccels)
-    << ",\"bitstreamFilters\":" << json_array_from_strings(probe.bitstream_filters)
-    << ",\"inputDevices\":" << json_array_from_strings(probe.input_devices)
     << ",\"videoEncoders\":" << json_array_from_strings(probe.video_encoders)
     << ",\"validatedVideoEncoders\":" << json_array_from_strings(probe.validated_video_encoders)
     << ",\"videoEncoderProbes\":" << json_array_from_video_encoder_probes(probe.video_encoder_probes)
-    << ",\"videoDecoders\":" << json_array_from_strings(probe.video_decoders)
     << ",\"audioEncoders\":" << json_array_from_strings(probe.audio_encoders)
-    << ",\"audioDecoders\":" << json_array_from_strings(probe.audio_decoders)
-    << ",\"h264MetadataBsfAvailable\":" << (probe.h264_metadata_bsf_available ? "true" : "false")
-    << ",\"hevcMetadataBsfAvailable\":" << (probe.hevc_metadata_bsf_available ? "true" : "false")
     << ",\"error\":\"" << json_escape(probe.error) << "\""
     << "}";
   return payload.str();

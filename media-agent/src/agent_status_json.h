@@ -2,7 +2,8 @@
 
 #include <string>
 
-#include "agent_runtime.h"
+struct AgentRuntimeState;
+struct PeerState;
 
 std::string capabilities_json(AgentRuntimeState& state);
 std::string build_status_json(AgentRuntimeState& state);

@@ -18,23 +18,14 @@ struct NativeLivePreviewConfig {
 
 struct NativeLivePreviewSnapshot {
   bool attached = false;
-  bool launch_attempted = false;
   bool running = false;
   bool waiting_for_artifact = false;
   bool decoder_ready = false;
   std::uint64_t decoded_frames_rendered = 0;
-  std::uint64_t avg_copy_resource_us = 0;
-  std::uint64_t avg_map_us = 0;
-  std::uint64_t avg_memcpy_us = 0;
-  std::uint64_t avg_total_readback_us = 0;
   double frame_interval_stddev_ms = 0.0;
-  std::int64_t last_decoded_frame_at_unix_ms = -1;
   unsigned long process_id = 0;
-  std::string preview_surface_backend = "native-win32-gdi";
-  std::string decoder_backend = "wgc-bgra";
   std::string codec_path = "bgra";
   std::string implementation = "wgc-live-preview";
-  std::string media_path;
   std::string window_title;
   std::string embedded_parent_debug;
   std::string surface_window_debug;

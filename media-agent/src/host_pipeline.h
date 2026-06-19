@@ -2,7 +2,10 @@
 
 #include <string>
 
-#include "agent_runtime.h"
+struct FfmpegProbeResult;
+struct HostCapturePlan;
+struct HostCaptureProcessState;
+struct HostPipelineState;
 
 std::string build_ffmpeg_host_capture_command(
   const FfmpegProbeResult& ffmpeg,

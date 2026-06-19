@@ -32,26 +32,6 @@ std::string quote_command_path(const std::string& path) {
   return quoted;
 }
 
-std::string build_gdigrab_hwnd_target(const std::string& hwnd_value) {
-  const std::string trimmed = trim_copy(hwnd_value);
-  if (trimmed.empty()) {
-    return {};
-  }
-
-  try {
-    std::size_t parsed_length = 0;
-    const unsigned long long handle = std::stoull(trimmed, &parsed_length, 0);
-    if (parsed_length == trimmed.size()) {
-      std::ostringstream target;
-      target << "hwnd=0x" << std::uppercase << std::hex << handle;
-      return target.str();
-    }
-  } catch (...) {
-  }
-
-  return "hwnd=" + trimmed;
-}
-
 #ifdef _WIN32
 namespace {
 

@@ -1,6 +1,18 @@
 #include "wasapi_backend.h"
 #include "json_protocol.h"
 
+struct WasapiProbeResult {
+  bool platform_supported = false;
+  bool device_enumerator_available = false;
+  unsigned int render_device_count = 0;
+  std::string backend_mode = "native-wasapi-agent";
+  std::string implementation = "wasapi-process-loopback";
+  std::string reason = "native-wasapi-capture-available-internal-only";
+  std::string last_error;
+};
+
+static WasapiProbeResult probe_wasapi_backend();
+
 #ifdef _WIN32
 
 #include <algorithm>
@@ -132,6 +144,17 @@ class ActivationCompletionHandler final : public IActivateAudioInterfaceCompleti
     return remaining;
   }
 
+  void keep_alive_until_completed() {
+    LONG expected = 0;
+    if (InterlockedCompareExchange(&self_keep_alive_, 1, expected) == expected) {
+      AddRef();
+    }
+  }
+
+  void cancel_keep_alive() {
+    release_keep_alive_after_completed();
+  }
+
   HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation* operation) override {
     activate_result_ = E_FAIL;
 
@@ -150,11 +173,20 @@ class ActivationCompletionHandler final : public IActivateAudioInterfaceCompleti
       SetEvent(completion_event_);
     }
 
+    release_keep_alive_after_completed();
+
     return S_OK;
   }
 
  private:
+  void release_keep_alive_after_completed() {
+    if (InterlockedExchange(&self_keep_alive_, 0) == 1) {
+      Release();
+    }
+  }
+
   volatile long ref_count_;
+  volatile long self_keep_alive_ = 0;
   HANDLE completion_event_ = nullptr;
   ComPtr<IAudioClient> audio_client_;
   HRESULT activate_result_ = E_PENDING;
@@ -191,12 +223,11 @@ void configure_pcm_request_format(WAVEFORMATEX& format) {
   format.cbSize = 0;
 }
 
-void fill_status_from_wave_format(WasapiSessionStatus& status, const WAVEFORMATEX& format, UINT32 buffer_frames) {
+void fill_status_from_wave_format(WasapiSessionStatus& status, const WAVEFORMATEX& format) {
   status.sample_rate = format.nSamplesPerSec;
   status.channel_count = format.nChannels;
   status.bits_per_sample = format.wBitsPerSample;
   status.block_align = format.nBlockAlign;
-  status.buffer_frame_count = buffer_frames;
 }
 
 std::string base64_encode(const BYTE* data, std::size_t size) {
@@ -304,6 +335,7 @@ HRESULT activate_process_loopback_audio_client(DWORD pid, ComPtr<IAudioClient>& 
   }
 
   ComPtr<IActivateAudioInterfaceAsyncOperation> async_operation;
+  completion_handler->keep_alive_until_completed();
   const HRESULT activate_result = ActivateAudioInterfaceAsync(
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
     __uuidof(IAudioClient),
@@ -313,6 +345,7 @@ HRESULT activate_process_loopback_audio_client(DWORD pid, ComPtr<IAudioClient>& 
   );
 
   if (FAILED(activate_result)) {
+    completion_handler->cancel_keep_alive();
     completion_handler->Release();
     return activate_result;
   }
@@ -398,7 +431,7 @@ HRESULT initialize_capture_client(
     return event_result;
   }
 
-  fill_status_from_wave_format(status, selected_format, buffer_frames);
+  fill_status_from_wave_format(status, selected_format);
   return S_OK;
 }
 
@@ -426,11 +459,6 @@ void capture_worker_main(DWORD pid, const std::string process_name) {
   }
 
   ComPtr<IAudioClient> audio_client;
-  {
-    std::lock_guard<std::mutex> lock(state.mutex);
-    state.status.activation_attempts += 1;
-  }
-
   const HRESULT activate_result = activate_process_loopback_audio_client(pid, audio_client);
   if (FAILED(activate_result)) {
     record_runtime_failure(state, probe, "native-wasapi-session-start-failed", hresult_to_string(activate_result));
@@ -444,7 +472,6 @@ void capture_worker_main(DWORD pid, const std::string process_name) {
   configured_status.pid = static_cast<int>(pid);
   configured_status.process_name = process_name;
   configured_status.reason = "native-wasapi-capture-internal-only";
-  configured_status.activation_attempts = 1;
 
   const HRESULT init_result = initialize_capture_client(audio_client.Get(), capture_client, sample_ready_event, configured_status);
   if (FAILED(init_result)) {
@@ -466,7 +493,6 @@ void capture_worker_main(DWORD pid, const std::string process_name) {
     state.status = configured_status;
     state.status.running = true;
     state.status.capture_active = true;
-    state.status.activation_successes = 1;
     state.status.last_error.clear();
     state.status.reason = "native-wasapi-capturing-internal-only";
     set_start_complete(state);
@@ -524,10 +550,6 @@ void capture_worker_main(DWORD pid, const std::string process_name) {
         std::lock_guard<std::mutex> lock(state.mutex);
         state.status.packets_captured += 1;
         state.status.frames_captured += frames_available;
-        state.status.last_buffer_frames = frames_available;
-        if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0) {
-          state.status.silent_packets += 1;
-        }
       }
 
       WasapiSessionStatus snapshot;
@@ -701,7 +723,7 @@ bool find_process_render_sessions(
 
 #endif
 
-WasapiProbeResult probe_wasapi_backend() {
+static WasapiProbeResult probe_wasapi_backend() {
   WasapiProbeResult probe;
 
 #ifndef _WIN32
@@ -713,9 +735,7 @@ WasapiProbeResult probe_wasapi_backend() {
 
   const HRESULT init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   const bool should_uninitialize = SUCCEEDED(init_result);
-  if (SUCCEEDED(init_result) || init_result == RPC_E_CHANGED_MODE) {
-    probe.com_initialized = true;
-  } else {
+  if (!SUCCEEDED(init_result) && init_result != RPC_E_CHANGED_MODE) {
     probe.reason = "wasapi-com-initialization-failed";
     probe.last_error = hresult_to_string(init_result);
     return probe;

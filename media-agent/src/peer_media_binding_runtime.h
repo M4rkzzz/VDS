@@ -2,15 +2,8 @@
 
 #include <string>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#endif
-
-#include "agent_runtime.h"
+struct AgentRuntimeState;
+struct PeerState;
 
 struct PeerMediaBindingCommandResult {
   bool ok = true;
@@ -32,12 +25,6 @@ bool attach_host_video_media_binding(
   PeerState& peer,
   std::string* error,
   bool force_restart = false);
-bool attach_relay_video_media_binding(
-  AgentRuntimeState& state,
-  PeerState& peer,
-  const std::string& source,
-  std::string* error);
 bool detach_peer_media_binding(PeerState& peer, std::string* error);
 bool prepare_peer_media_binding_for_transport_close(PeerState& peer, std::string* error);
-void clear_host_audio_sender(PeerState& peer);
 void refresh_host_audio_senders(AgentRuntimeState& state);

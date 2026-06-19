@@ -1,7 +1,9 @@
 param(
   [ValidateSet('Debug', 'Release')]
   [string]$Configuration = 'Release',
-  [string]$FfmpegSourceRoot = $env:VDS_FFMPEG_SOURCE
+  [string]$FfmpegSourceRoot = $env:VDS_FFMPEG_SOURCE,
+  [switch]$AllowNoLibDataChannel,
+  [switch]$AllowLocalFfmpegFallback
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,6 +16,9 @@ $runtimeFfmpegBinDir = Join-Path $runtimeDir 'ffmpeg\bin'
 $vcpkgRoot = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } elseif (Test-Path 'C:\vcpkg') { 'C:\vcpkg' } else { $null }
 $vcpkgToolchain = if ($vcpkgRoot) { Join-Path $vcpkgRoot 'scripts\buildsystems\vcpkg.cmake' } else { $null }
 $enableLibDataChannel = [bool]($vcpkgToolchain -and (Test-Path $vcpkgToolchain))
+if (-not $enableLibDataChannel -and -not $AllowNoLibDataChannel) {
+  throw 'vcpkg toolchain not found. Release media-agent builds require libdatachannel by default. Set VCPKG_ROOT or pass -AllowNoLibDataChannel for explicit local fallback builds.'
+}
 $libDataChannelOption = if ($enableLibDataChannel) { 'ON' } else { 'OFF' }
 
 function Test-FfmpegSdkRoot {
@@ -141,8 +146,10 @@ $ffmpegSdkSearchRoots = @()
 if ($FfmpegSourceRoot) {
   $ffmpegSdkSearchRoots += $FfmpegSourceRoot
 }
-$ffmpegSdkSearchRoots += 'D:\project\publicresource\ffmpeg-master-latest-win64-gpl-shared'
-$ffmpegSdkSearchRoots += 'D:\project\publicresource'
+if ($AllowLocalFfmpegFallback) {
+  $ffmpegSdkSearchRoots += 'D:\project\publicresource\ffmpeg-master-latest-win64-gpl-shared'
+  $ffmpegSdkSearchRoots += 'D:\project\publicresource'
+}
 $resolvedFfmpegRoot = Resolve-FfmpegSdkRoot -SearchRoots $ffmpegSdkSearchRoots
 if (-not $resolvedFfmpegRoot) {
   throw 'Unable to locate an FFmpeg SDK root with include/ and lib/ for media-agent build. Set VDS_FFMPEG_SOURCE to a shared FFmpeg build.'
@@ -159,10 +166,13 @@ if (Test-Path $buildDir) {
 $cmakeArgs = @(
   '-S', $sourceDir,
   '-B', $buildDir,
-  '-A', 'x64',
   "-DVDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL=$libDataChannelOption",
   "-DVDS_MEDIA_AGENT_FFMPEG_ROOT=$resolvedFfmpegRoot"
 )
+if (-not $env:CMAKE_GENERATOR -or $env:CMAKE_GENERATOR -match 'Visual Studio') {
+  $cmakeArgs += '-A'
+  $cmakeArgs += 'x64'
+}
 
 if ($enableLibDataChannel) {
   $cmakeArgs += "-DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchain"
@@ -170,7 +180,7 @@ if ($enableLibDataChannel) {
   $cmakeArgs += "-DVCPKG_MANIFEST_DIR=$sourceDir"
   Write-Host "Enabling libdatachannel backend with vcpkg toolchain: $vcpkgToolchain"
 } else {
-  Write-Warning 'vcpkg toolchain not found; building media-agent without libdatachannel backend.'
+  Write-Warning 'vcpkg toolchain not found; -AllowNoLibDataChannel was provided, building media-agent without libdatachannel backend.'
 }
 
 cmake @cmakeArgs | Out-Host
@@ -193,6 +203,9 @@ if (-not $builtBinary) {
   throw "Unable to locate built vds-media-agent.exe under $buildDir"
 }
 
+if (Test-Path $runtimeDir) {
+  Remove-Item $runtimeDir -Recurse -Force
+}
 New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
 $runtimeBinary = Join-Path $runtimeDir 'vds-media-agent.exe'
 Copy-Item $builtBinary $runtimeBinary -Force
@@ -216,7 +229,7 @@ if ($enableLibDataChannel) {
       Copy-Item $runtimeLibSource (Join-Path $runtimeDir $runtimeLibName) -Force
       Write-Host "Copied libdatachannel runtime dependency: $runtimeLibName"
     } else {
-      Write-Warning "Expected libdatachannel runtime dependency not found: $runtimeLibName"
+      throw "Expected libdatachannel runtime dependency not found: $runtimeLibName"
     }
   }
 }
@@ -225,7 +238,9 @@ $ffmpegSearchRoots = @($resolvedFfmpegRoot)
 if ($FfmpegSourceRoot) {
   $ffmpegSearchRoots += $FfmpegSourceRoot
 }
-$ffmpegSearchRoots += 'D:\project\publicresource'
+if ($AllowLocalFfmpegFallback) {
+  $ffmpegSearchRoots += 'D:\project\publicresource'
+}
 $ffmpegSearchRoots = $ffmpegSearchRoots | Where-Object { $_ } | Select-Object -Unique
 
 $ffmpegCandidates = @()

@@ -2,11 +2,11 @@
 
 #include <string>
 
-#include "agent_runtime.h"
+struct FfmpegProbeResult;
+struct HostCapturePlan;
+struct HostPipelineState;
+struct PeerState;
 
-#ifdef _WIN32
-void close_peer_video_sender_handles(PeerState::PeerVideoSenderRuntime& runtime);
-#endif
 bool start_peer_video_sender(
   const FfmpegProbeResult& ffmpeg,
   const HostPipelineState& pipeline,

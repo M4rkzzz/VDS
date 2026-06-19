@@ -7,6 +7,8 @@ extern "C" {
 #include <libavutil/avutil.h>
 }
 
+namespace {
+
 int aac_sample_rate_index(int sample_rate) {
   switch (sample_rate) {
     case 96000: return 0;
@@ -24,6 +26,8 @@ int aac_sample_rate_index(int sample_rate) {
     case 7350: return 12;
     default: return 3;
   }
+}
+
 }
 
 ParsedAacConfig parse_aac_config(const AVCodecParameters* codecpar) {
@@ -90,19 +94,6 @@ std::vector<std::uint8_t> build_adts_framed_aac(
   framed[6] = 0xFC;
   std::memcpy(framed.data() + 7, data, size);
   return framed;
-}
-
-std::int64_t packet_timestamp_us(const AVStream* stream, const AVPacket* packet) {
-  if (!stream || !packet) {
-    return 0;
-  }
-  const std::int64_t best_ts = packet->pts != AV_NOPTS_VALUE
-    ? packet->pts
-    : packet->dts;
-  if (best_ts == AV_NOPTS_VALUE) {
-    return 0;
-  }
-  return av_rescale_q(best_ts, stream->time_base, AVRational{ 1, 1000000 });
 }
 
 std::uint32_t packet_timestamp_at_clock_rate(

@@ -1,9 +1,9 @@
 #include "native_artifact_preview.h"
 
 #include "native_video_surface.h"
-#include "time_utils.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
@@ -24,7 +24,6 @@ namespace fs = std::filesystem;
 
 namespace {
 
-using vds::media_agent::current_time_millis;
 
 std::string to_lower_ascii(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
@@ -55,10 +54,8 @@ class NativeArtifactPreview::Impl {
  public:
   explicit Impl(NativeArtifactPreviewConfig config)
       : config_(std::move(config)) {
-    snapshot_.launch_attempted = true;
     snapshot_.codec_path = to_lower_ascii(config_.codec.empty() ? "h264" : config_.codec);
     snapshot_.window_title = config_.window_title;
-    snapshot_.media_path = config_.media_path;
   }
 
   ~Impl() {
@@ -71,7 +68,7 @@ class NativeArtifactPreview::Impl {
       return true;
     }
 
-    stop_requested_ = false;
+    stop_requested_.store(false);
     start_complete_ = false;
     start_succeeded_ = false;
     start_error_.clear();
@@ -140,7 +137,7 @@ class NativeArtifactPreview::Impl {
         return;
       }
 
-      stop_requested_ = true;
+      stop_requested_.store(true);
       if (!reason.empty()) {
         stop_reason_ = reason;
       }
@@ -185,14 +182,14 @@ class NativeArtifactPreview::Impl {
     }
     started_condition_.notify_all();
 
-    while (!stop_requested_) {
+    while (!stop_requested_.load()) {
       if (!wait_for_media_path()) {
         break;
       }
 
       AVFormatContext* format_context = nullptr;
       if (!open_input(&format_context)) {
-        if (stop_requested_) {
+        if (stop_requested_.load()) {
           break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -202,24 +199,31 @@ class NativeArtifactPreview::Impl {
       read_packets(format_context);
       avformat_close_input(&format_context);
 
-      if (!stop_requested_) {
+      if (!stop_requested_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
       }
     }
 
     if (created_surface) {
-      created_surface->close(stop_reason_.empty() ? "artifact-preview-stopped" : stop_reason_);
+      const std::string stop_reason = current_stop_reason();
+      created_surface->close(stop_reason.empty() ? "artifact-preview-stopped" : stop_reason);
     }
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      const std::string stop_reason = stop_reason_;
       surface_.reset();
       snapshot_.attached = false;
       snapshot_.running = false;
       snapshot_.decoder_ready = false;
       snapshot_.waiting_for_artifact = false;
-      snapshot_.reason = stop_reason_.empty() ? "artifact-preview-stopped" : stop_reason_;
+      snapshot_.reason = stop_reason.empty() ? "artifact-preview-stopped" : stop_reason;
     }
+  }
+
+  std::string current_stop_reason() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return stop_reason_;
   }
 
   void fail_start(const std::string& message) {
@@ -272,6 +276,7 @@ class NativeArtifactPreview::Impl {
       std::lock_guard<std::mutex> lock(mutex_);
       snapshot_.reason = "artifact-preview-stream-info-failed";
       snapshot_.last_error = ffmpeg_error_string(info_result);
+      avformat_close_input(format_context);
       return false;
     }
 
@@ -280,6 +285,7 @@ class NativeArtifactPreview::Impl {
       std::lock_guard<std::mutex> lock(mutex_);
       snapshot_.reason = "artifact-preview-video-stream-missing";
       snapshot_.last_error = ffmpeg_error_string(video_stream_index_);
+      avformat_close_input(format_context);
       return false;
     }
 
@@ -308,7 +314,7 @@ class NativeArtifactPreview::Impl {
       return;
     }
 
-    while (!stop_requested_) {
+    while (!stop_requested_.load()) {
       const int read_result = av_read_frame(format_context, packet);
       if (read_result == AVERROR_EOF || read_result == AVERROR(EAGAIN)) {
         {
@@ -359,10 +365,7 @@ class NativeArtifactPreview::Impl {
     snapshot_.running = surface_snapshot.running;
     snapshot_.decoder_ready = surface_snapshot.decoder_ready;
     snapshot_.decoded_frames_rendered = surface_snapshot.decoded_frames_rendered;
-    snapshot_.last_decoded_frame_at_unix_ms = surface_snapshot.last_decoded_frame_at_unix_ms;
     snapshot_.process_id = surface_snapshot.process_id;
-    snapshot_.preview_surface_backend = surface_snapshot.preview_surface_backend;
-    snapshot_.decoder_backend = surface_snapshot.decoder_backend;
     snapshot_.codec_path = surface_snapshot.codec_path;
     snapshot_.window_title = surface_snapshot.window_title;
     if (surface_snapshot.reason == "native-frame-rendered") {
@@ -377,7 +380,7 @@ class NativeArtifactPreview::Impl {
   mutable std::mutex mutex_;
   std::condition_variable started_condition_;
   std::thread worker_;
-  bool stop_requested_ = false;
+  std::atomic<bool> stop_requested_{false};
   bool start_complete_ = false;
   bool start_succeeded_ = false;
   std::string start_error_;

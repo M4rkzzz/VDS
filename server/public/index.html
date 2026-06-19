@@ -110,7 +110,7 @@
             <p class="status-detail">发送帧率：<span id="host-send-fps">-</span></p>
           </div>
 
-          <div id="host-p2p-diagnostic" class="workspace-card workspace-block p2p-diagnostic-card">
+          <div class="workspace-card workspace-block p2p-diagnostic-card">
             <div class="p2p-diagnostic-header">
               <span>P2P 诊断</span>
               <button id="btn-copy-host-p2p-diagnostic" class="btn btn-small btn-secondary" type="button">复制</button>
@@ -118,7 +118,7 @@
             <pre id="host-p2p-diagnostic-output" class="p2p-diagnostic-output">等待诊断数据...</pre>
           </div>
 
-          <div id="host-capture-diagnostic" class="workspace-card workspace-block capture-diagnostic-card">
+          <div class="workspace-card workspace-block capture-diagnostic-card">
             <div class="p2p-diagnostic-header">
               <span>采集资源</span>
               <button id="btn-copy-host-capture-diagnostic" class="btn btn-small btn-secondary" type="button">复制</button>
@@ -132,7 +132,7 @@
             <button id="btn-copy-room" class="btn btn-small">复制房间号</button>
           </div>
 
-          <div class="workspace-card workspace-block workspace-action-card">
+          <div class="workspace-card workspace-block">
             <div class="workspace-action-row workspace-action-row-stacked">
               <div class="host-public-room-row" aria-label="大厅公开">
                 <span id="host-public-room-label" class="host-public-room-label">公开房间至大厅</span>
@@ -166,7 +166,6 @@
         <section class="workspace-stage-panel workspace-stage-panel-viewer">
           <div id="remote-video-container" class="workspace-stage">
             <video id="remote-video" autoplay playsinline controls></video>
-            <audio id="remote-audio" autoplay style="display:none"></audio>
             <p id="waiting-message">等待分享者开始共享...</p>
             <div id="viewer-fullscreen-underbar" class="viewer-fullscreen-underbar" aria-hidden="true">
               <div class="viewer-fullscreen-underbar-track">
@@ -177,9 +176,9 @@
                       <span id="viewer-volume-fullscreen-value">100%</span>
                     </div>
                     <button id="btn-viewer-mute-fullscreen" class="viewer-fullscreen-icon-button" type="button" aria-label="静音切换" aria-pressed="false">
-                      <svg id="viewer-fullscreen-volume-icon" class="viewer-fullscreen-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <svg class="viewer-fullscreen-icon" viewBox="0 0 24 24" aria-hidden="true">
                         <path class="viewer-fullscreen-icon-speaker" d="M4 10h4.2L13 6.2v11.6L8.2 14H4z"></path>
-                        <path class="viewer-fullscreen-icon-wave viewer-fullscreen-icon-wave-low" d="M16.3 9.4a4.5 4.5 0 0 1 0 5.2"></path>
+                        <path class="viewer-fullscreen-icon-wave" d="M16.3 9.4a4.5 4.5 0 0 1 0 5.2"></path>
                         <path class="viewer-fullscreen-icon-wave viewer-fullscreen-icon-wave-high" d="M18.8 6.8a8.4 8.4 0 0 1 0 10.4"></path>
                         <path class="viewer-fullscreen-icon-mute" d="M15.5 8.5l5 7M20.5 8.5l-5 7"></path>
                       </svg>
@@ -199,7 +198,7 @@
             <p id="viewer-p2p-status" class="workspace-p2p-status">P2P：等待</p>
           </div>
 
-          <div id="join-form" class="workspace-card workspace-join-card workspace-block">
+          <div id="join-form" class="workspace-card workspace-block">
             <div class="viewer-join-tabs">
               <div class="quality-segment-group quality-segment-group-wrap" aria-label="加入方式">
                 <button id="btn-viewer-join-lobby" class="quality-segment-btn" type="button">大厅</button>
@@ -232,7 +231,7 @@
             <p>渲染帧率：<span id="viewer-render-fps">-</span></p>
           </div>
 
-          <div id="viewer-p2p-diagnostic" class="workspace-card workspace-block p2p-diagnostic-card">
+          <div class="workspace-card workspace-block p2p-diagnostic-card">
             <div class="p2p-diagnostic-header">
               <span>P2P 诊断</span>
               <button id="btn-copy-viewer-p2p-diagnostic" class="btn btn-small btn-secondary" type="button">复制</button>
@@ -240,7 +239,7 @@
             <pre id="viewer-p2p-diagnostic-output" class="p2p-diagnostic-output">等待诊断数据...</pre>
           </div>
 
-          <div class="workspace-card workspace-block workspace-action-card">
+          <div class="workspace-card workspace-block">
             <div class="workspace-action-row workspace-action-row-stacked">
               <button id="btn-leave" class="btn btn-danger hidden">离开</button>
               <button id="btn-back-viewer" class="btn btn-small">返回</button>
@@ -302,7 +301,7 @@
             <p class="quality-modal-subtitle">按当前设备能力选择编码、分辨率、帧率与实时性策略。</p>
           </div>
         </div>
-        <div id="quality-backend-options" class="quality-segment-group quality-segment-group-compact quality-backend-options" aria-label="host 推流模式"></div>
+        <div id="quality-backend-options" class="quality-segment-group quality-backend-options" aria-label="host 推流模式"></div>
         <div class="quality-settings quality-settings-modern">
           <div id="quality-native-panel" class="quality-backend-panel">
             <section class="quality-section">
@@ -313,7 +312,7 @@
                   <p id="quality-codec-note" class="quality-setting-note">当前直播链路将按所选编码启动。</p>
                 </div>
                 <div class="quality-setting-control">
-                  <div id="quality-codec-options" class="quality-segment-group quality-segment-group-compact" aria-label="编码选项"></div>
+                  <div id="quality-codec-options" class="quality-segment-group" aria-label="编码选项"></div>
                 </div>
               </div>
 
@@ -359,7 +358,7 @@
                   <label>分辨率</label>
                 </div>
                 <div class="quality-setting-control">
-                  <div id="quality-resolution-options" class="quality-segment-group quality-segment-group-wrap quality-segment-group-compact" aria-label="分辨率选项"></div>
+                  <div id="quality-resolution-options" class="quality-segment-group quality-segment-group-wrap" aria-label="分辨率选项"></div>
                 </div>
               </div>
 
@@ -368,7 +367,7 @@
                   <label>帧率</label>
                 </div>
                 <div class="quality-setting-control">
-                  <div id="quality-fps-options" class="quality-segment-group quality-segment-group-compact" aria-label="帧率选项"></div>
+                  <div id="quality-fps-options" class="quality-segment-group" aria-label="帧率选项"></div>
                 </div>
               </div>
 
@@ -392,7 +391,7 @@
                   <p id="quality-preset-note" class="quality-setting-note">默认均衡，将按实际编码器映射到对应预设。</p>
                 </div>
                 <div class="quality-setting-control">
-                  <div id="quality-preset-options" class="quality-segment-group quality-segment-group-compact" aria-label="编码器预设"></div>
+                  <div id="quality-preset-options" class="quality-segment-group" aria-label="编码器预设"></div>
                 </div>
               </div>
 
@@ -401,7 +400,7 @@
                   <label>调优</label>
                 </div>
                 <div class="quality-setting-control">
-                  <div id="quality-tune-options" class="quality-segment-group quality-segment-group-compact" aria-label="调优选项"></div>
+                  <div id="quality-tune-options" class="quality-segment-group" aria-label="调优选项"></div>
                 </div>
               </div>
 
@@ -411,7 +410,7 @@
                   <p class="quality-setting-note">All-Intra 仅用于排障，会显著增加带宽和编码负载。</p>
                 </div>
                 <div class="quality-setting-control">
-                  <div id="quality-keyframe-options" class="quality-segment-group quality-segment-group-compact" aria-label="关键帧间隔"></div>
+                  <div id="quality-keyframe-options" class="quality-segment-group" aria-label="关键帧间隔"></div>
                 </div>
               </div>
             </section>

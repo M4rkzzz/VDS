@@ -566,7 +566,7 @@ class MediaAgentManager extends EventEmitter {
       ...this.status,
       ...patch
     };
-    this.emit('status', this.getStatus());
+    this.emit('status', { ...this.status });
   }
 }
 

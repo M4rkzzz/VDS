@@ -81,7 +81,7 @@ SurfaceControlCommandResult attach_surface_from_request(
     }
 
     std::string surface_error;
-    if (!start_peer_video_surface_attachment(state.ffmpeg, *peer_it->second.receiver_runtime, &surface_error)) {
+    if (!start_peer_video_surface_attachment(*peer_it->second.receiver_runtime, &surface_error)) {
       sync_surface_attachment_from_peer_runtime(attachment, peer_it->second.receiver_runtime);
       attachment.last_error = surface_error;
       attachment.reason = "peer-video-surface-start-failed";
@@ -105,6 +105,18 @@ SurfaceControlCommandResult attach_surface_from_request(
   }
 
   if (!attachment.running) {
+    if (!attachment.peer_runtime && attachment.waiting_for_artifact) {
+      state.attached_surfaces[surface] = attachment;
+      emit_event(
+        "media-state",
+        std::string("{\"state\":\"surface-attached\",\"surface\":\"") + json_escape(surface) +
+          "\",\"target\":\"" + json_escape(target) +
+          "\",\"attachment\":" + surface_attachment_json(state.attached_surfaces[surface]) +
+          ",\"implementation\":\"" + json_escape(state.attached_surfaces[surface].implementation) + "\",\"transportReady\":" +
+          std::string(state.peer_transport_backend.transport_ready ? "true" : "false") + "}"
+      );
+      return ok_result(build_surface_result_json(state.attached_surfaces[surface]));
+    }
     const std::string attach_error = attachment.last_error.empty()
       ? "Native embedded surface failed to start."
       : attachment.last_error;
@@ -188,11 +200,11 @@ SurfaceControlCommandResult detach_surface_from_request(
   emit_event(
     "media-state",
     std::string("{\"state\":\"surface-detached\",\"surface\":\"") + json_escape(surface) +
-      "\",\"implementation\":\"stub\",\"transportReady\":" +
+      "\",\"implementation\":\"native-media-agent\",\"transportReady\":" +
       std::string(state.peer_transport_backend.transport_ready ? "true" : "false") + "}"
   );
   if (attachment != state.attached_surfaces.end()) {
     state.attached_surfaces.erase(attachment);
   }
-  return ok_result(R"json({"detached":true,"implementation":"stub"})json");
+  return ok_result(R"json({"detached":true,"implementation":"native-media-agent"})json");
 }

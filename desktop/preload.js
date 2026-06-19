@@ -13,9 +13,7 @@ const DEBUG_PRESET = String(process.env.VDS_DEBUG_PRESET || '').trim();
 const mediaEngineAudio = createMediaEngineAudioApi();
 
 contextBridge.exposeInMainWorld('electronAPI', {
-  getVersion: () => process.versions.electron,
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
-  getPlatform: () => process.platform,
   getRuntimeConfig: () => ({
     serverUrl: SERVER_URL,
     disconnectGraceMs: DISCONNECT_GRACE_MS,
@@ -29,33 +27,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
     debugPreset: DEBUG_PRESET
   }),
   writeClipboardText: (text) => ipcRenderer.invoke('clipboard-write-text', text),
-  getDesktopSources: () => ipcRenderer.invoke('get-desktop-sources'),
   minimize: () => ipcRenderer.send('window-minimize'),
   minimizeToTray: () => ipcRenderer.send('window-minimize-to-tray'),
   maximize: () => ipcRenderer.send('window-maximize'),
   close: () => ipcRenderer.send('window-close'),
   setDebugConfig: (config) => ipcRenderer.send('renderer-debug-config-changed', config || {}),
-  setDebugMode: (enabled) => ipcRenderer.send('renderer-debug-mode-changed', Boolean(enabled)),
   isMaximized: () => ipcRenderer.invoke('window-is-maximized'),
   getWindowBounds: () => ipcRenderer.invoke('window-get-bounds'),
   getCursorScreenPoint: () => ipcRenderer.invoke('window-get-cursor-screen-point'),
   setFullscreen: (enabled) => ipcRenderer.invoke('window-set-fullscreen', enabled),
   isFullscreen: () => ipcRenderer.invoke('window-is-fullscreen'),
-  showNotification: (title, body) => {
-    if (Notification.isSupported()) {
-      new Notification(title, { body });
-    }
-  },
   mediaEngine: {
-    getStatus: () => ipcRenderer.invoke('media-engine-get-status'),
     start: () => ipcRenderer.invoke('media-engine-start'),
-    stop: () => ipcRenderer.invoke('media-engine-stop'),
     audio: mediaEngineAudio,
     listCaptureTargets: () => ipcRenderer.invoke('media-engine-list-capture-targets'),
     startHostSession: (options) => ipcRenderer.invoke('media-engine-start-host-session', options),
     stopHostSession: () => ipcRenderer.invoke('media-engine-stop-host-session'),
     prepareObsIngest: (options) => ipcRenderer.invoke('media-engine-prepare-obs-ingest', options),
-    getAudioBackendStatus: () => ipcRenderer.invoke('media-engine-get-audio-backend-status'),
     startAudioSession: (options) => ipcRenderer.invoke('media-engine-start-audio-session', options),
     stopAudioSession: (options) => ipcRenderer.invoke('media-engine-stop-audio-session', options),
     createPeer: (options) => ipcRenderer.invoke('media-engine-create-peer', options),
@@ -67,7 +55,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
     attachSurface: (options) => ipcRenderer.invoke('media-engine-attach-surface', options),
     updateSurface: (options) => ipcRenderer.invoke('media-engine-update-surface', options),
     detachSurface: (options) => ipcRenderer.invoke('media-engine-detach-surface', options),
-    setViewerPlaybackMode: (options) => ipcRenderer.invoke('media-engine-set-viewer-playback-mode', options),
     setViewerAudioDelay: (options) => ipcRenderer.invoke('media-engine-set-viewer-audio-delay', options),
     setViewerVolume: (volume) => ipcRenderer.invoke('media-engine-set-viewer-volume', volume),
     getViewerVolume: () => ipcRenderer.invoke('media-engine-get-viewer-volume'),
@@ -83,11 +70,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
       const listener = (_event, data) => callback(data);
       ipcRenderer.on('media-engine-event', listener);
       return () => ipcRenderer.off('media-engine-event', listener);
-    },
-    onNativeAudioData: (callback) => {
-      const listener = (_event, data) => callback(data);
-      ipcRenderer.on('media-engine-native-audio-data', listener);
-      return () => ipcRenderer.off('media-engine-native-audio-data', listener);
     }
   },
   onMaximizedChange: (callback) => {
@@ -104,6 +86,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const listener = (_event, bounds) => callback(bounds);
     ipcRenderer.on('window-bounds-changed', listener);
     return () => ipcRenderer.off('window-bounds-changed', listener);
+  },
+  onCloseConfirmation: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('request-close-confirmation', listener);
+    return () => ipcRenderer.off('request-close-confirmation', listener);
   },
   checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
   downloadUpdate: () => ipcRenderer.invoke('download-update'),
@@ -127,33 +114,8 @@ function createMediaEngineAudioApi() {
   return {
     isPlatformSupported: () => ipcRenderer.invoke('media-engine-audio-is-platform-supported'),
     checkPermission: () => ipcRenderer.invoke('media-engine-audio-check-permission'),
-    requestPermission: () => ipcRenderer.invoke('media-engine-audio-request-permission'),
-    getProcessList: () => ipcRenderer.invoke('media-engine-audio-get-process-list'),
-    getBackendStatus: () => ipcRenderer.invoke('media-engine-audio-get-backend-status'),
-    startCapture: (pid) => ipcRenderer.invoke('media-engine-audio-start-capture', pid),
-    stopCapture: () => ipcRenderer.invoke('media-engine-audio-stop-capture'),
-    isCapturing: () => ipcRenderer.invoke('media-engine-audio-is-capturing'),
-    on: (eventName, callback) => {
-      const channel = getMediaEngineAudioEventChannel(eventName);
-      const listener = (_event, ...args) => callback(...args);
-      ipcRenderer.on(channel, listener);
-      return () => {
-        ipcRenderer.off(channel, listener);
-      };
-    }
+    getProcessList: () => ipcRenderer.invoke('media-engine-audio-get-process-list')
   };
-}
-
-function getMediaEngineAudioEventChannel(eventName) {
-  if (eventName === 'audio-data') {
-    return 'media-engine-audio-data';
-  }
-
-  if (eventName === 'capturing') {
-    return 'media-engine-audio-capturing';
-  }
-
-  throw new Error(`Unsupported media engine audio event: ${eventName}`);
 }
 
 function normalizeBaseUrl(baseUrl) {

@@ -121,6 +121,8 @@ function main() {
     'server/server-core.js',
     'server/index.js',
     'scripts/prepare-server-release.js',
+    'scripts/publish-github-release.js',
+    'scripts/check-server-docker-context.js',
     'scripts/test-server-core.js',
     'scripts/release-check.js'
   ];
@@ -136,6 +138,8 @@ function main() {
   run('npm', ['run', 'check:logging']);
   run('npm', ['run', 'verify:media-agent']);
   run('npm', ['audit', '--omit=dev']);
+  run('npm', ['--prefix', 'server', 'audit', '--omit=dev']);
+  run('node', ['scripts/check-server-docker-context.js']);
 
   validateReleaseArtifacts();
   validateUnreleasedSection();

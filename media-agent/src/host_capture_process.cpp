@@ -1,11 +1,9 @@
 #include "host_capture_process.h"
 
-#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <limits>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -130,7 +128,6 @@ std::string build_host_capture_manifest_json(
   payload
     << "{\"sessionId\":\"" << vds::media_agent::json_escape(state.session_id) << "\""
     << ",\"container\":\"" << vds::media_agent::json_escape(state.container) << "\""
-    << ",\"outputMode\":\"" << vds::media_agent::json_escape(state.output_mode) << "\""
     << ",\"preserveOutput\":" << (state.preserve_output ? "true" : "false")
     << ",\"running\":" << (state.running ? "true" : "false")
     << ",\"processId\":" << state.process_id
@@ -161,7 +158,6 @@ HostCaptureProcessState build_host_capture_process_state() {
   HostCaptureProcessState state;
   state.enabled = is_native_host_capture_process_enabled();
   state.preserve_output = should_preserve_host_capture_output();
-  state.output_mode = state.enabled ? "mpegts-session-artifact" : "disabled";
   if (state.enabled) {
     if (initialize_host_capture_artifact_paths(state)) {
       state.reason = "host-capture-process-idle";
@@ -181,37 +177,12 @@ std::string host_capture_process_json(HostCaptureProcessState& state) {
   std::ostringstream payload;
   payload
     << "{\"enabled\":" << (state.enabled ? "true" : "false")
-    << ",\"launchAttempted\":" << (state.launch_attempted ? "true" : "false")
     << ",\"running\":" << (state.running ? "true" : "false")
-    << ",\"preserveOutput\":" << (state.preserve_output ? "true" : "false")
     << ",\"processId\":" << state.process_id
     << ",\"outputBytes\":" << state.output_bytes
-    << ",\"lastExitCode\":";
-
-  if (state.last_exit_code == std::numeric_limits<int>::min()) {
-    payload << "null";
-  } else {
-    payload << state.last_exit_code;
-  }
-
-  payload
-    << ",\"implementation\":\"" << vds::media_agent::json_escape(state.implementation) << "\""
-    << ",\"outputMode\":\"" << vds::media_agent::json_escape(state.output_mode) << "\""
-    << ",\"container\":\"" << vds::media_agent::json_escape(state.container) << "\""
-    << ",\"sessionId\":\"" << vds::media_agent::json_escape(state.session_id) << "\""
-    << ",\"outputDirectory\":\"" << vds::media_agent::json_escape(state.output_directory) << "\""
-    << ",\"outputPath\":\"" << vds::media_agent::json_escape(state.output_path) << "\""
-    << ",\"manifestPath\":\"" << vds::media_agent::json_escape(state.manifest_path) << "\""
     << ",\"reason\":\"" << vds::media_agent::json_escape(state.reason) << "\""
     << ",\"lastError\":\"" << vds::media_agent::json_escape(state.last_error) << "\""
-    << ",\"commandLine\":\"" << vds::media_agent::json_escape(state.command_line) << "\""
-    << ",\"startedAtMs\":";
-  vds::media_agent::append_nullable_int64(payload, state.started_at_unix_ms);
-  payload << ",\"updatedAtMs\":";
-  vds::media_agent::append_nullable_int64(payload, state.updated_at_unix_ms);
-  payload << ",\"stoppedAtMs\":";
-  vds::media_agent::append_nullable_int64(payload, state.stopped_at_unix_ms);
-  payload << "}";
+    << "}";
   return payload.str();
 }
 
@@ -241,18 +212,14 @@ HostCaptureArtifactProbe probe_host_capture_artifact(
   const HostCaptureProcessState& host_capture_process,
   HostCaptureArtifactProbe previous_probe) {
   HostCaptureArtifactProbe probe = previous_probe;
-  probe.media_path = host_capture_process.output_path;
-  probe.last_probe_at_unix_ms = vds::media_agent::current_time_millis();
 
 #ifndef _WIN32
-  probe.available = false;
   probe.ready = false;
   probe.reason = "artifact-probe-unsupported-platform";
   probe.last_error = "Host capture artifact probing is only implemented on Windows.";
   return probe;
 #else
   if (host_capture_process.output_path.empty()) {
-    probe.available = false;
     probe.ready = false;
     probe.reason = "artifact-path-missing";
     probe.last_error = "Host capture artifact path is not available.";
@@ -261,7 +228,6 @@ HostCaptureArtifactProbe probe_host_capture_artifact(
 
   try {
     if (!fs::exists(host_capture_process.output_path)) {
-      probe.available = false;
       probe.ready = false;
       probe.file_size_bytes = 0;
       probe.reason = host_capture_process.running ? "artifact-pending" : "artifact-file-missing";
@@ -272,9 +238,7 @@ HostCaptureArtifactProbe probe_host_capture_artifact(
     }
 
     probe.file_size_bytes = static_cast<unsigned long long>(fs::file_size(host_capture_process.output_path));
-    probe.available = probe.file_size_bytes > 0;
   } catch (...) {
-    probe.available = false;
     probe.ready = false;
     probe.reason = "artifact-file-stat-failed";
     probe.last_error = "Failed to read host capture artifact file metadata.";
@@ -289,7 +253,7 @@ HostCaptureArtifactProbe probe_host_capture_artifact(
     return probe;
   }
 
-  if (!probe.available) {
+  if (probe.file_size_bytes == 0) {
     probe.ready = false;
     probe.reason = host_capture_process.running ? "artifact-growing" : "artifact-empty";
     probe.last_error = host_capture_process.running
@@ -300,7 +264,7 @@ HostCaptureArtifactProbe probe_host_capture_artifact(
 
   const std::string command =
     vds::media_agent::quote_command_path(ffprobe_path) +
-    " -v error -select_streams v:0 -show_entries stream=codec_name,width,height,avg_frame_rate,pix_fmt -show_entries format=format_name,size"
+    " -v error -select_streams v:0 -show_entries stream=codec_name,width,height -show_entries format=size"
     " -of default=noprint_wrappers=1:nokey=0 " + vds::media_agent::quote_command_path(host_capture_process.output_path) +
     " 2>&1";
 
@@ -330,26 +294,8 @@ HostCaptureArtifactProbe probe_host_capture_artifact(
       try { probe.width = std::stoi(value); } catch (...) {}
     } else if (key == "height") {
       try { probe.height = std::stoi(value); } catch (...) {}
-    } else if (key == "pix_fmt") {
-      probe.pixel_format = value;
-    } else if (key == "format_name") {
-      probe.format_name = value;
     } else if (key == "size") {
       try { probe.file_size_bytes = static_cast<unsigned long long>(std::stoull(value)); } catch (...) {}
-    } else if (key == "avg_frame_rate") {
-      const std::size_t slash_index = value.find('/');
-      try {
-        if (slash_index != std::string::npos) {
-          const double numerator = std::stod(value.substr(0, slash_index));
-          const double denominator = std::stod(value.substr(slash_index + 1));
-          if (denominator > 0.0) {
-            probe.frame_rate = numerator / denominator;
-          }
-        } else {
-          probe.frame_rate = std::stod(value);
-        }
-      } catch (...) {
-      }
     }
   }
 
@@ -399,7 +345,6 @@ void refresh_host_capture_process_state(HostCaptureProcessState& state) {
   }
 
   state.running = false;
-  state.last_exit_code = static_cast<int>(exit_code);
   state.reason = "host-capture-process-exited";
   state.stopped_at_unix_ms = vds::media_agent::current_time_millis();
   close_host_capture_process_handles(state);
@@ -472,15 +417,12 @@ HostCaptureProcessState start_host_capture_process(
   }
 
   if (plan.capture_backend == "wgc") {
-    state.launch_attempted = true;
     state.running = false;
     state.reason = "host-capture-process-skipped-for-wgc";
     state.last_error.clear();
     state.command_line.clear();
     return finish(state);
   }
-
-  state.launch_attempted = true;
 
   if (!plan.ready || !plan.validated || state.command_line.empty()) {
     state.reason = "host-capture-process-plan-not-ready";

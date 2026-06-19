@@ -11,6 +11,7 @@
 #include <iostream>
 #include <string>
 
+#include "agent_runtime.h"
 #include "agent_events.h"
 #include "agent_lifecycle.h"
 #include "agent_status_json.h"
@@ -56,7 +57,7 @@ void run_agent_rpc_loop(AgentRuntimeState& runtime_state) {
     }
 
     if (method == "ping") {
-      write_json_line(build_result_payload(id, R"json({"ok":true,"name":"vds-media-agent","implementation":"stub"})json"));
+      write_json_line(build_result_payload(id, R"json({"ok":true,"name":"vds-media-agent","implementation":"native-media-agent"})json"));
       continue;
     }
 
@@ -72,11 +73,6 @@ void run_agent_rpc_loop(AgentRuntimeState& runtime_state) {
 
     if (method == "listCaptureTargets") {
       write_json_line(build_result_payload(id, "[]"));
-      continue;
-    }
-
-    if (method == "getAudioBackendStatus") {
-      write_command_result(id, get_audio_backend_status_result(runtime_state));
       continue;
     }
 
@@ -157,11 +153,6 @@ void run_agent_rpc_loop(AgentRuntimeState& runtime_state) {
       continue;
     }
 
-    if (method == "setViewerPlaybackMode") {
-      write_command_result(id, set_viewer_playback_mode_from_request(runtime_state, line));
-      continue;
-    }
-
     if (method == "setViewerAudioDelay") {
       write_command_result(id, set_viewer_audio_delay_from_request(runtime_state, line));
       continue;
@@ -177,6 +168,6 @@ void run_agent_rpc_loop(AgentRuntimeState& runtime_state) {
       continue;
     }
 
-    write_json_line(build_error_payload(id, "NOT_IMPLEMENTED", "Method not implemented in scaffold"));
+    write_json_line(build_error_payload(id, "NOT_IMPLEMENTED", "Method is not implemented by this media-agent build"));
   }
 }

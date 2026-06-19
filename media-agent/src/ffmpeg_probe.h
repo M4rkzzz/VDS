@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "agent_runtime.h"
+#include "process_runner.h"
 
 namespace vds::media_agent {
 

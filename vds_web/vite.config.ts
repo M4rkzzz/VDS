@@ -6,7 +6,6 @@ export default defineConfig({
   base: '/vds_web/',
   build: {
     outDir: path.resolve(__dirname, '../server/public/vds_web'),
-    emptyOutDir: true,
-    sourcemap: true
+    emptyOutDir: true
   }
 });

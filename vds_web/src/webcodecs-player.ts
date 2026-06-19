@@ -8,7 +8,7 @@ type PlayerDiagnostics = {
   onVideoFrameInfo?: (info: VideoFrameDiagnostics) => void;
 };
 
-export type VideoFrameDiagnostics = {
+type VideoFrameDiagnostics = {
   codec: string;
   configuredCodec: string;
   canvasWidth: number;
@@ -314,7 +314,6 @@ export class WebCodecsVideoPlayer {
   }
 }
 
-export const WebCodecsH264Player = WebCodecsVideoPlayer;
 
 function looksLikeAnnexB(payload: ArrayBuffer): boolean {
   const bytes = new Uint8Array(payload);

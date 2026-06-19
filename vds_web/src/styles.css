@@ -230,8 +230,7 @@ h1 {
 }
 
 .btn-primary,
-.btn-secondary,
-.btn-danger {
+.btn-secondary {
   background: #ffffff;
   color: #080808;
 }

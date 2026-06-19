@@ -1,0 +1,28 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "desktop/main.js",
+    "desktop/preload.js",
+    "desktop/window-metadata-helper.js",
+    "server/public/app.js",
+    "server/public/app-native-overrides.js",
+    "vds_web/src/main.ts",
+    "vds_web/src/vite-env.d.ts",
+    "scripts/test-vds-web-protocol.js"
+  ],
+  "project": [
+    "desktop/**/*.js",
+    "scripts/**/*.js",
+    "server/**/*.js",
+    "vds_web/src/**/*.ts",
+    "vds_web/vite.config.ts"
+  ],
+  "ignoreBinaries": [
+    "powershell"
+  ],
+  "ignoreIssues": {
+    "vds_web/src/datachannel-protocol.ts": [
+      "exports"
+    ]
+  }
+}

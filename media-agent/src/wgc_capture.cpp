@@ -25,6 +25,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -44,6 +45,17 @@ struct FrameEventState {
   bool frame_arrived = false;
   bool closed = false;
 };
+
+std::mutex& wgc_source_creation_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::string format_hresult_error(const char* prefix, const winrt::hresult_error& error) {
+  std::ostringstream stream;
+  stream << prefix << ":0x" << std::hex << static_cast<unsigned int>(error.code()) << ":" << winrt::to_string(error.message());
+  return stream.str();
+}
 
 bool parse_unsigned_index(const std::string& value, unsigned int* parsed) {
   try {
@@ -720,9 +732,33 @@ std::shared_ptr<WgcFrameSource> create_wgc_frame_source(
   const WgcFrameSourceConfig& config,
   std::string* error
 ) {
+#ifdef _WIN32
+  std::lock_guard<std::mutex> creation_lock(wgc_source_creation_mutex());
+#endif
   auto impl = std::make_unique<WgcFrameSource::Impl>(config);
-  if (!impl->initialize(error)) {
-    return nullptr;
+  try {
+    if (!impl->initialize(error)) {
+      return nullptr;
+    }
+    return std::shared_ptr<WgcFrameSource>(new WgcFrameSource(std::move(impl)));
+#ifdef _WIN32
+  } catch (const winrt::hresult_error& ex) {
+    if (error) {
+      *error = format_hresult_error("wgc-source-create-hresult-error", ex);
+    }
+#endif
+  } catch (const std::exception& ex) {
+    if (error) {
+      *error = std::string("wgc-source-create-exception:") + ex.what();
+    }
+  } catch (...) {
+    if (error) {
+      *error = "wgc-source-create-unknown-exception";
+    }
   }
-  return std::shared_ptr<WgcFrameSource>(new WgcFrameSource(std::move(impl)));
+  try {
+    impl->close();
+  } catch (...) {
+  }
+  return nullptr;
 }

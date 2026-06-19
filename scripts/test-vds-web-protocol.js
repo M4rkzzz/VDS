@@ -91,6 +91,105 @@ function testDataChannelFrameRejection() {
   );
 }
 
+function testDataChannelRejectsInvalidChunkSize() {
+  const protocol = loadTsModule('vds_web/src/datachannel-protocol.ts');
+  const reassembler = new protocol.EncodedFrameReassembler();
+  const firstChunk = new Uint8Array(protocol.DATA_CHANNEL_CHUNK_PAYLOAD_BYTES - 1);
+  const encoded = protocol.encodeFrameMessage({
+    protocol: protocol.ENCODED_MEDIA_PROTOCOL,
+    type: 'chunk',
+    streamType: 'video',
+    codec: 'h264',
+    payloadFormat: 'annexb',
+    timestampUs: 123,
+    sequence: 1,
+    keyframe: true,
+    config: true,
+    frameId: 'invalid-short-first-chunk',
+    chunkIndex: 0,
+    chunkCount: 2,
+    framePayloadBytes: protocol.DATA_CHANNEL_CHUNK_PAYLOAD_BYTES + 1
+  }, firstChunk.buffer);
+
+  assert.throws(
+    () => reassembler.push(encoded),
+    /datachannel-chunk-invalid-header/
+  );
+}
+
+function testDataChannelRejectsOversizedChunkPayload() {
+  const protocol = loadTsModule('vds_web/src/datachannel-protocol.ts');
+  const reassembler = new protocol.EncodedFrameReassembler();
+  const oversizedChunk = new Uint8Array(protocol.DATA_CHANNEL_CHUNK_PAYLOAD_BYTES + 1);
+  const encoded = protocol.encodeFrameMessage({
+    protocol: protocol.ENCODED_MEDIA_PROTOCOL,
+    type: 'chunk',
+    streamType: 'video',
+    codec: 'h264',
+    payloadFormat: 'annexb',
+    timestampUs: 124,
+    sequence: 2,
+    keyframe: true,
+    config: true,
+    frameId: 'invalid-oversized-chunk',
+    chunkIndex: 0,
+    chunkCount: 1,
+    framePayloadBytes: oversizedChunk.byteLength
+  }, oversizedChunk.buffer);
+
+  assert.throws(
+    () => reassembler.push(encoded),
+    /datachannel-chunk-invalid-header/
+  );
+}
+
+function testDataChannelIgnoresDuplicateChunk() {
+  const protocol = loadTsModule('vds_web/src/datachannel-protocol.ts');
+  const reassembler = new protocol.EncodedFrameReassembler();
+  const payload = new Uint8Array(protocol.DATA_CHANNEL_CHUNK_PAYLOAD_BYTES + 5);
+  for (let index = 0; index < payload.length; index += 1) {
+    payload[index] = index % 251;
+  }
+  const messages = protocol.encodeFrameMessages({
+    protocol: protocol.ENCODED_MEDIA_PROTOCOL,
+    type: 'frame',
+    streamType: 'video',
+    codec: 'h264',
+    payloadFormat: 'annexb',
+    timestampUs: 125,
+    sequence: 3,
+    keyframe: true,
+    config: true
+  }, payload.buffer);
+
+  assert.strictEqual(reassembler.push(messages[0]), null);
+  assert.strictEqual(reassembler.push(messages[0]), null);
+  const decoded = reassembler.push(messages[1]);
+  assert.ok(decoded);
+  assert.deepStrictEqual(Array.from(new Uint8Array(decoded.payload)), Array.from(payload));
+}
+
+function testDataChannelReassemblerClearDropsPendingChunks() {
+  const protocol = loadTsModule('vds_web/src/datachannel-protocol.ts');
+  const reassembler = new protocol.EncodedFrameReassembler();
+  const payload = new Uint8Array(protocol.DATA_CHANNEL_CHUNK_PAYLOAD_BYTES + 5);
+  const messages = protocol.encodeFrameMessages({
+    protocol: protocol.ENCODED_MEDIA_PROTOCOL,
+    type: 'frame',
+    streamType: 'video',
+    codec: 'h264',
+    payloadFormat: 'annexb',
+    timestampUs: 126,
+    sequence: 4,
+    keyframe: true,
+    config: true
+  }, payload.buffer);
+
+  assert.strictEqual(reassembler.push(messages[0]), null);
+  reassembler.clear();
+  assert.strictEqual(reassembler.push(messages[1]), null);
+}
+
 function testDataChannelFrameChunking() {
   const protocol = loadTsModule('vds_web/src/datachannel-protocol.ts');
   const payload = new Uint8Array(protocol.DATA_CHANNEL_CHUNK_PAYLOAD_BYTES * 2 + 17);
@@ -182,7 +281,7 @@ async function testWebCodecsPlayerDecodePath() {
 
   try {
     const playerModule = loadTsModule('vds_web/src/webcodecs-player.ts');
-    const player = new playerModule.WebCodecsH264Player(fakeCanvas, {
+    const player = new playerModule.WebCodecsVideoPlayer(fakeCanvas, {
       onState: (state) => states.push(state),
       onDecodedFrame: () => renderedFrames.push('decoded'),
       onDroppedFrame: (reason) => drops.push(reason),
@@ -281,7 +380,7 @@ async function testWebCodecsHevc2kLevelSelection() {
 
   try {
     const playerModule = loadTsModule('vds_web/src/webcodecs-player.ts');
-    const player = new playerModule.WebCodecsH264Player(fakeCanvas, {
+    const player = new playerModule.WebCodecsVideoPlayer(fakeCanvas, {
       onState: (state) => states.push(state),
       onDecodedFrame: () => {},
       onDroppedFrame: (reason) => drops.push(reason),
@@ -368,7 +467,7 @@ async function testWebCodecsHevc1080pCodedDimensionAlignment() {
 
   try {
     const playerModule = loadTsModule('vds_web/src/webcodecs-player.ts');
-    const player = new playerModule.WebCodecsH264Player(fakeCanvas, {
+    const player = new playerModule.WebCodecsVideoPlayer(fakeCanvas, {
       onState: () => {},
       onDecodedFrame: () => {},
       onDroppedFrame: () => {},
@@ -454,7 +553,7 @@ async function testWebCodecsHevcUsesDecodedSizeWhenStreamIsSmallerThanManifest()
 
   try {
     const playerModule = loadTsModule('vds_web/src/webcodecs-player.ts');
-    const player = new playerModule.WebCodecsH264Player(fakeCanvas, {
+    const player = new playerModule.WebCodecsVideoPlayer(fakeCanvas, {
       onState: () => {},
       onDecodedFrame: () => {},
       onDroppedFrame: () => {},
@@ -625,6 +724,10 @@ async function testWebCodecsAudioDecodePath() {
 async function main() {
   testDataChannelFrameEnvelope();
   testDataChannelFrameRejection();
+  testDataChannelRejectsInvalidChunkSize();
+  testDataChannelRejectsOversizedChunkPayload();
+  testDataChannelIgnoresDuplicateChunk();
+  testDataChannelReassemblerClearDropsPendingChunks();
   testDataChannelFrameChunking();
   await testWebCodecsPlayerDecodePath();
   await testWebCodecsHevc2kLevelSelection();

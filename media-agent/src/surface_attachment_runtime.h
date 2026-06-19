@@ -20,17 +20,11 @@ bool update_surface_attachment_layout(
   std::string* error
 );
 bool start_peer_video_surface_attachment(
-  const FfmpegProbeResult& ffmpeg,
   PeerState::PeerVideoReceiverRuntime& runtime,
   std::string* error
 );
 bool restart_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& runtime, std::string* error);
 void stop_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& runtime, const std::string& reason);
-bool update_peer_video_surface_layout(
-  PeerState::PeerVideoReceiverRuntime& runtime,
-  const NativeEmbeddedSurfaceLayout& layout,
-  std::string* error
-);
 bool is_peer_video_surface_shutdown_reason(const std::string& reason);
 void sync_surface_attachment_from_peer_runtime(
   SurfaceAttachmentState& state,

@@ -1,6 +1,12 @@
 #pragma once
 
-#include "agent_runtime.h"
+#include <string>
+
+struct CommandResult {
+  bool launched = false;
+  int exit_code = -1;
+  std::string output;
+};
 
 namespace vds::media_agent {
 

@@ -244,7 +244,6 @@ HostCapturePlan build_host_capture_plan(
   const FfmpegProbeResult& ffmpeg,
   const WgcCaptureProbe& wgc_capture,
   const HostPipelineState& pipeline,
-  const HostCaptureProcessState& process_state,
   const std::string& capture_kind,
   const std::string& capture_state,
   const std::string& capture_title,
@@ -257,9 +256,7 @@ HostCapturePlan build_host_capture_plan(
   HostCapturePlan plan;
   plan.capture_kind = capture_kind.empty() ? "window" : vds::media_agent::to_lower_copy(capture_kind);
   plan.capture_state = capture_state.empty() ? "normal" : vds::media_agent::to_lower_copy(capture_state);
-  plan.preferred_capture_backend = "wgc";
   plan.capture_backend = "wgc";
-  plan.capture_fallback_reason.clear();
   plan.capture_handle = vds::media_agent::trim_copy(capture_hwnd);
   if (plan.capture_handle.empty()) {
     plan.capture_handle = vds::media_agent::resolve_window_handle_from_title(capture_title);
@@ -306,7 +303,6 @@ HostCapturePlan build_host_capture_plan(
     if (wgc_capture.display_capture_supported) {
       plan.input_format = "rawvideo";
       plan.input_target = "wgc-display:" + plan.capture_display_id;
-      plan.implementation = "windows-graphics-capture";
       plan.reason = "display-wgc-capture-planned";
       plan.ready = true;
       return plan;
@@ -318,7 +314,6 @@ HostCapturePlan build_host_capture_plan(
   } else if (can_use_wgc_window) {
     plan.input_format = "rawvideo";
     plan.input_target = "wgc-window:" + plan.capture_handle;
-    plan.implementation = "windows-graphics-capture";
     plan.reason = plan.capture_state == "minimized"
       ? "minimized-window-wgc-capture-planned"
       : "window-wgc-capture-planned";
@@ -335,7 +330,6 @@ HostCapturePlan build_host_capture_plan(
   }
 
   plan.ready = true;
-  plan.command_preview = build_ffmpeg_host_capture_command(ffmpeg, pipeline, plan, process_state);
   return plan;
 }
 
@@ -383,11 +377,6 @@ HostCapturePlan validate_host_capture_plan(const FfmpegProbeResult& ffmpeg, Host
     plan.input_height = resolved_height;
     plan.validated = true;
     plan.validation_reason = "wgc-capture-dimensions-resolved";
-    plan.command_preview =
-      (is_display_like
-        ? "wgc-display:" + (plan.capture_display_id.empty() ? "0" : plan.capture_display_id)
-        : "wgc-window:" + plan.capture_handle) +
-      " -> ffmpeg-stdin";
     plan.last_error.clear();
     emit_host_capture_plan_breadcrumb(
       "validateHostCapturePlan:wgc:after-resolve-dimensions size=" +

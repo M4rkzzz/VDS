@@ -151,9 +151,6 @@ void consume_remote_peer_video_frame(
       return;
     }
     runtime.codec_path = vds::media_agent::normalize_video_codec(codec);
-    runtime.remote_frames_received += 1;
-    runtime.remote_bytes_received += static_cast<unsigned long long>(frame.size());
-    runtime.last_remote_frame_at_unix_ms = vds::media_agent::current_time_millis();
     codec_path = runtime.codec_path;
 
     if (codec_path == "h264" || codec_path == "h265") {
@@ -264,7 +261,6 @@ void consume_remote_peer_video_frame(
       &warning_message
     );
     std::lock_guard<std::mutex> lock(runtime.mutex);
-    runtime.scheduled_video_units += 1;
     if (submitted) {
       runtime.submitted_video_units += 1;
       runtime.reason = "peer-video-passthrough-submitted";
