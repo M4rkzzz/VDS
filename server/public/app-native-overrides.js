@@ -122,6 +122,7 @@
   let viewerFullscreenCursorPollTimerId = 0;
   let viewerFullscreenVolumePopoverHideTimerId = 0;
   let viewerFullscreenVolumeDragging = false;
+  let fullscreenTransitionPromise = null;
   let lastViewerCursorPoint = null;
   let lastNonZeroViewerVolume = 100;
   const recoverableSurfaceSyncWarnings = new Map();
@@ -4583,14 +4584,29 @@
   }
 
   async function handleFullscreenButtonClick() {
-    const isFullscreen = await electronApi.isFullscreen();
-    const nextState = await electronApi.setFullscreen(!isFullscreen);
-    updateFullscreenUi(nextState);
+    if (fullscreenTransitionPromise) {
+      return fullscreenTransitionPromise;
+    }
+    fullscreenTransitionPromise = (async () => {
+      const isFullscreen = await electronApi.isFullscreen();
+      const nextState = await electronApi.setFullscreen(!isFullscreen);
+      updateFullscreenUi(nextState);
+    })();
+    try {
+      await fullscreenTransitionPromise;
+    } finally {
+      fullscreenTransitionPromise = null;
+    }
   }
 
   async function handleFullscreenEscapeKey(event) {
     if (!event || event.key !== 'Escape' || !electronApi || typeof electronApi.isFullscreen !== 'function') {
       return;
+    }
+    if (fullscreenTransitionPromise) {
+      event.preventDefault();
+      event.stopPropagation();
+      return fullscreenTransitionPromise;
     }
 
     const isFullscreen = await electronApi.isFullscreen();
@@ -4600,8 +4616,15 @@
 
     event.preventDefault();
     event.stopPropagation();
-    const nextState = await electronApi.setFullscreen(false);
-    updateFullscreenUi(nextState);
+    fullscreenTransitionPromise = electronApi.setFullscreen(false).then((nextState) => {
+      updateFullscreenUi(nextState);
+      return nextState;
+    });
+    try {
+      await fullscreenTransitionPromise;
+    } finally {
+      fullscreenTransitionPromise = null;
+    }
   }
 
   async function refreshViewerVolumeUi() {

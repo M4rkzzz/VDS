@@ -2564,3 +2564,12 @@
 - 建议：记录操作前音量，IPC 失败时恢复 UI，再把错误交给现有可恢复日志路径处理。
 - 修改意见：按建议修改
 - 处理结果：已处理。`setViewerVolumeValue()` 现在保存 previous volume，`setViewerVolume` 失败时调用 `applyViewerVolumeUi(previousVolume)` 回滚 UI，然后继续抛出错误给现有 `viewer-volume:*` recoverable warning 处理。已通过 `node --check server/public/app-native-overrides.js`。
+
+### ROBUSTNESS-P2-003 全屏按钮和 Escape 并发可导致 fullscreen 状态反跳
+
+- 位置：`server/public/app-native-overrides.js:4585`、`server/public/app-native-overrides.js:4591`
+- 问题：host/viewer 全屏按钮和 Escape 都会异步调用 `electronApi.isFullscreen()` 与 `setFullscreen()`，但没有 in-flight gate。用户连点全屏按钮、进入全屏同时按 Escape、或按钮与 Escape 同时触发时，多条 `setFullscreen` promise 会交错返回。
+- 影响：UI class、native surface resync 和主进程全屏状态可能短暂反跳，表现为按钮状态不准、surface 位置闪动或退出全屏后又进入全屏。
+- 建议：全屏切换使用单一 transition promise；已有切换进行中时，按钮复用同一 promise，Escape 阻止事件继续传播并等待当前切换完成。
+- 修改意见：按建议修改
+- 处理结果：已处理。`app-native-overrides.js` 新增 `fullscreenTransitionPromise`；全屏按钮和 Escape 均串行化 `setFullscreen` 调用，完成后统一清空 promise 并保持现有 `updateFullscreenUi()`/surface resync 流程。
