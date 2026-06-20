@@ -2528,3 +2528,21 @@
 - 建议：native host start 增加 generation token；每次 start 记录 generation，stop 或新 start 递增 generation。`startHostSession` 返回后、preview attach 后、OBS start 返回后都检查 generation/stop 状态，失效则主动 stopHostSession/cleanup 并抛出可恢复 superseded 错误。
 - 修改意见：按建议修改
 - 处理结果：已处理。新增 `nativeHostStartGeneration`；native/OBS start 入口递增并保存 generation，`stopScreenShare()` 递增使未完成 start 失效。`startHostSession` 返回后和 preview attach 后检查 generation 与 `stopScreenShareInFlight`，失效时停止 host session 或执行失败清理，并阻止后续 UI/manifest/create-room 回写。已通过 `node --check server/public/app-native-overrides.js`。
+
+### ROBUSTNESS-P1-007 捕获目标获取失败后开始共享 pending 未释放
+
+- 位置：`server/public/app.js:3347`、`server/public/app.js:3374`
+- 问题：`confirmQualitySelection()` 会设置 `shareStartInFlight` 后调用 `showSourceSelection()`；如果 Electron runtime 不可用、权限/枚举失败、没有捕获目标，`showSourceSelection()` 只显示错误并释放 `sourceSelectionInFlight`，但不释放 `shareStartInFlight`。
+- 影响：用户遇到权限拒绝、窗口刚关闭、目标枚举失败后，再次点击开始共享可能被 pending 锁直接返回，形成“开始按钮可见但无反应”的假死。
+- 建议：捕获目标获取失败应和源选择取消/开始失败一样调用 `resetShareStartPendingUi()`，把开始、确认、刷新按钮全部恢复到可操作状态。
+- 修改意见：按建议修改
+- 处理结果：已处理。`showSourceSelection()` catch 分支现在显示错误后调用 `resetShareStartPendingUi()`，确保无捕获目标、权限拒绝或 runtime 失败后可以立即再次尝试开始共享。已通过 `node --check server/public/app.js`。
+
+### ROBUSTNESS-P2-001 刷新捕获源失败可能残留旋转动画
+
+- 位置：`server/public/app.js:3384`
+- 问题：`refreshSources()` 在 try 成功末尾和 catch 分支分别清理按钮动画，未来新增提前返回、DOM 按钮缺失或中间异常时容易漏掉清理。
+- 影响：用户反复刷新捕获源或刷新过程中捕获目标消失时，刷新按钮可能持续旋转，误导用户以为仍在加载。
+- 建议：刷新动画应在函数入口统一设置，并在 `finally` 中无条件清理；按钮缺失时也要安全跳过。
+- 修改意见：按建议修改
+- 处理结果：已处理。`refreshSources()` 现在提前保存按钮引用，设置动画前判空，并在 `finally` 中清理动画，成功、失败和异常路径一致。已通过 `node --check server/public/app.js`。

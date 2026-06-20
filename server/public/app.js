@@ -3372,6 +3372,7 @@ async function showSourceSelection() {
   } catch (error) {
     debugLog('video', 'Error loading sources:', error && error.message ? error.message : String(error));
     showError('Failed to list capture targets: ' + error.message);
+    resetShareStartPendingUi();
   } finally {
     sourceSelectionInFlight = false;
     if (elements.btnConfirmQuality) {
@@ -3382,10 +3383,12 @@ async function showSourceSelection() {
 
 // 刷新屏幕源列表
 async function refreshSources() {
+  const btn = elements.btnRefreshSources;
   try {
     debugLog('video', 'Refreshing source list...');
-    const btn = elements.btnRefreshSources;
-    btn.style.animation = 'spin 1s linear infinite';
+    if (btn) {
+      btn.style.animation = 'spin 1s linear infinite';
+    }
 
     let sources = [];
 
@@ -3399,12 +3402,13 @@ async function refreshSources() {
     } else {
       showSourceModal(sources);
     }
-
-    btn.style.animation = '';
   } catch (error) {
     debugLog('video', 'Error refreshing sources:', error && error.message ? error.message : String(error));
     showError('刷新失败: ' + error.message);
-    elements.btnRefreshSources.style.animation = '';
+  } finally {
+    if (btn) {
+      btn.style.animation = '';
+    }
   }
 }
 
