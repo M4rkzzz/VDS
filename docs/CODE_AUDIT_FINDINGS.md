@@ -2492,3 +2492,21 @@
 - 建议：开始共享流程增加全局 pending gate，覆盖质量确认、OBS 启动、源选择确认、音频候选发现和 native start；pending 期间禁用确认/刷新/开始按钮，成功后由运行态按钮隐藏接管，失败/取消/停止时统一释放。
 - 修改意见：按建议修改
 - 处理结果：已处理。`server/public/app.js` 新增 `shareStartInFlight` 与 `resetShareStartPendingUi()`；`confirmQualitySelection()` 在进入 OBS/source 流程前加锁并禁用开始/确认按钮；`confirmSourceAndShare()` 禁用源确认和刷新按钮，失败时释放；`cancelSourceSelection()` 和 `stopScreenShare()` 统一释放 pending 状态，避免重复启动 native session 或 create-room。已通过 `node --check server/public/app.js`。
+
+### ROBUSTNESS-P1-003 Web viewer host 断开后只报错不清理本地播放状态
+
+- 位置：`vds_web/src/main.ts:145`、`vds_web/src/main.ts:273`、`vds_web/src/main.ts:810`
+- 问题：Web viewer 收到 `host-disconnected` 或 WebSocket close 时只更新错误/状态，没有关闭 DataChannel、PeerConnection、WebCodecs 播放器、pending ICE、sessionStorage。用户看到的是最后一帧 freeze，UI 仍保留旧房间和链位，后续再次加入可能复用旧 session。
+- 影响：host 强关、刷新、网络断开后，Web viewer 容易停在假连接状态；用户再点加入或切换房间时可能被旧播放器、旧 pending candidate 和旧 sessionToken 干扰。
+- 建议：拆出本地 viewer session 清理函数；主动离开负责先发送 `leave-room`，host 断开和 signaling close 只做本地清理，确保 UI、播放器、peer、sessionStorage 一次性回到可重新加入状态。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `resetLocalViewerSession()` 统一关闭 audio/video player、DataChannel、上下游 PeerConnection、pending timers、sessionStorage 和 UI；`leaveCurrentRoom()` 发送 leave 后复用该清理；`host-disconnected` 和 signaling `closed` 在本地存在 session 时立即清理，不再等待后续超时。
+
+### ROBUSTNESS-P1-004 Web viewer 缺少 roomId 过滤会处理旧房间乱序信令
+
+- 位置：`vds_web/src/main.ts:247`、`vds_web/src/main.ts:324`、`vds_web/src/main.ts:390`
+- 问题：Web viewer 已有 attemptId 过滤，但没有在信令入口校验 `message.roomId` 是否仍属于当前 session。用户快速离开再加入另一个房间、host 删除房间并新建、网络延迟导致旧 offer/answer/candidate 晚到时，旧房间信令仍可能进入当前 peer 处理。
+- 影响：旧房间的 offer/candidate 可能污染新房间 PeerConnection，造成等待上游、ICE 失败、诊断误报或短暂连接到错误上游。
+- 建议：所有带 roomId 的信令消息在进入 switch 前先和当前 session roomId 比对；无 session 时允许 join/error 类初始化消息，已有 session 时忽略不匹配 roomId 并记录诊断原因。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `isSignalForCurrentSession()`，`handleSignal()` 入口先过滤带 roomId 且与当前 session 不一致的消息，并写入 `stale-room-signal-ignored` 诊断；现有 attemptId 过滤继续处理同房间内的重连乱序。已通过 `npm run check:vds-web`。

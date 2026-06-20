@@ -141,6 +141,9 @@ diagnostics.subscribe(renderDiagnostics);
 signaling.onMessage((message) => void handleSignal(message));
 signaling.onStatus((status) => {
   if (status === 'closed') {
+    if (session) {
+      resetLocalViewerSession();
+    }
     setStatus('连接已断开');
   } else if (status === 'error') {
     setError('WebSocket 连接失败。');
@@ -245,6 +248,10 @@ async function joinRoom(roomId: string): Promise<void> {
 }
 
 async function handleSignal(message: SignalMessage): Promise<void> {
+  if (!isSignalForCurrentSession(message)) {
+    diagnostics.update({ relayFailureReason: 'stale-room-signal-ignored' });
+    return;
+  }
   switch (message.type) {
     case 'room-joined':
     case 'session-resumed':
@@ -271,6 +278,7 @@ async function handleSignal(message: SignalMessage): Promise<void> {
       setStatus('下游观看端已离开');
       break;
     case 'host-disconnected':
+      resetLocalViewerSession();
       setError('主持端已断开。');
       break;
     case 'error':
@@ -283,6 +291,17 @@ async function handleSignal(message: SignalMessage): Promise<void> {
       setError(`${String(message.code || 'error')}: ${String(message.message || '')}`);
       break;
   }
+}
+
+function isSignalForCurrentSession(message: SignalMessage): boolean {
+  if (!session) {
+    return true;
+  }
+  const signalRoomId = typeof message.roomId === 'string' ? message.roomId.trim().toUpperCase() : '';
+  if (!signalRoomId) {
+    return true;
+  }
+  return signalRoomId === session.roomId.trim().toUpperCase();
 }
 
 function handleJoined(message: SignalMessage): void {
@@ -822,6 +841,11 @@ function leaveCurrentRoom(): void {
   } catch {
     // The server also has a disconnect grace path; this only accelerates normal tab closes.
   }
+  resetLocalViewerSession();
+}
+
+function resetLocalViewerSession(): void {
+  setJoinPending(false);
   downstreamDataChannelReady = false;
   downstreamCloseExpected = true;
   clearRelayHelloAckTimer();
