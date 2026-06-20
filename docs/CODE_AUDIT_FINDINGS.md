@@ -2474,3 +2474,21 @@
 - 建议：clientId 生成需要兼容 fallback：优先 `randomUUID`，其次 `getRandomValues` 手动生成 UUID v4，最后退到时间戳和 `Math.random` 的非安全唯一值。同时 Web 入口 HTML 不应缓存，避免浏览器继续加载旧 hashed bundle。
 - 修改意见：按建议修改
 - 处理结果：已处理。`getClientId()` 改为调用 `createClientUuid()`，兼容 `crypto.randomUUID` 缺失场景；`server-core` 对 `/`、`/vds_web`、`/vds_web/` 和 `/admin` 入口 HTML 设置 `Cache-Control: no-store`，避免入口页缓存导致继续引用旧 JS。已通过 `npm run check:vds-web`、`npm run test:vds-web`、`npm run build:vds-web`、`node --check server/server-core.js`、`npm run test:server`；构建后的 `server/public/vds_web/index.html` 已指向新 bundle `index-BBw8ihmu.js`，旧 `index-DZl3WkvK.js` 不在当前构建目录中。
+
+### ROBUSTNESS-P1-001 Web viewer 重复加入可打穿加入状态机
+
+- 位置：`vds_web/src/main.ts:149`、`vds_web/src/main.ts:202`、`vds_web/src/main.ts:1006`
+- 问题：Web viewer 的加入入口没有 `viewerJoinPending` 等价锁。用户双击“加入”、恢复旧 session 时同时手动加入、加入中刷新大厅再点房间，可能在同一 socket 或同一 clientId 上发出多次 `join-room`，旧响应和新响应交错后会覆盖 `session/upstreamPeerId/diagnostics`。
+- 影响：极端 UI 操作下 Web viewer 可能停在等待上游、重复建 peer、收到与当前房间不匹配的 offer/candidate，或者按钮状态与真实 room/session 不一致。
+- 建议：Web viewer 加入流程应有单一 pending gate；pending 期间禁用直连输入、加入按钮、刷新大厅、模式切换和房间列表按钮；成功、错误、manifest 不兼容、主动离开时释放 gate。
+- 修改意见：按建议修改
+- 处理结果：已处理。`vds_web/src/main.ts` 新增 `joinPending` 和 `setJoinPending()`，`joinRoom()` 在 pending 或已入房时直接返回，发起 join 前锁定 UI；`handleJoined()`、server `error`、manifest failure、join catch 和 `leaveCurrentRoom()` 会释放 pending。大厅房间按钮渲染和已存在按钮同步纳入 pending 禁用逻辑。
+
+### ROBUSTNESS-P1-002 Electron host 重复确认共享可并发启动 native session
+
+- 位置：`server/public/app.js:2428`、`server/public/app.js:3315`、`server/public/app.js:3702`
+- 问题：停止共享已有 `stopScreenShareInFlight`，但开始共享流程没有同级锁。用户可在质量弹窗、源选择弹窗中重复点击确认，或在 source/audio 异步发现阶段连续触发确认，导致多条 `startScreenShareWithSource/startHostSession/create-room` 并发执行。
+- 影响：极端操作下可能创建多个 native host session、重复发 `create-room`、按钮状态和实际房间状态错位，后续停止共享只清理其中一条路径时留下预览/peer/manifest 残留。
+- 建议：开始共享流程增加全局 pending gate，覆盖质量确认、OBS 启动、源选择确认、音频候选发现和 native start；pending 期间禁用确认/刷新/开始按钮，成功后由运行态按钮隐藏接管，失败/取消/停止时统一释放。
+- 修改意见：按建议修改
+- 处理结果：已处理。`server/public/app.js` 新增 `shareStartInFlight` 与 `resetShareStartPendingUi()`；`confirmQualitySelection()` 在进入 OBS/source 流程前加锁并禁用开始/确认按钮；`confirmSourceAndShare()` 禁用源确认和刷新按钮，失败时释放；`cancelSourceSelection()` 和 `stopScreenShare()` 统一释放 pending 状态，避免重复启动 native session 或 create-room。已通过 `node --check server/public/app.js`。

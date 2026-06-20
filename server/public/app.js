@@ -220,6 +220,7 @@ let publicRoomsManualRefreshInFlight = false;
 let publicRoomsPollTimer = null;
 let publicRoomsLastError = '';
 let sourceSelectionInFlight = false;
+let shareStartInFlight = false;
 
 let viewerPlaybackPrefs = readViewerPlaybackPrefs();
 const initialObsIngestPrefs = readObsIngestPrefs();
@@ -2435,7 +2436,34 @@ async function openQualityModal() {
   }
 }
 
+function resetShareStartPendingUi() {
+  shareStartInFlight = false;
+  if (elements.btnConfirmQuality) {
+    elements.btnConfirmQuality.disabled = false;
+  }
+  if (elements.btnConfirmSource) {
+    elements.btnConfirmSource.disabled = false;
+  }
+  if (elements.btnRefreshSources) {
+    elements.btnRefreshSources.disabled = false;
+  }
+  if (elements.btnStartShare) {
+    elements.btnStartShare.disabled = false;
+  }
+}
+
 async function confirmQualitySelection() {
+  if (shareStartInFlight) {
+    return;
+  }
+  shareStartInFlight = true;
+  if (elements.btnConfirmQuality) {
+    elements.btnConfirmQuality.disabled = true;
+  }
+  if (elements.btnStartShare) {
+    elements.btnStartShare.disabled = true;
+  }
+  try {
   if (getSelectedHostBackend() === 'obs-ingest') {
     const port = isObsIngestCustomPortEnabled()
       ? commitObsIngestPortInput()
@@ -2444,10 +2472,14 @@ async function confirmQualitySelection() {
     elements.qualityModal.classList.add('hidden');
     await prepareObsIngestPreview(false, port);
     await startScreenShareWithObsIngest({ port });
-    return;
+      return;
   }
   elements.qualityModal.classList.add('hidden');
   await showSourceSelection();
+  } catch (error) {
+    resetShareStartPendingUi();
+    throw error;
+  }
 }
 
 function cancelQualitySelection() {
@@ -3705,12 +3737,22 @@ async function confirmSourceAndShare() {
     showError('Please select a capture target');
     return;
   }
+  if (!shareStartInFlight) {
+    shareStartInFlight = true;
+  }
+  if (elements.btnConfirmSource) {
+    elements.btnConfirmSource.disabled = true;
+  }
+  if (elements.btnRefreshSources) {
+    elements.btnRefreshSources.disabled = true;
+  }
 
   currentCaptureSource = selectedSource;
   document.getElementById('source-modal').classList.add('hidden');
   try {
     await showAudioProcessSelection();
   } catch (error) {
+    resetShareStartPendingUi();
     debugLog('video', 'Failed to start native share session:', error && error.message ? error.message : String(error));
     showError(error && error.message ? error.message : 'failed-to-start-native-share');
   }
@@ -3753,6 +3795,7 @@ async function showAudioProcessSelection() {
 // 取消选择
 function cancelSourceSelection() {
   currentCaptureSource = null;
+  resetShareStartPendingUi();
   document.getElementById('source-modal').classList.add('hidden');
 }
 
@@ -4002,6 +4045,7 @@ async function checkForUpdates() {
 }
 
 async function stopScreenShare() {
+  resetShareStartPendingUi();
   const override = getNativeAuthorityOverride('stopScreenShare', stopScreenShare);
   if (override) {
     return override();

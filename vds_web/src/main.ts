@@ -36,6 +36,7 @@ const signaling = new VdsWebSignaling();
 let serverConfig: { iceServers: RTCIceServer[]; version?: string } = { iceServers: [] };
 let session: SessionState | null = readStoredSession(clientId);
 let restoringStoredSession = Boolean(session);
+let joinPending = false;
 let upstreamPc: RTCPeerConnection | null = null;
 let downstreamPc: RTCPeerConnection | null = null;
 let downstreamDataChannel: RTCDataChannel | null = null;
@@ -181,6 +182,7 @@ async function bootstrap(): Promise<void> {
     setError(capability.reasons.join(' '));
     return;
   }
+  setJoinPending(false);
 
   try {
     serverConfig = await fetchServerConfig();
@@ -204,11 +206,19 @@ async function joinRoom(roomId: string): Promise<void> {
     setError(capability.reasons.join(' '));
     return;
   }
+  if (joinPending) {
+    return;
+  }
+  if (session && !restoringStoredSession) {
+    setStatus('已在房间中');
+    return;
+  }
   if (!roomId) {
     setError('请输入房间码。');
     return;
   }
 
+  setJoinPending(true);
   try {
     setStatus('连接信令中');
     await dataChannelAudioPlayer.resume();
@@ -228,6 +238,7 @@ async function joinRoom(roomId: string): Promise<void> {
     });
     setStatus('等待上游');
   } catch (error) {
+    setJoinPending(false);
     restoringStoredSession = false;
     setError(errorToMessage(error));
   }
@@ -267,6 +278,7 @@ async function handleSignal(message: SignalMessage): Promise<void> {
         clearStoredSession();
         session = null;
       }
+      setJoinPending(false);
       restoringStoredSession = false;
       setError(`${String(message.code || 'error')}: ${String(message.message || '')}`);
       break;
@@ -276,6 +288,7 @@ async function handleSignal(message: SignalMessage): Promise<void> {
 function handleJoined(message: SignalMessage): void {
   const manifestFailure = getManifestCompatibilityFailure(message.mediaManifest);
   if (manifestFailure) {
+    setJoinPending(false);
     setError(manifestFailure);
     return;
   }
@@ -288,6 +301,7 @@ function handleJoined(message: SignalMessage): void {
     chainPosition: Number(message.chainPosition || 0)
   };
   sessionStorage.setItem('vds-web-session', JSON.stringify(session));
+  setJoinPending(false);
   restoringStoredSession = false;
   viewerReadySent = false;
   clearPendingVideoDecodeTimers();
@@ -794,6 +808,7 @@ async function flushPendingIceCandidates(peerId: string, pc: RTCPeerConnection):
 }
 
 function leaveCurrentRoom(): void {
+  setJoinPending(false);
   if (!session) {
     return;
   }
@@ -1003,7 +1018,7 @@ async function refreshRooms(manual: boolean): Promise<void> {
       const item = document.createElement('button');
       item.className = 'room-item';
       item.type = 'button';
-      item.disabled = Boolean(session && !restoringStoredSession);
+      item.disabled = joinPending || Boolean(session && !restoringStoredSession);
       item.addEventListener('click', () => void joinRoom(room.roomId));
       const roomCode = document.createElement('span');
       roomCode.className = 'room-code';
@@ -1035,6 +1050,19 @@ function getWebEncodedMediaCapabilities() {
 
 function renderCapability(report: CapabilityReport): void {
   diagnostics.update({ capability: report, status: report.ok ? '等待加入' : '能力不足' });
+}
+
+function setJoinPending(pending: boolean): void {
+  joinPending = pending;
+  const disabled = pending || !capability.ok;
+  joinButton.disabled = disabled;
+  roomIdInput.disabled = disabled;
+  refreshRoomsButton.disabled = disabled;
+  lobbyTabButton.disabled = pending;
+  directTabButton.disabled = pending;
+  roomList.querySelectorAll<HTMLButtonElement>('button.room-item').forEach((button) => {
+    button.disabled = disabled || Boolean(session && !restoringStoredSession);
+  });
 }
 
 function renderDiagnostics(): void {
