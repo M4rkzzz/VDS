@@ -2546,3 +2546,21 @@
 - 建议：刷新动画应在函数入口统一设置，并在 `finally` 中无条件清理；按钮缺失时也要安全跳过。
 - 修改意见：按建议修改
 - 处理结果：已处理。`refreshSources()` 现在提前保存按钮引用，设置动画前判空，并在 `finally` 中清理动画，成功、失败和异常路径一致。已通过 `node --check server/public/app.js`。
+
+### ROBUSTNESS-P1-008 更新安装可被手动点击和自动定时重复触发
+
+- 位置：`server/public/app.js:310`、`server/public/app.js:3137`、`server/public/app.js:2681`、`desktop/main.js:319`
+- 问题：更新下载完成后会安排自动 `quitAndInstall`，用户也可以在安装按钮上手动触发；renderer 和主进程都没有 in-flight guard。连续点击、自动定时器与手动点击撞上、或更新事件重复到达时，会多次调用 `quitAndInstall`。
+- 影响：退出安装流程可能重复写日志、重复进入 updater 状态，甚至和 before-quit 清理流程交错，增加退出时 media-agent/窗口清理的不确定性。
+- 建议：renderer 侧统一走 `requestQuitAndInstall()`，第一次触发后清理 timer 并禁用安装按钮；主进程 IPC 再加一层 `updateInstallInProgress`，忽略所有重复请求。
+- 修改意见：按建议修改
+- 处理结果：已处理。`server/public/app.js` 新增 `updateInstallRequested/requestQuitAndInstall()`，自动安装 timer 和手动按钮共用同一入口，首次触发后禁用安装按钮；`desktop/main.js` 新增 `updateInstallInProgress`，重复 `quit-and-install` IPC 会记录并返回 false。已通过 `node --check server/public/app.js`、`node --check desktop/main.js`。
+
+### ROBUSTNESS-P2-002 viewer 音量 IPC 失败后 UI 显示假音量
+
+- 位置：`server/public/app-native-overrides.js:737`
+- 问题：viewer 音量/静音操作先调用 `applyViewerVolumeUi()` 乐观更新滑块、全屏音量和静音按钮，再 await `mediaEngine.setViewerVolume()`。如果 media-agent 正在重启、viewer 未创建或 IPC 失败，UI 不会回滚。
+- 影响：极端操作下用户看到音量已改变，但实际 native 播放音量未改变；后续静音/取消静音基于错误 UI 值继续计算。
+- 建议：记录操作前音量，IPC 失败时恢复 UI，再把错误交给现有可恢复日志路径处理。
+- 修改意见：按建议修改
+- 处理结果：已处理。`setViewerVolumeValue()` 现在保存 previous volume，`setViewerVolume` 失败时调用 `applyViewerVolumeUi(previousVolume)` 回滚 UI，然后继续抛出错误给现有 `viewer-volume:*` recoverable warning 处理。已通过 `node --check server/public/app-native-overrides.js`。

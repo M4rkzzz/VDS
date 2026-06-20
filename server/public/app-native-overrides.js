@@ -735,9 +735,15 @@
   }
 
   async function setViewerVolumeValue(nextValue) {
+    const previousVolume = Math.max(0, Math.min(100, Number(viewerVolumeInput && viewerVolumeInput.value) || 0));
     const normalizedVolume = Math.max(0, Math.min(100, Number(nextValue) || 0));
     applyViewerVolumeUi(normalizedVolume);
-    await mediaEngine.setViewerVolume(normalizedVolume / 100);
+    try {
+      await mediaEngine.setViewerVolume(normalizedVolume / 100);
+    } catch (error) {
+      applyViewerVolumeUi(previousVolume);
+      throw error;
+    }
   }
 
   async function toggleViewerMute() {

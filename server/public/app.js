@@ -308,6 +308,7 @@ let updateLogUnsubscribe = null;
 let updateCheckStarted = false;
 let updateModalAutoHideTimer = null;
 let updateInstallTimer = null;
+let updateInstallRequested = false;
 let updateLogPath = '';
 const updateLogEntries = [];
 const UPDATE_LOG_ENTRY_LIMIT = 40;
@@ -2679,11 +2680,8 @@ elements.btnCancelQuality.addEventListener('click', cancelQualitySelection);
 // 标题栏按钮事件
 elements.btnCloseUpdate.addEventListener('click', hideUpdateModal);
 elements.btnInstallUpdate.addEventListener('click', () => {
-  clearScheduledUpdateInstall();
   hideUpdateModal();
-  if (window.electronAPI && window.electronAPI.quitAndInstall) {
-    window.electronAPI.quitAndInstall();
-  }
+  requestQuitAndInstall();
 });
 
 elements.btnMinimize.addEventListener('click', () => {
@@ -3132,13 +3130,25 @@ function clearScheduledUpdateInstall() {
   }
 }
 
+function requestQuitAndInstall() {
+  if (updateInstallRequested) {
+    return;
+  }
+  updateInstallRequested = true;
+  clearScheduledUpdateInstall();
+  if (elements.btnInstallUpdate) {
+    elements.btnInstallUpdate.disabled = true;
+  }
+  if (window.electronAPI && window.electronAPI.quitAndInstall) {
+    window.electronAPI.quitAndInstall();
+  }
+}
+
 function scheduleSilentUpdateInstall(delayMs = 5000) {
   clearScheduledUpdateInstall();
   updateInstallTimer = setTimeout(() => {
     updateInstallTimer = null;
-    if (window.electronAPI && window.electronAPI.quitAndInstall) {
-      window.electronAPI.quitAndInstall();
-    }
+    requestQuitAndInstall();
   }, Math.max(0, Number(delayMs) || 0));
 }
 
@@ -3235,6 +3245,7 @@ function renderUpdateModal(options = {}) {
   elements.btnCloseUpdate.textContent = closeLabel;
   elements.btnInstallUpdate.classList.toggle('hidden', !showInstallButton);
   elements.btnInstallUpdate.textContent = installLabel;
+  elements.btnInstallUpdate.disabled = updateInstallRequested;
   elements.updateProgress.classList.toggle('indeterminate', indeterminate);
   elements.updateProgress.style.width = indeterminate ? '35%' : normalizedPercent + '%';
   elements.updatePercent.textContent = indeterminate ? '检查中' : normalizedPercent.toFixed(1) + '%';

@@ -37,6 +37,7 @@ const mainDebugRateLimitState = new Map();
 let quitInProgress = false;
 let quitCleanupComplete = false;
 let quitFinalizeTimer = null;
+let updateInstallInProgress = false;
 let audioCapture = undefined;
 let emulatedFullscreenState = {
   active: false,
@@ -317,11 +318,19 @@ ipcMain.handle('download-update', async () => {
 });
 
 ipcMain.handle('quit-and-install', () => {
+  if (updateInstallInProgress) {
+    writeUpdateLog('info', 'Ignoring duplicate quitAndInstall request.');
+    return false;
+  }
+  updateInstallInProgress = true;
   if (app.isPackaged) {
     const updater = getAutoUpdater();
     writeUpdateLog('info', 'quitAndInstall requested by renderer. mode=silent');
     updater.quitAndInstall(true, true);
+    return true;
   }
+  writeUpdateLog('info', 'Skip quitAndInstall in dev mode because app.isPackaged is false.');
+  return false;
 });
 
 function isAllowedExternalUrl(value) {
