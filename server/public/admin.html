@@ -241,6 +241,10 @@
     const updatedText = document.getElementById('updatedText');
     const refreshButton = document.getElementById('refreshButton');
     let refreshTimer = null;
+    let refreshController = null;
+    let refreshSeq = 0;
+    let refreshInFlight = false;
+    const REFRESH_INTERVAL_MS = 1000;
 
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[char]));
@@ -447,21 +451,63 @@
     }
 
     async function refresh() {
+      return refreshAdminSnapshot({ manual: false });
+    }
+
+    async function refreshAdminSnapshot({ manual = false } = {}) {
+      if (document.hidden && !manual) {
+        return;
+      }
+      if (refreshInFlight && !manual) {
+        return;
+      }
+      if (refreshController && manual) {
+        refreshController.abort();
+      }
+      const controller = new AbortController();
+      refreshController = controller;
+      const seq = refreshSeq + 1;
+      refreshSeq = seq;
+      refreshInFlight = true;
+      refreshButton.disabled = true;
+      statusText.textContent = manual ? '手动刷新中' : '实时轮询中';
       try {
-        const response = await fetch('/api/rooms', { cache: 'no-store' });
+        const response = await fetch('/api/rooms', { cache: 'no-store', signal: controller.signal });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        render(await response.json());
+        const snapshot = await response.json();
+        if (seq !== refreshSeq) {
+          return;
+        }
+        render(snapshot);
       } catch (error) {
+        if (controller.signal.aborted || seq !== refreshSeq) {
+          return;
+        }
         statusText.textContent = '连接失败';
-        roomsEl.innerHTML = `<div class="error">${escapeHtml(error.message || error)}</div>`;
+        updatedText.textContent = `错误：${formatTime(Date.now())}`;
+        if (!roomsEl.children.length) {
+          roomsEl.innerHTML = `<div class="error">${escapeHtml(error.message || error)}</div>`;
+        }
+      } finally {
+        if (seq === refreshSeq) {
+          refreshInFlight = false;
+          refreshController = null;
+          refreshButton.disabled = false;
+        }
       }
     }
 
-    refreshButton.addEventListener('click', refresh);
+    refreshButton.addEventListener('click', () => refreshAdminSnapshot({ manual: true }));
     refresh();
-    refreshTimer = window.setInterval(refresh, 1000);
+    refreshTimer = window.setInterval(refresh, REFRESH_INTERVAL_MS);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        refreshAdminSnapshot({ manual: true });
+      }
+    });
     window.addEventListener('beforeunload', () => {
       if (refreshTimer) window.clearInterval(refreshTimer);
+      if (refreshController) refreshController.abort();
     });
   </script>
 </body>

@@ -182,6 +182,9 @@ const DEBUG_PRESET_DEFINITIONS = Object.freeze({
 const DEBUG_CATEGORY_KEYS = Object.keys(DEBUG_CATEGORY_DEFINITIONS);
 const DEBUG_CHANNEL_KEYS = Object.keys(DEBUG_CHANNEL_DEFINITIONS);
 let debugConfig = readDebugConfig();
+let debugConfigFlushTimer = null;
+let debugConfigFlushPersist = false;
+let debugConfigFlushNotify = false;
 
 const DEFAULT_OBS_INGEST_PORT = 61080;
 const OBS_INGEST_PORT_MIN = 1024;
@@ -219,8 +222,22 @@ let publicRoomsRefreshInFlight = false;
 let publicRoomsManualRefreshInFlight = false;
 let publicRoomsPollTimer = null;
 let publicRoomsLastError = '';
+let publicRoomsRefreshSeq = 0;
+let publicRoomsAbortController = null;
 let sourceSelectionInFlight = false;
+let sourceListRefreshSeq = 0;
+let sourceListRefreshInFlight = false;
+let sourceConfirmInFlight = false;
+let sourceAudioSelectionSeq = 0;
 let shareStartInFlight = false;
+let fallbackStopShareInFlight = false;
+let closeWindowActionInFlight = false;
+let maximizeWindowActionInFlight = false;
+let errorToastHideTimer = null;
+const buttonActionInFlight = new WeakSet();
+let navigationTransitionPromise = null;
+let viewerAudioDelayApplyTimer = null;
+let viewerAudioDelayApplySeq = 0;
 
 let viewerPlaybackPrefs = readViewerPlaybackPrefs();
 const initialObsIngestPrefs = readObsIngestPrefs();
@@ -253,6 +270,7 @@ let qualityUiBound = false;
 let obsIngestPreview = null;
 let obsIngestPreparePromise = null;
 let obsIngestPrepareRequestPort = 0;
+let obsIngestPrepareSeq = 0;
 
 const QUALITY_BITRATE_MIN = 1000;
 const QUALITY_BITRATE_MAX = 80000;
@@ -309,6 +327,8 @@ let updateCheckStarted = false;
 let updateModalAutoHideTimer = null;
 let updateInstallTimer = null;
 let updateInstallRequested = false;
+let updateReadyToInstall = false;
+let updateDownloadRequested = false;
 let updateLogPath = '';
 const updateLogEntries = [];
 const UPDATE_LOG_ENTRY_LIMIT = 40;
@@ -519,6 +539,27 @@ function propagateDebugConfig(config) {
   }
 }
 
+function scheduleDebugConfigFlush({ persist = true, notify = true } = {}) {
+  debugConfigFlushPersist = debugConfigFlushPersist || Boolean(persist);
+  debugConfigFlushNotify = debugConfigFlushNotify || Boolean(notify);
+  if (debugConfigFlushTimer) {
+    clearTimeout(debugConfigFlushTimer);
+  }
+  debugConfigFlushTimer = setTimeout(() => {
+    debugConfigFlushTimer = null;
+    const shouldPersist = debugConfigFlushPersist;
+    const shouldNotify = debugConfigFlushNotify;
+    debugConfigFlushPersist = false;
+    debugConfigFlushNotify = false;
+    if (shouldPersist) {
+      persistDebugConfig(debugConfig);
+    }
+    if (shouldNotify) {
+      propagateDebugConfig(debugConfig);
+    }
+  }, 100);
+}
+
 function isDebugModeEnabled() {
   return isAnyDebugPathEnabled();
 }
@@ -571,11 +612,8 @@ function describeDebugSelection(config = debugConfig) {
 function setDebugConfig(nextConfig, options = {}) {
   const { persist = true, notify = true } = options;
   debugConfig = normalizeDebugConfig(nextConfig, false);
-  if (persist) {
-    persistDebugConfig(debugConfig);
-  }
-  if (notify) {
-    propagateDebugConfig(debugConfig);
+  if (persist || notify) {
+    scheduleDebugConfigFlush({ persist, notify });
   }
   syncDebugUi();
   if (typeof window.__vdsRenderP2pDiagnosticReport === 'function') {
@@ -700,10 +738,28 @@ function setViewerAudioDelayMs(nextDelayMs, { applyNative = false } = {}) {
   persistViewerPlaybackPrefs();
   renderViewerPlaybackPrefsUi();
   if (applyNative && sessionRole === 'viewer' && currentRoomId) {
-    applyNativeViewerPlaybackPrefs().catch((error) => {
-      debugLog('audio', '[media-engine] setViewerAudioDelay failed:', error && error.message ? error.message : String(error));
-    });
+    scheduleNativeViewerPlaybackPrefsApply();
   }
+}
+
+function scheduleNativeViewerPlaybackPrefsApply() {
+  if (viewerAudioDelayApplyTimer) {
+    clearTimeout(viewerAudioDelayApplyTimer);
+    viewerAudioDelayApplyTimer = null;
+  }
+  const applySeq = viewerAudioDelayApplySeq + 1;
+  viewerAudioDelayApplySeq = applySeq;
+  viewerAudioDelayApplyTimer = setTimeout(() => {
+    viewerAudioDelayApplyTimer = null;
+    if (applySeq !== viewerAudioDelayApplySeq || sessionRole !== 'viewer' || !currentRoomId) {
+      return;
+    }
+    applyNativeViewerPlaybackPrefs().catch((error) => {
+      if (applySeq === viewerAudioDelayApplySeq) {
+        debugLog('audio', '[media-engine] setViewerAudioDelay failed:', error && error.message ? error.message : String(error));
+      }
+    });
+  }, 120);
 }
 
 function normalizeViewerJoinMode(mode) {
@@ -755,6 +811,16 @@ function setViewerJoinPending(pending, { source = null } = {}) {
     }, VIEWER_JOIN_PENDING_TIMEOUT_MS);
   }
   renderViewerJoinUi();
+}
+
+function cancelPendingViewerJoin() {
+  setViewerJoinPending(false);
+  removePendingMessages((entry) => Boolean(
+    entry &&
+    entry.type === 'join-room' &&
+    entry.clientId === clientId &&
+    (!currentRoomId || !entry.roomId || String(entry.roomId).toUpperCase() === String(currentRoomId).toUpperCase())
+  ));
 }
 
 function renderPublicRooms() {
@@ -846,6 +912,17 @@ function stopPublicRoomsPolling() {
   }
 }
 
+function cancelPublicRoomsRefresh() {
+  publicRoomsRefreshSeq += 1;
+  if (publicRoomsAbortController) {
+    publicRoomsAbortController.abort();
+    publicRoomsAbortController = null;
+  }
+  publicRoomsRefreshInFlight = false;
+  publicRoomsManualRefreshInFlight = false;
+  renderViewerJoinUi();
+}
+
 function updatePublicRoomsPollingState() {
   if (!shouldPollPublicRooms()) {
     stopPublicRoomsPolling();
@@ -863,8 +940,18 @@ async function refreshPublicRooms({ manual = false, force = false } = {}) {
   if (!force && publicRoomsRefreshInFlight) {
     return publicRooms;
   }
+  if (!shouldPollPublicRooms() && !manual) {
+    return publicRooms;
+  }
+  if (force && publicRoomsAbortController) {
+    publicRoomsAbortController.abort();
+  }
 
   const showRefreshUi = Boolean(manual);
+  const refreshSeq = publicRoomsRefreshSeq + 1;
+  publicRoomsRefreshSeq = refreshSeq;
+  const abortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  publicRoomsAbortController = abortController;
   publicRoomsRefreshInFlight = true;
   publicRoomsManualRefreshInFlight = showRefreshUi;
   if (showRefreshUi) {
@@ -874,12 +961,19 @@ async function refreshPublicRooms({ manual = false, force = false } = {}) {
 
   try {
     const response = await fetch(`${serverBaseUrl}/api/public-rooms`, {
-      cache: 'no-store'
+      cache: 'no-store',
+      signal: abortController ? abortController.signal : undefined
     });
+    if (refreshSeq !== publicRoomsRefreshSeq || (abortController && abortController.signal.aborted)) {
+      return publicRooms;
+    }
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
     const payload = await response.json();
+    if (refreshSeq !== publicRoomsRefreshSeq || (abortController && abortController.signal.aborted)) {
+      return publicRooms;
+    }
     publicRooms = Array.isArray(payload && payload.rooms)
       ? payload.rooms
         .map((room) => ({
@@ -890,16 +984,24 @@ async function refreshPublicRooms({ manual = false, force = false } = {}) {
       : [];
     publicRoomsLastError = '';
   } catch (_error) {
+    if (refreshSeq !== publicRoomsRefreshSeq || (abortController && abortController.signal.aborted)) {
+      return publicRooms;
+    }
     if (showRefreshUi) {
       publicRoomsLastError = '大厅列表暂不可用';
       showError('无法刷新公开房间列表');
     }
   } finally {
-    publicRoomsRefreshInFlight = false;
-    if (showRefreshUi) {
-      publicRoomsManualRefreshInFlight = false;
+    if (refreshSeq === publicRoomsRefreshSeq) {
+      publicRoomsRefreshInFlight = false;
+      publicRoomsAbortController = null;
+      if (showRefreshUi) {
+        publicRoomsManualRefreshInFlight = false;
+      }
+      if (shouldPollPublicRooms() || showRefreshUi) {
+        renderViewerJoinUi();
+      }
     }
-    renderViewerJoinUi();
   }
 
   return publicRooms;
@@ -1187,6 +1289,33 @@ async function transitionToHome(from) {
   setLandingFocus('idle');
   setLandingCommit('idle');
   await waitMs(LANDING_TRANSITION_MS);
+}
+
+async function runNavigationTransition(action) {
+  if (navigationTransitionPromise) {
+    return navigationTransitionPromise;
+  }
+  if (typeof action !== 'function') {
+    return null;
+  }
+  navigationTransitionPromise = (async () => {
+    setNavigationButtonsDisabled(true);
+    try {
+      return await action();
+    } finally {
+      navigationTransitionPromise = null;
+      setNavigationButtonsDisabled(false);
+    }
+  })();
+  return navigationTransitionPromise;
+}
+
+function setNavigationButtonsDisabled(disabled) {
+  [elements.btnHost, elements.btnViewer, elements.btnBack, elements.btnBackViewer].forEach((button) => {
+    if (button) {
+      button.disabled = Boolean(disabled);
+    }
+  });
 }
 
 function normalizeBaseUrl(baseUrl) {
@@ -1593,26 +1722,28 @@ function buildHostBackendOptions() {
 
 async function prepareObsIngestPreview(forceRefresh = false, requestedPort = null) {
   if (!window.isElectron || !window.electronAPI || !window.electronAPI.mediaEngine) {
-    obsIngestPreview = {
+    const preview = {
       prepared: false,
       port: getSelectedObsIngestPort(),
       url: '',
       lastError: '当前环境不支持 OBS 本地推流接入'
     };
+    obsIngestPreview = preview;
     renderQualitySettingsUi();
-    return obsIngestPreview;
+    return preview;
   }
 
   const mediaEngine = window.electronAPI.mediaEngine;
   if (typeof mediaEngine.prepareObsIngest !== 'function') {
-    obsIngestPreview = {
+    const preview = {
       prepared: false,
       port: getSelectedObsIngestPort(),
       url: '',
       lastError: '当前构建未启用 OBS ingest'
     };
+    obsIngestPreview = preview;
     renderQualitySettingsUi();
-    return obsIngestPreview;
+    return preview;
   }
 
   const targetPort = getObsIngestPortForPrepare(requestedPort);
@@ -1634,29 +1765,39 @@ async function prepareObsIngestPreview(forceRefresh = false, requestedPort = nul
     return obsIngestPreparePromise;
   }
 
+  const requestSeq = obsIngestPrepareSeq + 1;
+  obsIngestPrepareSeq = requestSeq;
   const request = (async () => {
     try {
       const result = await mediaEngine.prepareObsIngest({
         refresh: Boolean(forceRefresh),
         port: targetPort
       });
-      obsIngestPreview = result && result.obsIngest
+      const preview = result && result.obsIngest
         ? result.obsIngest
         : (result || null);
-      if (obsIngestPreview && Number(obsIngestPreview.port) > 0) {
-        setSelectedObsIngestPort(Number(obsIngestPreview.port));
+      if (requestSeq === obsIngestPrepareSeq) {
+        obsIngestPreview = preview;
+        if (preview && Number(preview.port) > 0) {
+          setSelectedObsIngestPort(Number(preview.port));
+        }
       }
-      return obsIngestPreview;
+      return preview;
     } catch (error) {
-      obsIngestPreview = {
+      const preview = {
         prepared: false,
         port: targetPort,
         url: '',
         lastError: error && error.message ? error.message : String(error)
       };
+      if (requestSeq === obsIngestPrepareSeq) {
+        obsIngestPreview = preview;
+      }
       throw error;
     } finally {
-      renderQualitySettingsUi();
+      if (requestSeq === obsIngestPrepareSeq) {
+        renderQualitySettingsUi();
+      }
     }
   })();
 
@@ -1750,6 +1891,24 @@ async function copyTextToClipboard(text, {
       showError(failureMessage);
     }
     throw error;
+  }
+}
+
+async function runButtonActionOnce(button, action) {
+  if (!button || typeof action !== 'function') {
+    return null;
+  }
+  if (buttonActionInFlight.has(button)) {
+    return null;
+  }
+  buttonActionInFlight.add(button);
+  const previousDisabled = Boolean(button.disabled);
+  button.disabled = true;
+  try {
+    return await action();
+  } finally {
+    buttonActionInFlight.delete(button);
+    button.disabled = previousDisabled;
   }
 }
 
@@ -2203,8 +2362,11 @@ function renderQualitySettingsUi() {
 
   if (elements.qualityObsStatus) {
     const requestedPort = getEffectiveObsIngestPort();
-    if (obsIngestPreparePromise) {
-      elements.qualityObsStatus.textContent = `正在检查并预留 127.0.0.1:${requestedPort}...`;
+    const preparePendingForRequestedPort = Boolean(obsIngestPreparePromise && obsIngestPrepareRequestPort === requestedPort);
+    if (preparePendingForRequestedPort) {
+      elements.qualityObsStatus.textContent = `正在检查并预留 127.0.0.1:${obsIngestPrepareRequestPort}...`;
+    } else if (obsIngestPreparePromise) {
+      elements.qualityObsStatus.textContent = `正在检查并预留 127.0.0.1:${obsIngestPrepareRequestPort}，当前输入端口 ${requestedPort} 尚未保存。`;
     } else if (obsIngestPreview && obsIngestPreview.lastError && Number(obsIngestPreview.port) === requestedPort) {
       elements.qualityObsStatus.textContent = `端口 ${requestedPort} 不可用：${obsIngestPreview.lastError}`;
     } else if (obsIngestPreview && obsIngestPreview.url && Number(obsIngestPreview.port) === requestedPort) {
@@ -2217,7 +2379,7 @@ function renderQualitySettingsUi() {
   }
 
   if (elements.btnSaveObsPort) {
-    elements.btnSaveObsPort.disabled = Boolean(obsIngestPreparePromise);
+    elements.btnSaveObsPort.disabled = Boolean(obsIngestPreparePromise && obsIngestPrepareRequestPort === getEffectiveObsIngestPort());
   }
 
   if (elements.btnConfirmQuality) {
@@ -2439,14 +2601,16 @@ async function openQualityModal() {
 
 function resetShareStartPendingUi() {
   shareStartInFlight = false;
+  sourceConfirmInFlight = false;
+  sourceAudioSelectionSeq += 1;
   if (elements.btnConfirmQuality) {
     elements.btnConfirmQuality.disabled = false;
   }
   if (elements.btnConfirmSource) {
-    elements.btnConfirmSource.disabled = false;
+    elements.btnConfirmSource.disabled = sourceListRefreshInFlight;
   }
   if (elements.btnRefreshSources) {
-    elements.btnRefreshSources.disabled = false;
+    elements.btnRefreshSources.disabled = sourceListRefreshInFlight;
   }
   if (elements.btnStartShare) {
     elements.btnStartShare.disabled = false;
@@ -2489,6 +2653,7 @@ function cancelQualitySelection() {
 }
 
 window.__vdsRefreshQualitySettingsUi = renderQualitySettingsUi;
+window.__vdsResetShareStartPendingUi = resetShareStartPendingUi;
 
 function renderDebugMenu() {
   if (!elements.debugMenu) {
@@ -2589,8 +2754,18 @@ renderHostPublicListingUi();
 prewarmWorkspacePanels().catch(() => {});
 
 // 事件绑定
-elements.btnHost.addEventListener('click', () => showHostPanel());
-elements.btnViewer.addEventListener('click', () => showViewerPanel());
+elements.btnHost.addEventListener('click', () => {
+  runNavigationTransition(showHostPanel).catch((error) => {
+    debugLog('misc', 'Failed to open host panel:', error && error.message ? error.message : String(error));
+    showError(error && error.message ? error.message : '无法打开主播界面');
+  });
+});
+elements.btnViewer.addEventListener('click', () => {
+  runNavigationTransition(showViewerPanel).catch((error) => {
+    debugLog('misc', 'Failed to open viewer panel:', error && error.message ? error.message : String(error));
+    showError(error && error.message ? error.message : '无法打开观众界面');
+  });
+});
 elements.btnStartShare.addEventListener('click', startScreenShare);
 elements.btnStopShare.addEventListener('click', stopScreenShare);
 elements.btnJoin.addEventListener('click', joinRoom);
@@ -2617,24 +2792,34 @@ if (elements.btnRefreshPublicRooms) {
   });
 }
 elements.btnLeave.addEventListener('click', leaveRoom);
-elements.btnBack.addEventListener('click', goBack);
-elements.btnBackViewer.addEventListener('click', goBackViewer);
+elements.btnBack.addEventListener('click', () => {
+  runNavigationTransition(goBack).catch((error) => {
+    debugLog('misc', 'Failed to return from host panel:', error && error.message ? error.message : String(error));
+    showError(error && error.message ? error.message : '无法返回主页');
+  });
+});
+elements.btnBackViewer.addEventListener('click', () => {
+  runNavigationTransition(goBackViewer).catch((error) => {
+    debugLog('misc', 'Failed to return from viewer panel:', error && error.message ? error.message : String(error));
+    showError(error && error.message ? error.message : '无法返回主页');
+  });
+});
 elements.btnCopyRoom.addEventListener('click', () => {
-  copyRoomId().catch(() => {});
+  runButtonActionOnce(elements.btnCopyRoom, () => copyRoomId()).catch(() => {});
 });
 if (elements.btnCopyHostP2pDiagnostic) {
   elements.btnCopyHostP2pDiagnostic.addEventListener('click', () => {
-    copyP2pDiagnosticReport().catch(() => {});
+    runButtonActionOnce(elements.btnCopyHostP2pDiagnostic, () => copyP2pDiagnosticReport()).catch(() => {});
   });
 }
 if (elements.btnCopyViewerP2pDiagnostic) {
   elements.btnCopyViewerP2pDiagnostic.addEventListener('click', () => {
-    copyP2pDiagnosticReport().catch(() => {});
+    runButtonActionOnce(elements.btnCopyViewerP2pDiagnostic, () => copyP2pDiagnosticReport()).catch(() => {});
   });
 }
 if (elements.btnCopyHostCaptureDiagnostic) {
   elements.btnCopyHostCaptureDiagnostic.addEventListener('click', () => {
-    copyHostCaptureDiagnosticReport().catch(() => {});
+    runButtonActionOnce(elements.btnCopyHostCaptureDiagnostic, () => copyHostCaptureDiagnosticReport()).catch(() => {});
   });
 }
 if (elements.viewerAudioDelayInput) {
@@ -2689,10 +2874,21 @@ elements.btnMinimize.addEventListener('click', () => {
 });
 
 elements.btnMaximize.addEventListener('click', async () => {
-  window.electronAPI.maximize();
-  // 切换最大化图标
-  const isMax = await window.electronAPI.isMaximized();
-  updateMaximizeButton(isMax);
+  if (maximizeWindowActionInFlight) {
+    return;
+  }
+  maximizeWindowActionInFlight = true;
+  elements.btnMaximize.disabled = true;
+  try {
+    window.electronAPI.maximize();
+    const isMax = await window.electronAPI.isMaximized();
+    updateMaximizeButton(isMax);
+  } catch (error) {
+    debugLog('misc', 'Failed to toggle maximize state:', error && error.message ? error.message : String(error));
+  } finally {
+    maximizeWindowActionInFlight = false;
+    elements.btnMaximize.disabled = false;
+  }
 });
 
 elements.btnClose.addEventListener('click', () => {
@@ -2719,20 +2915,40 @@ document.addEventListener('keydown', (event) => {
 
 // 关闭确认弹窗事件
 elements.btnMinimizeToTray.addEventListener('click', () => {
+  if (closeWindowActionInFlight) {
+    return;
+  }
+  closeWindowActionInFlight = true;
   setCloseModalState('closed');
   elements.closeModal.classList.add('hidden');
-  window.electronAPI.minimizeToTray();
+  try {
+    window.electronAPI.minimizeToTray();
+    closeWindowActionInFlight = false;
+  } catch (error) {
+    closeWindowActionInFlight = false;
+    debugLog('misc', 'Failed to minimize to tray:', error && error.message ? error.message : String(error));
+  }
 });
 
 elements.btnCloseModalDismiss.addEventListener('click', () => {
+  closeWindowActionInFlight = false;
   setCloseModalState('closed');
   elements.closeModal.classList.add('hidden');
 });
 
 elements.btnExitApp.addEventListener('click', () => {
+  if (closeWindowActionInFlight) {
+    return;
+  }
+  closeWindowActionInFlight = true;
   setCloseModalState('closed');
   elements.closeModal.classList.add('hidden');
-  window.electronAPI.close();
+  try {
+    window.electronAPI.close();
+  } catch (error) {
+    closeWindowActionInFlight = false;
+    debugLog('misc', 'Failed to close app:', error && error.message ? error.message : String(error));
+  }
 });
 
 // 更新最大化按钮图标
@@ -2942,6 +3158,7 @@ function scheduleReconnect() {
 }
 
 function disconnectWebSocket() {
+  clearPendingSignalingQueues('disconnect');
   wsManualClose = true;
   pendingReconnect = false;
   resumeOnNextConnect = false;
@@ -2991,6 +3208,20 @@ function removePendingMessages(predicate) {
     if (predicate(payload)) {
       pendingMessages.splice(index, 1);
     }
+  }
+}
+
+function clearPendingSignalingQueues(reason = '') {
+  const queuedMessages = pendingMessages.length;
+  const queuedCandidates = pendingRemoteCandidates.size;
+  pendingMessages.length = 0;
+  pendingRemoteCandidates.clear();
+  if (queuedMessages > 0 || queuedCandidates > 0) {
+    debugLog('connection', 'Cleared pending signaling queues:', {
+      reason,
+      queuedMessages,
+      queuedCandidates
+    });
   }
 }
 
@@ -3135,6 +3366,7 @@ function requestQuitAndInstall() {
     return;
   }
   updateInstallRequested = true;
+  updateReadyToInstall = true;
   clearScheduledUpdateInstall();
   if (elements.btnInstallUpdate) {
     elements.btnInstallUpdate.disabled = true;
@@ -3255,6 +3487,10 @@ function renderUpdateModal(options = {}) {
 }
 
 function applyUpdateStatus(status) {
+  if (updateReadyToInstall && status.status !== 'downloaded') {
+    debugLog('update', 'Ignoring update status after downloaded:', status.status || 'unknown');
+    return;
+  }
   clearUpdateModalAutoHide();
   clearScheduledUpdateInstall();
 
@@ -3263,6 +3499,8 @@ function applyUpdateStatus(status) {
   const feedUrl = status.feedUrl || getUpdateManifestUrl();
 
   if (status.status === 'checking') {
+    updateReadyToInstall = false;
+    updateDownloadRequested = false;
     renderUpdateModal({
       title: '正在检查更新',
       step: '第 1 步 / 共 3 步：连接更新源并比较版本',
@@ -3277,6 +3515,7 @@ function applyUpdateStatus(status) {
   }
 
   if (status.status === 'available') {
+    updateReadyToInstall = false;
     renderUpdateModal({
       title: `发现新版本：v${targetVersion}`,
       step: '第 2 步 / 共 3 步：已发现更新，开始下载',
@@ -3289,12 +3528,23 @@ function applyUpdateStatus(status) {
     });
 
     if (window.electronAPI && window.electronAPI.downloadUpdate) {
-      window.electronAPI.downloadUpdate();
+      if (!updateDownloadRequested) {
+        updateDownloadRequested = true;
+        window.electronAPI.downloadUpdate().then((started) => {
+          if (started === false) {
+            updateDownloadRequested = false;
+          }
+        }).catch((error) => {
+          updateDownloadRequested = false;
+          debugLog('update', 'Update download request failed:', error && error.message ? error.message : String(error));
+        });
+      }
     }
     return;
   }
 
   if (status.status === 'downloading') {
+    updateReadyToInstall = false;
     const percent = Number.isFinite(status.percent) ? status.percent : 0;
     const speed = formatBytes(status.bytesPerSecond);
     const transferred = formatBytes(status.transferred);
@@ -3315,6 +3565,7 @@ function applyUpdateStatus(status) {
   }
 
   if (status.status === 'downloaded') {
+    updateReadyToInstall = true;
     renderUpdateModal({
       title: `更新已下载：v${targetVersion}`,
       step: '下载完成，正在安装。',
@@ -3332,6 +3583,8 @@ function applyUpdateStatus(status) {
   }
 
   if (status.status === 'not-available') {
+    updateReadyToInstall = false;
+    updateDownloadRequested = false;
     renderUpdateModal({
       title: '当前已是最新版本',
       step: '版本比较完成',
@@ -3344,6 +3597,8 @@ function applyUpdateStatus(status) {
   }
 
   if (status.status === 'error') {
+    updateReadyToInstall = false;
+    updateDownloadRequested = false;
     renderUpdateModal({
       title: '检查更新失败',
       step: '无法完成本次更新检查',
@@ -3359,6 +3614,9 @@ async function showSourceSelection() {
   if (sourceSelectionInFlight) {
     return;
   }
+  const refreshSeq = sourceListRefreshSeq + 1;
+  sourceListRefreshSeq = refreshSeq;
+  sourceAudioSelectionSeq += 1;
 
   sourceSelectionInFlight = true;
   if (elements.btnConfirmQuality) {
@@ -3366,14 +3624,15 @@ async function showSourceSelection() {
   }
 
   try {
-    await waitForWsConnected();
-
     if (!window.isElectron || !window.electronAPI || !window.electronAPI.mediaEngine) {
       throw new Error('native-electron-runtime-required');
     }
 
     debugLog('video', 'Getting capture targets for selection...');
     const sources = await window.electronAPI.mediaEngine.listCaptureTargets();
+    if (refreshSeq !== sourceListRefreshSeq || sourceConfirmInFlight) {
+      return;
+    }
 
     if (!sources || sources.length === 0) {
       throw new Error('No capture target available');
@@ -3381,6 +3640,9 @@ async function showSourceSelection() {
 
     showSourceModal(sources);
   } catch (error) {
+    if (refreshSeq !== sourceListRefreshSeq || sourceConfirmInFlight) {
+      return;
+    }
     debugLog('video', 'Error loading sources:', error && error.message ? error.message : String(error));
     showError('Failed to list capture targets: ' + error.message);
     resetShareStartPendingUi();
@@ -3395,10 +3657,21 @@ async function showSourceSelection() {
 // 刷新屏幕源列表
 async function refreshSources() {
   const btn = elements.btnRefreshSources;
+  if (sourceListRefreshInFlight || sourceConfirmInFlight) {
+    return;
+  }
+  const refreshSeq = sourceListRefreshSeq + 1;
+  sourceListRefreshSeq = refreshSeq;
+  sourceAudioSelectionSeq += 1;
+  sourceListRefreshInFlight = true;
   try {
     debugLog('video', 'Refreshing source list...');
     if (btn) {
       btn.style.animation = 'spin 1s linear infinite';
+      btn.disabled = true;
+    }
+    if (elements.btnConfirmSource) {
+      elements.btnConfirmSource.disabled = true;
     }
 
     let sources = [];
@@ -3407,6 +3680,9 @@ async function refreshSources() {
     if (window.isElectron) {
       sources = await window.electronAPI.mediaEngine.listCaptureTargets();
     }
+    if (refreshSeq !== sourceListRefreshSeq || sourceConfirmInFlight) {
+      return;
+    }
 
     if (!sources || sources.length === 0) {
       showError('没有找到可用的屏幕源');
@@ -3414,11 +3690,21 @@ async function refreshSources() {
       showSourceModal(sources);
     }
   } catch (error) {
+    if (refreshSeq !== sourceListRefreshSeq || sourceConfirmInFlight) {
+      return;
+    }
     debugLog('video', 'Error refreshing sources:', error && error.message ? error.message : String(error));
     showError('刷新失败: ' + error.message);
   } finally {
-    if (btn) {
-      btn.style.animation = '';
+    if (refreshSeq === sourceListRefreshSeq) {
+      sourceListRefreshInFlight = false;
+      if (btn) {
+        btn.style.animation = '';
+        btn.disabled = sourceConfirmInFlight;
+      }
+      if (elements.btnConfirmSource) {
+        elements.btnConfirmSource.disabled = sourceConfirmInFlight;
+      }
     }
   }
 }
@@ -3687,6 +3973,7 @@ function showSourceModal(sources) {
       // 移除其他选中状态
       document.querySelectorAll('.source-item').forEach(el => el.classList.remove('selected'));
       item.classList.add('selected');
+      sourceAudioSelectionSeq += 1;
       updateSourceAudioUi();
     });
 
@@ -3748,11 +4035,17 @@ function buildCaptureSourceStatus(source) {
 let currentCaptureSource = null;
 
 async function confirmSourceAndShare() {
+  if (sourceConfirmInFlight) {
+    return;
+  }
   const selectedSource = getSelectedCaptureSource();
   if (!selectedSource) {
     showError('Please select a capture target');
     return;
   }
+  sourceConfirmInFlight = true;
+  sourceListRefreshSeq += 1;
+  sourceAudioSelectionSeq += 1;
   if (!shareStartInFlight) {
     shareStartInFlight = true;
   }
@@ -3769,8 +4062,13 @@ async function confirmSourceAndShare() {
     await showAudioProcessSelection();
   } catch (error) {
     resetShareStartPendingUi();
-    debugLog('video', 'Failed to start native share session:', error && error.message ? error.message : String(error));
-    showError(error && error.message ? error.message : 'failed-to-start-native-share');
+    const message = error && error.message ? error.message : String(error);
+    if (message === 'source-audio-selection-superseded') {
+      debugLog('audio', '[source-audio] selection superseded before share start');
+      return;
+    }
+    debugLog('video', 'Failed to start native share session:', message);
+    showError(message || 'failed-to-start-native-share');
   }
 }
 
@@ -3779,6 +4077,8 @@ async function confirmSourceAndShare() {
 // Active source-audio path: one modal only, no secondary audio modal.
 async function showAudioProcessSelection() {
   const selectedItem = getSelectedSourceItem();
+  const selectionSeq = sourceAudioSelectionSeq;
+  const selectedSourceId = currentCaptureSource && currentCaptureSource.id ? String(currentCaptureSource.id) : '';
   const audioEnabled = Boolean(elements.sourceAudioEnabled && elements.sourceAudioEnabled.checked);
 
   if (!audioEnabled) {
@@ -3789,6 +4089,9 @@ async function showAudioProcessSelection() {
   let audioCandidates = parseSelectedSourceAudioCandidates(selectedItem);
   if (!audioCandidates.length) {
     audioCandidates = await discoverAudioCandidatesForSource(currentCaptureSource);
+    if (selectionSeq !== sourceAudioSelectionSeq || !currentCaptureSource || String(currentCaptureSource.id || '') !== selectedSourceId) {
+      throw new Error('source-audio-selection-superseded');
+    }
     if (selectedItem && audioCandidates.length) {
       selectedItem.dataset.audioCandidates = JSON.stringify(audioCandidates);
       selectedItem.dataset.audioIndex = '0';
@@ -3810,6 +4113,11 @@ async function showAudioProcessSelection() {
 
 // 取消选择
 function cancelSourceSelection() {
+  if (sourceConfirmInFlight) {
+    return;
+  }
+  sourceListRefreshSeq += 1;
+  sourceAudioSelectionSeq += 1;
   currentCaptureSource = null;
   resetShareStartPendingUi();
   document.getElementById('source-modal').classList.add('hidden');
@@ -3885,11 +4193,15 @@ async function joinRoom() {
 
 // Viewer: 离开房间
 async function leaveRoom() {
-  sendMessage({
-    type: 'leave-room',
-    roomId: currentRoomId,
-    clientId: clientId
-  }, { queueIfDisconnected: false });
+  cancelPendingViewerJoin();
+  if (currentRoomId) {
+    sendMessage({
+      type: 'leave-room',
+      roomId: currentRoomId,
+      clientId: clientId,
+      sessionToken: currentSessionToken || ''
+    }, { queueIfDisconnected: false });
+  }
 
   // resetViewerState 会清理 peerConnections
   await resetViewerState();
@@ -3974,10 +4286,15 @@ async function copyHostCaptureDiagnosticReport() {
 
 // 显示错误
 function showError(message) {
+  if (errorToastHideTimer) {
+    clearTimeout(errorToastHideTimer);
+    errorToastHideTimer = null;
+  }
   elements.errorToast.textContent = message;
   elements.errorToast.classList.remove('hidden');
-  setTimeout(() => {
+  errorToastHideTimer = setTimeout(() => {
     elements.errorToast.classList.add('hidden');
+    errorToastHideTimer = null;
   }, 3000);
 }
 
@@ -4066,7 +4383,15 @@ async function stopScreenShare() {
   if (override) {
     return override();
   }
+  if (fallbackStopShareInFlight) {
+    return;
+  }
+  fallbackStopShareInFlight = true;
+  if (elements.btnStopShare) {
+    elements.btnStopShare.disabled = true;
+  }
 
+  try {
   if (window.isElectron && window.electronAPI && window.electronAPI.mediaEngine) {
     try {
       const mediaEngine = window.electronAPI.mediaEngine;
@@ -4087,7 +4412,8 @@ async function stopScreenShare() {
     sendMessage({
       type: 'leave-room',
       roomId: currentRoomId,
-      clientId
+      clientId,
+      sessionToken: currentSessionToken || ''
     }, { queueIfDisconnected: false });
   }
 
@@ -4102,20 +4428,41 @@ async function stopScreenShare() {
   upstreamConnected = false;
   viewerReadySent = false;
   videoStarted = false;
-  elements.roomInfo.classList.add('hidden');
-  elements.viewerCount.textContent = '0';
-  elements.btnStartShare.classList.remove('hidden');
-  elements.btnStopShare.classList.add('hidden');
-  elements.hostStatus.textContent = '准备就绪';
-  elements.hostStatus.classList.remove('waiting');
+  if (elements.roomInfo) {
+    elements.roomInfo.classList.add('hidden');
+  }
+  if (elements.viewerCount) {
+    elements.viewerCount.textContent = '0';
+  }
+  if (elements.btnStartShare) {
+    elements.btnStartShare.classList.remove('hidden');
+  }
+  if (elements.btnStopShare) {
+    elements.btnStopShare.classList.add('hidden');
+  }
+  if (elements.hostStatus) {
+    elements.hostStatus.textContent = '准备就绪';
+    elements.hostStatus.classList.remove('waiting');
+  }
   if (elements.hostP2pStatus) {
     elements.hostP2pStatus.dataset.p2pState = 'idle';
     elements.hostP2pStatus.textContent = 'P2P：等待';
   }
   renderHostPublicListingUi();
+  } finally {
+    fallbackStopShareInFlight = false;
+    if (elements.btnStopShare) {
+      elements.btnStopShare.disabled = false;
+    }
+  }
 }
 
 async function resetViewerState() {
+  if (viewerAudioDelayApplyTimer) {
+    clearTimeout(viewerAudioDelayApplyTimer);
+    viewerAudioDelayApplyTimer = null;
+  }
+  viewerAudioDelayApplySeq += 1;
   currentRoomId = null;
   sessionRole = null;
   currentSessionToken = null;
@@ -4127,7 +4474,9 @@ async function resetViewerState() {
   upstreamConnected = false;
   relayPc = null;
   relayStream = null;
-  setViewerJoinPending(false);
+  cancelPublicRoomsRefresh();
+  cancelPendingViewerJoin();
+  clearPendingSignalingQueues('reset-viewer');
 
   await clearAllPeerConnections({ clearRetryState: true });
   elements.joinForm.classList.remove('hidden');

@@ -2573,3 +2573,403 @@
 - 建议：全屏切换使用单一 transition promise；已有切换进行中时，按钮复用同一 promise，Escape 阻止事件继续传播并等待当前切换完成。
 - 修改意见：按建议修改
 - 处理结果：已处理。`app-native-overrides.js` 新增 `fullscreenTransitionPromise`；全屏按钮和 Escape 均串行化 `setFullscreen` 调用，完成后统一清空 promise 并保持现有 `updateFullscreenUi()`/surface resync 流程。
+
+### ROBUSTNESS-P2-004 标题栏关闭/最大化动作可被重复触发
+
+- 位置：`server/public/app.js:224`、`server/public/app.js:2691`、`server/public/app.js:2721`
+- 问题：最大化按钮直接连续调用 `maximize()` 与 `isMaximized()`，关闭确认弹窗里的最小化到托盘/退出按钮也没有 renderer 侧 in-flight guard。用户连点按钮、IPC 短暂失败或关闭弹窗重复打开时，可能出现重复 IPC、未捕获 rejection 或按钮状态与窗口状态不一致。
+- 影响：极端操作下可能造成标题栏图标错误、关闭弹窗动作重复发送、主进程退出保护被频繁打扰，降低问题复现时的诊断可信度。
+- 建议：窗口动作使用 renderer 侧轻量 in-flight guard；最大化动作失败只记录日志并恢复按钮；退出动作首个请求后忽略重复请求；最小化到托盘成功后释放 guard，确保恢复窗口后仍可再次操作。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `closeWindowActionInFlight` 与 `maximizeWindowActionInFlight`；最大化按钮在 IPC 期间禁用并捕获错误；最小化到托盘和退出按钮忽略重复点击，IPC 抛错时恢复状态，最小化到托盘成功后释放 guard 以便下一次关闭操作。
+
+### ROBUSTNESS-P2-005 native surface 同步连续失败后缺少自愈清理
+
+- 位置：`server/public/app-native-overrides.js:129`、`server/public/app-native-overrides.js:379`、`server/public/app-native-overrides.js:1456`
+- 问题：`syncAllEmbeddedSurfaces()` 对 `updateSurface()` 普通失败只做限流日志，surface entry 会一直留在 `attachedEmbeddedSurfaces` 里。窗口移动、native surface 失效、media-agent 短暂异常时，如果没有返回明确的 `Surface is not attached`，renderer 会长期对坏 surface 做同步。
+- 影响：播放/预览 surface 可能卡在失效状态，tracking loop 继续运行并周期性刷可恢复错误；后续 attach/detach 状态也更容易和实际 media-agent 状态错开。
+- 建议：为每个 surface 记录连续失败次数；同步成功或重新 attach 时清零；超过阈值后移除本地 tracking，host preview 同步复位 attached 标记，让后续显式 attach 能重新建立干净 surface。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `surfaceSyncFailureCounts`、`removeEmbeddedSurfaceTracking()` 与 `recoverEmbeddedSurface()`；`Surface is not attached`、media-state `surface-detached`、显式 detach、host start 失败清理都走统一入口；`updateSurface` 连续失败 5 次后会最佳努力 detach 旧 surface 并重新 attach，成功同步或 attach 会清零失败计数。
+
+### ROBUSTNESS-P1-009 viewer pending join 被返回/离开打断后缺少取消语义
+
+- 位置：`server/public/app.js:771`、`server/public/app.js:3926`、`server/public/app.js:4173`
+- 问题：桌面 viewer 在 `joinRoomById()` 中会先设置 `currentRoomId/sessionRole` 并发送 `join-room`，但用户可在服务器确认前点击返回或离开。旧逻辑会无条件发送 `leave-room`，即使 roomId 为空或 join 仍在 pending；断网时 pending 队列里的 `join-room` 也可能在用户返回首页后重新发出。
+- 影响：极端操作下可能出现服务器收到 `roomId:null` 的 leave、用户返回首页后又自动加入旧房间、公开房间列表和本地 viewer 状态短暂错位。
+- 建议：离开/重置 viewer 时显式取消 pending join，清理待发送 `join-room`，只有存在有效 `currentRoomId` 时才发送 `leave-room`。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `cancelPendingViewerJoin()`，统一清理 join pending timer/UI 和 pending message queue 中当前客户端的 `join-room`；`leaveRoom()` 现在无房间时只做本地 reset，不再发送空 roomId；`resetViewerState()` 复用该取消逻辑。
+
+### ROBUSTNESS-P2-006 fallback 停止共享路径缺少防重入和异常释放
+
+- 位置：`server/public/app.js:224`、`server/public/app.js:4111`
+- 问题：native authority override 正常安装时停止共享走原生实现并已有 in-flight guard；但 override 未安装或初始化失败时会落到 `app.js` 的 fallback `stopScreenShare()`，该路径没有防重入。用户连点停止、返回首页触发停止同时按钮也触发停止时，会重复停止 media session、重复发送 leave、重复改 UI。
+- 影响：异常兜底场景下可能扩大原始故障，导致 UI 状态反复切换、重复 leave 干扰服务器房间清理，甚至中途异常后按钮保持不可预期状态。
+- 建议：fallback stop 使用独立 in-flight guard，停止按钮临时禁用，并用 `finally` 保证异常路径释放 guard；关键 DOM 更新判空。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `fallbackStopShareInFlight`；fallback `stopScreenShare()` 连续触发时直接返回，执行期间禁用停止按钮，清理逻辑包在 `try/finally` 中，结束后必定释放 guard 并恢复按钮 disabled 状态。
+
+### ROBUSTNESS-P2-007 复制诊断/房间号按钮缺少并发保护
+
+- 位置：`server/public/app.js:227`、`server/public/app.js:1792`、`server/public/app.js:2651`、`vds_web/src/main.ts:61`、`vds_web/src/main.ts:155`
+- 问题：桌面端复制房间号、P2P 诊断、采集诊断按钮可被连续点击并发执行 Clipboard API；Web 端复制诊断直接调用 `navigator.clipboard.writeText()`，在非安全上下文、权限拒绝或 Clipboard API 不存在时没有 fallback 和 UI 反馈。
+- 影响：用户排障时高频点击复制会得到多次 toast、并发 clipboard 请求，浏览器端还可能静默失败，导致用户以为诊断已复制但剪贴板为空。
+- 建议：复制类按钮统一串行化；执行期间临时 disabled；Web 端增加 textarea fallback，并把成功/失败反馈落到现有状态/错误 UI。
+- 修改意见：按建议修改
+- 处理结果：已处理。桌面端新增 `runButtonActionOnce()` 和 `buttonActionInFlight`，复制按钮执行期间禁用并忽略重复点击；Web 端新增 `writeTextToClipboard()` fallback 与 `copyDiagnosticsReport()`，复制成功显示“诊断已复制”，失败显示具体错误。
+
+### ROBUSTNESS-P2-008 viewer 音频延迟输入会高频打 native IPC
+
+- 位置：`server/public/app.js:228`、`server/public/app.js:698`、`server/public/app.js:4199`
+- 问题：桌面 viewer 音频延迟输入框在 `input` 事件中每次变化都立即调用 `applyNativeViewerPlaybackPrefs()`。用户长按加减、拖动输入法候选或快速输入数字时，会产生一串 `setViewerAudioDelay` IPC。
+- 影响：media-agent 正忙或重启时更容易产生过期 IPC 错误；旧请求晚返回时日志噪声变多，用户看到的 UI 值和最后实际应用值也更难判断。
+- 建议：UI 仍即时更新和持久化，但 native 应用做短 debounce；每次新输入递增序号，离开 viewer 时取消待应用任务，旧请求失败不再污染当前状态。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `viewerAudioDelayApplyTimer/viewerAudioDelayApplySeq` 和 `scheduleNativeViewerPlaybackPrefsApply()`，120ms 内合并多次输入，只应用最后一次；`resetViewerState()` 会清掉待应用 timer 并使旧序号失效。
+
+### ROBUSTNESS-P1-010 OBS ingest 端口预留旧请求可覆盖新端口状态
+
+- 位置：`server/public/app.js:261`、`server/public/app.js:1629`、`server/public/app.js:2258`
+- 问题：质量弹窗中切换 OBS 默认/自定义端口、快速保存多个端口或反复打开弹窗时，会并发触发 `prepareObsIngestPreview()`。旧请求晚返回后仍会写入全局 `obsIngestPreview`、调用 `setSelectedObsIngestPort()` 并刷新 UI，可能把新输入端口覆盖成旧请求结果。
+- 影响：用户看到的 OBS 推流地址/状态可能不是当前输入端口；确认开始时可能复制旧地址或进入错误端口等待，导致 OBS 推流接不上。
+- 建议：OBS prepare 增加请求序号，只允许最新请求更新全局预览、端口和 UI；旧请求只把结果返回给自己的 await，不污染当前弹窗状态。UI 状态应显示正在预留的真实端口，保存按钮只在当前端口请求进行中时禁用。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `obsIngestPrepareSeq`；`prepareObsIngestPreview()` 的成功、失败、finally 都校验 request seq 后才写全局状态和刷新 UI；质量弹窗状态现在区分“当前端口正在检查”和“旧端口仍在检查”，保存按钮只在当前端口 prepare 中禁用。
+
+### ROBUSTNESS-P2-009 Web viewer 大厅刷新和全屏切换缺少串行化
+
+- 位置：`vds_web/src/main.ts:61`、`vds_web/src/main.ts:1039`、`vds_web/src/main.ts:1177`
+- 问题：Web viewer 的公开房间刷新按钮可连续点击并发请求，旧请求晚返回后可能覆盖新列表和状态；全屏按钮也没有 transition guard，用户快速点击或浏览器全屏权限异步返回时，`requestFullscreen()` 与 `exitFullscreen()` 可能交错。
+- 影响：公开房间列表可能回退到旧快照，状态栏显示“已刷新”但内容不是最新；全屏按钮可能出现状态反跳或错误提示覆盖当前播放状态。
+- 建议：刷新请求使用序号，只允许最新请求更新列表/状态；刷新期间禁用按钮并在最新请求结束后恢复。全屏切换使用单一 promise gate，进行中重复点击复用当前 promise。
+- 修改意见：按建议修改
+- 处理结果：已处理。Web 端新增 `refreshRoomsSeq/refreshRoomsInFlight`，`refreshRooms()` 只允许最新请求落 UI，并通过 `setJoinPending()` 统一恢复按钮状态；新增 `fullscreenTransitionPromise`，全屏进入/退出串行执行并在 finally 清理。
+
+### ROBUSTNESS-P1-011 捕获源列表刷新旧结果可覆盖当前选择
+
+- 位置：`server/public/app.js:223`、`server/public/app.js:3457`、`server/public/app.js:3495`、`server/public/app.js:3849`
+- 问题：源选择弹窗打开、刷新和确认之间没有统一的请求序号。用户打开源选择后快速刷新、取消、确认，旧的 `listCaptureTargets()` 晚返回仍会调用 `showSourceModal()`，可能重新打开弹窗并覆盖当前选择；确认按钮也只依赖 disabled，函数本身可被重复触发。
+- 影响：极端操作下可能出现用户已确认或取消后源列表又弹回、当前选择被旧列表替换、重复进入音频匹配/开始共享流程。
+- 建议：源列表请求增加序号，只允许最新请求落 UI；刷新期间禁用刷新和确认按钮；确认开始后递增序号使所有未完成刷新失效，并用 `sourceConfirmInFlight` 阻止重复确认/取消。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `sourceListRefreshSeq/sourceListRefreshInFlight/sourceConfirmInFlight`；`showSourceSelection()` 和 `refreshSources()` 会忽略过期结果，刷新期间禁用按钮；`confirmSourceAndShare()` 函数级防重入并使未完成刷新失效，`cancelSourceSelection()` 在确认已开始后不再打断流程。
+
+### ROBUSTNESS-P2-010 主界面 Host/Viewer/返回转场缺少全局串行化
+
+- 位置：`server/public/app.js:231`、`server/public/app.js:1183`、`server/public/app.js:1211`、`server/public/app.js:2692`、`server/public/app.js:2730`
+- 问题：主界面的 Host、Viewer、返回按钮直接触发异步转场函数。用户快速点击 Host/Viewer，或返回过程中再次点击入口/返回，会并发修改 `data-app-view`、panel hidden class、workspace mask 和连接/离开逻辑。
+- 影响：极端操作下可能出现主页和面板同时显示、Host/Viewer 状态互相覆盖、返回时停止共享/离开房间与新面板连接流程交错。
+- 建议：主导航入口使用单一 transition promise；转场期间禁用 Host/Viewer/返回按钮；重复点击复用当前 promise，异常路径恢复按钮并给出错误反馈。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `navigationTransitionPromise`、`runNavigationTransition()` 和 `setNavigationButtonsDisabled()`；Host/Viewer/返回按钮均通过统一入口执行，转场期间禁用导航按钮，finally 中恢复，异常记录 debug log 并显示错误提示。
+
+### ROBUSTNESS-P2-011 调试控制台高频切换会刷本地存储和主进程 IPC
+
+- 位置：`server/public/app.js:184`、`server/public/app.js:525`、`server/public/app.js:582`、`server/public/app.js:1018`
+- 问题：顶栏调试控制台的每次预设点击、类别勾选、通道勾选都会立即 `localStorage.setItem()` 并发送 `renderer-debug-config-changed` 到主进程。用户快速切换多个选项时，会产生一串存储写入和 IPC，同步改变日志输出。
+- 影响：排障时容易制造额外日志噪声和主进程配置抖动；短时间打开/关闭高频日志通道时，media-agent 日志策略可能多次切换，降低诊断数据一致性。
+- 建议：调试 UI 状态即时更新，但持久化和主进程通知做短 debounce，合并用户连续操作，只传播最后一次配置；保留显式 `persist:false`/`notify:false` 语义。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `debugConfigFlushTimer/debugConfigFlushPersist/debugConfigFlushNotify` 和 `scheduleDebugConfigFlush()`；`setDebugConfig()` 默认只调度 100ms 合并 flush，UI 仍立即同步，最终持久化和 IPC 只使用最后一次配置。
+
+### ROBUSTNESS-P2-012 主进程窗口 IPC 缺少统一可用性检查
+
+- 位置：`desktop/main.js:242`、`desktop/main.js:248`、`desktop/main.js:259`、`desktop/main.js:590`
+- 问题：renderer 已有窗口按钮防重入，但主进程的 minimize、minimize-to-tray、maximize IPC 和托盘“显示窗口”仍直接访问 `mainWindow`。窗口正在销毁、退出流程中、或托盘双击与退出同时发生时，可能对已销毁窗口调用 show/hide/minimize/maximize。
+- 影响：极端操作下可能产生 Electron 异常、托盘恢复无焦点、退出流程被恢复窗口打断，增加关闭/更新安装时的不确定性。
+- 建议：主进程也增加窗口可用性检查；退出中忽略窗口操作；托盘菜单和双击共用恢复 helper，恢复时 show/restore/focus 一次完成。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `isMainWindowUsable()` 和 `showMainWindowFromTray()`；窗口 IPC 现在先检查窗口未销毁且未退出；`window-close` 重复请求直接忽略；托盘“显示窗口”和双击共用恢复 helper。
+
+### ROBUSTNESS-P2-013 3010 后台轮询可并发覆盖实时拓扑
+
+- 位置：`server/public/admin.html:244`、`server/public/admin.html:449`
+- 问题：3010 后台使用 `setInterval(refresh, 1000)`，手动刷新按钮也直接调用 `refresh()`。网络慢或浏览器后台标签页时，多个 `/api/rooms` 请求可并发，旧响应/旧错误晚到后会覆盖新的拓扑和 Manifest；失败时还会清空已有房间视图。
+- 影响：后台显示的实时拓扑可能回退到旧快照，接口短暂失败会把已有可用拓扑替换成错误块，排查链路时容易误判房间已经消失或 manifest 丢失。
+- 建议：后台刷新使用单飞请求和序号；手动刷新中止旧请求；页面隐藏时暂停自动轮询，恢复可见时立即刷新；错误只更新状态，不覆盖已有拓扑。
+- 修改意见：按建议修改
+- 处理结果：已处理。`admin.html` 新增 `refreshController/refreshSeq/refreshInFlight` 与 `REFRESH_INTERVAL_MS`；自动轮询有请求在途时跳过，手动刷新会 abort 旧请求，只有最新序号能 render；页面隐藏暂停自动轮询，重新可见时手动刷新；失败时保留已有拓扑，仅在无内容时显示错误块。
+
+### ROBUSTNESS-P2-014 native viewer 音量输入高频 IPC 失败可回滚到旧状态
+
+- 位置：`server/public/app-native-overrides.js:126`、`server/public/app-native-overrides.js:781`、`server/public/app-native-overrides.js:4694`
+- 问题：native viewer 音量滑块和全屏音量滑块在每个 `input` 事件中立即 await `mediaEngine.setViewerVolume()`。用户拖动滑块会产生大量 IPC，旧请求失败时会把 UI 回滚到当时的 previous volume，可能覆盖用户已经拖到的新音量。
+- 影响：极端拖动或 media-agent 短暂繁忙时，音量 UI 与实际系统音量容易短暂不一致；失败日志也会被高频请求放大，降低诊断信噪比。
+- 建议：音量 UI 即时响应，但 native 设置做短 debounce；每次请求带序号，只有当前请求失败才允许回滚；成功后更新已确认音量。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `viewerVolumeApplyTimerId/viewerVolumeApplySeq/viewerVolumeApplyPreviousVolume` 和 `scheduleViewerVolumeApply()`；音量输入 80ms 内合并为最后一次 IPC，旧请求失败不会覆盖新 UI，当前请求失败才回滚到最近确认音量并限流记录。
+
+### ROBUSTNESS-P2-015 桌面 viewer 公开房间刷新可乱序落 UI
+
+- 位置：`server/public/app.js:220`、`server/public/app.js:909`、`server/public/app.js:922`、`server/public/app.js:4394`
+- 问题：桌面 viewer 大厅公开房间列表由 500ms 轮询和手动刷新共同驱动。手动 `force` 刷新可以和自动轮询并发，旧请求晚返回后会覆盖新列表；用户加入房间或返回主页后，请求结束仍会调用 `renderViewerJoinUi()` 更新大厅 UI。
+- 影响：公开房间列表可能回退到旧快照，加入过程中按钮状态被旧刷新重置；离开 viewer 面板后仍发生 UI 更新，增加导航和加入流程交错风险。
+- 建议：公开房间刷新增加序号和 AbortController；自动轮询有请求在途时跳过，手动刷新中止旧请求；只有最新请求且仍处在大厅状态时才落 UI。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `publicRoomsRefreshSeq/publicRoomsAbortController` 和 `cancelPublicRoomsRefresh()`；`refreshPublicRooms()` 会 abort 旧请求、忽略过期响应/错误，并在 `shouldPollPublicRooms()` 或手动刷新场景下才 render；`resetViewerState()` 清理 viewer 状态后取消在途大厅刷新。
+
+### ROBUSTNESS-P1-012 源选择音频候选旧结果可带着过期源开始共享
+
+- 位置：`server/public/app.js:231`、`server/public/app.js:3576`、`server/public/app.js:4007`、`server/public/app.js:4039`
+- 问题：源选择确认后会异步探测窗口音频候选。用户在探测期间刷新源列表、切换源、取消弹窗或重复确认时，旧探测结果仍可能写回当前 source item，并继续用过期的 source/PID 进入共享启动流程。
+- 影响：极端操作下可能出现选中 A 窗口但实际共享 B 窗口、音频 PID 和画面源不匹配、取消后仍开播，或者候选数据写到已经不是当前选择的 DOM 项上。
+- 建议：给源选择音频探测增加独立版本号；打开/刷新/切换/取消/确认都使旧探测失效；异步返回后必须校验当前 source id 和版本号，不匹配时静默丢弃并释放启动 pending。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `sourceAudioSelectionSeq`，源列表刷新、源项切换、确认和取消都会递增版本；`showAudioProcessSelection()` 在 `discoverAudioCandidatesForSource()` 返回后校验版本和 source id，过期结果抛出 `source-audio-selection-superseded`；`confirmSourceAndShare()` 对该过期错误只释放 UI pending 并记录 debug，不再弹错误或继续开播。
+
+### ROBUSTNESS-P2-016 更新检查/下载可被重复状态事件触发
+
+- 位置：`server/public/app.js:326`、`server/public/app.js:3469`、`desktop/main.js:40`、`desktop/main.js:282`、`desktop/main.js:305`
+- 问题：renderer 收到 `available` 更新状态时会直接调用 `downloadUpdate()`，如果 updater 重复发出 available、用户重复触发检查、或 renderer/main 之间旧事件交错，可能并发调用下载。主进程 `check-for-updates` 和 `download-update` 也缺少单飞保护。
+- 影响：更新下载日志刷屏、下载任务相互抢 updater 状态，失败时弹窗状态可能被旧事件覆盖；极端情况下用户会看到反复“发现更新/下载失败/重新下载”的抖动。
+- 建议：renderer 对单轮更新只发送一次下载请求，检查重新开始或失败后再释放；主进程对检查和下载分别加 in-flight guard，updater 的 not-available/downloaded/error 事件释放下载状态。
+- 修改意见：按建议修改
+- 处理结果：已处理。`app.js` 新增 `updateDownloadRequested`，`available` 状态只触发一次 `downloadUpdate()`，请求失败或无更新/错误状态会释放；`desktop/main.js` 新增 `updateCheckInProgressPromise` 和 `updateDownloadInProgress`，重复检查复用同一个 promise，重复下载直接忽略，downloaded/not-available/error 会释放下载 guard。
+
+### ROBUSTNESS-P1-013 Web viewer 加入房间无 ACK 超时会永久卡住
+
+- 位置：`vds_web/src/main.ts:39`、`vds_web/src/main.ts:228`、`vds_web/src/main.ts:311`、`vds_web/src/main.ts:1098`
+- 问题：Web viewer 发送 `join-room` 后只等待服务器返回 `room-joined/session-resumed`，没有 ACK 超时。服务器未响应、信令断开前没有 close、或链路异常时，`joinPending` 会一直保持 true；若之后旧 ACK 迟到，还可能在用户已放弃后重新进入房间。
+- 影响：Web 页面会长期卡在加入中，按钮不可用；用户刷新/重试前无法从 UI 自愈，迟到信令还会造成“明明失败了又自己进房”的状态跳变。
+- 建议：加入请求设置短 ACK timer；离开、reset、失败都清理 timer 并递增尝试序号；超时后关闭本次信令连接、释放 UI；迟到的 join ACK 在非 pending 状态下丢弃。
+- 修改意见：按建议修改
+- 处理结果：已处理。`vds_web/src/main.ts` 新增 `joinAttemptSeq/joinAckTimer`，`joinRoom()` 发送前启动 10 秒 ACK 超时；`leaveCurrentRoom()`、`resetLocalViewerSession()`、失败路径和 `setJoinPending(false)` 统一清理 timer；`handleJoined()` 在非 pending/非恢复状态下忽略迟到 ACK 并写入 `stale-join-ack-ignored` 诊断。
+
+### ROBUSTNESS-P1-014 手动离开后本地信令队列仍可能 flush 旧房间消息
+
+- 位置：`server/public/app.js:201`、`server/public/app.js:3157`、`server/public/app.js:3196`、`server/public/app.js:4412`
+- 问题：断网或 WebSocket 未连接时，offer/answer/ice/viewer-ready 等消息会进入 `pendingMessages`，远端 ICE 也会进入 `pendingRemoteCandidates`。用户此时返回主页、停止共享或离开 viewer 后，旧队列没有统一清理；下一次连接成功时 `flushPendingMessages()` 仍可能发送旧房间/旧角色消息。
+- 影响：极端断网和快速切换场景下，服务器可能收到过期 offer/ice/viewer-ready/resume，造成房间拓扑误判、旧 peer 被唤醒、诊断中出现不属于当前房间的信令噪声。
+- 建议：手动断开连接和 viewer reset 时清空本地待发信令队列及远端候选缓存；清理时只记录简短 debug 计数，不引入新状态机。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `clearPendingSignalingQueues()`，清空 `pendingMessages` 与 `pendingRemoteCandidates` 并记录原因/计数；`disconnectWebSocket()` 和 `resetViewerState()` 调用该函数，避免离开后旧信令在下一次连接时 flush。
+
+### ROBUSTNESS-P2-017 连续错误 toast 会被旧隐藏定时器提前盖掉
+
+- 位置：`server/public/app.js:236`、`server/public/app.js:4276`
+- 问题：`showError()` 每次显示错误都会创建新的 3 秒隐藏定时器，但旧定时器不会清理。用户连续触发两个错误时，前一个定时器可能在后一个错误刚出现后立刻隐藏 toast。
+- 影响：极端操作或网络错误连发时，最新错误提示会闪一下就消失，用户看不到真正失败原因，排障信息也更容易丢。
+- 建议：保存当前 toast hide timer；显示新错误前清理旧 timer；当前 timer 执行后置空，避免旧 timer 控制新 toast。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `errorToastHideTimer`；`showError()` 现在会先清理旧隐藏定时器，再为当前错误创建唯一 timer，旧错误不会提前隐藏新错误。
+
+### ROBUSTNESS-P1-015 关闭当前 viewer 上游 peer 时旧等待 timer 仍可能残留
+
+- 位置：`server/public/app-native-overrides.js:3050`、`server/public/app-native-overrides.js:3073`
+- 问题：`closeNativePeerConnectionImpl()` 会清理 peer 自身的连接/断开 timer，但不知道正在关闭的 peer 是否是 viewer 当前上游。若用户快速离开、切换上游、重连或服务端重新分配拓扑，旧上游的 media wait / offer wait timer 可能在 peer 已关闭后仍保留。
+- 影响：旧 timer 迟到触发后可能把 viewer 状态改回“等待画面/等待上游”，或发送过期 `viewer-reconnect-ready`，制造旧 peer 对新房间/新上游的状态污染。
+- 建议：关闭 native peer 前记录它是否为当前 viewer upstream；finally 中若匹配，则同步清理 viewer 级等待 timer 和该 peer 的一次性重连标记。
+- 修改意见：按建议修改
+- 处理结果：已处理。`closeNativePeerConnectionImpl()` 新增 `closingCurrentViewerUpstream` 兜底；关闭当前 viewer 上游 peer 时会清理 `viewerMediaWaitTimerId`、`viewerUpstreamOfferWaitTimerId`，并释放 `viewerUpstreamOfferReconnectSentForPeerId`。
+
+### ROBUSTNESS-P2-018 Web viewer 离开后旧 ICE/下游状态未完全清空
+
+- 位置：`vds_web/src/main.ts:53`、`vds_web/src/main.ts:863`
+- 问题：Web viewer `resetLocalViewerSession()` 会关闭 peer/datachannel 和 decode timer，但没有清空 `pendingIceCandidates`，也没有重置 `downstreamPeerId` 与 bootstrap frame 标记。用户在同一页面反复加入/离开，旧候选和旧下游标识可能残留到下一轮。
+- 影响：如果下一轮房间复用相同 peer id 或迟到信令撞上旧缓存，可能 flush 旧 ICE、错误归类上下游候选，或 relay bootstrap 状态判断偏旧。
+- 建议：本地 session reset 时清空全部 pending ICE，并把下游 peer id、edge attempt、bootstrap keyframe 状态归零。
+- 修改意见：按建议修改
+- 处理结果：已处理。`resetLocalViewerSession()` 现在会 `pendingIceCandidates.clear()`，并重置 `downstreamPeerId` 与 `lastBootstrapFrameId`，确保 Web viewer 同页反复进退不会继承旧候选/下游状态。
+
+### ROBUSTNESS-P1-016 同一 WebSocket 可跨房间重新绑定造成幽灵 viewer
+
+- 位置：`server/server-core.js:350`、`server/server-core.js:464`、`server/server-core.js:961`
+- 问题：`create-room` 已拒绝已绑定 socket，但 `join-room` 和 `resume-session` 没有同等保护。同一个 WebSocket 如果先加入 A 房，再发送加入/恢复 B 房或其他角色，服务端会覆盖 `ws.roomId/ws.clientId/ws.role`，旧房间仍保留 viewer/host 元数据。
+- 影响：断开清理会按新绑定执行，旧房间留下幽灵 viewer；拓扑容量、上游重选、公开房间人数和后续信令转发都可能被污染。
+- 建议：服务端在 join/resume 前检查 socket 是否未绑定或仍是同一 room/client/role；跨房间/跨角色重绑直接返回 `socket-already-bound`，允许同身份重试。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `isSocketUnboundOrSameBinding()` 和 `sendSocketAlreadyBound()`；`handleJoinRoom()` 与 `handleResumeSession()` 现在拒绝跨绑定 socket。新增 `testBoundViewerSocketCannotJoinAnotherRoom()` 覆盖同一 viewer socket 从 A 房跳 B 房时 B 房人数不增加、A 房状态不丢失。
+
+### ROBUSTNESS-P1-017 旧 leave-room 迟到可误删当前房间
+
+- 位置：`server/server-core.js:270`、`server/server-core.js:592`
+- 问题：服务端收到 `leave-room` 时直接按 socket 当前绑定执行 `handleDisconnect(ws, true)`，没有校验消息里的 `roomId/clientId` 是否仍匹配当前 socket。用户停止共享后立刻重新共享、断网队列迟到、或旧客户端重复发送旧房间 leave 时，旧消息可能作用到新房间。
+- 影响：当前 host 房间可能被旧 leave 删除；viewer 也可能因为旧 leave 误退，导致拓扑、公开房间列表和 manifest 状态突然消失。
+- 建议：`leave-room` 只接受与 socket 当前 `roomId/clientId` 完全匹配的消息；不匹配的旧消息静默忽略。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `handleLeaveRoom()`，只有 `data.roomId === ws.roomId`、`data.clientId === ws.clientId` 且 `sessionToken` 匹配当前 host/viewer 会话时才执行立即断开；桌面端、native override、Web 端离房路径均带 session token。新增 `testStaleLeaveRoomCannotRemoveCurrentRoom()` 覆盖 host 重建新房后旧房 leave 迟到不会删除当前房间。
+
+### ROBUSTNESS-P1-018 旧 viewer-reconnect-ready 可误触发当前拓扑重选
+
+- 位置：`server/server-core.js:568`、`server/public/app-native-overrides.js:2065`、`server/public/app-native-overrides.js:2777`、`server/public/app-native-overrides.js:4643`
+- 问题：服务端处理 `viewer-reconnect-ready` 时只校验 socket 权威性和 `chainPosition`，没有校验 viewer 当前 `sessionToken`，也没有确认 `failedUpstreamPeerId` 仍是当前上游。用户快速重连、服务端刚重选上游、旧 timer/旧失败报告迟到时，旧消息仍可能再次触发上游重选。
+- 影响：viewer 已经切到新上游后，旧失败报告可能把拓扑再次改写，导致重复 `viewer-joined`/`connect-to-next`、链位显示抖动、媒体连接重新协商。
+- 建议：`viewer-reconnect-ready` 必须匹配当前 viewer 会话 token；携带 `failedUpstreamPeerId` 时，该值必须等于服务端记录的当前上游，否则静默忽略；客户端发送该消息时补齐 session token。
+- 修改意见：按建议修改
+- 处理结果：已处理。`handleViewerReconnectReady()` 新增 viewer `sessionToken` 校验，并在 `failedUpstreamPeerId` 不等于当前 `getViewerUpstreamId()` 时忽略旧报告；native 三处 `viewer-reconnect-ready` payload 补齐 `sessionToken`，Web 端原本已带 token。新增 `testStaleViewerReconnectReadyDoesNotReselectCurrentUpstream()` 覆盖 viewer 已从旧上游重选后，迟到旧失败报告不会再次通知 host 重连。
+
+### ROBUSTNESS-P1-019 旧 viewer-ready 可误标记当前 viewer 为可转发
+
+- 位置：`server/server-core.js:540`、`server/public/app-native-overrides.js:3704`、`vds_web/src/main.ts:587`
+- 问题：服务端处理 `viewer-ready` 时只校验权威 socket 和 `chainPosition`，没有校验当前 viewer 的 `sessionToken`。用户快速离开/重进、断线恢复、旧 pending message 或旧 timer 迟到时，旧 ready 仍可能把当前 viewer 标记为 `mediaReady/relayEstablished`。
+- 影响：服务端可能提前通知后续下游连接一个并非当前会话确认就绪的上游，导致链式 relay 错接、拓扑状态抖动或媒体协商被旧状态污染。
+- 建议：`viewer-ready` 必须匹配当前 viewer 的 session token；Web/native 发送 ready 时补齐 token；测试中的 ready 消息使用真实 join ack token。
+- 修改意见：按建议修改
+- 处理结果：已处理。`handleViewerReady()` 新增 viewer `sessionToken` 校验；Web `maybeSendViewerReady()` 与 native viewer ready payload 补齐 session token；`test-server-core` 里的 viewer-ready 路径均使用对应 join ack token，已通过 server-core 和 Web 类型检查。
+
+### ROBUSTNESS-P1-020 停止共享后迟到 media-state 可复活 host 运行态
+
+- 位置：`server/public/app-native-overrides.js:80`、`server/public/app-native-overrides.js:2960`、`server/public/app-native-overrides.js:3769`、`server/public/app-native-overrides.js:3901`、`server/public/app-native-overrides.js:3979`
+- 问题：native media engine 的 `media-state` 事件异步到达，`host-session-started`、`obs-ingest-waiting`、`obs-stream-running` 等状态原来没有生命周期门禁。用户开始共享后立刻停止、OBS 状态迟到、或 stop 已完成后旧事件返回时，renderer 仍可能把 `nativeHostSessionRunning` 置回 true，OBS 分支还可能重新触发建房。
+- 影响：停止共享后 UI/内部状态被旧事件复活，可能出现开始按钮状态错位、等待 OBS/host 运行态残留、迟到 `create-room` 或后续停止共享清理对象不一致。
+- 建议：host session 类 `media-state` 只有在 native start 正在进行、host 已运行、或当前仍有 host 房间时才允许改写 host 状态；stop 入口递增 generation 并清理 start-in-flight；start 函数用 `finally` 释放 in-flight。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `HOST_SESSION_MEDIA_STATES` 与 `nativeHostStartInFlight` 门禁，停止共享入口会立即递增 `nativeHostStartGeneration` 并清理 start-in-flight；native/OBS 两条 start 路径用 `try/finally` 释放 in-flight；停止完成后迟到的 host session media-state 会记录 `media-state:ignored-after-stop` 并丢弃。
+
+### ROBUSTNESS-P1-021 停止共享后迟到 room-created ACK 可复活旧房间
+
+- 位置：`server/public/app-native-overrides.js:581`、`server/public/app-native-overrides.js:4421`
+- 问题：native host 创建房间是异步信令。用户开始共享后立刻停止共享时，本地已经清空 `currentHostMediaSessionId` 和 host 状态，但服务端迟到的 `room-created` ACK 原来仍会被无条件接收，重新设置 `currentRoomId/sessionRole/currentSessionToken` 并显示停止共享按钮。
+- 影响：停止共享后旧房间可能在 UI 和本地状态中“复活”，下一次共享可能继承错误房间/manifest，或让服务端残留一个无人使用的旧房间。
+- 建议：`room-created` ACK 必须携带并匹配当前 `mediaSessionId`，且 native host session 仍在运行；不匹配的 ACK 只记录一次精简日志，并立即发送不入队 `leave-room` 清理服务端旧房间。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `getManifestMediaSessionId()`，`room-created` 分支现在校验 ACK 的 `mediaSessionId`、当前 `currentHostMediaSessionId` 与 `nativeHostSessionRunning`；迟到 ACK 会记录 `room-created:stale-ignored`，并 best-effort 发送 `leave-room` 清理旧房间，不再复活 host UI/状态。
+
+### ROBUSTNESS-P1-022 Web 静态产物未同步导致旧 randomUUID 调用卡住能力检测
+
+- 位置：`vds_web/src/main.ts:1399`、`server/public/vds_web/index.html`、`server/public/vds_web/assets/index-CPXacECN.js`
+- 问题：源码里的 `createClientUuid()` 已有 `crypto.randomUUID` / `getRandomValues` / `Math.random` 三级 fallback，但服务端静态目录可能仍保留旧 bundle。用户通过不支持 `crypto.randomUUID` 的环境打开 Web viewer 时，旧产物会在初始化 client id 前抛错，页面停在“P2P：能力检测中”。
+- 影响：Web 端还没进入能力检测和信令连接就崩溃；用户看不到可操作错误，只能从控制台看到 `crypto.randomUUID is not a function`。
+- 建议：重新构建并同步 `server/public/vds_web` 产物；确认实际引用 bundle 中 `randomUUID` 调用有 `typeof` 保护，并保留 fallback。
+- 修改意见：按建议修改
+- 处理结果：已处理。执行 `npm run build:vds-web`，服务端 Web 产物更新为 `index-CPXacECN.js`，`index.html` 已引用新 hash；产物检查确认 `randomUUID` 只在 `typeof ... === 'function'` 后调用，并保留 `getRandomValues` 与 `Math.random` fallback；`npm run check:vds-web` 已通过。
+
+### ROBUSTNESS-P1-023 Web viewer 切换加入房间时旧 room-joined ACK 可落入新请求
+
+- 位置：`vds_web/src/main.ts:39`、`vds_web/src/main.ts:230`、`vds_web/src/main.ts:316`、`vds_web/src/main.ts:1116`
+- 问题：Web viewer 的 `handleSignal()` 在尚未建立 `session` 时会允许 `room-joined` 进入，`handleJoined()` 只判断 `joinPending/restoringStoredSession`。用户加入 A 房后快速超时/离开/再加入 B 房，A 房迟到 ACK 可能在 B 房 join pending 期间被接收。
+- 影响：Web viewer 可能显示已加入错误房间，后续 offer/ice、sessionToken、manifest 都来自旧 ACK，造成连接状态和实际用户输入不一致。
+- 建议：记录当前 pending join 的目标房间号；`room-joined/session-resumed` ACK 必须匹配该目标房间，离开、超时、reset 或 join 完成时清空。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `pendingJoinRoomId`；`joinRoom()` 发起请求时记录规范化房间号，`handleJoined()` 校验 ACK roomId，不匹配则记录 `stale-join-room-ack-ignored` 并丢弃；`setJoinPending(false)` 会统一清空 pending 房间。
+
+### ROBUSTNESS-P1-024 Web viewer 离开后迟到房间信令仍可污染首页状态
+
+- 位置：`vds_web/src/main.ts:263`、`vds_web/src/main.ts:304`
+- 问题：Web viewer 离开或 reset 后会清空 `session` 并关闭信令，但迟到消息仍可能进入 `handleSignal()`。原 `isSignalForCurrentSession()` 在 `!session` 时直接返回 true，导致带 `roomId` 的旧 `offer/ice/host-disconnected/connect-to-next` 仍能继续处理。
+- 影响：用户已经返回加入页后，迟到 `host-disconnected` 可把状态改成“连接失败”；迟到 offer/ice 也会写入错误诊断或触发无 session 错误，影响下一次加入前的 UI/诊断可信度。
+- 建议：无当前 session 时，只允许 join ACK、session resume ACK 和 error 这类建连消息进入；其他携带 roomId 的房间信令一律作为旧信令丢弃。
+- 修改意见：按建议修改
+- 处理结果：已处理。`isSignalForCurrentSession()` 在 `!session` 时只放行 `room-joined/session-resumed/error`，其他带 `roomId` 的旧房间信令会返回 false 并记录 `stale-room-signal-ignored`，避免离开后旧消息污染首页状态。
+
+### ROBUSTNESS-P1-025 更新下载完成后迟到状态可取消静默安装
+
+- 位置：`server/public/app.js:329`、`server/public/app.js:3363`、`server/public/app.js:3490`
+- 问题：renderer 收到 `downloaded` 后会安排静默安装 timer，但 `applyUpdateStatus()` 每次新状态进来都会先清理安装 timer。若下载完成后又收到迟到的 `error/not-available/downloading` 状态，可能取消已经排好的安装并把弹窗改成失败或检查结果。
+- 影响：用户看到“更新已下载”后应用不重启安装，或者安装前 UI 又跳成错误，发布更新时体验和诊断都不稳定。
+- 建议：把 `downloaded` 视作待安装终态；进入该状态后，除新的 downloaded 外忽略后续迟到状态，直到安装请求发出或进程退出。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `updateReadyToInstall`；`downloaded` 和 `requestQuitAndInstall()` 会设置该终态，`applyUpdateStatus()` 在终态下忽略非 downloaded 的迟到状态，避免清掉静默安装 timer；新一轮 checking/available/downloading/not-available/error 会在非终态路径重置该标记。
+
+### ROBUSTNESS-P1-026 native surface attach 晚返回可复活已 detach 的 surface
+
+- 位置：`server/public/app-native-overrides.js:58`、`server/public/app-native-overrides.js:390`、`server/public/app-native-overrides.js:1862`
+- 问题：`attachEmbeddedSurface()` 异步调用 media-agent 后，无条件把 surface 写回 `attachedEmbeddedSurfaces`。用户在窗口移动、停止共享、关闭 peer 或重建预览期间，如果 `detachEmbeddedSurface()` 已经执行但旧 attach 晚返回，renderer 会重新登记一个实际应被清理的 surface。
+- 影响：旧 surface 继续进入 tracking loop 和 `updateSurface`，可能导致窗口移动后播放/预览卡住、重复 recover、或 media-agent 里出现 surface 状态与 renderer tracking 不一致。
+- 建议：每个 surface 维护轻量 generation；attach 发起时记录 generation，detach/remove 时递增；attach 返回后 generation 不一致则立即 best-effort detach 并丢弃结果。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `embeddedSurfaceGenerations`；`removeEmbeddedSurfaceTracking()` 会递增对应 surface generation；`attachEmbeddedSurface()` 发起 attach 时记录票据，晚返回发现票据过期会调用 `detachSurface` 清理并记录 `attachSurface:stale-result-ignored`，不再把旧 surface 放回 tracking。
+
+### ROBUSTNESS-P1-027 native surface recover 失败后仍可能误标 host 预览已挂载
+
+- 位置：`server/public/app-native-overrides.js:425`
+- 问题：`recoverEmbeddedSurface()` 调用 `attachEmbeddedSurface()` 后，不管返回值是否为 `null` 都会把 `hostPreviewSurfaceAttached` 重新置为 true。当前 generation 保护下，`attachEmbeddedSurface()` 在旧 attach 过期时会返回 `null`，这时继续标记已挂载会让 renderer 认为 host 预览存在，但 native agent 侧已经 detach。
+- 影响：窗口移动、停止共享、surface recover 或打包版启动时序偏慢时，可能出现“内部认为预览已挂上，实际没有预览窗口”的假状态，后续同步循环也更难触发正确重挂。
+- 建议：recover 只有在 `attachEmbeddedSurface()` 返回有效结果后，才恢复 `hostPreviewSurfaceAttached`。
+- 修改意见：按建议修改
+- 处理结果：已处理。`recoverEmbeddedSurface()` 现在判断 `result && surfaceId === HOST_PREVIEW_SURFACE_ID` 后才把 `hostPreviewSurfaceAttached` 置 true；过期/失败的 attach 返回 `null` 时不会伪造 host preview 已挂载状态。
+
+## 用户操作稳健性审计最终验证记录
+
+- 范围：本轮审计覆盖桌面 UI 极端点击/返回/停止共享、native surface attach/recover、host/viewer 房间生命周期、Web viewer 加入/离开/恢复、链式 relay 拓扑重选、更新下载安装状态、日志开关和 Docker server 上下文。
+- 已通过命令验证：`node --check desktop/main.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`node --check server/server-core.js`、`npm run check:vds-web`、`npm run test:vds-web`、`node scripts/test-server-core.js`、`npm run check:logging`、`npm run check:server-docker`、`npm run build:vds-web`、`npm run smoke:media-agent`、`git diff --check`。
+- 人工 E2E 入口：`powershell -ExecutionPolicy Bypass -File scripts/manual-media-agent-e2e.ps1 -SkipVerify` 可打印基础双端 native、三端 native、OBS ingest，以及下方剩余人工复核场景的手测步骤；按清单逐项填写验收结果。
+- 审计闭环：当前 `CODE_AUDIT_FINDINGS` 中带 `修改意见` 的问题均已填写 `处理结果`。
+- 剩余人工复核：打包版 native host 预览出现、窗口拖动期间 viewer 画面不断流、host 停止共享后立刻重新共享创建新房间、Web v1/v2 链路切换、host/v1 强关后的 viewer 断开提示。这些依赖真实 Electron 窗口、media-agent、显卡/采集和网络时序，不能仅靠静态检查证明。
+
+### 人工 E2E 复核清单
+
+- [ ] 打包版 native host 开始共享后，host 预览窗口出现且非黑屏；移动/最小化/恢复窗口后仍能恢复预览。结果：待验证。
+- [ ] native viewer 播放时拖动 viewer 窗口，画面不中断、不长期 freeze，surface recover 不产生重复 attach/detach 风暴。结果：待验证。
+- [ ] host 停止共享但不退出应用后，立刻再次开始共享，应创建新房间、新 manifest、新 sessionToken，旧 room-created/leave-room 不污染新房间。结果：待验证。
+- [ ] Web v1/v2 链式观看场景：优先链式 relay；上游不可达时服务端重选上游；每个上游最多两个下游；音频本地播放和转发语义正确。结果：待验证。
+- [ ] host 或 v1 强关后，下游 viewer 在 grace 时间后明确显示断开/重选，不长期停留 freeze 或错误链位。结果：待验证。
+
+### ROBUSTNESS-P1-028 预览崩溃重试后开播按钮状态和建房时序不闭环
+
+- 位置：`server/public/app.js:2602`、`server/public/app.js:3612`、`server/public/app-native-overrides.js:3505`、`server/public/app-native-overrides.js:3890`、`server/public/app-native-overrides.js:4471`
+- 问题：源选择弹窗在列本地窗口前先等待 WebSocket，网络未就绪会让用户误以为窗口选择页打不开；native host 预览 attach 崩溃后重试无预览开播时，`create-room` 发送前没有显式确认 WebSocket 已连通，且成功 `room-created` 后没有释放通用开播 pending 状态。重复尝试后可能出现“确认并继续”按钮无反应，或 native session 已启动但房间创建没有明确成功/失败闭环。
+- 影响：打包版/时序较慢环境里，预览 crash、网络重连、用户重复点击确认会互相叠加，导致源选择页不出现、确认按钮被旧状态锁住、无预览重试后没有房间。
+- 建议：源选择只依赖本地 media-engine；真正建房前短等 WebSocket，失败走现有 host start cleanup；`room-created` 成功时释放开播 pending UI。
+- 修改意见：按建议修改
+- 处理结果：已处理。`showSourceSelection()` 移除建连等待，窗口/屏幕枚举不再被信令状态阻塞；native/OBS 两条建房路径在发送 `create-room` 前等待 WebSocket 最多 5 秒，失败清理 pending 并提示；`create-room` 成功发出后立即调用 `__vdsResetShareStartPendingUi()` 释放 `shareStartInFlight/sourceConfirmInFlight` 和按钮状态，`room-created` ACK 分支也保留幂等释放，避免重复尝试后确认按钮被旧状态挡住。
+
+### RUNTIME-FIX-P1-029 WGC live preview 创建时 SEH 访问冲突会杀死 media-agent
+
+- 位置：`media-agent/src/wgc_capture.cpp`、`media-agent/CMakeLists.txt`
+- 问题：当前崩溃日志停在 `nativeLivePreview:source-create-begin target=display/window` 后，进程退出码 `3221225477`，即 Windows `0xC0000005` 访问冲突。`create_wgc_frame_source()` 只捕获 `winrt::hresult_error`、`std::exception` 和 C++ `catch (...)`，但 MSVC 默认 `/EHsc` 下结构化异常不会进入这些 catch，WinRT/WGC/驱动层 AV 会直接终止 media-agent。
+- 影响：host 主采集正常时，预览创建只要在 WGC source 边界触发一次 AV，整个 media-agent 就退出，renderer 只能看到 `media-agent-exited:3221225477`，表现为无预览甚至需要重启 agent。
+- 建议：只在 WGC source 创建编译单元开启 MSVC `/EHa`，并在 `create_wgc_frame_source()` 入口安装 `_set_se_translator`，把 SEH 转成普通可诊断错误；不要把 `/EHa` 扩到整个 media-agent。
+- 修改意见：按建议修改
+- 处理结果：已处理。`wgc_capture.cpp` 新增 `ScopedSehTranslator` 和 `WgcSehException`，`create_wgc_frame_source()` 在已有全局创建互斥内安装 SEH translator；`0xC0000005` 等 SEH 会返回 `wgc-source-create-seh-error:0xc0000005:wgc-source-create-seh-exception`，然后 live preview 按已有失败路径返回 `surface-live-preview-start-failed`，不再杀死 media-agent。`CMakeLists.txt` 将 `/EHa` 收窄到 `src/wgc_capture.cpp` 单文件。已执行两轮 `scripts/verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、单元测试、smoke test 均通过，并已复制新 `runtime/media-agent/vds-media-agent.exe`。
+
+### RUNTIME-FIX-P1-030 WGC live preview source 失败会触发前端重复 attach 风暴
+
+- 位置：`media-agent/src/native_live_preview.cpp`、`media-agent/src/surface_control_runtime.cpp`
+- 问题：SEH 收住后，Dota 2 等窗口目标会把 WGC source 创建失败转成 `SURFACE_ATTACH_FAILED`。由于 attach 失败不会登记 surface，renderer 后续同步/恢复会继续发起 attach，每次又重新创建 WGC source，造成重复错误日志、预览黑屏和状态抖动。
+- 影响：media-agent 不再进程崩溃，但 host 预览仍可能无窗口或反复失败；用户看到“无预览”和大量重复 `wgc-source-create-seh-error`，诊断噪声掩盖真实原因。
+- 建议：WGC live preview 的 source 创建失败时，不把整个 surface attach 判为失败；保留可更新布局的 native preview 窗口，渲染稳定占位帧并记录 `live-preview-source-unavailable`，本次 attach 生命周期内不再重复创建 source。
+- 修改意见：按建议修改
+- 处理结果：已处理。`NativeLivePreview::thread_main()` 现在在 capture source 启动失败后仍将 preview surface 标记为 attached/running，渲染 `Host preview unavailable` 占位帧，并保留原始 `wgc-source-create-seh-error` 到 `lastError`。同时 `NativeLivePreview::capture_loop()` 对窗口 WGC source 初次创建失败增加一次 display WGC fallback；fallback 成功时保留 `live-preview-display-fallback-running`，后续帧渲染显示 `live-preview-display-fallback-frame-rendered`，失败时才进入稳定占位。这样 `attachSurface` 对前端返回成功，后续窗口移动只走 `updateSurface`，不会反复触发 WGC source 创建；真正的共享/发送链路不受影响。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、`vds-media-agent-unit-tests`、media-agent smoke test 均通过，并已复制新 `runtime/media-agent/vds-media-agent.exe`。
+
+### RUNTIME-FIX-P1-035 WGC live preview source 创建 SEH 仍缺少阶段定位且更新间隔过激
+
+- 位置：`media-agent/src/wgc_capture.cpp`、`media-agent/src/wgc_capture.h`、`media-agent/src/native_live_preview.h`、`media-agent/src/surface_attachment_runtime.cpp`、`media-agent/src/host_capture_plan.cpp`
+- 问题：新复现日志中，host 选择 `Codex` 窗口后 `attachSurface` 已稳定返回 `live-preview-source-unavailable`，并保留 `lastError=wgc-source-create-seh-error:0xc0000005:wgc-source-create-seh-exception`，说明上一轮状态竞态已修复，但 WGC source 创建本身仍在某个 WinRT/WGC 阶段触发 SEH。当前错误没有携带初始化阶段，无法判断崩在 `CreateForWindow`、`CreateFreeThreaded`、`CreateCaptureSession` 还是 `StartCapture`；同时 `MinUpdateInterval` 硬编码为 1ms，会让 WGC 尽可能高频出帧，和前面出现过的 host preview 160fps、鼠标卡顿风险一致。
+- 影响：后续日志只能看到 `0xc0000005`，仍无法精确定位驱动/WinRT 崩点；预览创建成功时也可能以远高于配置帧率运行，增加 GPU/DWM/WGC 压力。
+- 建议：WGC source 初始化过程维护 `creation_stage`，所有 HRESULT/SEH/std/unknown 错误都加 `stage=...` 前缀；`MinUpdateInterval` 按配置帧率计算，host sender 和 live preview 都传递 `frame_rate`。
+- 修改意见：按建议修改
+- 处理结果：已处理。`WgcFrameSourceConfig` 新增 `frame_rate`；host capture plan 和 live preview config 都传入实际帧率。`WgcFrameSource::Impl` 在 support check、WinRT apartment、D3D device、item 创建、frame pool、session 创建、属性设置和 `StartCapture` 各阶段更新 `creation_stage`，`create_wgc_frame_source()` 对失败和异常统一输出 `stage=<stage>; ...`。`MinUpdateInterval` 从固定 1ms 改为按帧率计算，例如 30fps 约 33ms、60fps 约 16ms。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、`vds-media-agent-unit-tests`、media-agent smoke test 均通过，并已复制新 `runtime/media-agent/vds-media-agent.exe`。
+
+### RUNTIME-FIX-P1-034 WGC live preview 初次 source 失败会返回半成品状态且清空错误
+
+- 位置：`media-agent/src/native_live_preview.cpp`
+- 问题：快速多次开始/停止共享后，`attachSurface` 偶发返回 `reason=live-preview-source-create-failed` 且 `lastError=""`。原因是 capture worker 在 source 创建失败时先写入中间态 `live-preview-source-create-failed`，主线程随后按“启动成功”分支把 `last_error.clear()` 执行掉，前端正好可读到一个没有诊断价值的半成品状态。
+- 影响：用户看到预览没出来，但诊断既不是稳定占位态，也没有保留 `wgc-source-create-*` 原始错误；这会误导后续排查，把 transient WGC source 创建失败看成未知黑屏。
+- 建议：source 创建失败不直接写 surface snapshot；先记录原始错误，渲染 `Host preview unavailable` 占位，并把 snapshot 一次性落到 `live-preview-source-unavailable` 后再通知 attach 返回。启动主线程不得清理失败态的 `lastError`。
+- 修改意见：按建议修改
+- 处理结果：已处理。`try_create_source()` 现在只保存规范化后的 source 创建错误并写 breadcrumb，不再暴露 `live-preview-source-create-failed` 中间态；初次失败路径改为先渲染占位、写 `live-preview-source-unavailable` 和非空 `lastError`，再 `finalize_capture_start(true)` 返回 attach；主线程启动成功分支保留 `source-unavailable` 的错误字段，并把遗留 `source-create-failed` 归一成 `source-unavailable`。同一 surface 内的 1.5 秒重试逻辑保持不变，重试成功后会清空错误并恢复真实预览。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、`vds-media-agent-unit-tests`、media-agent smoke test 均通过，并已复制新 `runtime/media-agent/vds-media-agent.exe`。
+
+### RUNTIME-FIX-P1-033 多次快速 start/stop 后 WGC live preview source transient SEH 失败不会自恢复
+
+- 位置：`media-agent/src/native_live_preview.cpp`
+- 问题：多次开始共享/停止共享后，前几次 `wgc-live-preview` 能 attach，后几次 `attachSurface` 返回 `live-preview-source-unavailable`，`lastError=wgc-source-create-seh-error:0xc0000005:wgc-source-create-seh-exception`。现有逻辑虽然避免 media-agent 崩溃和前端 attach 风暴，但初始 source 创建失败后 capture worker 退出，只留下稳定占位；如果这是 WGC/驱动在快速释放后短暂不可用，当前 surface 生命周期内不会再尝试恢复。
+- 影响：用户看到“前几次可以预览，后几次预览挂了”；即使 WGC 状态随后恢复，host preview 也不会自动出画，必须停止/重新开始或重建 agent。
+- 建议：保持 attach 成功和稳定占位，但不要结束 live preview capture worker；在同一个 surface 内低频重试 WGC source 创建。重试失败仍保持占位和原始错误，成功后直接切回真实预览，避免前端重复 attach。
+- 修改意见：按建议修改
+- 处理结果：已处理。`NativeLivePreview::capture_loop()` 初始 source 创建失败时现在 `finalize_capture_start(true)`，渲染 `Host preview unavailable` 占位并保留错误，同时保持 worker 存活；后续每约 1.5 秒在同一 preview runtime 内重试 `create_wgc_frame_source()`，成功后清掉 retry deadline 并进入正常帧渲染。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、`vds-media-agent-unit-tests`、media-agent smoke test 均通过，并已复制新 `runtime/media-agent/vds-media-agent.exe`。
+
+### RUNTIME-FIX-P1-031 源选择枚举被 desktopCapturer 缩略图 WGC 首帧等待拖到超时
+
+- 位置：`desktop/main.js:173`、`desktop/main.js:1161`、`server/public/app.js:3613`
+- 问题：单端 native 点击开始共享后，窗口选择弹窗没有拉起；日志显示 `listCaptureTargets failed: capture-target-list-timeout`，随后 Electron Chromium desktop capture 输出 `wgc_capture_session.cc: Timed out after waiting 5000 ms for the first frame`。本地 Electron 类型定义说明 `desktopCapturer.getSources({ thumbnailSize })` 会为每个 source 生成 thumbnail，且 `thumbnailSize` 任一维度设为 0 时可跳过缩略图以节省采集处理时间。现有代码在源列表阶段请求 `320x180` 缩略图，导致窗口枚举被 WGC 缩略图首帧等待拖死。
+- 影响：真实采集/预览可能还没开始，用户只是在打开源选择列表，就已经触发 WGC 帧采集；某些窗口、游戏或驱动状态下首帧超时，前端只能看到源选择弹窗迟迟不出现或失败。
+- 建议：源选择列表阶段不要请求 desktopCapturer 缩略图；列表只负责返回可选 source 元数据。IPC 层不要把枚举错误吞成空数组，失败直接抛给前端显示，便于 failfast 定位。
+- 修改意见：按建议修改
+- 处理结果：已处理。`desktopCapturer.getSources()` 的 `thumbnailSize` 改为 `{ width: 0, height: 0 }`，不再为源列表触发缩略图 WGC 首帧采集；`media-engine-list-capture-targets` 捕获异常后记录日志并重新抛出，不再返回 `[]` 伪装成“没有源”。`showSourceModal()` 已支持无 thumbnail source，列表会显示名称、副标题和状态。
+- 验证结果：已执行 `node --check desktop/main.js`、`node --check server/public/app.js`、`node scripts/test-server-core.js`，均通过；已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、单元测试、media-agent smoke test 均通过。
+
+### RUNTIME-FIX-P1-032 最小化窗口恢复后 native 预览/发送仍停留等待窗口恢复
+
+- 位置：`media-agent/src/native_live_preview.cpp`、`media-agent/src/native_live_preview.h`、`media-agent/src/surface_attachment_runtime.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/peer_video_sender.cpp`
+- 问题：选择最小化窗口开始共享时，native preview 正确显示“等待房主窗口恢复”；但恢复窗口后仍停留在等待占位。代码只保存初始 HWND 并用 `IsIconic(hwnd)` 判断恢复状态，部分应用恢复时会重建/切换主窗口 HWND，旧 HWND 仍可能保持 minimized；同时 host peer sender 在检测到 minimized->normal 后进入 `refresh_pending`，但当前线程只 sleep/continue，依赖外部 soft refresh，单端或无下游场景更容易表现为一直等待。
+- 影响：用户恢复目标窗口后 host 预览不出画；有 viewer 时发送路径也可能卡在等待/刷新 pending，导致画面不恢复或状态长时间停留在窗口恢复中。
+- 建议：preview config 携带 capture title；旧 HWND 仍 minimized 时按标题重新解析当前窗口 HWND，解析到 normal 窗口后切换 source handle 并创建 WGC source。peer sender 在窗口恢复为 normal 时直接退出 placeholder 并重建 source，不进入永久 refresh pending。
+- 修改意见：按建议修改
+- 处理结果：已处理。`NativeLivePreviewConfig` 新增 `capture_title`，surface attach 传入 host capture title；`native_live_preview` 和 `agent_lifecycle` 在旧 HWND 仍 minimized 时会用 `resolve_window_handle_from_title()` 尝试解析新的 normal HWND 并更新 capture handle/state；`peer_video_sender` 在窗口恢复 normal 后直接切出 placeholder 并创建 WGC source，不再把 minimized 恢复挂到 soft refresh pending。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、`vds-media-agent-unit-tests`、media-agent smoke test 均通过，并已复制新 `runtime/media-agent/vds-media-agent.exe`。

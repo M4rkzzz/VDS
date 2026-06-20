@@ -38,6 +38,8 @@ let quitInProgress = false;
 let quitCleanupComplete = false;
 let quitFinalizeTimer = null;
 let updateInstallInProgress = false;
+let updateCheckInProgressPromise = null;
+let updateDownloadInProgress = false;
 let audioCapture = undefined;
 let emulatedFullscreenState = {
   active: false,
@@ -177,7 +179,7 @@ ipcMain.handle('media-engine-list-capture-targets', async () => {
     );
   } catch (error) {
     logMainProcessDebug('video', '[media-agent] listCaptureTargets failed:', error && error.message ? error.message : String(error));
-    return [];
+    throw error;
   }
 });
 ipcMain.handle('media-engine-audio-is-platform-supported', () => invokeAudioCaptureOperation('isPlatformSupported'));
@@ -240,13 +242,13 @@ ipcMain.handle('window-set-fullscreen', (_event, enabled) => {
 ipcMain.handle('window-is-fullscreen', () => isWindowFullscreenActive());
 
 ipcMain.on('window-minimize', () => {
-  if (mainWindow) {
+  if (isMainWindowUsable() && !quitInProgress) {
     mainWindow.minimize();
   }
 });
 
 ipcMain.on('window-minimize-to-tray', () => {
-  if (!mainWindow) {
+  if (!isMainWindowUsable() || quitInProgress) {
     return;
   }
 
@@ -257,7 +259,7 @@ ipcMain.on('window-minimize-to-tray', () => {
 });
 
 ipcMain.on('window-maximize', () => {
-  if (!mainWindow) {
+  if (!isMainWindowUsable() || quitInProgress) {
     return;
   }
 
@@ -269,6 +271,9 @@ ipcMain.on('window-maximize', () => {
 });
 
 ipcMain.on('window-close', () => {
+  if (quitInProgress) {
+    return;
+  }
   requestAppQuit();
 });
 
@@ -282,21 +287,32 @@ ipcMain.handle('check-for-updates', async () => {
     return { devMode: true };
   }
 
-  try {
-    const updater = getAutoUpdater();
-    writeUpdateLog('info', `Starting update check. version=${app.getVersion()} feed=${getUpdateFeedBaseUrl()}`);
-    updater.setFeedURL({
-      provider: 'generic',
-      url: getUpdateFeedBaseUrl(),
-      useMultipleRangeRequest: false
-    });
-    writeUpdateLog('info', `Feed URL configured: ${getUpdateManifestUrl()} (multi-range disabled)`);
-    return await updater.checkForUpdates();
-  } catch (error) {
-    writeUpdateLog('error', `Update check failed before completion: ${formatLogMessage(error)}`);
-    console.error('Update check error:', error);
-    throw error;
+  if (updateCheckInProgressPromise) {
+    writeUpdateLog('info', 'Reusing in-flight update check.');
+    return updateCheckInProgressPromise;
   }
+
+  updateCheckInProgressPromise = (async () => {
+    try {
+      const updater = getAutoUpdater();
+      writeUpdateLog('info', `Starting update check. version=${app.getVersion()} feed=${getUpdateFeedBaseUrl()}`);
+      updater.setFeedURL({
+        provider: 'generic',
+        url: getUpdateFeedBaseUrl(),
+        useMultipleRangeRequest: false
+      });
+      writeUpdateLog('info', `Feed URL configured: ${getUpdateManifestUrl()} (multi-range disabled)`);
+      return await updater.checkForUpdates();
+    } catch (error) {
+      writeUpdateLog('error', `Update check failed before completion: ${formatLogMessage(error)}`);
+      console.error('Update check error:', error);
+      throw error;
+    } finally {
+      updateCheckInProgressPromise = null;
+    }
+  })();
+
+  return updateCheckInProgressPromise;
 });
 
 ipcMain.handle('download-update', async () => {
@@ -305,12 +321,19 @@ ipcMain.handle('download-update', async () => {
     return false;
   }
 
+  if (updateDownloadInProgress) {
+    writeUpdateLog('info', 'Ignoring duplicate update download request.');
+    return true;
+  }
+  updateDownloadInProgress = true;
+
   try {
     const updater = getAutoUpdater();
     writeUpdateLog('info', 'Starting update download from renderer request.');
     await updater.downloadUpdate();
     return true;
   } catch (error) {
+    updateDownloadInProgress = false;
     writeUpdateLog('error', `Update download failed before completion: ${formatLogMessage(error)}`);
     console.error('Update download error:', error);
     return false;
@@ -590,6 +613,21 @@ function getRendererProcessId() {
   return Number(mainWindow.webContents.getOSProcessId() || 0);
 }
 
+function isMainWindowUsable() {
+  return Boolean(mainWindow && !mainWindow.isDestroyed());
+}
+
+function showMainWindowFromTray() {
+  if (!isMainWindowUsable() || quitInProgress) {
+    return;
+  }
+  mainWindow.show();
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+  mainWindow.focus();
+}
+
 function createTray() {
   const iconPath = path.join(__dirname, 'app.ico');
   const icon = nativeImage.createFromPath(iconPath);
@@ -599,11 +637,7 @@ function createTray() {
   tray.setContextMenu(Menu.buildFromTemplate([
     {
       label: '显示窗口',
-      click: () => {
-        if (mainWindow) {
-          mainWindow.show();
-        }
-      }
+      click: showMainWindowFromTray
     },
     {
       label: '退出',
@@ -613,11 +647,7 @@ function createTray() {
     }
   ]));
 
-  tray.on('double-click', () => {
-    if (mainWindow) {
-      mainWindow.show();
-    }
-  });
+  tray.on('double-click', showMainWindowFromTray);
 }
 
 function sendToRenderer(channel, payload) {
@@ -1130,7 +1160,7 @@ async function listDesktopSources(options = {}) {
     : null;
   const rawSources = await desktopCapturer.getSources({
     types: ['window', 'screen'],
-    thumbnailSize: { width: 320, height: 180 },
+    thumbnailSize: { width: 0, height: 0 },
     fetchWindowIcons: ENABLE_CAPTURE_TARGET_WINDOW_ICONS
   });
 
@@ -1891,6 +1921,7 @@ function configureAutoUpdater() {
   });
 
   autoUpdater.on('update-not-available', (info) => {
+    updateDownloadInProgress = false;
     writeUpdateLog('info', `update-not-available: currentVersion=${app.getVersion()} latestVersion=${(info && info.version) || app.getVersion()}`);
     sendToRenderer('update-status', {
       status: 'not-available',
@@ -1918,6 +1949,7 @@ function configureAutoUpdater() {
   });
 
   autoUpdater.on('update-downloaded', (info) => {
+    updateDownloadInProgress = false;
     writeUpdateLog('info', `update-downloaded: version=${info.version} releaseDate=${info.releaseDate || 'n/a'}`);
     cacheDownloadedInstallerForDifferentialUpdate(info.downloadedFile);
     sendToRenderer('update-status', {
@@ -1929,6 +1961,7 @@ function configureAutoUpdater() {
   });
 
   autoUpdater.on('error', (error) => {
+    updateDownloadInProgress = false;
     writeUpdateLog('error', `autoUpdater error event: ${formatLogMessage(error)}`);
     sendToRenderer('update-status', {
       status: 'error',

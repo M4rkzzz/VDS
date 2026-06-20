@@ -268,7 +268,7 @@ function startServer(options = {}) {
         handleViewerReconnectReady(ws, data);
         break;
       case 'leave-room':
-        handleDisconnect(ws, true);
+        handleLeaveRoom(ws, data);
         break;
       default:
         logServerDebug('Unknown message type:', data.type);
@@ -345,6 +345,10 @@ function startServer(options = {}) {
         code: 'host-media-manifest-missing',
         message: 'Host media manifest is not ready'
       });
+      return;
+    }
+    if (!isSocketUnboundOrSameBinding(ws, roomId, clientId, 'viewer')) {
+      sendSocketAlreadyBound(ws);
       return;
     }
 
@@ -457,6 +461,10 @@ function startServer(options = {}) {
       });
       return;
     }
+    if (!isSocketUnboundOrSameBinding(ws, data.roomId, data.clientId, data.role)) {
+      sendSocketAlreadyBound(ws);
+      return;
+    }
 
     if (data.role === 'host' && room.host.clientId === data.clientId) {
       if (!isValidSessionToken(room.host.sessionToken, data.sessionToken)) {
@@ -542,6 +550,9 @@ function startServer(options = {}) {
     if (!viewer) {
       return;
     }
+    if (!isValidSessionToken(viewer.sessionToken, data.sessionToken)) {
+      return;
+    }
     if (Number(data.chainPosition) !== viewer.chainPosition) {
       return;
     }
@@ -570,7 +581,14 @@ function startServer(options = {}) {
     if (!viewer) {
       return;
     }
+    if (!isValidSessionToken(viewer.sessionToken, data.sessionToken)) {
+      return;
+    }
     if (Number(data.chainPosition) !== viewer.chainPosition) {
+      return;
+    }
+    const failedUpstreamId = String(data.failedUpstreamPeerId || '');
+    if (failedUpstreamId && failedUpstreamId !== getViewerUpstreamId(room, viewer)) {
       return;
     }
 
@@ -578,7 +596,27 @@ function startServer(options = {}) {
     viewer.relayEstablished = false;
     viewer.connectRequestPending = false;
 
-    requestViewerReconnect(room, viewer, maxDownstreamsPerUpstream, String(data.failedUpstreamPeerId || ''));
+    requestViewerReconnect(room, viewer, maxDownstreamsPerUpstream, failedUpstreamId);
+  }
+
+  function handleLeaveRoom(ws, data) {
+    if (data.roomId !== ws.roomId || data.clientId !== ws.clientId) {
+      return;
+    }
+    const room = rooms.get(ws.roomId);
+    if (!room) {
+      return;
+    }
+    if (ws.role === 'host' && !isValidSessionToken(room.host.sessionToken, data.sessionToken)) {
+      return;
+    }
+    if (ws.role === 'viewer') {
+      const viewer = room.viewers.find((candidate) => candidate.clientId === ws.clientId);
+      if (!viewer || !isValidSessionToken(viewer.sessionToken, data.sessionToken)) {
+        return;
+      }
+    }
+    handleDisconnect(ws, true);
   }
 
   function notifyHostViewerCount(room) {
@@ -948,6 +986,21 @@ function attachSocketMetadata(ws, roomId, clientId, role) {
   ws.roomId = roomId;
   ws.clientId = clientId;
   ws.role = role;
+}
+
+function isSocketUnboundOrSameBinding(ws, roomId, clientId, role) {
+  if (!ws || !ws.roomId || !ws.clientId || !ws.role) {
+    return true;
+  }
+  return ws.roomId === roomId && ws.clientId === clientId && ws.role === role;
+}
+
+function sendSocketAlreadyBound(ws) {
+  sendJson(ws, {
+    type: 'error',
+    code: 'socket-already-bound',
+    message: 'This connection is already bound to a room'
+  });
 }
 
 function clearSocketMetadata(ws) {

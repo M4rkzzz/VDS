@@ -237,6 +237,7 @@ WgcFrameSourceConfig build_wgc_frame_source_config(const HostCapturePlan& plan) 
     config.target_kind = "display";
     config.display_id = plan.capture_display_id.empty() ? "0" : plan.capture_display_id;
   }
+  config.frame_rate = plan.frame_rate > 0 ? plan.frame_rate : 30;
   return config;
 }
 
@@ -257,6 +258,7 @@ HostCapturePlan build_host_capture_plan(
   plan.capture_kind = capture_kind.empty() ? "window" : vds::media_agent::to_lower_copy(capture_kind);
   plan.capture_state = capture_state.empty() ? "normal" : vds::media_agent::to_lower_copy(capture_state);
   plan.capture_backend = "wgc";
+  plan.capture_title = vds::media_agent::trim_copy(capture_title);
   plan.capture_handle = vds::media_agent::trim_copy(capture_hwnd);
   if (plan.capture_handle.empty()) {
     plan.capture_handle = vds::media_agent::resolve_window_handle_from_title(capture_title);

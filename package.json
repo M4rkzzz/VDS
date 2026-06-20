@@ -1,11 +1,12 @@
 {
   "name": "screenshare-relay",
-  "version": "1.6.8",
+  "version": "1.6.9",
   "description": "Multi-viewer screen sharing with cascade relay (蜈蚣法) - Electron Edition",
   "main": "desktop/main.js",
   "scripts": {
     "start": "powershell -ExecutionPolicy Bypass -File scripts/start-electron-dev.ps1 .",
     "dev": "powershell -ExecutionPolicy Bypass -File scripts/start-electron-dev.ps1 .",
+    "dev:single:native": "powershell -ExecutionPolicy Bypass -File scripts/start-single-test-env.ps1 -EnableNativePeerTransport",
     "dev:dual": "powershell -ExecutionPolicy Bypass -File scripts/start-dual-test-env.ps1",
     "dev:dual:native": "powershell -ExecutionPolicy Bypass -File scripts/start-dual-test-env.ps1 -EnableNativePeerTransport",
     "dual:web": "powershell -ExecutionPolicy Bypass -File scripts/start-dual-web-test-env.ps1 -EnableNativePeerTransport",

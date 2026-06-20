@@ -109,6 +109,7 @@ target_compile_definitions(vds-media-agent PRIVATE
 
 if(MSVC)
   target_compile_options(vds-media-agent PRIVATE /W4 /permissive-)
+  set_source_files_properties(src/wgc_capture.cpp PROPERTIES COMPILE_OPTIONS /EHa)
 else()
   target_compile_options(vds-media-agent PRIVATE -Wall -Wextra -Wpedantic)
 endif()

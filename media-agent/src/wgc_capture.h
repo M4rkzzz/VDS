@@ -20,6 +20,7 @@ struct WgcFrameSourceConfig {
   std::string target_kind = "display";
   std::string display_id = "0";
   std::string window_handle;
+  int frame_rate = 30;
   bool with_cursor = true;
   bool with_border = false;
 };

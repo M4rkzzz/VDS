@@ -12,7 +12,9 @@ struct NativeLivePreviewConfig {
   std::string target_kind = "display";
   std::string display_id = "0";
   std::string window_handle;
+  std::string capture_title;
   std::string capture_state = "normal";
+  int frame_rate = 30;
   NativeEmbeddedSurfaceLayout layout;
 };
 

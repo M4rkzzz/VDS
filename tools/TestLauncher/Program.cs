@@ -20,6 +20,7 @@ internal sealed class LauncherForm : Form
 
     private readonly LauncherCommand[] commands =
     [
+        new("单端 Native", "npm run dev:single:native", "启动本地 server + 一个 Electron 客户端，并启用 native peer transport/media-agent 链路。"),
         new("双端 Native Peer", "npm run dev:dual:native", "启动本地 server + 两个 Electron 客户端，并启用 native peer transport/media-agent 链路。"),
         new("双端默认 Peer", "npm run dev:dual", "启动本地 server + 两个 Electron 客户端，使用默认 peer transport；不是 Web viewer。"),
         new("双端 Web", "npm run dev:dual:web", "启动 Electron host，并打开浏览器 Web viewer。"),

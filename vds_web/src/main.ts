@@ -37,6 +37,9 @@ let serverConfig: { iceServers: RTCIceServer[]; version?: string } = { iceServer
 let session: SessionState | null = readStoredSession(clientId);
 let restoringStoredSession = Boolean(session);
 let joinPending = false;
+let pendingJoinRoomId = '';
+let joinAttemptSeq = 0;
+let joinAckTimer: number | null = null;
 let upstreamPc: RTCPeerConnection | null = null;
 let downstreamPc: RTCPeerConnection | null = null;
 let downstreamDataChannel: RTCDataChannel | null = null;
@@ -63,6 +66,10 @@ let lastVideoKeyframeForRelay: {
 } | null = null;
 let lastBootstrapFrameId = '';
 let lastConsoleDiagnosticsAt = 0;
+let copyDiagnosticsInFlight = false;
+let refreshRoomsSeq = 0;
+let refreshRoomsInFlight = false;
+let fullscreenTransitionPromise: Promise<void> | null = null;
 
 const statusBadge = getElement<HTMLSpanElement>('statusBadge');
 const statusText = getElement<HTMLParagraphElement>('statusText');
@@ -152,7 +159,7 @@ signaling.onStatus((status) => {
 
 joinButton.addEventListener('click', () => void joinRoom(roomIdInput.value.trim()));
 refreshRoomsButton.addEventListener('click', () => void refreshRooms(true));
-copyDiagnosticsButton.addEventListener('click', () => void navigator.clipboard.writeText(diagnostics.format()));
+copyDiagnosticsButton.addEventListener('click', () => void copyDiagnosticsReport());
 lobbyTabButton.addEventListener('click', () => setJoinMode('lobby'));
 directTabButton.addEventListener('click', () => setJoinMode('direct'));
 leaveButton.addEventListener('click', () => {
@@ -222,6 +229,9 @@ async function joinRoom(roomId: string): Promise<void> {
   }
 
   setJoinPending(true);
+  pendingJoinRoomId = roomId.trim().toUpperCase();
+  const joinSeq = ++joinAttemptSeq;
+  startJoinAckTimer(joinSeq);
   try {
     setStatus('连接信令中');
     await dataChannelAudioPlayer.resume();
@@ -241,6 +251,7 @@ async function joinRoom(roomId: string): Promise<void> {
     });
     setStatus('等待上游');
   } catch (error) {
+    clearJoinAckTimer();
     setJoinPending(false);
     restoringStoredSession = false;
     setError(errorToMessage(error));
@@ -295,7 +306,11 @@ async function handleSignal(message: SignalMessage): Promise<void> {
 
 function isSignalForCurrentSession(message: SignalMessage): boolean {
   if (!session) {
-    return true;
+    if (message.type === 'room-joined' || message.type === 'session-resumed' || message.type === 'error') {
+      return true;
+    }
+    const signalRoomId = typeof message.roomId === 'string' ? message.roomId.trim() : '';
+    return !signalRoomId;
   }
   const signalRoomId = typeof message.roomId === 'string' ? message.roomId.trim().toUpperCase() : '';
   if (!signalRoomId) {
@@ -305,6 +320,16 @@ function isSignalForCurrentSession(message: SignalMessage): boolean {
 }
 
 function handleJoined(message: SignalMessage): void {
+  if (!joinPending && !restoringStoredSession) {
+    diagnostics.update({ relayFailureReason: 'stale-join-ack-ignored' });
+    return;
+  }
+  const ackRoomId = typeof message.roomId === 'string' ? message.roomId.trim().toUpperCase() : '';
+  if (pendingJoinRoomId && ackRoomId && ackRoomId !== pendingJoinRoomId) {
+    diagnostics.update({ relayFailureReason: 'stale-join-room-ack-ignored' });
+    return;
+  }
+  clearJoinAckTimer();
   const manifestFailure = getManifestCompatibilityFailure(message.mediaManifest);
   if (manifestFailure) {
     setJoinPending(false);
@@ -579,6 +604,7 @@ function maybeSendViewerReady(): void {
     type: 'viewer-ready',
     roomId: session.roomId,
     clientId,
+    sessionToken: session.sessionToken,
     chainPosition: session.chainPosition
   });
 }
@@ -827,6 +853,8 @@ async function flushPendingIceCandidates(peerId: string, pc: RTCPeerConnection):
 }
 
 function leaveCurrentRoom(): void {
+  joinAttemptSeq += 1;
+  clearJoinAckTimer();
   setJoinPending(false);
   if (!session) {
     return;
@@ -845,12 +873,15 @@ function leaveCurrentRoom(): void {
 }
 
 function resetLocalViewerSession(): void {
+  joinAttemptSeq += 1;
+  clearJoinAckTimer();
   setJoinPending(false);
   downstreamDataChannelReady = false;
   downstreamCloseExpected = true;
   clearRelayHelloAckTimer();
   clearPendingVideoDecodeTimers();
   inboundFrameReassembler.clear();
+  pendingIceCandidates.clear();
   dataChannelAudioPlayer.close();
   dataChannelVideoPlayer.close();
   downstreamDataChannel?.close();
@@ -860,8 +891,10 @@ function resetLocalViewerSession(): void {
   downstreamDataChannel = null;
   downstreamPc = null;
   upstreamPc = null;
+  downstreamPeerId = '';
   upstreamEdgeAttemptId = null;
   downstreamEdgeAttemptId = null;
+  lastBootstrapFrameId = '';
   session = null;
   clearStoredSession();
   downstreamCloseExpected = false;
@@ -1036,8 +1069,15 @@ function clearRelayHelloAckTimer(): void {
 }
 
 async function refreshRooms(manual: boolean): Promise<void> {
+  const refreshSeq = refreshRoomsSeq + 1;
+  refreshRoomsSeq = refreshSeq;
+  refreshRoomsInFlight = true;
+  refreshRoomsButton.disabled = true;
   try {
     const rooms = await fetchPublicRooms();
+    if (refreshSeq !== refreshRoomsSeq) {
+      return;
+    }
     roomList.replaceChildren(...rooms.map((room) => {
       const item = document.createElement('button');
       item.className = 'room-item';
@@ -1058,9 +1098,17 @@ async function refreshRooms(manual: boolean): Promise<void> {
       setStatus('大厅已刷新');
     }
   } catch (error) {
+    if (refreshSeq !== refreshRoomsSeq) {
+      return;
+    }
     roomListStatus.textContent = '大厅刷新失败。';
     if (manual) {
       setError(errorToMessage(error));
+    }
+  } finally {
+    if (refreshSeq === refreshRoomsSeq) {
+      refreshRoomsInFlight = false;
+      setJoinPending(joinPending);
     }
   }
 }
@@ -1077,16 +1125,42 @@ function renderCapability(report: CapabilityReport): void {
 }
 
 function setJoinPending(pending: boolean): void {
+  if (!pending) {
+    clearJoinAckTimer();
+    pendingJoinRoomId = '';
+  }
   joinPending = pending;
   const disabled = pending || !capability.ok;
   joinButton.disabled = disabled;
   roomIdInput.disabled = disabled;
-  refreshRoomsButton.disabled = disabled;
+  refreshRoomsButton.disabled = disabled || refreshRoomsInFlight;
   lobbyTabButton.disabled = pending;
   directTabButton.disabled = pending;
   roomList.querySelectorAll<HTMLButtonElement>('button.room-item').forEach((button) => {
     button.disabled = disabled || Boolean(session && !restoringStoredSession);
   });
+}
+
+function startJoinAckTimer(joinSeq: number): void {
+  clearJoinAckTimer();
+  joinAckTimer = window.setTimeout(() => {
+    joinAckTimer = null;
+    if (joinSeq !== joinAttemptSeq || !joinPending) {
+      return;
+    }
+    joinAttemptSeq += 1;
+    setJoinPending(false);
+    restoringStoredSession = false;
+    signaling.close();
+    setError('加入房间超时，请重试。');
+  }, 10000);
+}
+
+function clearJoinAckTimer(): void {
+  if (joinAckTimer !== null) {
+    window.clearTimeout(joinAckTimer);
+    joinAckTimer = null;
+  }
 }
 
 function renderDiagnostics(): void {
@@ -1126,16 +1200,71 @@ function clearError(): void {
   errorText.textContent = '';
 }
 
-async function toggleFullscreen(): Promise<void> {
+async function writeTextToClipboard(text: string): Promise<void> {
+  const value = String(text || '');
+  if (!value) {
+    throw new Error('clipboard-text-empty');
+  }
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = value;
+  textarea.setAttribute('readonly', 'readonly');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  textarea.style.pointerEvents = 'none';
+  textarea.style.left = '-9999px';
+  textarea.style.top = '0';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
   try {
-    if (document.fullscreenElement === playerShell) {
-      await document.exitFullscreen();
-      return;
+    if (!document.execCommand('copy')) {
+      throw new Error('clipboard-write-failed');
     }
-    await playerShell.requestFullscreen();
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
+async function copyDiagnosticsReport(): Promise<void> {
+  if (copyDiagnosticsInFlight) {
+    return;
+  }
+  copyDiagnosticsInFlight = true;
+  const previousDisabled = copyDiagnosticsButton.disabled;
+  copyDiagnosticsButton.disabled = true;
+  try {
+    await writeTextToClipboard(diagnostics.format());
+    setStatus('诊断已复制');
   } catch (error) {
     setError(errorToMessage(error));
+  } finally {
+    copyDiagnosticsInFlight = false;
+    copyDiagnosticsButton.disabled = previousDisabled;
   }
+}
+
+async function toggleFullscreen(): Promise<void> {
+  if (fullscreenTransitionPromise) {
+    return fullscreenTransitionPromise;
+  }
+  fullscreenTransitionPromise = (async () => {
+    try {
+      if (document.fullscreenElement === playerShell) {
+        await document.exitFullscreen();
+        return;
+      }
+      await playerShell.requestFullscreen();
+    } catch (error) {
+      setError(errorToMessage(error));
+    } finally {
+      fullscreenTransitionPromise = null;
+    }
+  })();
+  return fullscreenTransitionPromise;
 }
 
 function syncFullscreenButton(): void {

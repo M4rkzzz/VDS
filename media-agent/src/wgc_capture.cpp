@@ -10,6 +10,7 @@
 #include <roapi.h>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
+#include <eh.h>
 
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
@@ -38,7 +39,41 @@ std::string to_lower_ascii(std::string value) {
   return value;
 }
 
+std::string format_wgc_stage_error(const std::string& stage, const std::string& error) {
+  const std::string normalized_error = error.empty() ? "wgc-source-create-failed" : error;
+  if (stage.empty()) {
+    return normalized_error;
+  }
+  return "stage=" + stage + "; " + normalized_error;
+}
+
 #ifdef _WIN32
+struct WgcSehException : public std::exception {
+  explicit WgcSehException(unsigned int code) : code(code) {}
+
+  const char* what() const noexcept override {
+    return "wgc-source-create-seh-exception";
+  }
+
+  unsigned int code = 0;
+};
+
+class ScopedSehTranslator {
+ public:
+  ScopedSehTranslator() : previous_(_set_se_translator(&ScopedSehTranslator::translate)) {}
+  ~ScopedSehTranslator() { _set_se_translator(previous_); }
+
+  ScopedSehTranslator(const ScopedSehTranslator&) = delete;
+  ScopedSehTranslator& operator=(const ScopedSehTranslator&) = delete;
+
+ private:
+  static void translate(unsigned int code, EXCEPTION_POINTERS*) {
+    throw WgcSehException(code);
+  }
+
+  _se_translator_function previous_ = nullptr;
+};
+
 struct FrameEventState {
   std::mutex mutex;
   std::condition_variable cv;
@@ -55,6 +90,17 @@ std::string format_hresult_error(const char* prefix, const winrt::hresult_error&
   std::ostringstream stream;
   stream << prefix << ":0x" << std::hex << static_cast<unsigned int>(error.code()) << ":" << winrt::to_string(error.message());
   return stream.str();
+}
+
+std::string format_seh_error(const char* prefix, const WgcSehException& error) {
+  std::ostringstream stream;
+  stream << prefix << ":0x" << std::hex << error.code << ":" << error.what();
+  return stream.str();
+}
+
+std::chrono::milliseconds wgc_min_update_interval(int frame_rate) {
+  const int normalized_frame_rate = std::clamp(frame_rate > 0 ? frame_rate : 30, 1, 240);
+  return std::chrono::milliseconds(std::max(1, 1000 / normalized_frame_rate));
 }
 
 bool parse_unsigned_index(const std::string& value, unsigned int* parsed) {
@@ -311,8 +357,13 @@ class WgcFrameSource::Impl {
   explicit Impl(WgcFrameSourceConfig config)
       : config_(std::move(config)) {}
 
+  const std::string& creation_stage() const {
+    return creation_stage_;
+  }
+
   bool initialize(std::string* error) {
 #ifdef _WIN32
+    set_creation_stage("support-check");
     if (!winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported()) {
       if (error) {
         *error = "wgc-not-supported-on-this-windows-build";
@@ -320,12 +371,15 @@ class WgcFrameSource::Impl {
       return false;
     }
 
+    set_creation_stage("winrt-init-apartment");
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     apartment_initialized_ = true;
 
+    set_creation_stage("d3d11-device-create");
     if (!create_d3d11_device(&device_, &context_, error)) {
       return false;
     }
+    set_creation_stage("winrt-d3d11-device-create");
     if (!create_winrt_d3d11_device(device_, &winrt_device_, error)) {
       return false;
     }
@@ -333,17 +387,21 @@ class WgcFrameSource::Impl {
     const std::string target_kind = to_lower_ascii(config_.target_kind.empty() ? "display" : config_.target_kind);
     if (target_kind == "display") {
       HMONITOR monitor = nullptr;
+      set_creation_stage("resolve-monitor");
       if (!resolve_monitor_from_display_id(config_.display_id, &monitor, error)) {
         return false;
       }
+      set_creation_stage("create-monitor-item");
       if (!create_capture_item_from_monitor(monitor, &item_, error)) {
         return false;
       }
     } else if (target_kind == "window") {
       HWND hwnd = nullptr;
+      set_creation_stage("resolve-window");
       if (!resolve_window_from_handle(config_.window_handle, &hwnd, error)) {
         return false;
       }
+      set_creation_stage("create-window-item");
       if (!create_capture_item_from_window(hwnd, &item_, error)) {
         return false;
       }
@@ -354,6 +412,7 @@ class WgcFrameSource::Impl {
       return false;
     }
 
+    set_creation_stage("create-frame-pool");
     pool_ = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
       winrt_device_,
       winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -362,6 +421,7 @@ class WgcFrameSource::Impl {
     );
     current_pool_size_ = item_.Size();
     const auto event_state = frame_event_state_;
+    set_creation_stage("subscribe-frame-arrived");
     frame_arrived_token_ = pool_.FrameArrived([event_state](
       const winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool&,
       const winrt::Windows::Foundation::IInspectable&) {
@@ -374,32 +434,41 @@ class WgcFrameSource::Impl {
       }
       event_state->cv.notify_one();
     });
+    set_creation_stage("create-capture-session");
     session_ = pool_.CreateCaptureSession(item_);
     if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
           winrt::name_of<winrt::Windows::Graphics::Capture::GraphicsCaptureSession>(),
           L"IsCursorCaptureEnabled")) {
       try {
+        set_creation_stage("set-cursor-capture");
         session_.IsCursorCaptureEnabled(config_.with_cursor);
-      } catch (...) {
+      } catch (const winrt::hresult_error&) {
+      } catch (const std::exception&) {
       }
     }
     if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
           winrt::name_of<winrt::Windows::Graphics::Capture::GraphicsCaptureSession>(),
           L"IsBorderRequired")) {
       try {
+        set_creation_stage("set-border-required");
         session_.IsBorderRequired(config_.with_border);
-      } catch (...) {
+      } catch (const winrt::hresult_error&) {
+      } catch (const std::exception&) {
       }
     }
     if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
           winrt::name_of<winrt::Windows::Graphics::Capture::GraphicsCaptureSession>(),
           L"MinUpdateInterval")) {
       try {
-        session_.MinUpdateInterval(std::chrono::milliseconds(1));
-      } catch (...) {
+        set_creation_stage("set-min-update-interval");
+        session_.MinUpdateInterval(wgc_min_update_interval(config_.frame_rate));
+      } catch (const winrt::hresult_error&) {
+      } catch (const std::exception&) {
       }
     }
+    set_creation_stage("start-capture");
     session_.StartCapture();
+    set_creation_stage("running");
     return true;
 #else
     if (error) {
@@ -509,6 +578,10 @@ class WgcFrameSource::Impl {
 
  private:
 #ifdef _WIN32
+  void set_creation_stage(std::string stage) {
+    creation_stage_ = std::move(stage);
+  }
+
   bool try_get_latest_frame(
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame* frame
   ) {
@@ -649,6 +722,7 @@ class WgcFrameSource::Impl {
   }
 
   WgcFrameSourceConfig config_;
+  std::string creation_stage_;
   bool apartment_initialized_ = false;
   winrt::com_ptr<ID3D11Device> device_;
   winrt::com_ptr<ID3D11DeviceContext> context_;
@@ -663,6 +737,7 @@ class WgcFrameSource::Impl {
   std::shared_ptr<FrameEventState> frame_event_state_ = std::make_shared<FrameEventState>();
 #else
   WgcFrameSourceConfig config_;
+  std::string creation_stage_;
 #endif
 };
 
@@ -734,26 +809,43 @@ std::shared_ptr<WgcFrameSource> create_wgc_frame_source(
 ) {
 #ifdef _WIN32
   std::lock_guard<std::mutex> creation_lock(wgc_source_creation_mutex());
+  ScopedSehTranslator seh_translator;
 #endif
   auto impl = std::make_unique<WgcFrameSource::Impl>(config);
   try {
     if (!impl->initialize(error)) {
+      if (error) {
+        *error = format_wgc_stage_error(impl->creation_stage(), *error);
+      }
       return nullptr;
     }
     return std::shared_ptr<WgcFrameSource>(new WgcFrameSource(std::move(impl)));
 #ifdef _WIN32
   } catch (const winrt::hresult_error& ex) {
     if (error) {
-      *error = format_hresult_error("wgc-source-create-hresult-error", ex);
+      *error = format_wgc_stage_error(
+        impl->creation_stage(),
+        format_hresult_error("wgc-source-create-hresult-error", ex)
+      );
+    }
+  } catch (const WgcSehException& ex) {
+    if (error) {
+      *error = format_wgc_stage_error(
+        impl->creation_stage(),
+        format_seh_error("wgc-source-create-seh-error", ex)
+      );
     }
 #endif
   } catch (const std::exception& ex) {
     if (error) {
-      *error = std::string("wgc-source-create-exception:") + ex.what();
+      *error = format_wgc_stage_error(
+        impl->creation_stage(),
+        std::string("wgc-source-create-exception:") + ex.what()
+      );
     }
   } catch (...) {
     if (error) {
-      *error = "wgc-source-create-unknown-exception";
+      *error = format_wgc_stage_error(impl->creation_stage(), "wgc-source-create-unknown-exception");
     }
   }
   try {

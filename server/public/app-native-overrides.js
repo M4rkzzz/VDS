@@ -56,6 +56,7 @@
   const NATIVE_PEER_SIGNAL_MAX_WAITERS_PER_KEY = 8;
   const NATIVE_PEER_SIGNAL_TTL_MS = 30000;
   const attachedEmbeddedSurfaces = new Map();
+  const embeddedSurfaceGenerations = new Map();
   const nativeDebugRateLimitState = new Map();
   const P2P_UI_STATE_LABELS = Object.freeze({
     idle: '等待',
@@ -77,8 +78,16 @@
   const P2P_NAT_MAPPING_MAX_CANDIDATES = 4;
 
   const HOST_PREVIEW_SURFACE_ID = 'embedded-host-preview';
+  const HOST_SESSION_MEDIA_STATES = new Set([
+    'host-session-started',
+    'obs-ingest-waiting',
+    'obs-ingest-connected',
+    'obs-stream-running',
+    'obs-ingest-ended'
+  ]);
 
   let nativeHostSessionRunning = false;
+  let nativeHostStartInFlight = false;
   let nativeViewerStatsIntervalId = null;
   let nativeHostStatsIntervalId = null;
   let mediaEngineStarted = false;
@@ -123,9 +132,14 @@
   let viewerFullscreenVolumePopoverHideTimerId = 0;
   let viewerFullscreenVolumeDragging = false;
   let fullscreenTransitionPromise = null;
+  let viewerVolumeApplyTimerId = 0;
+  let viewerVolumeApplySeq = 0;
+  let viewerVolumeApplyPreviousVolume = 100;
   let lastViewerCursorPoint = null;
   let lastNonZeroViewerVolume = 100;
   const recoverableSurfaceSyncWarnings = new Map();
+  const surfaceSyncFailureCounts = new Map();
+  const SURFACE_SYNC_MAX_CONSECUTIVE_FAILURES = 5;
   const recoverableNativeWarnings = new Map();
 
   function isDebugModeEnabled() {
@@ -371,6 +385,48 @@
       return;
     }
     recoverableSurfaceSyncWarnings.delete(surfaceId);
+    surfaceSyncFailureCounts.delete(surfaceId);
+  }
+
+  function removeEmbeddedSurfaceTracking(surfaceId, reason = 'surface-sync-failed') {
+    if (!surfaceId) {
+      return;
+    }
+    embeddedSurfaceGenerations.set(surfaceId, (embeddedSurfaceGenerations.get(surfaceId) || 0) + 1);
+    attachedEmbeddedSurfaces.delete(surfaceId);
+    clearRecoverableSurfaceSyncWarning(surfaceId);
+    if (surfaceId === HOST_PREVIEW_SURFACE_ID) {
+      hostPreviewSurfaceAttached = false;
+    }
+    if (attachedEmbeddedSurfaces.size === 0) {
+      stopEmbeddedSurfaceTrackingLoop();
+    }
+    if (shouldShowDebugLogsFor('video', 'nativeSteps')) {
+      logNativeStep('surface-tracking:removed', { surfaceId, reason }, 'video');
+    }
+  }
+
+  async function recoverEmbeddedSurface(surfaceId, entry, reason = 'surface-sync-failed') {
+    if (!surfaceId || !entry || !entry.element || !entry.target) {
+      removeEmbeddedSurfaceTracking(surfaceId, reason);
+      return null;
+    }
+
+    removeEmbeddedSurfaceTracking(surfaceId, reason);
+    try {
+      await mediaEngine.detachSurface({ surface: surfaceId });
+    } catch (_error) {
+      // Best effort cleanup before re-attaching a fresh native surface.
+    }
+
+    if (shouldShowDebugLogsFor('video', 'nativeSteps')) {
+      logNativeStep('surface-tracking:reattach', { surfaceId, target: entry.target, reason }, 'video');
+    }
+    const result = await attachEmbeddedSurface(surfaceId, entry.target, entry.element);
+    if (result && surfaceId === HOST_PREVIEW_SURFACE_ID) {
+      hostPreviewSurfaceAttached = true;
+    }
+    return result;
   }
 
   function logRecoverableNativeWarning(scope, error, {
@@ -528,6 +584,11 @@
     if (mediaManifest && typeof mediaManifest === 'object') {
       currentMediaManifest = mediaManifest;
     }
+  }
+
+  function getManifestMediaSessionId(mediaManifest) {
+    const mediaSessionId = mediaManifest && typeof mediaManifest === 'object' ? mediaManifest.mediaSessionId : '';
+    return typeof mediaSessionId === 'string' ? mediaSessionId.trim() : '';
   }
 
   function isViewerFullscreenMode() {
@@ -739,12 +800,39 @@
     const previousVolume = Math.max(0, Math.min(100, Number(viewerVolumeInput && viewerVolumeInput.value) || 0));
     const normalizedVolume = Math.max(0, Math.min(100, Number(nextValue) || 0));
     applyViewerVolumeUi(normalizedVolume);
-    try {
-      await mediaEngine.setViewerVolume(normalizedVolume / 100);
-    } catch (error) {
-      applyViewerVolumeUi(previousVolume);
-      throw error;
+    scheduleViewerVolumeApply(normalizedVolume, previousVolume);
+  }
+
+  function scheduleViewerVolumeApply(normalizedVolume, previousVolume) {
+    const nextVolume = Math.max(0, Math.min(100, Number(normalizedVolume) || 0));
+    if (viewerVolumeApplyTimerId) {
+      window.clearTimeout(viewerVolumeApplyTimerId);
+      viewerVolumeApplyTimerId = 0;
+    } else {
+      viewerVolumeApplyPreviousVolume = Math.max(0, Math.min(100, Number(previousVolume) || 0));
     }
+
+    const applySeq = viewerVolumeApplySeq + 1;
+    viewerVolumeApplySeq = applySeq;
+    viewerVolumeApplyTimerId = window.setTimeout(async () => {
+      viewerVolumeApplyTimerId = 0;
+      try {
+        await mediaEngine.setViewerVolume(nextVolume / 100);
+        if (applySeq === viewerVolumeApplySeq) {
+          viewerVolumeApplyPreviousVolume = nextVolume;
+        }
+      } catch (error) {
+        if (applySeq === viewerVolumeApplySeq) {
+          applyViewerVolumeUi(viewerVolumeApplyPreviousVolume);
+        }
+        logRecoverableNativeWarning('viewer-volume:set-failed', error, {
+          key: 'viewer-volume-set',
+          category: 'audio',
+          channel: 'nativeSteps',
+          fallbackLabel: '[media-engine] setViewerVolume failed:'
+        });
+      }
+    }, 80);
   }
 
   async function toggleViewerMute() {
@@ -847,9 +935,7 @@
 
   async function cleanupAfterFailedHostStart() {
     hostPreviewSurfaceAttached = false;
-    attachedEmbeddedSurfaces.delete(HOST_PREVIEW_SURFACE_ID);
-    clearRecoverableSurfaceSyncWarning(HOST_PREVIEW_SURFACE_ID);
-    stopEmbeddedSurfaceTrackingLoop();
+    removeEmbeddedSurfaceTracking(HOST_PREVIEW_SURFACE_ID, 'host-start-failed');
     await Promise.all([
       typeof mediaEngine.stopAudioSession === 'function'
         ? mediaEngine.stopAudioSession({}).catch(() => {})
@@ -1415,11 +1501,7 @@
     } catch (error) {
       const message = error && error.message ? error.message : String(error);
       if (message.includes('Surface is not attached')) {
-        attachedEmbeddedSurfaces.delete(surfaceId);
-        clearRecoverableSurfaceSyncWarning(surfaceId);
-        if (attachedEmbeddedSurfaces.size === 0) {
-          stopEmbeddedSurfaceTrackingLoop();
-        }
+        removeEmbeddedSurfaceTracking(surfaceId, 'surface-not-attached');
         if (shouldShowDebugLogsFor('video', 'nativeSteps')) {
           logNativeStep('updateSurface:detached-skip', { surfaceId, message }, 'video');
         }
@@ -1427,6 +1509,7 @@
       }
       throw error;
     }
+    clearRecoverableSurfaceSyncWarning(surfaceId);
     entry.lastLayoutKey = layoutKey;
     if (shouldShowDebugLogsFor('video')) {
       logNativeStep('updateSurface:result', {
@@ -1439,9 +1522,17 @@
 
   async function syncAllEmbeddedSurfaces() {
     const jobs = [];
-    attachedEmbeddedSurfaces.forEach((_entry, surfaceId) => {
+    attachedEmbeddedSurfaces.forEach((entry, surfaceId) => {
       jobs.push(syncEmbeddedSurface(surfaceId).catch((error) => {
         logRecoverableSurfaceSyncWarning(surfaceId, error);
+        const failureCount = (surfaceSyncFailureCounts.get(surfaceId) || 0) + 1;
+        surfaceSyncFailureCounts.set(surfaceId, failureCount);
+        if (failureCount >= SURFACE_SYNC_MAX_CONSECUTIVE_FAILURES) {
+          return recoverEmbeddedSurface(surfaceId, entry, 'surface-sync-consecutive-failures').catch((recoverError) => {
+            logRecoverableSurfaceSyncWarning(surfaceId, recoverError);
+          });
+        }
+        return null;
       }));
     });
     await Promise.all(jobs);
@@ -1777,6 +1868,8 @@
 
     const layout = buildSurfaceLayout(element);
     const layoutKey = getSurfaceLayoutKey(layout);
+    const attachGeneration = (embeddedSurfaceGenerations.get(surfaceId) || 0) + 1;
+    embeddedSurfaceGenerations.set(surfaceId, attachGeneration);
     const payload = {
       surface: surfaceId,
       target,
@@ -1789,6 +1882,11 @@
       element: describeSurfaceElement(element)
     });
     const result = await mediaEngine.attachSurface(payload);
+    if (embeddedSurfaceGenerations.get(surfaceId) !== attachGeneration) {
+      await mediaEngine.detachSurface({ surface: surfaceId }).catch(() => {});
+      logNativeStep('attachSurface:stale-result-ignored', { surfaceId, target }, 'video');
+      return null;
+    }
     clearRecoverableSurfaceSyncWarning(surfaceId);
     attachedEmbeddedSurfaces.set(surfaceId, { target, element, lastLayoutKey: layoutKey });
     startEmbeddedSurfaceTrackingLoop();
@@ -1801,11 +1899,7 @@
   }
 
   async function detachEmbeddedSurface(surfaceId) {
-    attachedEmbeddedSurfaces.delete(surfaceId);
-    clearRecoverableSurfaceSyncWarning(surfaceId);
-    if (attachedEmbeddedSurfaces.size === 0) {
-      stopEmbeddedSurfaceTrackingLoop();
-    }
+    removeEmbeddedSurfaceTracking(surfaceId, 'detach-requested');
     logNativeStep('detachSurface:request', { surfaceId });
     const result = await mediaEngine.detachSurface({ surface: surfaceId });
     logNativeStep('detachSurface:result', { surfaceId, result });
@@ -1831,7 +1925,7 @@
       'host-capture-artifact',
       hostVideoContainer
     );
-    hostPreviewSurfaceAttached = true;
+    hostPreviewSurfaceAttached = Boolean(result);
     hideLegacyVideoElements();
     return result;
   }
@@ -1993,6 +2087,7 @@
         type: 'viewer-reconnect-ready',
         roomId: currentRoomId,
         clientId,
+        sessionToken: currentSessionToken || '',
         chainPosition: myChainPosition,
         upstreamPeerId: peerId,
         failedUpstreamPeerId: peerId
@@ -2705,6 +2800,7 @@
         type: 'viewer-reconnect-ready',
         roomId: currentRoomId,
         clientId,
+        sessionToken: currentSessionToken || '',
         chainPosition: myChainPosition,
         upstreamPeerId: peerId,
         failedUpstreamPeerId: peerId,
@@ -2880,16 +2976,23 @@
       return;
     }
 
+    if (
+      HOST_SESSION_MEDIA_STATES.has(params.state) &&
+      !nativeHostStartInFlight &&
+      !nativeHostSessionRunning &&
+      !currentRoomId &&
+      sessionRole !== 'host'
+    ) {
+      logNativeStep('media-state:ignored-after-stop', { state: params.state }, 'video');
+      return;
+    }
+
     if (params.backend) {
       currentHostBackend = normalizeHostBackendName(params.backend);
     }
 
     if (params.state === 'surface-detached' && params.surface) {
-      attachedEmbeddedSurfaces.delete(params.surface);
-      clearRecoverableSurfaceSyncWarning(params.surface);
-      if (attachedEmbeddedSurfaces.size === 0) {
-        stopEmbeddedSurfaceTrackingLoop();
-      }
+      removeEmbeddedSurfaceTracking(params.surface, 'media-state-surface-detached');
     }
 
     if (params.state === 'host-session-started') {
@@ -2989,6 +3092,10 @@
       return null;
     }
 
+    const closingCurrentViewerUpstream =
+      handle.role === 'viewer-upstream' &&
+      sessionRole === 'viewer' &&
+      upstreamPeerId === peerId;
     handle.closed = true;
     try {
       await detachNativePeerVideoSurface(peerId).catch(() => {});
@@ -3002,6 +3109,13 @@
       clearNativePeerSignalState(peerId);
       clearPeerConnectionTimeout(peerId);
       clearPeerDisconnectTimer(peerId);
+      if (closingCurrentViewerUpstream) {
+        clearViewerMediaWaitTimer();
+        clearViewerUpstreamOfferWaitTimer();
+        if (viewerUpstreamOfferReconnectSentForPeerId === peerId) {
+          viewerUpstreamOfferReconnectSentForPeerId = '';
+        }
+      }
       if (options.clearRetryState) {
         clearPeerReconnect(peerId);
       }
@@ -3333,7 +3447,8 @@
       sendMessage({
         type: 'leave-room',
         roomId: currentRoomId,
-        clientId
+        clientId,
+        sessionToken: currentSessionToken || ''
       }, { queueIfDisconnected: false });
     }
 
@@ -3386,12 +3501,22 @@
       ? buildHostMediaManifestFromObsIngest(obsIngest)
       : buildHostMediaManifestFromStats(latestP2pStatsSnapshot);
     rememberMediaManifest(mediaManifest);
-    sendMessage({
-      type: 'create-room',
-      clientId,
-      publicListing: Boolean(qualitySettings && qualitySettings.publicRoomEnabled),
-      mediaManifest
-    });
+    waitForWsConnected(5000)
+      .then(() => {
+        sendMessage({
+          type: 'create-room',
+          clientId,
+          publicListing: Boolean(qualitySettings && qualitySettings.publicRoomEnabled),
+          mediaManifest
+        });
+        if (typeof window.__vdsResetShareStartPendingUi === 'function') {
+          window.__vdsResetShareStartPendingUi();
+        }
+      })
+      .catch((error) => {
+        obsRoomCreatePending = false;
+        showError(error && error.message ? error.message : 'websocket-timeout');
+      });
   }
 
   async function pollNativeHostStats(reason = 'periodic') {
@@ -3622,6 +3747,7 @@
             type: 'viewer-ready',
             roomId: currentRoomId,
             clientId,
+            sessionToken: currentSessionToken || '',
             chainPosition: myChainPosition
           });
           viewerReadySent = true;
@@ -3669,125 +3795,134 @@
       throw new Error('native-host-session-disabled');
     }
     const startGeneration = ++nativeHostStartGeneration;
+    nativeHostStartInFlight = true;
 
-    currentHostBackend = 'native';
-    obsRoomCreatePending = false;
-    obsIngestStreamActive = false;
-    await ensureNativeUiReady();
-    const parsedSource = parseCaptureSource(sourceId);
-    parsedSource.backend = 'native';
-    logNativeStep('startHostSession:source', {
-      sourceId,
-      parsedSource
-    });
-    await ensureMediaEngineStarted();
-    await waitForHostUiReady();
-    lockCodecUiToNativeH264();
-    const preferredPreview = !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
-    let allowPreviewForAttempt = nativeHostPreviewEnabled && preferredPreview;
-    let previewFallbackNoticeShown = false;
+    try {
+      currentHostBackend = 'native';
+      obsRoomCreatePending = false;
+      obsIngestStreamActive = false;
+      await ensureNativeUiReady();
+      const parsedSource = parseCaptureSource(sourceId);
+      parsedSource.backend = 'native';
+      logNativeStep('startHostSession:source', {
+        sourceId,
+        parsedSource
+      });
+      await ensureMediaEngineStarted();
+      await waitForHostUiReady();
+      lockCodecUiToNativeH264();
+      const preferredPreview = !(typeof qualitySettings === 'object' && qualitySettings && qualitySettings.previewEnabled === false);
+      let allowPreviewForAttempt = nativeHostPreviewEnabled && preferredPreview;
+      let previewFallbackNoticeShown = false;
 
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        const session = await mediaEngine.startHostSession(parsedSource);
-        logNativeDebug('video', '[media-engine] host session result:', JSON.stringify(session));
-        if (startGeneration !== nativeHostStartGeneration || stopScreenShareInFlight) {
-          await mediaEngine.stopHostSession({}).catch(() => {});
-          throw new Error('native-host-start-superseded');
-        }
-        if (!session || session.running !== true) {
-          throw new Error(session && session.reason ? session.reason : 'native-host-session-start-failed');
-        }
-        if (!session.capturePlan || session.capturePlan.ready !== true || session.capturePlan.validated !== true) {
-          await mediaEngine.stopHostSession({}).catch(() => {});
-          const captureReason =
-            (session && session.capturePlan && (session.capturePlan.lastError || session.capturePlan.validationReason || session.capturePlan.reason)) ||
-            'native-host-capture-plan-not-ready';
-          throw new Error(captureReason);
-        }
-        if (!session.pipeline || session.pipeline.ready !== true || session.pipeline.validated !== true) {
-          await mediaEngine.stopHostSession({}).catch(() => {});
-          const pipelineReason =
-            (session && session.pipeline && (session.pipeline.lastError || session.pipeline.validationReason || session.pipeline.reason)) ||
-            'native-host-pipeline-not-ready';
-          throw new Error(pipelineReason);
-        }
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const session = await mediaEngine.startHostSession(parsedSource);
+          logNativeDebug('video', '[media-engine] host session result:', JSON.stringify(session));
+          if (startGeneration !== nativeHostStartGeneration || stopScreenShareInFlight) {
+            await mediaEngine.stopHostSession({}).catch(() => {});
+            throw new Error('native-host-start-superseded');
+          }
+          if (!session || session.running !== true) {
+            throw new Error(session && session.reason ? session.reason : 'native-host-session-start-failed');
+          }
+          if (!session.capturePlan || session.capturePlan.ready !== true || session.capturePlan.validated !== true) {
+            await mediaEngine.stopHostSession({}).catch(() => {});
+            const captureReason =
+              (session && session.capturePlan && (session.capturePlan.lastError || session.capturePlan.validationReason || session.capturePlan.reason)) ||
+              'native-host-capture-plan-not-ready';
+            throw new Error(captureReason);
+          }
+          if (!session.pipeline || session.pipeline.ready !== true || session.pipeline.validated !== true) {
+            await mediaEngine.stopHostSession({}).catch(() => {});
+            const pipelineReason =
+              (session && session.pipeline && (session.pipeline.lastError || session.pipeline.validationReason || session.pipeline.reason)) ||
+              'native-host-pipeline-not-ready';
+            throw new Error(pipelineReason);
+          }
 
-        const requestedCodec = normalizeNativeVideoCodec(
-          session && session.requestedCodec,
-          normalizeNativeVideoCodec(parsedSource.requestedCodec, 'h264')
-        );
-        const effectiveCodec = normalizeNativeVideoCodec(
-          session && (session.effectiveCodec || session.codec),
-          requestedCodec
-        );
-        nativeHostEffectiveCodec = effectiveCodec;
+          const requestedCodec = normalizeNativeVideoCodec(
+            session && session.requestedCodec,
+            normalizeNativeVideoCodec(parsedSource.requestedCodec, 'h264')
+          );
+          const effectiveCodec = normalizeNativeVideoCodec(
+            session && (session.effectiveCodec || session.codec),
+            requestedCodec
+          );
+          nativeHostEffectiveCodec = effectiveCodec;
 
-        if (typeof qualitySettings === 'object' && qualitySettings) {
-          qualitySettings.codecPreference = effectiveCodec;
-        }
-        lockCodecUiToNativeH264();
+          if (typeof qualitySettings === 'object' && qualitySettings) {
+            qualitySettings.codecPreference = effectiveCodec;
+          }
+          lockCodecUiToNativeH264();
 
-        nativeHostSessionRunning = true;
-        localStream = null;
-        hostPreviewRequested = allowPreviewForAttempt;
-        hideLegacyVideoElements();
-        if (hostVideoContainer) {
-          hostVideoContainer.classList.toggle('hidden', !hostPreviewRequested);
-        }
-        startNativeHostStatsPolling();
+          nativeHostSessionRunning = true;
+          localStream = null;
+          hostPreviewRequested = allowPreviewForAttempt;
+          hideLegacyVideoElements();
+          if (hostVideoContainer) {
+            hostVideoContainer.classList.toggle('hidden', !hostPreviewRequested);
+          }
+          startNativeHostStatsPolling();
 
-        elements.btnStartShare.classList.add('hidden');
-        elements.btnStopShare.classList.remove('hidden');
-        syncHostWaitingWindowRestoreUi(
-          session && session.capturePlan && session.capturePlan.captureState === 'minimized',
-          `正在共享（原生，${effectiveCodec.toUpperCase()}）`
-        );
-        updateHostEncoderDetail(session && session.pipeline ? session.pipeline : null);
+          elements.btnStartShare.classList.add('hidden');
+          elements.btnStopShare.classList.remove('hidden');
+          syncHostWaitingWindowRestoreUi(
+            session && session.capturePlan && session.capturePlan.captureState === 'minimized',
+            `正在共享（原生，${effectiveCodec.toUpperCase()}）`
+          );
+          updateHostEncoderDetail(session && session.pipeline ? session.pipeline : null);
 
-        if (allowPreviewForAttempt) {
-          await waitForHostUiReady();
-          await attachNativeHostPreviewSurface();
-        }
-        if (startGeneration !== nativeHostStartGeneration || stopScreenShareInFlight) {
+          if (allowPreviewForAttempt) {
+            await waitForHostUiReady();
+            await attachNativeHostPreviewSurface();
+          }
+          if (startGeneration !== nativeHostStartGeneration || stopScreenShareInFlight) {
+            await cleanupAfterFailedHostStart();
+            throw new Error('native-host-start-superseded');
+          }
+
+          if (!allowPreviewForAttempt && preferredPreview && !previewFallbackNoticeShown) {
+            previewFallbackNoticeShown = true;
+            showError('原生预览暂不可用，已自动改为无预览开播');
+          }
+
+          const mediaManifest = buildHostMediaManifest({
+            backend: 'native',
+            videoCodec: effectiveCodec,
+            width: session && session.capturePlan && session.capturePlan.width,
+            height: session && session.capturePlan && session.capturePlan.height,
+            frameRate: session && session.capturePlan && session.capturePlan.frameRate,
+            audioCodec: 'opus'
+          });
+          rememberMediaManifest(mediaManifest);
+          await waitForWsConnected(5000);
+          sendMessage({
+            type: 'create-room',
+            clientId,
+            publicListing: Boolean(qualitySettings && qualitySettings.publicRoomEnabled),
+            mediaManifest
+          });
+          if (typeof window.__vdsResetShareStartPendingUi === 'function') {
+            window.__vdsResetShareStartPendingUi();
+          }
+          return;
+        } catch (error) {
           await cleanupAfterFailedHostStart();
-          throw new Error('native-host-start-superseded');
+          if (attempt === 0 && allowPreviewForAttempt && isRecoverableHostPreviewAttachError(error)) {
+            logNativeStep('startHostSession:retry-without-preview', {
+              message: error && error.message ? error.message : String(error),
+              sourceId
+            }, 'video');
+            allowPreviewForAttempt = false;
+            await ensureMediaEngineStarted();
+            continue;
+          }
+          throw error;
         }
-
-        if (!allowPreviewForAttempt && preferredPreview && !previewFallbackNoticeShown) {
-          previewFallbackNoticeShown = true;
-          showError('原生预览暂不可用，已自动改为无预览开播');
-        }
-
-        const mediaManifest = buildHostMediaManifest({
-          backend: 'native',
-          videoCodec: effectiveCodec,
-          width: session && session.capturePlan && session.capturePlan.width,
-          height: session && session.capturePlan && session.capturePlan.height,
-          frameRate: session && session.capturePlan && session.capturePlan.frameRate,
-          audioCodec: 'opus'
-        });
-        rememberMediaManifest(mediaManifest);
-        sendMessage({
-          type: 'create-room',
-          clientId,
-          publicListing: Boolean(qualitySettings && qualitySettings.publicRoomEnabled),
-          mediaManifest
-        });
-        return;
-      } catch (error) {
-        await cleanupAfterFailedHostStart();
-        if (attempt === 0 && allowPreviewForAttempt && isRecoverableHostPreviewAttachError(error)) {
-          logNativeStep('startHostSession:retry-without-preview', {
-            message: error && error.message ? error.message : String(error),
-            sourceId
-          }, 'video');
-          allowPreviewForAttempt = false;
-          await ensureMediaEngineStarted();
-          continue;
-        }
-        throw error;
       }
+    } finally {
+      nativeHostStartInFlight = false;
     }
   }
 
@@ -3796,46 +3931,51 @@
       throw new Error('native-host-session-disabled');
     }
     const startGeneration = ++nativeHostStartGeneration;
+    nativeHostStartInFlight = true;
 
-    currentHostBackend = 'obs-ingest';
-    obsRoomCreatePending = false;
-    obsIngestStreamActive = false;
-    await ensureNativeUiReady();
-    await ensureMediaEngineStarted();
-    await waitForHostUiReady();
-    const requestedPort = Number.isFinite(Number(options && options.port))
-      ? Math.round(Number(options.port))
-      : 0;
-    const session = await mediaEngine.startHostSession({
-      backend: 'obs-ingest',
-      port: requestedPort
-    });
-    logNativeDebug('video', '[media-engine] obs ingest session result:', JSON.stringify(session));
-    if (startGeneration !== nativeHostStartGeneration || stopScreenShareInFlight) {
-      await mediaEngine.stopHostSession({}).catch(() => {});
-      throw new Error('native-host-start-superseded');
-    }
-    if (!session || session.running !== true) {
-      throw new Error(session && session.reason ? session.reason : 'obs-ingest-session-start-failed');
-    }
+    try {
+      currentHostBackend = 'obs-ingest';
+      obsRoomCreatePending = false;
+      obsIngestStreamActive = false;
+      await ensureNativeUiReady();
+      await ensureMediaEngineStarted();
+      await waitForHostUiReady();
+      const requestedPort = Number.isFinite(Number(options && options.port))
+        ? Math.round(Number(options.port))
+        : 0;
+      const session = await mediaEngine.startHostSession({
+        backend: 'obs-ingest',
+        port: requestedPort
+      });
+      logNativeDebug('video', '[media-engine] obs ingest session result:', JSON.stringify(session));
+      if (startGeneration !== nativeHostStartGeneration || stopScreenShareInFlight) {
+        await mediaEngine.stopHostSession({}).catch(() => {});
+        throw new Error('native-host-start-superseded');
+      }
+      if (!session || session.running !== true) {
+        throw new Error(session && session.reason ? session.reason : 'obs-ingest-session-start-failed');
+      }
 
-    nativeHostSessionRunning = true;
-    localStream = null;
-    hostWaitingWindowRestore = false;
-    hostPreviewRequested = false;
-    hideLegacyVideoElements();
-    if (hostVideoContainer) {
-      hostVideoContainer.classList.add('hidden');
-    }
-    startNativeHostStatsPolling();
+      nativeHostSessionRunning = true;
+      localStream = null;
+      hostWaitingWindowRestore = false;
+      hostPreviewRequested = false;
+      hideLegacyVideoElements();
+      if (hostVideoContainer) {
+        hostVideoContainer.classList.add('hidden');
+      }
+      startNativeHostStatsPolling();
 
-    elements.roomInfo.classList.add('hidden');
-    elements.viewerCount.textContent = '0';
-    elements.btnStartShare.classList.add('hidden');
-    elements.btnStopShare.classList.remove('hidden');
-    elements.hostStatus.textContent = '等待 OBS 推流...';
-    elements.hostStatus.classList.add('waiting');
-    updateHostEncoderDetail(null, session && session.obsIngest ? session.obsIngest : null);
+      elements.roomInfo.classList.add('hidden');
+      elements.viewerCount.textContent = '0';
+      elements.btnStartShare.classList.add('hidden');
+      elements.btnStopShare.classList.remove('hidden');
+      elements.hostStatus.textContent = '等待 OBS 推流...';
+      elements.hostStatus.classList.add('waiting');
+      updateHostEncoderDetail(null, session && session.obsIngest ? session.obsIngest : null);
+    } finally {
+      nativeHostStartInFlight = false;
+    }
   }
 
   async function startScreenShareWithAudio(sourceId, audioPid) {
@@ -3867,6 +4007,7 @@
       return;
     }
     nativeHostStartGeneration += 1;
+    nativeHostStartInFlight = false;
 
     stopScreenShareInFlight = true;
     setHostStopUiState(true);
@@ -3912,7 +4053,8 @@
         sendMessage({
           type: 'leave-room',
           roomId: currentRoomId,
-          clientId
+          clientId,
+          sessionToken: currentSessionToken || ''
         }, { queueIfDisconnected: false });
         logNativeStep('stopScreenShare:leave-room-sent', { roomId: currentRoomId }, 'connection');
       }
@@ -4304,12 +4446,33 @@
     switch (data.type) {
       case 'room-created':
         obsRoomCreatePending = false;
+        {
+          const ackMediaSessionId = getManifestMediaSessionId(data.mediaManifest);
+          if (!nativeHostSessionRunning || !currentHostMediaSessionId || !ackMediaSessionId || ackMediaSessionId !== currentHostMediaSessionId) {
+            logNativeStep('room-created:stale-ignored', {
+              roomId: data.roomId,
+              mediaSessionId: ackMediaSessionId,
+              currentMediaSessionId: currentHostMediaSessionId || '',
+              nativeHostSessionRunning
+            }, 'connection');
+            if (data.roomId) {
+              sendMessage({
+                type: 'leave-room',
+                roomId: data.roomId,
+                clientId,
+                sessionToken: data.sessionToken || ''
+              }, { queueIfDisconnected: false });
+            }
+            return;
+          }
+        }
         rememberMediaManifest(data.mediaManifest);
         if (isObsIngestHostBackend() && !obsIngestStreamActive) {
           sendMessage({
             type: 'leave-room',
             roomId: data.roomId,
-            clientId
+            clientId,
+            sessionToken: data.sessionToken || currentSessionToken || ''
           }, { queueIfDisconnected: false });
           if (elements.hostStatus) {
             elements.hostStatus.textContent = '等待 OBS 推流...';
@@ -4320,6 +4483,9 @@
         currentRoomId = data.roomId;
         sessionRole = 'host';
         currentSessionToken = data.sessionToken || '';
+        if (typeof window.__vdsResetShareStartPendingUi === 'function') {
+          window.__vdsResetShareStartPendingUi();
+        }
         elements.roomIdDisplay.textContent = data.roomId;
         elements.roomInfo.classList.remove('hidden');
         elements.btnStartShare.classList.add('hidden');
@@ -4561,6 +4727,7 @@
               type: 'viewer-reconnect-ready',
               roomId: currentRoomId,
               clientId,
+              sessionToken: currentSessionToken || '',
               chainPosition: myChainPosition,
               upstreamPeerId: nextUpstreamPeerId
             });
@@ -4655,7 +4822,7 @@
 
   async function handleViewerVolumeInput(event) {
     const nextValue = Math.max(0, Math.min(100, Number(event.target.value) || 0));
-    await setViewerVolumeValue(nextValue);
+    setViewerVolumeValue(nextValue);
     showViewerFullscreenControls();
   }
 

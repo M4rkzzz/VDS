@@ -314,7 +314,9 @@ SurfaceAttachmentState start_surface_attachment(
     config.target_kind = host_capture_plan.capture_kind == "display" ? "display" : "window";
     config.display_id = host_capture_plan.capture_display_id.empty() ? "0" : host_capture_plan.capture_display_id;
     config.window_handle = host_capture_plan.capture_handle;
+    config.capture_title = host_capture_plan.capture_title;
     config.capture_state = host_capture_plan.capture_state;
+    config.frame_rate = host_capture_plan.frame_rate > 0 ? host_capture_plan.frame_rate : 30;
     config.layout = state.surface_layout;
 
     std::string preview_error;

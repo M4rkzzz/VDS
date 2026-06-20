@@ -2,6 +2,7 @@
 
 #include "wgc_capture.h"
 #include "win32_placeholder_frame.h"
+#include "platform_utils.h"
 
 #include <algorithm>
 #include <atomic>
@@ -217,6 +218,21 @@ WindowCaptureAvailability query_window_capture_availability(const std::string& w
     return WindowCaptureAvailability::minimized;
   }
   return WindowCaptureAvailability::normal;
+}
+
+bool try_resolve_restored_window_handle(const std::string& capture_title, std::string* window_handle) {
+  if (!window_handle) {
+    return false;
+  }
+  const std::string resolved = vds::media_agent::resolve_window_handle_from_title(capture_title);
+  if (resolved.empty() || resolved == *window_handle) {
+    return false;
+  }
+  if (query_window_capture_availability(resolved) != WindowCaptureAvailability::normal) {
+    return false;
+  }
+  *window_handle = resolved;
+  return true;
 }
 
 bool get_window_capture_rect(HWND hwnd, RECT* rect) {
@@ -790,19 +806,35 @@ class NativeLivePreview::Impl {
       });
       if (!capture_start_succeeded_) {
         emit_live_preview_breadcrumb("capture-source-create-failed");
-        start_error_ = capture_start_error_.empty()
+        snapshot_.attached = true;
+        snapshot_.running = true;
+        snapshot_.decoder_ready = true;
+        snapshot_.waiting_for_artifact = false;
+        snapshot_.reason = "live-preview-source-unavailable";
+        snapshot_.last_error = capture_start_error_.empty()
           ? "native-live-preview-source-create-failed"
           : capture_start_error_;
         start_complete_ = true;
-        start_succeeded_ = false;
+        start_succeeded_ = true;
         started_condition_.notify_all();
       } else {
         snapshot_.attached = true;
         snapshot_.running = true;
         snapshot_.decoder_ready = true;
         snapshot_.waiting_for_artifact = false;
-        snapshot_.reason = "live-preview-running";
-        snapshot_.last_error.clear();
+        if (snapshot_.reason == "live-preview-source-create-failed") {
+          snapshot_.reason = "live-preview-source-unavailable";
+        }
+        const bool preserve_startup_reason =
+          snapshot_.reason == "live-preview-display-fallback-running" ||
+          snapshot_.reason == "live-preview-waiting-for-window-restore" ||
+          snapshot_.reason == "live-preview-source-unavailable";
+        if (!preserve_startup_reason) {
+          snapshot_.reason = "live-preview-running";
+        }
+        if (snapshot_.reason != "live-preview-source-unavailable") {
+          snapshot_.last_error.clear();
+        }
         start_complete_ = true;
         start_succeeded_ = true;
         started_condition_.notify_all();
@@ -814,8 +846,22 @@ class NativeLivePreview::Impl {
       if (capture_worker_.joinable()) {
         capture_worker_.join();
       }
-      destroy_window();
-      return;
+      WgcFrameCpuBuffer unavailable_frame;
+      unavailable_frame.width = std::max(640, config_.layout.width > 0 ? config_.layout.width : 1280);
+      unavailable_frame.height = std::max(360, config_.layout.height > 0 ? config_.layout.height : 720);
+      unavailable_frame.bgra = build_placeholder_frame_bgra(
+        unavailable_frame.width,
+        unavailable_frame.height,
+        L"Host preview unavailable"
+      );
+      present_frame(unavailable_frame);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_.reason = "live-preview-source-unavailable";
+        snapshot_.last_error = capture_start_error_.empty()
+          ? "native-live-preview-source-create-failed"
+          : capture_start_error_;
+      }
     }
 
     bool should_stop = false;
@@ -862,6 +908,9 @@ class NativeLivePreview::Impl {
     source_config.target_kind = config_.target_kind;
     source_config.display_id = config_.display_id.empty() ? "0" : config_.display_id;
     source_config.window_handle = config_.window_handle;
+    source_config.frame_rate = config_.frame_rate > 0 ? config_.frame_rate : 30;
+    const std::string capture_title = config_.capture_title;
+    bool using_display_fallback = false;
     const bool use_window_restore_placeholder =
       source_config.target_kind == "window" &&
       config_.capture_state == "minimized" &&
@@ -869,6 +918,11 @@ class NativeLivePreview::Impl {
     const int placeholder_width = std::max(640, config_.layout.width > 0 ? config_.layout.width : 1280);
     const int placeholder_height = std::max(360, config_.layout.height > 0 ? config_.layout.height : 720);
     std::vector<std::uint8_t> placeholder_bgra;
+    std::vector<std::uint8_t> source_unavailable_bgra;
+    const auto normalize_source_error = [](const std::string& error) -> std::string {
+      return error.empty() ? "native-live-preview-source-create-failed" : error;
+    };
+    std::string last_source_create_error;
     const auto ensure_placeholder_bgra = [&]() -> const std::vector<std::uint8_t>& {
       if (placeholder_bgra.empty()) {
         placeholder_bgra = build_placeholder_frame_bgra(
@@ -878,6 +932,31 @@ class NativeLivePreview::Impl {
         );
       }
       return placeholder_bgra;
+    };
+    const auto ensure_source_unavailable_bgra = [&]() -> const std::vector<std::uint8_t>& {
+      if (source_unavailable_bgra.empty()) {
+        source_unavailable_bgra = build_placeholder_frame_bgra(
+          placeholder_width,
+          placeholder_height,
+          L"Host preview unavailable"
+        );
+      }
+      return source_unavailable_bgra;
+    };
+    const auto present_source_unavailable_placeholder = [&](const std::string& last_error) {
+      const auto& current_placeholder_bgra = ensure_source_unavailable_bgra();
+      if (!current_placeholder_bgra.empty()) {
+        WgcFrameCpuBuffer placeholder_frame;
+        placeholder_frame.width = placeholder_width;
+        placeholder_frame.height = placeholder_height;
+        placeholder_frame.bgra = current_placeholder_bgra;
+        present_frame(placeholder_frame);
+      }
+      const std::string normalized_error = normalize_source_error(last_error);
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot_.reason = "live-preview-source-unavailable";
+      snapshot_.last_error = normalized_error;
+      snapshot_.decoder_ready = true;
     };
 
     const auto finalize_capture_start = [&](bool success, const std::string& error_message) {
@@ -891,19 +970,47 @@ class NativeLivePreview::Impl {
       capture_started_condition_.notify_all();
     };
 
-    const auto try_create_source = [&]() -> std::shared_ptr<WgcFrameSource> {
+    const auto make_display_fallback_config = [&]() -> WgcFrameSourceConfig {
+      WgcFrameSourceConfig fallback_config = source_config;
+      fallback_config.target_kind = "display";
+      fallback_config.display_id = fallback_config.display_id.empty() ? "0" : fallback_config.display_id;
+      fallback_config.window_handle.clear();
+      return fallback_config;
+    };
+
+    const auto try_create_source = [&](const WgcFrameSourceConfig& candidate_config) -> std::shared_ptr<WgcFrameSource> {
       std::string source_error;
       emit_live_preview_breadcrumb(
-        "source-create-begin target=" + source_config.target_kind +
-        (source_config.window_handle.empty() ? "" : " hwnd=" + source_config.window_handle) +
-        (source_config.display_id.empty() ? "" : " display=" + source_config.display_id));
-      std::shared_ptr<WgcFrameSource> created = create_wgc_frame_source(source_config, &source_error);
+        "source-create-begin target=" + candidate_config.target_kind +
+        (candidate_config.window_handle.empty() ? "" : " hwnd=" + candidate_config.window_handle) +
+        (candidate_config.display_id.empty() ? "" : " display=" + candidate_config.display_id));
+      std::shared_ptr<WgcFrameSource> created = create_wgc_frame_source(candidate_config, &source_error);
       if (!created) {
-        {
+        last_source_create_error = normalize_source_error(source_error);
+        emit_live_preview_breadcrumb("source-create-failed error=" + last_source_create_error);
+      }
+      return created;
+    };
+
+    const auto try_create_source_with_window_fallback = [&]() -> std::shared_ptr<WgcFrameSource> {
+      std::shared_ptr<WgcFrameSource> created = try_create_source(source_config);
+      if (!created && source_config.target_kind == "window") {
+        const std::string window_source_error = last_source_create_error;
+        emit_live_preview_breadcrumb("source-create-window-failed-trying-display-fallback");
+        WgcFrameSourceConfig fallback_config = make_display_fallback_config();
+        created = try_create_source(fallback_config);
+        if (created) {
+          source_config = fallback_config;
+          using_display_fallback = true;
           std::lock_guard<std::mutex> lock(mutex_);
-          snapshot_.reason = "live-preview-source-create-failed";
-          snapshot_.last_error = source_error.empty() ? "native-live-preview-source-create-failed" : source_error;
-          snapshot_.decoder_ready = false;
+          display_fallback_active_ = true;
+          snapshot_.reason = "live-preview-display-fallback-running";
+          snapshot_.last_error.clear();
+          snapshot_.decoder_ready = true;
+        } else if (!window_source_error.empty() &&
+                   !last_source_create_error.empty() &&
+                   last_source_create_error != window_source_error) {
+          last_source_create_error = window_source_error + "; display-fallback=" + last_source_create_error;
         }
       }
       return created;
@@ -913,13 +1020,13 @@ class NativeLivePreview::Impl {
       const WindowCaptureAvailability availability =
         query_window_capture_availability(source_config.window_handle);
       if (availability == WindowCaptureAvailability::minimized) {
-        finalize_capture_start(true, "");
         {
           std::lock_guard<std::mutex> lock(mutex_);
           snapshot_.reason = "live-preview-waiting-for-window-restore";
           snapshot_.last_error.clear();
           snapshot_.decoder_ready = true;
         }
+        finalize_capture_start(true, "");
       } else if (availability == WindowCaptureAvailability::unavailable) {
         const std::string missing_target_error = "Selected window is no longer available for capture.";
         finalize_capture_start(false, missing_target_error);
@@ -929,19 +1036,22 @@ class NativeLivePreview::Impl {
     }
 
     if (!capture_start_complete_) {
-      source_ = try_create_source();
-      finalize_capture_start(
-        static_cast<bool>(source_),
-        source_ ? "" : snapshot_.last_error
-      );
+      source_ = try_create_source_with_window_fallback();
       if (!source_) {
-        emit_live_preview_breadcrumb("source-create-failed error=" + capture_start_error_);
-        return;
+        const std::string source_start_error = normalize_source_error(last_source_create_error);
+        emit_live_preview_breadcrumb("source-create-deferred error=" + source_start_error);
+        present_source_unavailable_placeholder(source_start_error);
+        finalize_capture_start(true, source_start_error);
+      } else {
+        finalize_capture_start(true, "");
+        emit_live_preview_breadcrumb(using_display_fallback ? "source-create-display-fallback-succeeded" : "source-create-succeeded");
       }
-      emit_live_preview_breadcrumb("source-create-succeeded");
     }
 
     bool placeholder_mode_active = use_window_restore_placeholder;
+    auto next_source_retry_at = source_
+      ? std::chrono::steady_clock::time_point {}
+      : std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
     while (!stop_requested_.load(std::memory_order_acquire)) {
       if (placeholder_mode_active) {
         const WindowCaptureAvailability availability =
@@ -954,36 +1064,58 @@ class NativeLivePreview::Impl {
           break;
         }
         if (availability == WindowCaptureAvailability::minimized) {
-          if (source_) {
-            source_->close();
-            source_.reset();
-          }
-          {
+          if (try_resolve_restored_window_handle(capture_title, &source_config.window_handle)) {
+            emit_live_preview_breadcrumb("window-restored-with-new-hwnd hwnd=" + source_config.window_handle);
             std::lock_guard<std::mutex> lock(mutex_);
-            snapshot_.reason = "live-preview-waiting-for-window-restore";
+            snapshot_.reason = "live-preview-restoring-window-source";
             snapshot_.last_error.clear();
-            snapshot_.decoder_ready = true;
+            snapshot_.decoder_ready = false;
+          } else {
+            if (source_) {
+              source_->close();
+              source_.reset();
+            }
+            {
+              std::lock_guard<std::mutex> lock(mutex_);
+              snapshot_.reason = "live-preview-waiting-for-window-restore";
+              snapshot_.last_error.clear();
+              snapshot_.decoder_ready = true;
+            }
+            const auto& current_placeholder_bgra = ensure_placeholder_bgra();
+            if (!current_placeholder_bgra.empty()) {
+              WgcFrameCpuBuffer placeholder_frame;
+              placeholder_frame.width = placeholder_width;
+              placeholder_frame.height = placeholder_height;
+              placeholder_frame.bgra = current_placeholder_bgra;
+              present_frame(placeholder_frame);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+            continue;
           }
-          const auto& current_placeholder_bgra = ensure_placeholder_bgra();
-          if (!current_placeholder_bgra.empty()) {
-            WgcFrameCpuBuffer placeholder_frame;
-            placeholder_frame.width = placeholder_width;
-            placeholder_frame.height = placeholder_height;
-            placeholder_frame.bgra = current_placeholder_bgra;
-            present_frame(placeholder_frame);
-          }
-          std::this_thread::sleep_for(std::chrono::milliseconds(120));
-          continue;
         }
       }
 
       if (!source_) {
-        source_ = try_create_source();
-        if (!source_) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        const auto now = std::chrono::steady_clock::now();
+        if (next_source_retry_at != std::chrono::steady_clock::time_point {} && now < next_source_retry_at) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(120));
           continue;
         }
-        emit_live_preview_breadcrumb("source-create-succeeded");
+        source_ = try_create_source_with_window_fallback();
+        if (!source_) {
+          const std::string source_retry_error = normalize_source_error(last_source_create_error);
+          present_source_unavailable_placeholder(source_retry_error);
+          next_source_retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+          continue;
+        }
+        next_source_retry_at = std::chrono::steady_clock::time_point {};
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          snapshot_.reason = display_fallback_active_ ? "live-preview-display-fallback-running" : "live-preview-running";
+          snapshot_.last_error.clear();
+          snapshot_.decoder_ready = true;
+        }
+        emit_live_preview_breadcrumb(using_display_fallback ? "source-create-display-fallback-succeeded" : "source-create-succeeded");
         placeholder_mode_active = false;
       }
 
@@ -1512,7 +1644,9 @@ class NativeLivePreview::Impl {
       last_frame_present_at_steady_us_ = now_steady_us;
       snapshot_.decoded_frames_rendered += 1;
       snapshot_.decoder_ready = true;
-      snapshot_.reason = "live-preview-frame-rendered";
+      snapshot_.reason = display_fallback_active_
+        ? "live-preview-display-fallback-frame-rendered"
+        : "live-preview-frame-rendered";
       snapshot_.last_error.clear();
       if (snapshot_.decoded_frames_rendered == 1) {
         emit_live_preview_breadcrumb(
@@ -1540,6 +1674,7 @@ class NativeLivePreview::Impl {
   std::atomic<bool> stop_requested_ { false };
   bool start_complete_ = false;
   bool start_succeeded_ = false;
+  bool display_fallback_active_ = false;
   std::string start_error_;
   bool capture_start_complete_ = false;
   bool capture_start_succeeded_ = false;

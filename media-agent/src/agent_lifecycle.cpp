@@ -23,6 +23,7 @@
 #include "host_session_controller.h"
 #include "media_audio.h"
 #include "obs_ingest_runtime.h"
+#include "platform_utils.h"
 #include "peer_media_binding_runtime.h"
 #include "peer_receiver_runtime.h"
 #include "relay_dispatch.h"
@@ -77,6 +78,21 @@ WindowCaptureAvailability query_window_capture_availability(const std::string& w
   }
   return WindowCaptureAvailability::normal;
 }
+
+bool try_resolve_restored_window_handle(const std::string& capture_title, std::string* window_handle) {
+  if (!window_handle) {
+    return false;
+  }
+  const std::string resolved = vds::media_agent::resolve_window_handle_from_title(capture_title);
+  if (resolved.empty() || resolved == *window_handle) {
+    return false;
+  }
+  if (query_window_capture_availability(resolved) != WindowCaptureAvailability::normal) {
+    return false;
+  }
+  *window_handle = resolved;
+  return true;
+}
 #endif
 
 }  // namespace
@@ -91,10 +107,22 @@ void refresh_host_capture_runtime(AgentRuntimeState& state) {
     const WindowCaptureAvailability availability =
       query_window_capture_availability(state.host_capture_plan.capture_handle);
     if (availability == WindowCaptureAvailability::minimized) {
-      state.host_capture_state = "minimized";
-      state.host_capture_plan.capture_state = "minimized";
-      state.host_capture_plan.reason = "minimized-window-wgc-capture-planned";
-      state.host_capture_plan.last_error.clear();
+      std::string resolved_handle = state.host_capture_plan.capture_handle;
+      if (try_resolve_restored_window_handle(state.host_capture_title, &resolved_handle)) {
+        state.host_capture_hwnd = resolved_handle;
+        state.host_capture_plan.capture_handle = resolved_handle;
+        state.host_capture_state = "normal";
+        state.host_capture_plan.capture_state = "normal";
+        state.host_window_restore_placeholder_active = false;
+        state.host_capture_plan.reason = "window-wgc-capture-planned";
+        state.host_capture_plan.last_error.clear();
+        state.host_capture_plan = validate_host_capture_plan(state.ffmpeg, state.host_capture_plan);
+      } else {
+        state.host_capture_state = "minimized";
+        state.host_capture_plan.capture_state = "minimized";
+        state.host_capture_plan.reason = "minimized-window-wgc-capture-planned";
+        state.host_capture_plan.last_error.clear();
+      }
     } else if (availability == WindowCaptureAvailability::normal) {
       state.host_capture_state = "normal";
       state.host_capture_plan.capture_state = "normal";

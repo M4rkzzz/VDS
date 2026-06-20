@@ -479,9 +479,8 @@ bool start_peer_video_sender(
             continue;
           }
           if (availability == WindowCaptureAvailability::normal) {
-            runtime->soft_refresh_requested.store(true);
-            update_runtime_state("peer-video-sender-refresh-pending", "", false);
-            refresh_pending = true;
+            update_runtime_state("peer-video-sender-restoring-window-source", "", false);
+            placeholder_mode_active = false;
             continue;
           }
 #endif

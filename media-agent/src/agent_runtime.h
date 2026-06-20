@@ -200,6 +200,7 @@ struct HostCapturePlan {
   std::string capture_state = "normal";
   std::string capture_backend = "gdigrab";
   std::string capture_handle;
+  std::string capture_title;
   std::string capture_display_id = "0";
   int width = 1920;
   int height = 1080;
