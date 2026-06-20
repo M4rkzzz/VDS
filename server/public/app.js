@@ -2464,18 +2464,18 @@ async function confirmQualitySelection() {
     elements.btnStartShare.disabled = true;
   }
   try {
-  if (getSelectedHostBackend() === 'obs-ingest') {
-    const port = isObsIngestCustomPortEnabled()
-      ? commitObsIngestPortInput()
-      : DEFAULT_OBS_INGEST_PORT;
-    await copyObsIngestUrl();
-    elements.qualityModal.classList.add('hidden');
-    await prepareObsIngestPreview(false, port);
-    await startScreenShareWithObsIngest({ port });
+    if (getSelectedHostBackend() === 'obs-ingest') {
+      const port = isObsIngestCustomPortEnabled()
+        ? commitObsIngestPortInput()
+        : DEFAULT_OBS_INGEST_PORT;
+      await copyObsIngestUrl();
+      elements.qualityModal.classList.add('hidden');
+      await prepareObsIngestPreview(false, port);
+      await startScreenShareWithObsIngest({ port });
       return;
-  }
-  elements.qualityModal.classList.add('hidden');
-  await showSourceSelection();
+    }
+    elements.qualityModal.classList.add('hidden');
+    await showSourceSelection();
   } catch (error) {
     resetShareStartPendingUi();
     throw error;
@@ -2483,6 +2483,7 @@ async function confirmQualitySelection() {
 }
 
 function cancelQualitySelection() {
+  resetShareStartPendingUi();
   elements.qualityModal.classList.add('hidden');
 }
 

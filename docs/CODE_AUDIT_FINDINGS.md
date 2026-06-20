@@ -2510,3 +2510,21 @@
 - 建议：所有带 roomId 的信令消息在进入 switch 前先和当前 session roomId 比对；无 session 时允许 join/error 类初始化消息，已有 session 时忽略不匹配 roomId 并记录诊断原因。
 - 修改意见：按建议修改
 - 处理结果：已处理。新增 `isSignalForCurrentSession()`，`handleSignal()` 入口先过滤带 roomId 且与当前 session 不一致的消息，并写入 `stale-room-signal-ignored` 诊断；现有 attemptId 过滤继续处理同房间内的重连乱序。已通过 `npm run check:vds-web`。
+
+### ROBUSTNESS-P1-005 取消质量弹窗后开始共享 pending 状态残留
+
+- 位置：`server/public/app.js:2455`、`server/public/app.js:2485`
+- 问题：开始共享流程已加 `shareStartInFlight`，但用户打开质量弹窗后点击取消没有调用 pending 复位。若此前确认流程或按钮禁用状态进入 pending，后续再次点开始共享可能被锁挡住或按钮状态残留。
+- 影响：用户反复打开/取消质量弹窗、切换设置后再开始共享时，可能出现开始按钮不可用或确认按钮保持 disabled 的假死状态。
+- 建议：质量弹窗取消应与源选择取消、失败清理使用同一 `resetShareStartPendingUi()`，同时整理确认流程缩进，避免后续维护误读 try/catch 范围。
+- 修改意见：按建议修改
+- 处理结果：已处理。`cancelQualitySelection()` 现在调用 `resetShareStartPendingUi()`；`confirmQualitySelection()` 的 OBS/source 分支统一包在 try 内，失败仍释放 pending。已通过 `node --check server/public/app.js`。
+
+### ROBUSTNESS-P1-006 native host start/stop 交错可让旧 start 异步回写房间
+
+- 位置：`server/public/app-native-overrides.js:52`、`server/public/app-native-overrides.js:3659`、`server/public/app-native-overrides.js:3777`、`server/public/app-native-overrides.js:3843`
+- 问题：用户开始共享后立刻停止，或 startHostSession/attach preview 正在 await 时触发停止，旧 start promise 返回后仍会继续设置 `nativeHostSessionRunning`、更新 UI、构建 manifest 并发送 `create-room`。停止路径虽然清理当前状态，但没有让未完成的 start 自弃。
+- 影响：极端快点开始/停止时可能出现已经停止却又创建新房间、按钮回到正在共享、media-agent host session 残留或 manifest 与用户实际操作不一致。
+- 建议：native host start 增加 generation token；每次 start 记录 generation，stop 或新 start 递增 generation。`startHostSession` 返回后、preview attach 后、OBS start 返回后都检查 generation/stop 状态，失效则主动 stopHostSession/cleanup 并抛出可恢复 superseded 错误。
+- 修改意见：按建议修改
+- 处理结果：已处理。新增 `nativeHostStartGeneration`；native/OBS start 入口递增并保存 generation，`stopScreenShare()` 递增使未完成 start 失效。`startHostSession` 返回后和 preview attach 后检查 generation 与 `stopScreenShareInFlight`，失效时停止 host session 或执行失败清理，并阻止后续 UI/manifest/create-room 回写。已通过 `node --check server/public/app-native-overrides.js`。

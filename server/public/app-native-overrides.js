@@ -50,6 +50,7 @@
   const nativePeerSignalBacklog = new Map();
   const nativePeerSignalWaiters = new Map();
   let nativePeerAttemptSeq = 0;
+  let nativeHostStartGeneration = 0;
   const NATIVE_PEER_SIGNAL_MAX_BACKLOG_PER_PEER = 32;
   const NATIVE_PEER_SIGNAL_MAX_BACKLOG_TOTAL = 256;
   const NATIVE_PEER_SIGNAL_MAX_WAITERS_PER_KEY = 8;
@@ -3660,6 +3661,7 @@
     if (!nativeHostSessionEnabled) {
       throw new Error('native-host-session-disabled');
     }
+    const startGeneration = ++nativeHostStartGeneration;
 
     currentHostBackend = 'native';
     obsRoomCreatePending = false;
@@ -3682,6 +3684,10 @@
       try {
         const session = await mediaEngine.startHostSession(parsedSource);
         logNativeDebug('video', '[media-engine] host session result:', JSON.stringify(session));
+        if (startGeneration !== nativeHostStartGeneration || stopScreenShareInFlight) {
+          await mediaEngine.stopHostSession({}).catch(() => {});
+          throw new Error('native-host-start-superseded');
+        }
         if (!session || session.running !== true) {
           throw new Error(session && session.reason ? session.reason : 'native-host-session-start-failed');
         }
@@ -3736,6 +3742,10 @@
           await waitForHostUiReady();
           await attachNativeHostPreviewSurface();
         }
+        if (startGeneration !== nativeHostStartGeneration || stopScreenShareInFlight) {
+          await cleanupAfterFailedHostStart();
+          throw new Error('native-host-start-superseded');
+        }
 
         if (!allowPreviewForAttempt && preferredPreview && !previewFallbackNoticeShown) {
           previewFallbackNoticeShown = true;
@@ -3778,6 +3788,7 @@
     if (!nativeHostSessionEnabled) {
       throw new Error('native-host-session-disabled');
     }
+    const startGeneration = ++nativeHostStartGeneration;
 
     currentHostBackend = 'obs-ingest';
     obsRoomCreatePending = false;
@@ -3793,6 +3804,10 @@
       port: requestedPort
     });
     logNativeDebug('video', '[media-engine] obs ingest session result:', JSON.stringify(session));
+    if (startGeneration !== nativeHostStartGeneration || stopScreenShareInFlight) {
+      await mediaEngine.stopHostSession({}).catch(() => {});
+      throw new Error('native-host-start-superseded');
+    }
     if (!session || session.running !== true) {
       throw new Error(session && session.reason ? session.reason : 'obs-ingest-session-start-failed');
     }
@@ -3844,6 +3859,7 @@
     if (stopScreenShareInFlight) {
       return;
     }
+    nativeHostStartGeneration += 1;
 
     stopScreenShareInFlight = true;
     setHostStopUiState(true);
