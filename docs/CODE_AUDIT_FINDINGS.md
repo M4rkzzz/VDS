@@ -2465,3 +2465,12 @@
 - 建议：发布流程拆成打包前检查和打包后校验。打包前允许 `build:vds-web`、`verify:media-agent` 生成运行时；打包后禁止再重建运行时，只校验 installer、server updates 和 packaged media-agent 哈希一致。
 - 修改意见：按建议修改
 - 处理结果：已处理。新增 `release:precheck` 和 `release:check --postbuild` 两阶段入口；`build:release` 改为 `release:precheck -> electron-builder -> prepare-server-release -> release:check -> release:github`。`release:check` 打包后不再执行 `verify:media-agent`，并新增 `validatePackagedMediaAgentRuntime()` 比对 `runtime/media-agent/vds-media-agent.exe` 与 `dist/win-unpacked/resources/runtime/media-agent/vds-media-agent.exe` 的 SHA256，不一致会直接失败并提示重新打包。已通过 `node --check scripts/release-check.js`。
+
+### RUNTIME-FIX-P1-021 Web 端依赖 crypto.randomUUID 导致能力检测前崩溃
+
+- 位置：`vds_web/src/main.ts:1235`、`server/server-core.js:138`
+- 问题：Web viewer 初始化 clientId 时直接调用 `crypto.randomUUID()`。部分浏览器版本、非安全上下文或被代理/嵌入后的环境没有该函数，脚本在能力检测前抛出 `TypeError: crypto.randomUUID is not a function`，页面停在“P2P：能力检测中”。
+- 影响：Web 端完全无法进入 capability detect、房间列表和加入流程；浏览器控制台只显示旧 bundle 的初始化异常。
+- 建议：clientId 生成需要兼容 fallback：优先 `randomUUID`，其次 `getRandomValues` 手动生成 UUID v4，最后退到时间戳和 `Math.random` 的非安全唯一值。同时 Web 入口 HTML 不应缓存，避免浏览器继续加载旧 hashed bundle。
+- 修改意见：按建议修改
+- 处理结果：已处理。`getClientId()` 改为调用 `createClientUuid()`，兼容 `crypto.randomUUID` 缺失场景；`server-core` 对 `/`、`/vds_web`、`/vds_web/` 和 `/admin` 入口 HTML 设置 `Cache-Control: no-store`，避免入口页缓存导致继续引用旧 JS。已通过 `npm run check:vds-web`、`npm run test:vds-web`、`npm run build:vds-web`、`node --check server/server-core.js`、`npm run test:server`；构建后的 `server/public/vds_web/index.html` 已指向新 bundle `index-BBw8ihmu.js`，旧 `index-DZl3WkvK.js` 不在当前构建目录中。

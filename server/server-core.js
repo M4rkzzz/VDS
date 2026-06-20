@@ -137,6 +137,16 @@ function startServer(options = {}) {
     app.get('/', (req, res, next) => {
       const webEntry = path.join(publicDir, 'vds_web', 'index.html');
       if (!isElectronUserAgent(req) && fs.existsSync(webEntry)) {
+        res.set('Cache-Control', 'no-store');
+        res.sendFile(webEntry);
+        return;
+      }
+      next();
+    });
+    app.get(['/vds_web', '/vds_web/'], (_req, res, next) => {
+      const webEntry = path.join(publicDir, 'vds_web', 'index.html');
+      if (fs.existsSync(webEntry)) {
+        res.set('Cache-Control', 'no-store');
         res.sendFile(webEntry);
         return;
       }
@@ -145,6 +155,7 @@ function startServer(options = {}) {
     app.get('/admin', (_req, res, next) => {
       const adminEntry = path.join(publicDir, 'admin.html');
       if (fs.existsSync(adminEntry)) {
+        res.set('Cache-Control', 'no-store');
         res.sendFile(adminEntry);
         return;
       }
