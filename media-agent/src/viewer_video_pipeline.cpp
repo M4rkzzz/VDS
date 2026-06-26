@@ -6,14 +6,15 @@
 #include "json_protocol.h"
 #include "native_video_surface.h"
 #include "peer_receiver_runtime.h"
-#include "relay_dispatch.h"
+#include "peer_transport.h"
+#include "relay_hub.h"
 #include "surface_attachment_runtime.h"
 #include "time_utils.h"
 #include "video_access_unit.h"
 
 bool submit_scheduled_video_unit_to_surface(
   const std::string& peer_id,
-  PeerState::PeerVideoReceiverRuntime& runtime,
+  PeerVideoReceiverRuntime& runtime,
   const std::vector<std::uint8_t>& frame,
   const std::string& codec_path,
   std::string* warning_message) {
@@ -125,7 +126,7 @@ bool submit_scheduled_video_unit_to_surface(
 
 void consume_remote_peer_video_frame(
   const std::string& peer_id,
-  const std::shared_ptr<PeerState::PeerVideoReceiverRuntime>& runtime_ptr,
+  const std::shared_ptr<PeerVideoReceiverRuntime>& runtime_ptr,
   const std::shared_ptr<PeerTransportSession>& transport_session,
   const std::vector<std::uint8_t>& frame,
   const std::string& codec,
@@ -224,7 +225,7 @@ void consume_remote_peer_video_frame(
     }
 
     if (waiting_for_random_access) {
-      fanout_relay_video_units(peer_id, codec_path, relay_decode_units, rtp_timestamp);
+      relay_hub().publish_video_units(peer_id, codec_path, relay_decode_units, rtp_timestamp);
       refresh_peer_video_receiver_runtime(runtime);
       update_peer_decoder_state_from_runtime(runtime_ptr, transport_session);
       return;
@@ -235,7 +236,7 @@ void consume_remote_peer_video_frame(
     }
   }
 
-  fanout_relay_video_units(peer_id, codec_path, relay_decode_units, rtp_timestamp);
+  relay_hub().publish_video_units(peer_id, codec_path, relay_decode_units, rtp_timestamp);
   bool local_playback_enabled = false;
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);

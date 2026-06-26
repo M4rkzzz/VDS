@@ -2,8 +2,11 @@
 
 #include <string>
 
-#include "agent_runtime.h"
-#include "wgc_capture.h"
+struct FfmpegProbeResult;
+struct HostCapturePlan;
+struct HostPipelineState;
+struct WgcCaptureProbe;
+struct WgcFrameSourceConfig;
 
 WgcFrameSourceConfig build_wgc_frame_source_config(const HostCapturePlan& plan);
 HostCapturePlan build_host_capture_plan(

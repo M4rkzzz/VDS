@@ -1,0 +1,22 @@
+#pragma once
+
+#include <functional>
+#include <string>
+
+struct PeerState;
+
+struct HostSessionControllerCallbacks {
+  std::function<void(const std::string& reason)> stop_all_surface_attachments;
+  std::function<void()> refresh_host_capture_runtime;
+  std::function<void()> restart_host_capture_surface_attachments;
+  std::function<bool()> transport_ready;
+  std::function<bool(PeerState& peer, std::string* error)> attach_host_video_media_binding;
+  std::function<bool(PeerState& peer, std::string* error)> detach_peer_media_binding;
+};
+
+struct HostSessionCommandResult {
+  bool ok = false;
+  std::string result_json;
+  std::string error_code;
+  std::string error_message;
+};

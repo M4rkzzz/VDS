@@ -977,7 +977,7 @@ function notifyViewerCurrentUpstream(room, viewer, reconnect) {
     return;
   }
   const upstreamViewer = findViewerById(room, upstreamPeerId);
-  if (upstreamViewer && upstreamViewer.mediaReady && isSocketOpen(upstreamViewer.ws)) {
+  if (upstreamViewer && upstreamViewer.mediaReady && upstreamViewer.relayEstablished && isSocketOpen(upstreamViewer.ws)) {
     notifyViewerToConnectNext(room, upstreamViewer, viewer);
   }
 }
@@ -1532,7 +1532,7 @@ function isUpstreamCandidateReady(room, upstreamPeerId) {
     return isSocketOpen(room.host.ws);
   }
   const upstreamViewer = findViewerById(room, upstreamPeerId);
-  return Boolean(upstreamViewer && upstreamViewer.mediaReady && isSocketOpen(upstreamViewer.ws));
+  return Boolean(upstreamViewer && upstreamViewer.mediaReady && upstreamViewer.relayEstablished && isSocketOpen(upstreamViewer.ws));
 }
 
 function wouldCreateUpstreamCycle(room, viewerId, upstreamPeerId) {
@@ -1664,7 +1664,7 @@ function notifyReconnectTargets(room) {
 }
 
 function notifyPendingDownstreams(room, upstreamViewer) {
-  if (!room || !upstreamViewer || !upstreamViewer.mediaReady || !isSocketOpen(upstreamViewer.ws)) {
+  if (!room || !upstreamViewer || !upstreamViewer.mediaReady || !upstreamViewer.relayEstablished || !isSocketOpen(upstreamViewer.ws)) {
     return;
   }
   room.viewers

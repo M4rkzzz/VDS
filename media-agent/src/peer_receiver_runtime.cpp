@@ -8,7 +8,7 @@
 #include "native_video_surface.h"
 #include "peer_transport.h"
 
-void begin_close_peer_video_receiver_runtime(PeerState::PeerVideoReceiverRuntime& runtime) {
+void begin_close_peer_video_receiver_runtime(PeerVideoReceiverRuntime& runtime) {
   std::lock_guard<std::mutex> lock(runtime.mutex);
   runtime.closing = true;
   runtime.pending_video_annexb_bytes.clear();
@@ -16,7 +16,7 @@ void begin_close_peer_video_receiver_runtime(PeerState::PeerVideoReceiverRuntime
   runtime.reason = "peer-closing";
 }
 
-void close_peer_video_receiver_handles(PeerState::PeerVideoReceiverRuntime& runtime) {
+void close_peer_video_receiver_handles(PeerVideoReceiverRuntime& runtime) {
   begin_close_peer_video_receiver_runtime(runtime);
   reset_peer_audio_decoder_runtime(runtime);
   std::lock_guard<std::mutex> lock(runtime.mutex);
@@ -26,7 +26,7 @@ void close_peer_video_receiver_handles(PeerState::PeerVideoReceiverRuntime& runt
   runtime.process_id = 0;
 }
 
-void refresh_peer_video_receiver_runtime(PeerState::PeerVideoReceiverRuntime& runtime) {
+void refresh_peer_video_receiver_runtime(PeerVideoReceiverRuntime& runtime) {
   std::shared_ptr<NativeVideoSurface> surface;
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
@@ -55,7 +55,7 @@ void refresh_peer_video_receiver_runtime(PeerState::PeerVideoReceiverRuntime& ru
 }
 
 void update_peer_decoder_state_from_runtime(
-  const std::shared_ptr<PeerState::PeerVideoReceiverRuntime>& runtime,
+  const std::shared_ptr<PeerVideoReceiverRuntime>& runtime,
   const std::shared_ptr<PeerTransportSession>& transport_session) {
   if (!transport_session || !runtime) {
     return;
@@ -71,7 +71,7 @@ void update_peer_decoder_state_from_runtime(
 }
 
 std::string peer_video_receiver_runtime_json(
-  const std::shared_ptr<PeerState::PeerVideoReceiverRuntime>& runtime) {
+  const std::shared_ptr<PeerVideoReceiverRuntime>& runtime) {
   if (!runtime) {
     return "null";
   }

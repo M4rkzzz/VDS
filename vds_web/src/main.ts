@@ -44,6 +44,7 @@ let upstreamPc: RTCPeerConnection | null = null;
 let downstreamPc: RTCPeerConnection | null = null;
 let downstreamDataChannel: RTCDataChannel | null = null;
 let downstreamDataChannelReady = false;
+let downstreamRelayForwarding = false;
 let downstreamCloseExpected = false;
 let relayHelloAckTimer: number | null = null;
 let webEdgeAttemptSeq = 0;
@@ -476,6 +477,7 @@ async function handleConnectToNext(message: SignalMessage): Promise<void> {
   downstreamPc?.close();
   downstreamDataChannel?.close();
   downstreamDataChannelReady = false;
+  downstreamRelayForwarding = false;
   downstreamCloseExpected = false;
   clearRelayHelloAckTimer();
   downstreamEdgeAttemptId = ++webEdgeAttemptSeq;
@@ -610,6 +612,7 @@ function maybeSendViewerReady(): void {
 }
 
 function markRelayUnsupported(reason: string): void {
+  downstreamRelayForwarding = false;
   diagnostics.update({
     status: 'relay 失败',
     relayProtocolState: 'failed',
@@ -623,6 +626,9 @@ function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): voi
   downstreamCloseExpected = false;
   diagnostics.update({ relayProtocolState: 'datachannel-opening' });
   const openTimer = window.setTimeout(() => {
+    if (!isCurrentDownstreamChannel(channel, peerId)) {
+      return;
+    }
     if (channel.readyState !== 'open') {
       markRelayUnsupported('datachannel-open-timeout');
       channel.close();
@@ -631,15 +637,25 @@ function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): voi
 
   channel.binaryType = 'arraybuffer';
   channel.onopen = () => {
+    if (!isCurrentDownstreamChannel(channel, peerId)) {
+      window.clearTimeout(openTimer);
+      return;
+    }
     window.clearTimeout(openTimer);
     diagnostics.update({ relayProtocolState: 'datachannel-hello-sent' });
     channel.send(JSON.stringify(helloMessage('relay', getCurrentManifest())));
     relayHelloAckTimer = window.setTimeout(() => {
+      if (!isCurrentDownstreamChannel(channel, peerId)) {
+        return;
+      }
       markRelayUnsupported('datachannel-hello-ack-timeout');
       channel.close();
     }, DATA_CHANNEL_HELLO_ACK_TIMEOUT_MS);
   };
   channel.onmessage = (event) => {
+    if (!isCurrentDownstreamChannel(channel, peerId)) {
+      return;
+    }
     if (typeof event.data === 'string') {
       const control = parseControlMessage(event.data);
       if (control?.type === 'hello-ack') {
@@ -656,7 +672,7 @@ function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): voi
         }
         clearRelayHelloAckTimer();
         downstreamDataChannelReady = true;
-        diagnostics.update({ relayProtocolState: 'datachannel-ready' });
+        markDownstreamRelayReady();
         sendRelayBootstrapKeyframe();
       } else if (control?.type === 'error') {
         markRelayUnsupported(control.reason || 'datachannel-remote-error');
@@ -666,6 +682,9 @@ function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): voi
     handleInboundEncodedFrame(event.data, peerId);
   };
   channel.onerror = () => {
+    if (!isCurrentDownstreamChannel(channel, peerId)) {
+      return;
+    }
     window.clearTimeout(openTimer);
     if (downstreamCloseExpected || downstreamDataChannelReady || channel.readyState === 'closing' || channel.readyState === 'closed') {
       handleDownstreamChannelClosed();
@@ -674,6 +693,9 @@ function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): voi
     markRelayUnsupported('datachannel-error');
   };
   channel.onclose = () => {
+    if (!isCurrentDownstreamChannel(channel, peerId)) {
+      return;
+    }
     window.clearTimeout(openTimer);
     clearRelayHelloAckTimer();
     handleDownstreamChannelClosed();
@@ -771,7 +793,7 @@ function sendRelayBootstrapKeyframe(): void {
       downstreamDataChannel.send(message);
     }
     lastBootstrapFrameId = bootstrapFrameId;
-    diagnostics.update({ relayProtocolState: 'datachannel-bootstrap-sent' });
+    markDownstreamRelayForwarding('datachannel-bootstrap-sent');
     diagnostics.incrementCounter('dataChannelBootstrapFramesSent');
   } catch (error) {
     markRelayUnsupported(errorToMessage(error));
@@ -782,6 +804,10 @@ function isDataChannelRelayReady(): boolean {
   return downstreamDataChannelReady;
 }
 
+function isCurrentDownstreamChannel(channel: RTCDataChannel, peerId: string): boolean {
+  return channel === downstreamDataChannel && peerId === downstreamPeerId;
+}
+
 function handleViewerLeft(message: SignalMessage): void {
   const viewerId = String(message.viewerId || message.clientId || '');
   if (!viewerId || viewerId !== downstreamPeerId) {
@@ -789,6 +815,7 @@ function handleViewerLeft(message: SignalMessage): void {
   }
   downstreamCloseExpected = true;
   downstreamDataChannelReady = false;
+  downstreamRelayForwarding = false;
   clearRelayHelloAckTimer();
   downstreamDataChannel?.close();
   downstreamPc?.close();
@@ -802,6 +829,7 @@ function handleViewerLeft(message: SignalMessage): void {
     relayFailureReason: undefined,
     lastError: undefined
   });
+  restoreWatchingStatusAfterRelay();
 }
 
 function handleDownstreamChannelClosed(): void {
@@ -810,10 +838,14 @@ function handleDownstreamChannelClosed(): void {
     downstreamCloseExpected = true;
   }
   downstreamDataChannelReady = false;
+  downstreamRelayForwarding = false;
   clearRelayHelloAckTimer();
   diagnostics.update({
     relayProtocolState: wasReady || downstreamCloseExpected ? 'downstream-closed' : 'datachannel-closed'
   });
+  if (wasReady || downstreamCloseExpected) {
+    restoreWatchingStatusAfterRelay();
+  }
 }
 
 function queuePendingIceCandidate(peerId: string, candidate: RTCIceCandidateInit): void {
@@ -877,6 +909,7 @@ function resetLocalViewerSession(): void {
   clearJoinAckTimer();
   setJoinPending(false);
   downstreamDataChannelReady = false;
+  downstreamRelayForwarding = false;
   downstreamCloseExpected = true;
   clearRelayHelloAckTimer();
   clearPendingVideoDecodeTimers();
@@ -1044,8 +1077,43 @@ function forwardDecodedDataChannelFrame(header: {
       diagnostics.incrementCounter('encodedFramesForwarded');
     }
     diagnostics.incrementCounter('dataChannelFramesForwarded');
+    markDownstreamRelayForwarding(`forwarding-${header.streamType}-${header.codec}`);
   } catch (error) {
     markRelayUnsupported(errorToMessage(error));
+  }
+}
+
+function markDownstreamRelayReady(): void {
+  diagnostics.update({
+    status: 'relay 已连接',
+    relayProtocolState: 'datachannel-ready',
+    relayFailureReason: undefined,
+    lastError: undefined
+  });
+  setStatus('relay 已连接');
+}
+
+function markDownstreamRelayForwarding(relayProtocolState: string): void {
+  if (downstreamRelayForwarding && diagnostics.getSnapshot().status === 'relay 转发中') {
+    return;
+  }
+  downstreamRelayForwarding = true;
+  diagnostics.update({
+    status: 'relay 转发中',
+    relayProtocolState,
+    relayFailureReason: undefined,
+    lastError: undefined
+  });
+  setStatus('relay 转发中');
+}
+
+function restoreWatchingStatusAfterRelay(): void {
+  if (!session) {
+    return;
+  }
+  const snapshot = diagnostics.getSnapshot();
+  if (!snapshot.lastError) {
+    setStatus(snapshot.encodedFramesReceived > 0 || snapshot.webDecodedVideoFrames > 0 ? '观看中' : '等待上游');
   }
 }
 

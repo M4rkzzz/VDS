@@ -2,44 +2,46 @@
 
 VDS is an Electron desktop client plus a Node.js signaling server for cascade screen sharing.
 
-## 1.6.8 Overview
+## 1.7.0 Overview
 
-Version `1.6.8` focuses on packaged-client parity for minimized-window capture discovery while keeping the 1.6.7 native P2P, media surface, topology, and release-flow hardening.
+Version `1.7.0` focuses on renderer/native-authority modularization, media-agent session ownership, native/OBS lifecycle reliability, and Web/native relay topology robustness.
 
 Highlights:
 
-- improved native offer/answer attempt isolation and reconnect behavior for host/viewer/relay edges
-- added server-side upstream reselection with per-upstream downstream capacity limits
-- fixed host stop-share/re-share room lifecycle by fully unbinding destroyed room sockets
-- improved native viewer surface movement handling to avoid updateSurface storms during window dragging
-- restored WGC live preview as the default host preview path while hardening WGC source creation errors
-- fixed packaged Electron minimized-window capture discovery so installed clients match dev behavior
-- added a 3010 signal admin dashboard with graphical topology, node state, edge state, and live manifests
-- improved diagnostic density by moving high-frequency surface/getStats logs behind the debug high-frequency channel
-- kept native `H.264 / H.265` + encoded relay fanout and Web viewer relay as the production path
+- split renderer responsibilities into dedicated app state, room client, UI, native session, peer, surface, diagnostics, and P2P state-machine modules
+- tightened media-agent ownership around Host, Peer, Surface, Relay, Audio, and OBS ingest session controllers
+- fixed native/OBS share start, stop-share, repeated share, room creation, room-code display, public-room discovery, and stale-manifest cleanup
+- fixed OBS ingest audio and AAC manifest behavior for downstream playback and relay
+- improved source thumbnail and WGC preview timing with async thumbnail loading and diagnostic WGC preview failures
+- strengthened chain-first Web/native relay routing with server-side upstream reselection and per-upstream downstream limits
+- added renderer/native bridge, room-client, media-agent boundary, logging, server, VDS_web, and media-agent release gates
+- improved the 3010 signal admin dashboard with live topology, node/edge state, capacity, and manifest visualization
 
-Current media path:
+## Current Media Path
 
 - host backend: native capture or local OBS ingest
-- native host capture: `Windows Graphics Capture`
-- OBS ingest: local-only `MPEG-TS over SRT` on `127.0.0.1`
+- native host capture: Windows Graphics Capture
+- OBS ingest: local-only MPEG-TS over SRT on `127.0.0.1`
 - transport: native `libdatachannel`
 - video: `H.264 / H.265`
 - audio: native host uses `Opus 48k stereo`, OBS ingest uses `AAC 48k`
-- relay: native encoded fanout (`host -> v1 -> v2`), not browser re-encode
-- rendering: native preview / native viewer surface
+- relay: encoded fanout, not browser re-encode
+- rendering: native preview / native viewer surface; web viewer uses WebCodecs
 
 ## Repository Layout
 
 - `desktop/`: Electron main process, preload bridge, updater, native agent bridge
-- `server/public/`: canonical frontend assets
-- `server/index.js`: shared local/deploy server entry
-- `server/server-core.js`: signaling and relay-chain room logic
-- `vds_web/`: Chrome/Edge web viewer and encoded relay feasibility harness
-- `media-agent/`: native capture / encode / decode / relay implementation
-- `scripts/`: local test, release, and native build scripts
-- `docs/`: manual documents
-- `MEDIA_REFACTOR_PLAN.md`: current media architecture and refactor truth source
+- `server/`: deployable Node signaling server, Docker context, admin dashboard, update feed output
+- `server/public/`: Electron renderer assets served by the local/deployed server
+- `vds_web/`: Chrome/Edge web viewer source; build output is copied to `server/public/vds_web/`
+- `media-agent/`: native capture, encode, decode, relay, preview, and viewer surface implementation
+- `runtime/`: generated native runtime copied into Electron packages; not committed
+- `scripts/`: local test, release, server, and native build scripts
+- `tools/`: helper tools such as the VDS test launcher
+- `docs/`: audit notes, logging policy, media-agent notes, and project structure docs
+- `MEDIA_REFACTOR_PLAN.md`: current media architecture and unreleased-change truth source
+
+More detail: [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md).
 
 ## Core Commands
 
@@ -47,10 +49,14 @@ Current media path:
 npm install
 npm run dev
 npm run server
-npm run dual:web
+npm run dev:single:native
 npm run dev:dual:native
+npm run dev:dual:web
 npm run dev:triple:native
+npm run triple:nwn
 npm run check:vds-web
+npm run test:vds-web
+npm run test:server
 npm run build:vds-web
 npm run build:media-agent
 npm run build:release
@@ -58,11 +64,16 @@ npm run build:release
 
 ## Native Test Flows
 
+- `npm run dev:single:native`
+  - local server + 1 native client
 - `npm run dev:dual:native`
-  - local server + 1 host + 1 viewer
+  - local server + 1 host + 1 native viewer
+- `npm run dev:dual:web`
+  - local server + native host + web viewer flow
 - `npm run dev:triple:native`
-  - local server + 1 host + 2 viewers
-  - suggested relay order: host creates room -> viewer 1 joins -> viewer 2 joins
+  - local server + 1 host + 2 native viewers
+- `npm run triple:nwn`
+  - native host + web relay/viewer + native viewer scenario
 
 ## Quality Settings
 
@@ -78,7 +89,7 @@ Current desktop UI supports:
 - hardware encoder selection: auto or manually select validated hardware encoders
 - encoder preset: `quality / balanced / speed`
 - tune: `fastdecode / zerolatency`
-- keyframe interval: `1s / 0.5s / all-intra`
+- keyframe interval controls
 
 OBS mode currently behaves like this:
 
@@ -91,28 +102,18 @@ OBS mode currently behaves like this:
 Viewer join mode currently behaves like this:
 
 - default tab is `Lobby`
-- the lobby polls `/api/public-rooms` every `500ms` while the join panel is open
+- the lobby polls `/api/public-rooms` while the join panel is open
 - hosts choose whether a room is public before starting share
 - manual room code entry remains available in the `Direct` tab
-
-## Current Highlights
-
-- H.265 is now part of the native mainline for host, viewer, and relay fanout
-- VDS_web now exists as a browser feasibility harness for Chrome/Edge watching and zero-reencode encoded relay validation
-- AAC is now part of the formal native transport / relay / viewer playback path
-- OBS local ingest is now a formal host backend, not a sidecar experiment
-- public room listing is now part of the default product flow instead of requiring room-code-only join every time
-- hardware encoder detection uses native self-test instead of raw FFmpeg enumeration
-- host and viewer UI expose native FPS diagnostics
-- Win11 24H2 WGC high-FPS capture requires `GraphicsCaptureSession.MinUpdateInterval(1ms)`
-- WGC session now explicitly sets cursor capture and border behavior when the platform exposes those properties
 
 ## Release and Deployment
 
 - `npm run build:release`
+  - runs prebuild checks, including VDS_web build and media-agent verification
   - builds Electron installer
   - refreshes `server/updates/`
-  - prepares `server/` for Docker upload
+  - validates packaged media-agent runtime against `runtime/media-agent`
+  - validates `dist/` and `server/updates/` update manifests
   - publishes the GitHub Release through `gh`
 - `npm run release:github`
   - requires GitHub CLI `gh` and an authenticated session
@@ -120,12 +121,12 @@ Viewer join mode currently behaves like this:
   - refuses dirty worktrees unless `ALLOW_DIRTY_GITHUB_RELEASE=1` is set
 - `server/` is the deployable server directory
 - desktop auto-update feed is served from `server/updates/`
-- `1.6.8` release assets are the installer, blockmap, and `latest.yml`
 - release notes for recent versions are tracked in [CHANGELOG.md](CHANGELOG.md)
 
 ## Source Control Rules
 
 - build outputs are not committed
 - `runtime/` binaries are not committed
-- `server/public/` is the canonical frontend source directory
+- `server/public/vds_web/` is generated by `npm run build:vds-web` and is not committed
 - update artifacts in `server/updates/` are deployment outputs, not source
+- `docs/CODE_AUDIT_FINDINGS.md` records discovered issues and handling results for audit continuity

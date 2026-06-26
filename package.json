@@ -1,6 +1,6 @@
 {
   "name": "screenshare-relay",
-  "version": "1.6.9",
+  "version": "1.7.0",
   "description": "Multi-viewer screen sharing with cascade relay (蜈蚣法) - Electron Edition",
   "main": "desktop/main.js",
   "scripts": {
@@ -24,6 +24,12 @@
     "test:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/test-media-agent.ps1 -Configuration Release",
     "test:server": "node scripts/test-server-core.js",
     "verify:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/verify-media-agent.ps1 -Configuration Release",
+    "check:architecture": "npm run check:renderer-entry && npm run check:renderer-syntax && npm run check:renderer-bridge && npm run check:room-client-dispatcher && npm run check:media-agent-boundary",
+    "check:media-agent-boundary": "node scripts/check-media-agent-boundary.js",
+    "check:renderer-entry": "node scripts/check-renderer-entry.js",
+    "check:renderer-syntax": "node scripts/check-renderer-syntax.js",
+    "check:renderer-bridge": "node scripts/check-renderer-bridge.js",
+    "check:room-client-dispatcher": "node scripts/check-room-client-dispatcher.js",
     "check:logging": "powershell -ExecutionPolicy Bypass -File scripts/check-logging-policy.ps1",
     "check:server-docker": "node scripts/check-server-docker-context.js",
     "e2e:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/manual-media-agent-e2e.ps1",

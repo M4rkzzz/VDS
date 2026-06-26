@@ -11,11 +11,14 @@
 #endif
 
 #include "agent_diagnostics.h"
+#include "ffmpeg_probe_state.h"
 #include "host_pipeline.h"
+#include "host_session_state.h"
 #include "json_protocol.h"
 #include "platform_utils.h"
 #include "string_utils.h"
 #include "time_utils.h"
+#include "wgc_capture.h"
 
 namespace {
 

@@ -4,7 +4,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
-#include <sstream>
 #include <thread>
 
 #ifdef _WIN32
@@ -14,14 +13,16 @@
 #include <windows.h>
 #endif
 
+#include "ffmpeg_probe_state.h"
+#include "host_session_state.h"
 #include "native_artifact_preview.h"
 #include "native_live_preview.h"
 #include "native_video_surface.h"
-#include "json_protocol.h"
 #include "peer_receiver_runtime.h"
 #include "platform_utils.h"
 #include "surface_target.h"
 #include "string_utils.h"
+#include "surface_attachment_state.h"
 
 namespace fs = std::filesystem;
 
@@ -76,7 +77,7 @@ void close_surface_attachment_handles(SurfaceAttachmentState& state) {
 
 #ifdef _WIN32
 bool start_peer_video_surface_attachment(
-  PeerState::PeerVideoReceiverRuntime& runtime,
+  PeerVideoReceiverRuntime& runtime,
   std::string* error) {
   refresh_peer_video_receiver_runtime(runtime);
 
@@ -137,12 +138,12 @@ bool is_peer_video_surface_shutdown_reason(const std::string& reason) {
     reason == "native-surface-stopped";
 }
 
-bool restart_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& runtime, std::string* error) {
+bool restart_peer_video_surface_attachment(PeerVideoReceiverRuntime& runtime, std::string* error) {
   stop_peer_video_surface_attachment(runtime, "peer-video-surface-auto-restart");
   return start_peer_video_surface_attachment(runtime, error);
 }
 
-void stop_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& runtime, const std::string& reason) {
+void stop_peer_video_surface_attachment(PeerVideoReceiverRuntime& runtime, const std::string& reason) {
   std::shared_ptr<NativeVideoSurface> surface;
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
@@ -165,7 +166,7 @@ void stop_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& run
 }
 
 bool update_peer_video_surface_layout(
-  PeerState::PeerVideoReceiverRuntime& runtime,
+  PeerVideoReceiverRuntime& runtime,
   const NativeEmbeddedSurfaceLayout& layout,
   std::string* error) {
   std::shared_ptr<NativeVideoSurface> surface;
@@ -249,7 +250,7 @@ void refresh_surface_attachment_state(SurfaceAttachmentState& state) {
 
 void sync_surface_attachment_from_peer_runtime(
   SurfaceAttachmentState& state,
-  const std::shared_ptr<PeerState::PeerVideoReceiverRuntime>& runtime) {
+  const std::shared_ptr<PeerVideoReceiverRuntime>& runtime) {
   if (!runtime) {
     return;
   }
@@ -469,7 +470,7 @@ bool update_surface_attachment_layout(
 }
 
 bool start_peer_video_surface_attachment(
-  PeerState::PeerVideoReceiverRuntime&,
+  PeerVideoReceiverRuntime&,
   std::string* error) {
   if (error) {
     *error = "peer-video-surface-is-only-implemented-on-windows";
@@ -477,12 +478,12 @@ bool start_peer_video_surface_attachment(
   return false;
 }
 
-bool restart_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& runtime, std::string* error) {
+bool restart_peer_video_surface_attachment(PeerVideoReceiverRuntime& runtime, std::string* error) {
   stop_peer_video_surface_attachment(runtime, "peer-video-surface-auto-restart");
   return start_peer_video_surface_attachment(runtime, error);
 }
 
-void stop_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& runtime, const std::string& reason) {
+void stop_peer_video_surface_attachment(PeerVideoReceiverRuntime& runtime, const std::string& reason) {
   runtime.surface_attached = false;
   runtime.running = false;
   runtime.decoder_ready = false;
@@ -490,7 +491,7 @@ void stop_peer_video_surface_attachment(PeerState::PeerVideoReceiverRuntime& run
 }
 
 bool update_peer_video_surface_layout(
-  PeerState::PeerVideoReceiverRuntime& runtime,
+  PeerVideoReceiverRuntime& runtime,
   const NativeEmbeddedSurfaceLayout& layout,
   std::string* error) {
   runtime.surface_layout = layout;
@@ -511,58 +512,5 @@ bool is_peer_video_surface_shutdown_reason(const std::string& reason) {
 
 void sync_surface_attachment_from_peer_runtime(
   SurfaceAttachmentState&,
-  const std::shared_ptr<PeerState::PeerVideoReceiverRuntime>&) {}
+  const std::shared_ptr<PeerVideoReceiverRuntime>&) {}
 #endif
-
-std::string surface_attachment_json(SurfaceAttachmentState& state) {
-  if (is_peer_video_surface_target(state.target)) {
-    sync_surface_attachment_from_peer_runtime(state, state.peer_runtime);
-  } else {
-    refresh_surface_attachment_state(state);
-  }
-
-  std::ostringstream payload;
-  payload
-    << "{\"attached\":" << (state.attached ? "true" : "false")
-    << ",\"running\":" << (state.running ? "true" : "false")
-    << ",\"decoderReady\":" << (state.decoder_ready ? "true" : "false")
-    << ",\"decodedFramesRendered\":" << state.decoded_frames_rendered
-    << ",\"frameIntervalStddevMs\":" << state.frame_interval_stddev_ms
-    << ",\"surface\":\"" << vds::media_agent::json_escape(state.surface_id) << "\""
-    << ",\"target\":\"" << vds::media_agent::json_escape(state.target) << "\""
-    << ",\"processId\":" << state.process_id
-    << ",\"implementation\":\"" << vds::media_agent::json_escape(state.implementation) << "\""
-    << ",\"layout\":" << surface_layout_json(state.surface_layout)
-    << ",\"windowTitle\":\"" << vds::media_agent::json_escape(state.window_title) << "\""
-    << ",\"embeddedParentDebug\":\"" << vds::media_agent::json_escape(state.embedded_parent_debug) << "\""
-    << ",\"surfaceWindowDebug\":\"" << vds::media_agent::json_escape(state.surface_window_debug) << "\""
-    << ",\"reason\":\"" << vds::media_agent::json_escape(state.reason) << "\""
-    << ",\"lastError\":\"" << vds::media_agent::json_escape(state.last_error) << "\""
-    << "}";
-  return payload.str();
-}
-
-std::string build_surface_result_json(SurfaceAttachmentState& state) {
-  std::ostringstream payload;
-  payload
-    << "{\"surface\":\"" << vds::media_agent::json_escape(state.surface_id) << "\""
-    << ",\"target\":\"" << vds::media_agent::json_escape(state.target) << "\""
-    << ",\"attachment\":" << surface_attachment_json(state)
-    << ",\"implementation\":\"" << vds::media_agent::json_escape(state.implementation) << "\"}";
-  return payload.str();
-}
-
-std::string build_surface_attachments_json(AgentRuntimeState& state) {
-  std::ostringstream payload;
-  payload << "[";
-  bool first = true;
-  for (auto& entry : state.attached_surfaces) {
-    if (!first) {
-      payload << ",";
-    }
-    first = false;
-    payload << surface_attachment_json(entry.second);
-  }
-  payload << "]";
-  return payload.str();
-}

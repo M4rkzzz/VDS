@@ -2,17 +2,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
-#include <cctype>
+#include <deque>
 #include <mutex>
-#include <sstream>
 #include <thread>
+#include <utility>
 
-#include "json_protocol.h"
-#include "media_audio.h"
-#include "relay_dispatch.h"
 #include "time_utils.h"
-#include "wasapi_backend.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -29,6 +26,32 @@ constexpr unsigned int kViewerAudioBaseMaxBufferedFrames = 4800; // 100 ms @ 48 
 constexpr unsigned int kViewerAudioPassthroughJitterHeadroomMs = 120;
 constexpr unsigned int kViewerAudioMaxDelayMs = 300;
 
+struct ViewerAudioPlaybackRuntime {
+  struct QueuedPcmBlock {
+    std::vector<std::int16_t> pcm;
+    std::int64_t release_at_steady_us = 0;
+  };
+
+  bool running = false;
+  bool ready = false;
+  bool stop_requested = false;
+  bool thread_started = false;
+  bool playback_primed = false;
+  unsigned long long buffered_pcm_frames = 0;
+  unsigned int channel_count = kViewerAudioChannelCount;
+  unsigned int passthrough_audio_delay_ms = 0;
+  float software_volume = 1.0f;
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::thread worker;
+  std::deque<QueuedPcmBlock> pcm_queue;
+};
+
+ViewerAudioPlaybackRuntime& viewer_audio_playback_runtime() {
+  static ViewerAudioPlaybackRuntime runtime;
+  return runtime;
+}
+
 unsigned int pcm_sample_count_to_frames(std::size_t sample_count, unsigned int channel_count) {
   const unsigned int normalized_channel_count = std::max(1u, channel_count);
   return static_cast<unsigned int>(sample_count / normalized_channel_count);
@@ -40,7 +63,7 @@ unsigned int viewer_audio_passthrough_startup_frames() {
 }
 
 unsigned int viewer_audio_passthrough_max_buffered_frames(
-  const AgentRuntimeState::ViewerAudioPlaybackRuntime& runtime) {
+  const ViewerAudioPlaybackRuntime& runtime) {
   const unsigned int delay_ms = std::min(runtime.passthrough_audio_delay_ms, kViewerAudioMaxDelayMs);
   const unsigned int target_ms = delay_ms + kViewerAudioPassthroughJitterHeadroomMs;
   const unsigned int target_frames =
@@ -48,7 +71,7 @@ unsigned int viewer_audio_passthrough_max_buffered_frames(
   return std::max(kViewerAudioBaseMaxBufferedFrames, target_frames);
 }
 
-void viewer_audio_playback_worker(AgentRuntimeState::ViewerAudioPlaybackRuntime* runtime) {
+void viewer_audio_playback_worker(ViewerAudioPlaybackRuntime* runtime) {
   if (!runtime) {
     return;
   }
@@ -187,91 +210,9 @@ void viewer_audio_playback_worker(AgentRuntimeState::ViewerAudioPlaybackRuntime*
 
 } // namespace
 
-ViewerAudioCommandResult set_viewer_volume_from_request(
-  AgentRuntimeState& state,
-  const std::string& request_json) {
-  const int pid = vds::media_agent::extract_int_value(request_json, "pid", 0);
-  const float requested_volume = static_cast<float>(
-    vds::media_agent::extract_double_value(request_json, "volume", 1.0));
-  {
-    std::lock_guard<std::mutex> lock(state.viewer_audio_playback.mutex);
-    if (state.viewer_audio_playback.thread_started || state.viewer_audio_playback.ready) {
-      state.viewer_audio_playback.software_volume =
-        std::max(0.0f, std::min(1.0f, requested_volume));
-
-      std::ostringstream payload;
-      payload
-        << "{\"pid\":0"
-        << ",\"volume\":" << state.viewer_audio_playback.software_volume
-        << ",\"implementation\":\"native-viewer-audio-software-volume\"}";
-      return {true, payload.str(), {}, {}};
-    }
-  }
-
-  float effective_volume = 0.0f;
-  std::string volume_error;
-  if (!set_wasapi_render_session_volume_for_pid(pid, requested_volume, &effective_volume, &volume_error)) {
-    return {false, {}, "VIEWER_VOLUME_SET_FAILED", volume_error};
-  }
-
-  std::ostringstream payload;
-  payload
-    << "{\"pid\":" << pid
-    << ",\"volume\":" << effective_volume
-    << ",\"implementation\":\"native-wasapi-render-session-volume\"}";
-  return {true, payload.str(), {}, {}};
-}
-
-ViewerAudioCommandResult get_viewer_volume_from_request(
-  AgentRuntimeState& state,
-  const std::string& request_json) {
-  const int pid = vds::media_agent::extract_int_value(request_json, "pid", 0);
-  {
-    std::lock_guard<std::mutex> lock(state.viewer_audio_playback.mutex);
-    if (state.viewer_audio_playback.thread_started || state.viewer_audio_playback.ready) {
-      std::ostringstream payload;
-      payload
-        << "{\"pid\":0"
-        << ",\"volume\":" << state.viewer_audio_playback.software_volume
-        << ",\"implementation\":\"native-viewer-audio-software-volume\"}";
-      return {true, payload.str(), {}, {}};
-    }
-  }
-
-  float effective_volume = 0.0f;
-  std::string volume_error;
-  if (!get_wasapi_render_session_volume_for_pid(pid, &effective_volume, &volume_error)) {
-    return {false, {}, "VIEWER_VOLUME_GET_FAILED", volume_error};
-  }
-
-  std::ostringstream payload;
-  payload
-    << "{\"pid\":" << pid
-    << ",\"volume\":" << effective_volume
-    << ",\"implementation\":\"native-wasapi-render-session-volume\"}";
-  return {true, payload.str(), {}, {}};
-}
-
-ViewerAudioCommandResult set_viewer_audio_delay_from_request(
-  AgentRuntimeState& state,
-  const std::string& request_json) {
-  const int requested_delay_ms = vds::media_agent::extract_int_value(request_json, "delayMs", 0);
-  const unsigned int normalized_delay_ms =
-    static_cast<unsigned int>(std::max(0, std::min(300, requested_delay_ms)));
-  {
-    std::lock_guard<std::mutex> lock(state.viewer_audio_playback.mutex);
-    state.viewer_audio_playback.passthrough_audio_delay_ms = normalized_delay_ms;
-    state.viewer_audio_playback.cv.notify_all();
-  }
-  std::ostringstream payload;
-  payload
-    << "{\"delayMs\":" << normalized_delay_ms
-    << ",\"implementation\":\"viewer-audio-delay\"}";
-  return {true, payload.str(), {}, {}};
-}
-
-void ensure_viewer_audio_playback_runtime(AgentRuntimeState::ViewerAudioPlaybackRuntime& runtime) {
+void ensure_viewer_audio_playback_runtime() {
 #ifdef _WIN32
+  auto& runtime = viewer_audio_playback_runtime();
   std::thread finished_worker;
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
@@ -295,12 +236,39 @@ void ensure_viewer_audio_playback_runtime(AgentRuntimeState::ViewerAudioPlayback
     runtime.worker = std::thread(viewer_audio_playback_worker, &runtime);
   }
 #else
-  (void)runtime;
+  (void)viewer_audio_playback_runtime();
 #endif
 }
 
-void stop_viewer_audio_playback_runtime(AgentRuntimeState::ViewerAudioPlaybackRuntime& runtime) {
+bool viewer_audio_playback_is_active() {
+  auto& runtime = viewer_audio_playback_runtime();
+  std::lock_guard<std::mutex> lock(runtime.mutex);
+  return runtime.thread_started || runtime.ready;
+}
+
+float set_viewer_audio_software_volume(float requested_volume) {
+  auto& runtime = viewer_audio_playback_runtime();
+  std::lock_guard<std::mutex> lock(runtime.mutex);
+  runtime.software_volume = std::max(0.0f, std::min(1.0f, requested_volume));
+  return runtime.software_volume;
+}
+
+float get_viewer_audio_software_volume() {
+  auto& runtime = viewer_audio_playback_runtime();
+  std::lock_guard<std::mutex> lock(runtime.mutex);
+  return runtime.software_volume;
+}
+
+void set_viewer_audio_delay_ms(unsigned int delay_ms) {
+  auto& runtime = viewer_audio_playback_runtime();
+  std::lock_guard<std::mutex> lock(runtime.mutex);
+  runtime.passthrough_audio_delay_ms = std::min(delay_ms, kViewerAudioMaxDelayMs);
+  runtime.cv.notify_all();
+}
+
+void stop_viewer_audio_playback_runtime() {
 #ifdef _WIN32
+  auto& runtime = viewer_audio_playback_runtime();
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
     runtime.stop_requested = true;
@@ -314,21 +282,20 @@ void stop_viewer_audio_playback_runtime(AgentRuntimeState::ViewerAudioPlaybackRu
   runtime.buffered_pcm_frames = 0;
   runtime.playback_primed = false;
 #else
-  (void)runtime;
+  (void)viewer_audio_playback_runtime();
 #endif
 }
 
-void queue_viewer_audio_pcm_block(
-  AgentRuntimeState::ViewerAudioPlaybackRuntime& runtime,
-  std::vector<std::int16_t> pcm_block) {
+void queue_viewer_audio_pcm_block(std::vector<std::int16_t> pcm_block) {
   if (pcm_block.empty()) {
     return;
   }
 
-  ensure_viewer_audio_playback_runtime(runtime);
+  ensure_viewer_audio_playback_runtime();
+  auto& runtime = viewer_audio_playback_runtime();
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
-    AgentRuntimeState::ViewerAudioPlaybackRuntime::QueuedPcmBlock queued_block;
+    ViewerAudioPlaybackRuntime::QueuedPcmBlock queued_block;
     queued_block.release_at_steady_us =
       vds::media_agent::current_time_micros_steady() +
       static_cast<std::int64_t>(std::min(runtime.passthrough_audio_delay_ms, kViewerAudioMaxDelayMs)) * 1000;
@@ -352,57 +319,4 @@ void queue_viewer_audio_pcm_block(
     }
   }
   runtime.cv.notify_one();
-}
-
-void consume_remote_peer_audio_frame(
-  AgentRuntimeState::ViewerAudioPlaybackRuntime& audio_runtime,
-  const std::string& peer_id,
-  const std::shared_ptr<PeerState::PeerVideoReceiverRuntime>& runtime_ptr,
-  const std::vector<std::uint8_t>& frame,
-  const std::string& codec,
-  std::uint32_t rtp_timestamp) {
-  if (!runtime_ptr) {
-    return;
-  }
-  bool local_playback_enabled = false;
-  {
-    std::lock_guard<std::mutex> lock(runtime_ptr->mutex);
-    if (runtime_ptr->closing) {
-      return;
-    }
-    local_playback_enabled = runtime_ptr->local_playback_enabled;
-  }
-  std::string lowered_codec = codec;
-  std::transform(lowered_codec.begin(), lowered_codec.end(), lowered_codec.begin(), [](unsigned char ch) {
-    return static_cast<char>(std::tolower(ch));
-  });
-  fanout_relay_audio_frame(peer_id, frame, lowered_codec, rtp_timestamp);
-  if (!local_playback_enabled) {
-    return;
-  }
-  if (lowered_codec != "pcmu" && lowered_codec != "opus" && lowered_codec != "aac") {
-    return;
-  }
-
-  auto pcm = lowered_codec == "pcmu"
-    ? decode_pcmu_to_pcm16(frame)
-    : decode_audio_to_pcm16(runtime_ptr, frame, lowered_codec, nullptr);
-  if (pcm.empty()) {
-    return;
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(runtime_ptr->mutex);
-    if (runtime_ptr->closing) {
-      return;
-    }
-    if (runtime_ptr->startup_waiting_for_random_access) {
-      runtime_ptr->dropped_audio_blocks += 1;
-      runtime_ptr->reason = "peer-audio-waiting-for-random-access";
-      return;
-    }
-    runtime_ptr->dispatched_audio_blocks += 1;
-    runtime_ptr->reason = "peer-audio-passthrough-dispatched";
-  }
-  queue_viewer_audio_pcm_block(audio_runtime, std::move(pcm));
 }

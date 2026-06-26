@@ -11,18 +11,19 @@
 #include <iostream>
 #include <string>
 
-#include "agent_runtime.h"
 #include "agent_events.h"
 #include "agent_lifecycle.h"
+#include "agent_rpc_session_bindings.h"
 #include "agent_status_json.h"
+#include "host_audio_dispatch_session.h"
 #include "host_session_controller.h"
 #include "json_protocol.h"
-#include "media_audio.h"
-#include "obs_ingest_runtime.h"
-#include "peer_control_runtime.h"
-#include "peer_media_binding_runtime.h"
-#include "surface_control_runtime.h"
-#include "viewer_audio_playback.h"
+#include "obs_ingest_session.h"
+#include "peer_session_controller.h"
+#include "runtime_registry.h"
+#include "session_owner_activation.h"
+#include "surface_session_controller.h"
+#include "viewer_audio_session.h"
 
 namespace {
 
@@ -30,6 +31,7 @@ using vds::media_agent::build_error_payload;
 using vds::media_agent::build_result_payload;
 using vds::media_agent::extract_id;
 using vds::media_agent::extract_method;
+
 
 template <typename CommandResult>
 void write_command_result(int id, const CommandResult& result) {
@@ -43,6 +45,9 @@ void write_command_result(int id, const CommandResult& result) {
 }  // namespace
 
 void run_agent_rpc_loop(AgentRuntimeState& runtime_state) {
+  vds::media_agent::PeerSessionController peer_sessions(runtime_state);
+  vds::media_agent::SurfaceSessionController surface_sessions(runtime_state);
+  ViewerAudioSession viewer_audio;
   std::string line;
   while (std::getline(std::cin, line)) {
     if (line.empty()) {
@@ -77,89 +82,99 @@ void run_agent_rpc_loop(AgentRuntimeState& runtime_state) {
     }
 
     if (method == "startAudioSession") {
-      write_command_result(id, start_audio_session_from_request(runtime_state, line));
+      vds::media_agent::activate_audio_owner_session_from_request(runtime_state, line);
+      HostAudioDispatchSession host_audio_dispatch = bind_active_host_audio_dispatch(runtime_state, peer_sessions);
+      write_command_result(id, host_audio_dispatch.start_from_request(line));
       continue;
     }
 
     if (method == "prepareObsIngest") {
-      write_command_result(id, prepare_obs_ingest_from_request(runtime_state, line));
+      vds::media_agent::activate_media_owner_sessions_from_request(runtime_state, line);
+      ObsIngestSession obs_ingest = bind_active_obs_ingest_session(runtime_state);
+      write_command_result(id, obs_ingest.prepare_from_request(line));
       continue;
     }
 
     if (method == "stopAudioSession") {
-      write_command_result(id, stop_audio_session_from_request(runtime_state));
+      vds::media_agent::activate_audio_owner_session_from_request(runtime_state, line);
+      HostAudioDispatchSession host_audio_dispatch = bind_active_host_audio_dispatch(runtime_state, peer_sessions);
+      write_command_result(id, host_audio_dispatch.stop_from_request());
       continue;
     }
 
     if (method == "startHostSession") {
+      vds::media_agent::activate_media_owner_sessions_from_request(runtime_state, line);
+      HostSessionController host_sessions(runtime_state);
       HostSessionControllerCallbacks callbacks = make_start_host_session_callbacks(runtime_state);
-      write_command_result(id, start_host_session_from_request(runtime_state, line, callbacks));
+      write_command_result(id, host_sessions.start_from_request(line, callbacks));
       continue;
     }
 
     if (method == "stopHostSession") {
+      vds::media_agent::activate_media_owner_sessions_from_request(runtime_state, line);
+      HostSessionController host_sessions(runtime_state);
       HostSessionControllerCallbacks callbacks = make_stop_host_session_callbacks(runtime_state);
-      write_command_result(id, stop_host_session(runtime_state, callbacks));
+      write_command_result(id, host_sessions.stop(callbacks));
       continue;
     }
 
     if (method == "createPeer") {
-      write_command_result(id, create_peer_from_request(runtime_state, line));
+      write_command_result(id, peer_sessions.create_from_request(line));
       continue;
     }
 
     if (method == "closePeer") {
-      write_command_result(id, close_peer_from_request(runtime_state, line));
+      write_command_result(id, peer_sessions.close_from_request(line));
       continue;
     }
 
     if (method == "setRemoteDescription") {
-      write_command_result(id, set_peer_remote_description_from_request(runtime_state, line));
+      write_command_result(id, peer_sessions.set_remote_description_from_request(line));
       continue;
     }
 
     if (method == "addRemoteIceCandidate") {
-      write_command_result(id, add_peer_remote_ice_candidate_from_request(runtime_state, line));
+      write_command_result(id, peer_sessions.add_remote_ice_candidate_from_request(line));
       continue;
     }
 
     if (method == "attachPeerMediaSource") {
-      write_command_result(id, attach_peer_media_source_from_request(runtime_state, line));
+      write_command_result(id, peer_sessions.attach_media_source_from_request(line));
       continue;
     }
 
     if (method == "detachPeerMediaSource") {
-      write_command_result(id, detach_peer_media_source_from_request(runtime_state, line));
+      write_command_result(id, peer_sessions.detach_media_source_from_request(line));
       continue;
     }
 
     if (method == "attachSurface") {
-      write_command_result(id, attach_surface_from_request(runtime_state, line));
+      write_command_result(id, surface_sessions.attach_from_request(line));
       continue;
     }
 
     if (method == "updateSurface") {
-      write_command_result(id, update_surface_from_request(runtime_state, line));
+      write_command_result(id, surface_sessions.update_from_request(line));
       continue;
     }
 
     if (method == "detachSurface") {
-      write_command_result(id, detach_surface_from_request(runtime_state, line));
+      write_command_result(id, surface_sessions.detach_from_request(line));
       continue;
     }
 
     if (method == "setViewerVolume") {
-      write_command_result(id, set_viewer_volume_from_request(runtime_state, line));
+      write_command_result(id, viewer_audio.set_volume_from_request(line));
       continue;
     }
 
     if (method == "setViewerAudioDelay") {
-      write_command_result(id, set_viewer_audio_delay_from_request(runtime_state, line));
+      write_command_result(id, viewer_audio.set_delay_from_request(line));
       continue;
     }
 
     if (method == "getViewerVolume") {
-      write_command_result(id, get_viewer_volume_from_request(runtime_state, line));
+      write_command_result(id, viewer_audio.get_volume_from_request(line));
       continue;
     }
 

@@ -2409,21 +2409,6 @@ PeerTransportSnapshot get_peer_transport_snapshot(const std::shared_ptr<PeerTran
 #endif
 }
 
-std::string peer_transport_backend_json(const PeerTransportBackendInfo& backend) {
-  std::ostringstream payload;
-  payload
-    << "{\"available\":" << (backend.available ? "true" : "false")
-    << ",\"transportReady\":" << (backend.transport_ready ? "true" : "false")
-    << ",\"backend\":\"" << vds::media_agent::json_escape(backend.backend) << "\""
-    << ",\"implementation\":\"" << vds::media_agent::json_escape(backend.implementation) << "\""
-    << ",\"mode\":\"" << vds::media_agent::json_escape(backend.mode) << "\""
-    << ",\"reason\":\"" << vds::media_agent::json_escape(backend.reason) << "\""
-    << ",\"lastError\":\"" << vds::media_agent::json_escape(backend.last_error) << "\""
-    << ",\"iceServers\":" << vds::media_agent::json_array_from_strings(backend.ice_servers)
-    << "}";
-  return payload.str();
-}
-
 std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot) {
   std::ostringstream payload;
   payload

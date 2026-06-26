@@ -156,6 +156,11 @@ function main() {
     'scripts/prepare-server-release.js',
     'scripts/publish-github-release.js',
     'scripts/check-server-docker-context.js',
+    'scripts/check-media-agent-boundary.js',
+    'scripts/check-renderer-entry.js',
+    'scripts/check-renderer-syntax.js',
+    'scripts/check-renderer-bridge.js',
+    'scripts/check-room-client-dispatcher.js',
     'scripts/test-server-core.js',
     'scripts/release-check.js'
   ];
@@ -170,6 +175,7 @@ function main() {
     run('npm', ['run', 'build:vds-web']);
   }
   run('npm', ['run', 'test:server']);
+  run('npm', ['run', 'check:architecture']);
   run('npm', ['run', 'check:logging']);
   if (mode === 'prebuild') {
     run('npm', ['run', 'verify:media-agent']);

@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.7.0
+
+### 中文
+
+- 完成 renderer 与 native authority 的第一轮模块化拆分，新增 app state、room client、调试面板、源选择、画质设置、更新 UI、native session/peer/surface/diagnostics/P2P 状态机等边界模块。
+- 完成 media-agent session/controller ownership 收口，Host、Peer、Surface、Relay、Audio、OBS ingest 等路径改为更清晰的 session owner 与 registry/facade 模型。
+- 修复 native/OBS 开始共享、停止共享、重复开播、房间创建、房间号显示、公开房间发现和 stale manifest 清理等生命周期问题。
+- 修复 OBS ingest 音频链路与 AAC manifest，OBS 推流后可正确发布音视频 manifest 并向下游播放/转发。
+- 修复源选择缩略图与 WGC 预览的多处时序问题，源缩略图改为异步加载，WGC 预览失败改为诊断化处理而不是拖垮主流程。
+- 强化 Web/native relay 拓扑稳健性：优先链式 relay，上游不可达时服务端重新协商上游，并限制单上游下游容量。
+- 新增/收紧 renderer 入口、renderer 语法、native bridge、room-client dispatcher、media-agent boundary、logging、server、VDS_web 与 media-agent 发布门禁。
+- 改进 3010 信令后台，支持实时房间、拓扑、节点状态、边状态、容量和 manifest 可视化。
+
+### English
+
+- Completed the first renderer/native-authority modularization pass with dedicated app state, room client, debug panel, source selection, quality settings, update UI, native session, peer, surface, diagnostics, and P2P state-machine boundaries.
+- Tightened media-agent session/controller ownership so Host, Peer, Surface, Relay, Audio, and OBS ingest paths are owned through clearer session owners plus registry/facade access.
+- Fixed native/OBS share start, stop-share, repeated share, room creation, room-code display, public-room discovery, and stale-manifest cleanup lifecycle issues.
+- Fixed OBS ingest audio and AAC manifest handling so OBS streams publish the correct audio/video manifest for playback and relay.
+- Fixed source thumbnail and WGC preview timing issues, moved thumbnails to async loading, and made WGC preview failures diagnostic instead of fatal to the main flow.
+- Improved Web/native relay topology robustness with chain-first routing, server-side upstream reselection when an upstream is unreachable, and per-upstream downstream capacity limits.
+- Added and tightened release gates for renderer entry order, renderer syntax, native bridge wiring, room-client dispatch, media-agent boundaries, logging, server tests, VDS_web tests, and media-agent verification.
+- Improved the 3010 signaling admin dashboard with live rooms, topology, node state, edge state, capacity, and manifest visualization.
+
+## 1.6.9
+
+- hardened WGC live preview source creation so SEH access violations are captured as diagnostics instead of terminating `media-agent`
+- changed WGC live preview update cadence from fixed 1ms to frame-rate-based intervals to reduce preview overrun risk
+- added staged WGC source creation diagnostics for capture item, frame pool, session, property, and start-capture failures
+- added single native test launcher support and kept dual/triple native and web relay scripts documented
+- tightened server topology selection so only fully relay-ready viewers can be assigned as downstream upstreams
+- refreshed README/project structure documentation for the current 1.6.9 release state
+
 ## 1.6.8
 
 - fixed packaged Electron minimized-window capture discovery by always launching `window-metadata-helper.js` with `ELECTRON_RUN_AS_NODE=1`, matching dev behavior where minimized windows are visible as capture targets

@@ -25,6 +25,7 @@ function Get-FreeUdpPort {
 }
 
 $obsIngestPort = Get-FreeUdpPort
+$smokeMediaSessionId = 'media-smoke-session'
 
 $requests = @(
   '{"jsonrpc":"2.0","id":1,"method":"ping"}',
@@ -33,7 +34,9 @@ $requests = @(
   '{"jsonrpc":"2.0","id":4,"method":"getStats"}',
   '{"jsonrpc":"2.0","id":5,"method":"unknownMethod"}',
   '{"jsonrpc":"2.0","id":6}',
-  ('{{"jsonrpc":"2.0","id":7,"method":"prepareObsIngest","port":{0},"refresh":true}}' -f $obsIngestPort)
+  ('{{"jsonrpc":"2.0","id":7,"method":"prepareObsIngest","port":{0},"refresh":true,"mediaSessionId":"{1}"}}' -f $obsIngestPort, $smokeMediaSessionId),
+  '{"jsonrpc":"2.0","id":8,"method":"getStatus"}',
+  '{"jsonrpc":"2.0","id":9,"method":"getStats"}'
 )
 
 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -122,6 +125,26 @@ foreach ($id in 1..4) {
   }
 }
 
+foreach ($id in 3..4) {
+  $response = $messages | Where-Object { $_.id -eq $id } | Select-Object -First 1
+  foreach ($field in @('hostSessionId', 'audioSessionId', 'obsIngestSessionId')) {
+    if (-not ($response.result.PSObject.Properties.Name -contains $field)) {
+      throw "media-agent smoke test response id=$id missing $field."
+    }
+    if (-not [string]$response.result.$field) {
+      throw "media-agent smoke test response id=$id returned empty $field."
+    }
+  }
+  foreach ($field in @('hostSessionCount', 'audioSessionCount', 'obsIngestSessionCount')) {
+    if (-not ($response.result.PSObject.Properties.Name -contains $field)) {
+      throw "media-agent smoke test response id=$id missing $field."
+    }
+    if ([int]$response.result.$field -lt 1) {
+      throw "media-agent smoke test response id=$id returned invalid $field=$($response.result.$field)."
+    }
+  }
+}
+
 $obsIngestResponse = $messages | Where-Object { $_.id -eq 7 } | Select-Object -First 1
 if (-not $obsIngestResponse) {
   throw 'media-agent smoke test missing prepareObsIngest response id=7.'
@@ -137,6 +160,26 @@ if ([int]$obsIngestResponse.result.obsIngest.port -ne $obsIngestPort) {
 }
 if ([string]$obsIngestResponse.result.obsIngest.url -notlike "srt://127.0.0.1:$obsIngestPort*") {
   throw "media-agent smoke test prepareObsIngest returned unexpected url: $($obsIngestResponse.result.obsIngest.url)"
+}
+
+foreach ($id in 8..9) {
+  $response = $messages | Where-Object { $_.id -eq $id } | Select-Object -First 1
+  if (-not $response) {
+    throw "media-agent smoke test missing post-activation response id=$id."
+  }
+  if ($response.PSObject.Properties.Name -contains 'error') {
+    throw "media-agent smoke test post-activation response id=$id returned error: $($response.error | ConvertTo-Json -Compress)"
+  }
+  foreach ($field in @('hostSessionId', 'audioSessionId', 'obsIngestSessionId')) {
+    if ([string]$response.result.$field -ne $smokeMediaSessionId) {
+      throw "media-agent smoke test response id=$id expected $field=$smokeMediaSessionId, got $($response.result.$field)."
+    }
+  }
+  foreach ($field in @('hostSessionCount', 'audioSessionCount', 'obsIngestSessionCount')) {
+    if ([int]$response.result.$field -lt 2) {
+      throw "media-agent smoke test response id=$id expected activated $field >= 2, got $($response.result.$field)."
+    }
+  }
 }
 
 function Assert-ErrorResponse {

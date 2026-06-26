@@ -17,9 +17,9 @@
 - 未完成项必须明确写成风险或下一步。
 - 不用“未来可能”掩盖当前事实。
 
-最近一次对齐日期：`2026-04-26`
+最近一次对齐日期：`2026-06-21`
 
-当前发布版本：`1.6.8`
+当前发布版本：`1.7.0`
 
 ## 2. 未发布改动记录
 
@@ -27,13 +27,14 @@
 
 当前未发布改动：
 
-- 下次发布携带：Docker compose/server image 暴露 3010 后台端口，并设置 `ADMIN_PORT=3010`。
-- 下次发布携带：默认关键帧间隔从 1s 调整为 2s，native stats 轮询从 2s 放宽到 5s，用于缓解约一秒一次的 IDR/诊断突发卡顿。
+- 1.7.0 发布候选：renderer/native authority 已按职责拆出 app state、room client、debug panel、source selection、quality settings、update UI、native session/peer/surface/diagnostics/P2P state machine 等边界模块。
+- 1.7.0 发布候选：media-agent 已收紧 session/controller ownership，Host、Peer、Surface、Relay、Audio、OBS ingest 通过更清晰的 session owner、registry 与 facade 协作。
+- 1.7.0 发布候选：native/OBS 开播、停止共享、重复开播、房间号显示、公开房间发现、OBS AAC manifest、Web/native relay 拓扑与 3010 后台均已纳入本次发布说明。
 
 当前未发布改动已验证：
 
-- `node --check scripts/check-server-docker-context.js` 和 `npm run check:server-docker` 已通过。
-- `node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run test:vds-web`、`npm run test:server`、`npm run check:logging`、`npm run verify:media-agent` 已通过。
+- 发布前继续执行 `npm run release:precheck`。
+- 完整发布继续执行 `npm run build:release`，该命令会构建安装包、准备更新目录、运行 postbuild 校验并发布 GitHub Release。
 
 ## 3. 当前结论
 

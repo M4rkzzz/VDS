@@ -15,7 +15,9 @@
 #include <windows.h>
 #endif
 
+#include "ffmpeg_probe_state.h"
 #include "host_pipeline.h"
+#include "host_session_state.h"
 #include "host_state_json.h"
 #include "json_protocol.h"
 #include "platform_utils.h"
@@ -205,6 +207,12 @@ void persist_host_capture_process_manifest(
     output.flush();
   } catch (...) {
   }
+}
+
+HostCaptureArtifactProbe probe_host_capture_artifact(
+  const FfmpegProbeResult& ffmpeg,
+  const HostCaptureProcessState& host_capture_process) {
+  return probe_host_capture_artifact(ffmpeg, host_capture_process, HostCaptureArtifactProbe{});
 }
 
 HostCaptureArtifactProbe probe_host_capture_artifact(

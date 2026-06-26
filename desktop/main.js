@@ -18,6 +18,7 @@ const ENABLE_NATIVE_SURFACE_EMBEDDING = process.env.VDS_ENABLE_NATIVE_SURFACE_EM
 const ENABLE_CAPTURE_TARGET_NATIVE_METADATA = process.env.VDS_ENABLE_CAPTURE_TARGET_NATIVE_METADATA !== '0';
 const ENABLE_CAPTURE_TARGET_WINDOW_ICONS = process.env.VDS_ENABLE_CAPTURE_TARGET_WINDOW_ICONS === '1';
 const CAPTURE_TARGET_LIST_TIMEOUT_MS = Number(process.env.VDS_CAPTURE_TARGET_LIST_TIMEOUT_MS || 2500);
+const CAPTURE_TARGET_THUMBNAIL_TIMEOUT_MS = Number(process.env.VDS_CAPTURE_TARGET_THUMBNAIL_TIMEOUT_MS || 1800);
 const DEBUG_PRESET = String(process.env.VDS_DEBUG_PRESET || '').trim();
 const DEBUG_CATEGORIES = ['connection', 'p2p', 'video', 'audio', 'update', 'misc'];
 const DEBUG_CHANNELS = ['renderer', 'nativeEvents', 'nativeSteps', 'periodicStats', 'mainProcess', 'highFrequency', 'agentBreadcrumbs', 'agentStderr'];
@@ -179,6 +180,18 @@ ipcMain.handle('media-engine-list-capture-targets', async () => {
     );
   } catch (error) {
     logMainProcessDebug('video', '[media-agent] listCaptureTargets failed:', error && error.message ? error.message : String(error));
+    throw error;
+  }
+});
+ipcMain.handle('media-engine-get-capture-target-thumbnail', async (_event, options) => {
+  try {
+    return await withTimeout(
+      getCaptureTargetThumbnail(options || {}),
+      CAPTURE_TARGET_THUMBNAIL_TIMEOUT_MS,
+      'capture-target-thumbnail-timeout'
+    );
+  } catch (error) {
+    logMainProcessDebug('video', '[media-agent] getCaptureTargetThumbnail failed:', error && error.message ? error.message : String(error));
     throw error;
   }
 });
@@ -1188,6 +1201,47 @@ async function listCaptureTargets() {
   return sources.map((source) => buildCaptureTarget(source, audioDiscovery, windowMetadata, displayMetadata));
 }
 
+async function getCaptureTargetThumbnail(options = {}) {
+  const sourceId = String(options.sourceId || options.id || '').trim();
+  const sourceHwnd = String(options.hwnd || options.windowHandle || '').trim();
+  const sourceTitle = String(options.title || options.name || '').trim();
+  const sourceKind = String(options.kind || options.captureKind || '').trim();
+  if (!sourceId) {
+    throw new Error('capture-target-thumbnail-missing-source-id');
+  }
+  if (sourceId.includes(':synthetic') || sourceId.includes(':minimized')) {
+    return { sourceId, thumbnail: null, reason: 'synthetic-source-no-thumbnail' };
+  }
+  const rawSources = await desktopCapturer.getSources({
+    types: ['window', 'screen'],
+    thumbnailSize: { width: 320, height: 180 },
+    fetchWindowIcons: false
+  });
+  const requestedHwnd = sourceHwnd || getDesktopWindowHandleFromSourceId(sourceId);
+  const normalizedTitle = normalizeComparableWindowTitle(sourceTitle);
+  const source = rawSources.find((candidate) => candidate && candidate.id === sourceId)
+    || rawSources.find((candidate) => requestedHwnd && getDesktopWindowHandleFromSourceId(candidate && candidate.id) === requestedHwnd)
+    || rawSources.find((candidate) => {
+      if (!candidate || !normalizedTitle) {
+        return false;
+      }
+      const candidateKind = String(candidate.id || '').startsWith('screen:') ? 'display' : 'window';
+      if (sourceKind && candidateKind !== sourceKind) {
+        return false;
+      }
+      return normalizeComparableWindowTitle(candidate.name) === normalizedTitle;
+    });
+  if (!source || !source.thumbnail || source.thumbnail.isEmpty()) {
+    return { sourceId, thumbnail: null, reason: 'capture-target-thumbnail-unavailable', matched: Boolean(source) };
+  }
+  return {
+    sourceId,
+    matchedSourceId: source.id,
+    thumbnail: source.thumbnail.toDataURL(),
+    reason: 'capture-target-thumbnail-ready'
+  };
+}
+
 function createDeferredAudioDiscoverySnapshot() {
   return {
     supported: false,
@@ -2017,6 +2071,9 @@ function normalizeDesktopSource(source) {
     if (!source || !source.id) {
       return null;
     }
+    const thumbnail = source.thumbnail && !source.thumbnail.isEmpty()
+      ? source.thumbnail.toDataURL()
+      : null;
 
     return {
       id: source.id,
@@ -2026,7 +2083,7 @@ function normalizeDesktopSource(source) {
       isSynthetic: false,
       captureMode: String(source.id || '').startsWith('screen:') ? 'display' : 'window',
       appIcon: source.appIcon ? source.appIcon.toDataURL() : null,
-      thumbnail: source.thumbnail ? source.thumbnail.toDataURL() : null
+      thumbnail
     };
   } catch (error) {
     logMainProcessDebug('video', '[capture-targets] failed to normalize desktop source:', error && error.message ? error.message : String(error));

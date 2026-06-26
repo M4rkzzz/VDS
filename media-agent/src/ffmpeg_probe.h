@@ -3,8 +3,9 @@
 #include <string>
 #include <vector>
 
-#include "agent_runtime.h"
 #include "process_runner.h"
+
+struct FfmpegProbeResult;
 
 namespace vds::media_agent {
 

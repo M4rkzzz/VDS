@@ -15,15 +15,19 @@
 #include <windows.h>
 #endif
 
-#include "agent_runtime.h"
 #include "agent_diagnostics.h"
+#include "ffmpeg_probe_state.h"
 #include "host_capture_plan.h"
 #include "host_pipeline.h"
+#include "host_session_state.h"
 #include "platform_utils.h"
 #include "peer_transport.h"
-#include "relay_dispatch.h"
+#include "peer_media_binding_state.h"
+#include "peer_session_state.h"
+#include "relay_hub.h"
 #include "time_utils.h"
 #include "video_access_unit.h"
+#include "peer_video_sender_state.h"
 #include "win32_placeholder_frame.h"
 #include "wgc_capture.h"
 
@@ -98,7 +102,7 @@ void emit_peer_video_sender_breadcrumb(const std::string& step) {
   emit_agent_breadcrumb(step);
 }
 
-void reset_peer_media_binding_sender_metrics(PeerState::MediaBindingState& binding) {
+void reset_peer_media_binding_sender_metrics(PeerMediaBindingState& binding) {
   binding.source_frames_captured = 0;
   binding.avg_source_copy_resource_us = 0;
   binding.avg_source_map_us = 0;
@@ -109,7 +113,7 @@ void reset_peer_media_binding_sender_metrics(PeerState::MediaBindingState& bindi
 }  // namespace
 
 #ifdef _WIN32
-void close_peer_video_sender_handles(PeerState::PeerVideoSenderRuntime& runtime) {
+void close_peer_video_sender_handles(PeerVideoSenderRuntime& runtime) {
   if (runtime.thread_handle) {
     CloseHandle(runtime.thread_handle);
     runtime.thread_handle = nullptr;
@@ -156,7 +160,7 @@ bool start_peer_video_sender(
   }
   emit_peer_video_sender_breadcrumb(std::string("startPeerVideoSender:after-build-command peer=") + peer.peer_id);
 
-  auto runtime = std::make_shared<PeerState::PeerVideoSenderRuntime>();
+  auto runtime = std::make_shared<PeerVideoSenderRuntime>();
   runtime->codec_path = normalize_video_codec(plan.codec_path, normalize_video_codec(pipeline.requested_video_codec));
   runtime->frame_interval_us = static_cast<unsigned long long>(
     std::max(1, 1000000 / std::max(1, plan.frame_rate > 0 ? plan.frame_rate : 60))
@@ -974,7 +978,7 @@ bool start_peer_video_sender(
 void refresh_peer_media_binding(PeerState& peer) {
   if (!peer.media_binding.runtime) {
     RelaySubscriberState relay_state;
-    if (query_relay_subscriber_state(peer.peer_id, &relay_state)) {
+    if (relay_hub().query_subscriber_state(peer.peer_id, &relay_state)) {
       reset_peer_media_binding_sender_metrics(peer.media_binding);
       peer.media_binding.frames_sent = relay_state.frames_sent;
       peer.media_binding.active =

@@ -14,12 +14,19 @@ add_executable(vds-media-agent
   src/agent_diagnostics.cpp
   src/agent_lifecycle.cpp
   src/agent_rpc_router.cpp
+  src/agent_rpc_session_bindings.cpp
   src/agent_status_json.cpp
+  src/audio_state_json.cpp
+  src/encoded_frame_bus.cpp
   src/ffmpeg_probe.cpp
+  src/host_audio_dispatch_session.cpp
   src/host_capture_plan.cpp
   src/host_capture_process.cpp
-  src/host_session_controller.cpp
-  src/host_state_json.cpp
+    src/host_session_controller.cpp
+    src/host_session_runtime.cpp
+    src/host_session_start_pipeline.cpp
+    src/host_session_stop_pipeline.cpp
+    src/host_state_json.cpp
   src/host_pipeline.cpp
   src/json_protocol.cpp
   src/main.cpp
@@ -29,23 +36,42 @@ add_executable(vds-media-agent
   src/native_surface_layout.cpp
   src/native_video_surface.cpp
   src/obs_ingest_media.cpp
-  src/obs_ingest_runtime.cpp
+  src/obs_ingest_session.cpp
   src/obs_ingest_state.cpp
-  src/peer_control_runtime.cpp
-  src/peer_media_binding_runtime.cpp
+  src/peer_create_pipeline.cpp
+  src/peer_create_request_config.cpp
+  src/peer_host_binding_pipeline.cpp
+  src/peer_host_source_binding.cpp
+  src/peer_lifecycle_pipeline.cpp
+  src/peer_media_detach_binding.cpp
+  src/peer_media_manifest.cpp
+  src/peer_media_source_pipeline.cpp
   src/peer_transport.cpp
+  src/peer_transport_state_json.cpp
+  src/peer_transport_callback_factory.cpp
+  src/peer_transport_session_factory.cpp
   src/peer_receiver_runtime.cpp
+  src/peer_refresh_pipeline.cpp
+  src/peer_relay_source_binding.cpp
+  src/peer_session_controller.cpp
+  src/peer_snapshot_aggregator.cpp
   src/peer_state_json.cpp
   src/peer_video_sender.cpp
   src/platform_utils.cpp
   src/process_runner.cpp
-  src/relay_dispatch.cpp
+  src/relay_backend_runtime.cpp
+  src/relay_hub.cpp
+  src/runtime_registry.cpp
+  src/session_owner_activation.cpp
   src/string_utils.cpp
-  src/surface_attachment_runtime.cpp
-  src/surface_control_runtime.cpp
+    src/surface_attachment_runtime.cpp
+    src/surface_session_controller.cpp
+    src/surface_snapshot_aggregator.cpp
+    src/surface_state_json.cpp
   src/surface_target.cpp
   src/time_utils.cpp
   src/viewer_audio_playback.cpp
+  src/viewer_audio_session.cpp
   src/viewer_video_pipeline.cpp
   src/video_access_unit.cpp
   src/wasapi_backend.cpp
@@ -124,6 +150,8 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
     src/obs_ingest_state.cpp
     src/platform_utils.cpp
     src/process_runner.cpp
+    src/runtime_registry.cpp
+    src/session_owner_activation.cpp
     src/string_utils.cpp
     src/surface_target.cpp
     src/video_access_unit.cpp

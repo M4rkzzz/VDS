@@ -1,283 +1,112 @@
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#endif
-
 #include "agent_lifecycle.h"
 
-#include <algorithm>
-#include <cctype>
-#include <cstdint>
 #include <string>
 
-#include "agent_runtime.h"
 #include "agent_status_json.h"
 #include "ffmpeg_probe.h"
-#include "host_capture_plan.h"
-#include "host_capture_process.h"
-#include "host_pipeline.h"
+#include "ffmpeg_probe_state.h"
+#include "host_audio_dispatch_session.h"
 #include "host_session_controller.h"
-#include "media_audio.h"
-#include "obs_ingest_runtime.h"
-#include "platform_utils.h"
-#include "peer_media_binding_runtime.h"
-#include "peer_receiver_runtime.h"
-#include "relay_dispatch.h"
+#include "host_session_state.h"
+#include "host_session_runtime.h"
+#include "obs_ingest_session.h"
+#include "peer_host_source_binding.h"
+#include "peer_media_detach_binding.h"
+#include "peer_session_controller.h"
+#include "relay_hub.h"
 #include "peer_transport.h"
-#include "surface_attachment_runtime.h"
-#include "surface_target.h"
+#include "runtime_registry.h"
+#include "surface_session_controller.h"
 #include "string_utils.h"
-#include "viewer_audio_playback.h"
+#include "viewer_audio_session.h"
 #include "wasapi_backend.h"
 #include "wgc_capture.h"
 
 namespace {
 
-#ifdef _WIN32
-enum class WindowCaptureAvailability {
-  normal,
-  minimized,
-  unavailable
+struct AgentLifecycleSessions {
+  explicit AgentLifecycleSessions(AgentRuntimeState& runtime_state)
+      : state(runtime_state),
+        host(vds::media_agent::active_host_session(runtime_state)),
+        audio(vds::media_agent::active_audio_session(runtime_state)),
+        obs(vds::media_agent::active_obs_ingest_session(runtime_state)),
+        peer_sessions(runtime_state),
+        surface_sessions(runtime_state),
+        host_audio(audio, peer_sessions, [&runtime_state]() {
+          return vds::media_agent::peer_transport_ready(runtime_state);
+        }) {}
+
+  AgentRuntimeState& state;
+  HostSessionState& host;
+  AudioSessionState& audio;
+  ObsIngestState& obs;
+  vds::media_agent::PeerSessionController peer_sessions;
+  vds::media_agent::SurfaceSessionController surface_sessions;
+  HostAudioDispatchSession host_audio;
 };
 
-HWND parse_runtime_window_handle(const std::string& value) {
-  std::string trimmed = value;
-  trimmed.erase(trimmed.begin(), std::find_if(trimmed.begin(), trimmed.end(), [](unsigned char ch) {
-    return !std::isspace(ch);
-  }));
-  trimmed.erase(std::find_if(trimmed.rbegin(), trimmed.rend(), [](unsigned char ch) {
-    return !std::isspace(ch);
-  }).base(), trimmed.end());
-  if (trimmed.empty()) {
-    return nullptr;
-  }
-
-  try {
-    std::size_t parsed_length = 0;
-    const auto numeric = static_cast<std::uintptr_t>(std::stoull(trimmed, &parsed_length, 0));
-    if (parsed_length != trimmed.size()) {
-      return nullptr;
-    }
-    return reinterpret_cast<HWND>(numeric);
-  } catch (...) {
-    return nullptr;
-  }
+void refresh_host_capture_runtime(AgentLifecycleSessions& sessions) {
+  vds::media_agent::refresh_host_capture_runtime(sessions.state, sessions.host);
+  sessions.surface_sessions.refresh_host_capture_surfaces();
 }
 
-WindowCaptureAvailability query_window_capture_availability(const std::string& window_handle) {
-  const HWND hwnd = parse_runtime_window_handle(window_handle);
-  if (!hwnd || !IsWindow(hwnd)) {
-    return WindowCaptureAvailability::unavailable;
-  }
-  if (IsIconic(hwnd)) {
-    return WindowCaptureAvailability::minimized;
-  }
-  return WindowCaptureAvailability::normal;
+void stop_all_surface_attachments(AgentLifecycleSessions& sessions, const std::string& reason) {
+  sessions.surface_sessions.stop_all(reason);
 }
 
-bool try_resolve_restored_window_handle(const std::string& capture_title, std::string* window_handle) {
-  if (!window_handle) {
-    return false;
-  }
-  const std::string resolved = vds::media_agent::resolve_window_handle_from_title(capture_title);
-  if (resolved.empty() || resolved == *window_handle) {
-    return false;
-  }
-  if (query_window_capture_availability(resolved) != WindowCaptureAvailability::normal) {
-    return false;
-  }
-  *window_handle = resolved;
-  return true;
+void restart_host_capture_surface_attachments(AgentLifecycleSessions& sessions) {
+  sessions.surface_sessions.restart_host_capture_surfaces();
 }
-#endif
 
-}  // namespace
+} // namespace
 
 void refresh_host_capture_runtime(AgentRuntimeState& state) {
-#ifdef _WIN32
-  if (state.host_session_running &&
-      state.host_window_restore_placeholder_active &&
-      state.host_capture_plan.capture_backend == "wgc" &&
-      vds::media_agent::to_lower_copy(state.host_capture_plan.capture_kind) == "window" &&
-      !state.host_capture_plan.capture_handle.empty()) {
-    const WindowCaptureAvailability availability =
-      query_window_capture_availability(state.host_capture_plan.capture_handle);
-    if (availability == WindowCaptureAvailability::minimized) {
-      std::string resolved_handle = state.host_capture_plan.capture_handle;
-      if (try_resolve_restored_window_handle(state.host_capture_title, &resolved_handle)) {
-        state.host_capture_hwnd = resolved_handle;
-        state.host_capture_plan.capture_handle = resolved_handle;
-        state.host_capture_state = "normal";
-        state.host_capture_plan.capture_state = "normal";
-        state.host_window_restore_placeholder_active = false;
-        state.host_capture_plan.reason = "window-wgc-capture-planned";
-        state.host_capture_plan.last_error.clear();
-        state.host_capture_plan = validate_host_capture_plan(state.ffmpeg, state.host_capture_plan);
-      } else {
-        state.host_capture_state = "minimized";
-        state.host_capture_plan.capture_state = "minimized";
-        state.host_capture_plan.reason = "minimized-window-wgc-capture-planned";
-        state.host_capture_plan.last_error.clear();
-      }
-    } else if (availability == WindowCaptureAvailability::normal) {
-      state.host_capture_state = "normal";
-      state.host_capture_plan.capture_state = "normal";
-      state.host_window_restore_placeholder_active = false;
-      if (state.host_capture_plan.reason == "minimized-window-wgc-capture-planned" ||
-          state.host_capture_plan.reason == "window-capture-target-unavailable") {
-        state.host_capture_plan.reason = "window-wgc-capture-planned";
-      }
-      state.host_capture_plan.last_error.clear();
-      state.host_capture_plan = validate_host_capture_plan(state.ffmpeg, state.host_capture_plan);
-    } else {
-      state.host_capture_plan.reason = "window-capture-target-unavailable";
-      state.host_capture_plan.last_error = "Selected window is no longer available.";
-    }
-  }
-#endif
-  refresh_host_capture_process_state(state.host_capture_process);
-  state.host_capture_artifact = probe_host_capture_artifact(
-    state.ffmpeg,
-    state.host_capture_process,
-    state.host_capture_artifact
-  );
-  persist_host_capture_process_manifest(
-    state.host_pipeline,
-    state.host_capture_plan,
-    state.host_capture_process,
-    state.host_capture_artifact
-  );
-  for (auto& entry : state.attached_surfaces) {
-    refresh_surface_attachment_state(entry.second);
-    SurfaceAttachmentState& surface = entry.second;
-    if (!surface.attached || !is_host_capture_surface_target(surface.target)) {
-      continue;
-    }
-
-    const bool should_wait_for_artifact =
-      state.host_session_running &&
-      !surface.running &&
-      surface.waiting_for_artifact &&
-      state.host_capture_artifact.ready;
-    const bool should_restart_exited_surface =
-      state.host_session_running &&
-      !surface.running &&
-      !surface.waiting_for_artifact &&
-      state.host_capture_artifact.ready &&
-      (surface.reason == "surface-process-exited" ||
-        surface.reason == "artifact-preview-stopped");
-
-    if (!should_wait_for_artifact && !should_restart_exited_surface) {
-      continue;
-    }
-
-    if (surface.running) {
-      stop_surface_attachment(surface, "surface-auto-restart");
-    }
-    surface = start_surface_attachment(
-      state.ffmpeg,
-      state.host_capture_plan,
-      state.host_capture_process,
-      state.host_capture_artifact,
-      surface
-    );
-  }
+  AgentLifecycleSessions sessions(state);
+  refresh_host_capture_runtime(sessions);
 }
 
 void refresh_agent_runtime_state(AgentRuntimeState& state) {
-  state.audio_session = build_audio_session_state(get_wasapi_process_loopback_session_status());
-  refresh_host_capture_runtime(state);
-  refresh_peer_transport_runtime(state);
-  perform_host_video_sender_soft_refresh(state);
-  refresh_peer_transport_runtime(state);
+  AgentLifecycleSessions sessions(state);
+  sessions.host_audio.refresh_session_status();
+  refresh_host_capture_runtime(sessions);
+  sessions.peer_sessions.refresh_transport_runtime();
+  sessions.peer_sessions.perform_host_video_sender_soft_refresh();
+  sessions.peer_sessions.refresh_transport_runtime();
 }
 
 void initialize_agent_runtime(AgentRuntimeState& state, const std::string& agent_binary_path) {
-  attach_wasapi_audio_callbacks(state);
-  state.peer_transport_backend = get_peer_transport_backend_info();
-  state.ffmpeg = vds::media_agent::probe_ffmpeg(agent_binary_path);
-  state.wgc_capture_backend = probe_wgc_capture_backend();
-  state.audio_session = build_audio_session_state(get_wasapi_process_loopback_session_status());
-  state.host_capture_process = build_host_capture_process_state();
-  state.host_pipeline = select_and_validate_host_pipeline(
-    state.ffmpeg,
-    state.host_codec,
-    state.host_hardware_acceleration,
-    state.host_video_encoder_preference,
-    state.host_encoder_preset,
-    state.host_encoder_tune
-  );
-  state.host_capture_plan = build_host_capture_plan(
-    state.ffmpeg,
-    state.wgc_capture_backend,
-    state.host_pipeline,
-    state.host_capture_kind,
-    state.host_capture_state,
-    state.host_capture_title,
-    state.host_capture_hwnd,
-    state.host_capture_display_id,
-    state.host_width,
-    state.host_height,
-    state.host_frame_rate,
-    state.host_bitrate_kbps
-  );
-  state.host_capture_plan = validate_host_capture_plan(state.ffmpeg, state.host_capture_plan);
-  refresh_host_capture_runtime(state);
+  AgentLifecycleSessions sessions(state);
+  sessions.host_audio.attach_wasapi_callbacks();
+  vds::media_agent::peer_transport_backend(state) = get_peer_transport_backend_info();
+  vds::media_agent::ffmpeg_probe_result(state) = vds::media_agent::probe_ffmpeg(agent_binary_path);
+  vds::media_agent::wgc_capture_backend(state) = probe_wgc_capture_backend();
+  sessions.host_audio.refresh_session_status();
+  vds::media_agent::initialize_default_capture_runtime(state, sessions.host);
+  refresh_host_capture_runtime(sessions);
 }
 
 void stop_all_surface_attachments(AgentRuntimeState& state, const std::string& reason) {
-  for (auto& entry : state.attached_surfaces) {
-    if (entry.second.peer_runtime) {
-      stop_peer_video_surface_attachment(*entry.second.peer_runtime, reason);
-    } else {
-      stop_surface_attachment(entry.second, reason);
-    }
-  }
+  AgentLifecycleSessions sessions(state);
+  stop_all_surface_attachments(sessions, reason);
 }
 
 void restart_host_capture_surface_attachments(AgentRuntimeState& state) {
-  for (auto& entry : state.attached_surfaces) {
-    SurfaceAttachmentState& surface = entry.second;
-    if (!surface.attached || !is_host_capture_surface_target(surface.target)) {
-      continue;
-    }
-    stop_surface_attachment(surface, "host-capture-surface-restart");
-    surface = start_surface_attachment(
-      state.ffmpeg,
-      state.host_capture_plan,
-      state.host_capture_process,
-      state.host_capture_artifact,
-      surface
-    );
-  }
+  AgentLifecycleSessions sessions(state);
+  restart_host_capture_surface_attachments(sessions);
 }
 
 void shutdown_agent_runtime(AgentRuntimeState& state) {
+  AgentLifecycleSessions sessions(state);
   stop_wasapi_process_loopback_session();
-  stop_all_surface_attachments(state, "agent-shutdown");
-  for (auto& entry : state.peers) {
-    if (entry.second.receiver_runtime) {
-      close_peer_video_receiver_handles(*entry.second.receiver_runtime);
-    }
-  }
-  reset_host_audio_transport_sessions();
-  stop_viewer_audio_playback_runtime(state.viewer_audio_playback);
-  for (auto& entry : state.peers) {
-    close_peer_transport_session(entry.second.transport_session);
-  }
-  stop_obs_ingest_runtime(state);
-  shutdown_relay_dispatch_runtime();
-  stop_host_capture_process(
-    state.host_capture_process,
-    state.host_pipeline,
-    state.host_capture_plan,
-    state.host_capture_artifact,
-    "agent-shutdown"
-  );
+  stop_all_surface_attachments(sessions, "agent-shutdown");
+  sessions.peer_sessions.close_all_receiver_handles();
+  sessions.host_audio.reset_transport_sessions();
+  ViewerAudioSession viewer_audio;
+  viewer_audio.stop();
+  sessions.peer_sessions.close_all_transport_sessions();
+  vds::media_agent::stop_obs_ingest_session(state, sessions.host, sessions.obs);
+  relay_hub().shutdown_runtime();
+  vds::media_agent::stop_host_capture_process(sessions.host, "agent-shutdown");
 }
 
 AgentLifecycleCommandResult get_status_result(AgentRuntimeState& state) {
@@ -306,8 +135,21 @@ HostSessionControllerCallbacks make_start_host_session_callbacks(AgentRuntimeSta
   callbacks.restart_host_capture_surface_attachments = [&state]() {
     restart_host_capture_surface_attachments(state);
   };
+  callbacks.transport_ready = [&state]() {
+    return vds::media_agent::peer_transport_ready(state);
+  };
   callbacks.attach_host_video_media_binding = [&state](PeerState& peer, std::string* error) {
-    return attach_host_video_media_binding(state, peer, error);
+    const ObsIngestSessionSnapshot obs_ingest =
+      make_obs_ingest_session_snapshot(vds::media_agent::obs_ingest_session_snapshot(state));
+    return attach_host_video_media_binding(
+      HostVideoBindingContext{
+        vds::media_agent::host_session_snapshot(state),
+        vds::media_agent::ffmpeg_probe_result(state),
+        vds::media_agent::audio_session_snapshot(state),
+        obs_ingest
+      },
+      peer,
+      error);
   };
   return callbacks;
 }
@@ -319,6 +161,9 @@ HostSessionControllerCallbacks make_stop_host_session_callbacks(AgentRuntimeStat
   };
   callbacks.detach_peer_media_binding = [](PeerState& peer, std::string* error) {
     return detach_peer_media_binding(peer, error);
+  };
+  callbacks.transport_ready = [&state]() {
+    return vds::media_agent::peer_transport_ready(state);
   };
   return callbacks;
 }

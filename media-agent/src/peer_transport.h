@@ -6,16 +6,7 @@
 #include <string>
 #include <vector>
 
-struct PeerTransportBackendInfo {
-  bool available = false;
-  bool transport_ready = false;
-  std::string backend = "stub";
-  std::string implementation = "stub";
-  std::string mode = "disabled";
-  std::string reason = "libdatachannel-not-compiled";
-  std::string last_error;
-  std::vector<std::string> ice_servers;
-};
+#include "peer_transport_state.h"
 
 struct PeerTransportSnapshot {
   bool transport_ready = false;
@@ -210,5 +201,4 @@ void close_peer_transport_session(const std::shared_ptr<PeerTransportSession>& s
 
 PeerTransportSnapshot get_peer_transport_snapshot(const std::shared_ptr<PeerTransportSession>& session);
 
-std::string peer_transport_backend_json(const PeerTransportBackendInfo& backend);
 std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot);

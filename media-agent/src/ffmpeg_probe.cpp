@@ -16,6 +16,7 @@ extern "C" {
 #include <libavutil/mem.h>
 }
 
+#include "ffmpeg_probe_state.h"
 #include "json_protocol.h"
 #include "platform_utils.h"
 #include "process_runner.h"

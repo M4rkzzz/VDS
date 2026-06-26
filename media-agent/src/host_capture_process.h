@@ -2,14 +2,21 @@
 
 #include <string>
 
-#include "agent_runtime.h"
+struct FfmpegProbeResult;
+struct HostCaptureArtifactProbe;
+struct HostCapturePlan;
+struct HostCaptureProcessState;
+struct HostPipelineState;
 
 HostCaptureProcessState build_host_capture_process_state();
 std::string host_capture_process_json(HostCaptureProcessState& state);
 HostCaptureArtifactProbe probe_host_capture_artifact(
   const FfmpegProbeResult& ffmpeg,
+  const HostCaptureProcessState& host_capture_process);
+HostCaptureArtifactProbe probe_host_capture_artifact(
+  const FfmpegProbeResult& ffmpeg,
   const HostCaptureProcessState& host_capture_process,
-  HostCaptureArtifactProbe previous_probe = {});
+  HostCaptureArtifactProbe previous_probe);
 void persist_host_capture_process_manifest(
   const HostPipelineState& pipeline,
   const HostCapturePlan& plan,

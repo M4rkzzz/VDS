@@ -16,6 +16,256 @@
 
 ## P1 高优先级
 
+### RUNTIME-FIX-P1-051 stop share begin 使用已删除 logStep helper 导致停止流程中断
+
+- 位置：`server/public/native/native-session-controller.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`beginStopShare()` 中仍调用拆分前的 `logStep()` helper，但 session controller 内已没有该函数；点击停止共享后先进入 `setHostStopUiState(true)`，UI 显示“正在结束直播...”，随后抛 `logStep is not defined`，停止流程中断。
+- 影响：native/OBS 停止共享点击后卡在“正在结束直播...”，media-agent 和房间清理不会继续执行。
+- 建议：session controller 内部日志统一通过注入的 `logNativeStep` callback，不再引用 legacy helper 名。
+- 修改意见：按建议实施一行 runtime 修复，不改变 stop lifecycle 顺序。
+- 处理结果：已处理。`beginStopShare()` 的 `logStep('stopScreenShare:begin', ...)` 改为 `callOptional('logNativeStep', 'stopScreenShare:begin', ...)`，恢复停止流程继续执行。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`npm run check:renderer-syntax`、`rg -n "\\blogStep\\(" server/public/native/native-session-controller.js server/public/app-native-overrides.js`、`npm run check:renderer-bridge`、`npm run check:logging`、`npm run test:server`，均通过；`rg` 无命中，确认 stop/session controller 不再引用已删除 helper。
+
+### RUNTIME-FIX-P1-050 stop share 流程未停止 media-agent/房间且点击 gate 静默返回
+
+- 位置：`server/public/native/native-session-controller.js`、`server/public/app-native-overrides.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：R6 拆分后的 `runStopShare()` 只停止 stats、detach host preview 并清 renderer 状态，没有调用 `mediaEngine.stopHostSession()`，也没有发送 host `leave-room` 删除服务器房间。停止按钮 capture listener 还先判断 `nativeHostSessionRunning`，状态不同步时会静默 return，不拦截、不报错。manual stop finalize 最后还会无条件进入 OBS waiting UI，导致停止后按钮/状态看起来仍像没停。
+- 影响：native/OBS 开始共享后点击停止共享可能完全没反应，或没有真正停掉 media-agent/服务器房间，UI 继续显示共享/等待状态。
+- 建议：停止按钮点击必须进入统一 stop 流程，不能靠 `nativeHostSessionRunning` 前置 gate 静默跳过；stop 流程按顺序停止轮询/预览、关闭所有 peer、调用 `stopHostSession()`、发送 host `leave-room`、再清 renderer state/UI。manual stop 回到准备就绪，不进入 OBS waiting。
+- 修改意见：按建议实施 runtime stop lifecycle 修复，不改变 stop 按钮 DOM，不改变服务端 leave-room wire shape。
+- 处理结果：已处理。`bindHostControlEvents()` 删除 `isHostSessionRunning()` 静默 return，点击时总是 `preventDefault/stopImmediatePropagation` 并调用 `onStopShare({ event, hostSessionRunning })`；`app-native-overrides.js::stopScreenShare(context)` 透传 event 给 controller。`cleanupStopResources()` 现在关闭所有 peer 并调用 `stopHostSession({})`；`finalizeStopState()` 在清状态前读取 room snapshot 并发送 host `leave-room`，随后清 renderer state、playback state 和 stopped UI。manual stop 不再调用 `resetObsRoomUiWaitingForStream()`，避免停止后又回到 OBS 等待态。
+- 补充处理结果：已处理。`roomClient.leaveRoom()` 当前返回同步布尔值，`finalizeStopState()` 对 `options.sendLeaveRoom(...).catch(...)` 的 Promise 假设会抛 `catch is not a function` 并中断停止流程；已改为 `await Promise.resolve(options.sendLeaveRoom(...)).catch(...)`。`teardownObsHostRoom()` 同步改为 `await Promise.resolve(options.sendLeaveRoom(...))`，兼容同步/异步 leave-room 实现。
+- 补充处理结果：已处理。`host-session-stopped` 后继续暴露 `patchRendererState` 注入仍指向已删除的 `applyNativeRendererStatePatch()`，导致 renderer 清理阶段抛 `applyNativeRendererStatePatch is not defined`。`app-native-overrides.js` 现在将 `patchRendererState` 直接转发到 `legacyAppStateBridge.applyPatch(patch)`；已顺着 stop 后续链条检查 `setCurrentMediaManifest`、`syncRendererAppState`、`setRelayStream`、viewer wait timer、FPS/UI reset、OBS waiting reset 等注入，均有当前实现。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:logging`、`npm run test:server`、`git diff --check -- server/public/native/native-session-controller.js server/public/app-native-overrides.js docs/CODE_AUDIT_FINDINGS.md`，均通过；`git diff --check` 仅有既有 LF/CRLF 工作区提示。
+
+### RUNTIME-FIX-P1-049 OBS 音频 manifest 仍声明 opus 导致 AAC 帧被丢弃
+
+- 位置：`server/public/native/native-session-controller.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：OBS ingest 实际音频 codec 为 AAC，但 `buildEncodedMediaManifest()` 默认硬编码 `audio.codec='opus'`、`payloadFormat='opus-raw'`，`buildHostMediaManifestFromObsIngest()` 未覆盖音频 codec。观众端 media-agent 收到 AAC encoded audio frame 后按 manifest 校验，持续触发 `media-manifest-audio-codec-mismatch` 并丢弃音频块。
+- 影响：OBS 视频可正常观看，但音频全被接收端丢弃，表现为 OBS 没声音；日志大量刷 `media-manifest-audio-codec-mismatch suppressed=...`。
+- 建议：encoded manifest 构造支持音频 codec/payloadFormat；native capture 默认仍为 `opus/opus-raw`，OBS ingest manifest 必须声明 `aac/aac-adts`，与 media-agent encoded DataChannel audio frame payload format 保持一致。
+- 修改意见：按建议实施 manifest 修复，不改变 DataChannel 协议、不改变 OBS ingest 音频编码，不改 native capture 音频默认 opus 行为。
+- 处理结果：已处理。`native-session-controller.js` 新增 `normalizeAudioCodec()`；`buildEncodedMediaManifest()` 支持 `fields.audioCodec` 并按 codec 生成 `opus/opus-raw` 或 `aac/aac-adts`；`buildHostMediaManifestFromObsIngest()` 传入 `obsIngest.audioCodec || 'aac'`，OBS 房间和 peer manifest 现在声明 AAC；fallback `createHostSessionResult()` 的 OBS `audioManifest` 也改为 `aac/aac-adts`。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:logging`、`npm run test:server`、`git diff --check -- server/public/native/native-session-controller.js docs/CODE_AUDIT_FINDINGS.md`，均通过；`git diff --check` 仅有既有 LF/CRLF 工作区提示。
+
+### RUNTIME-FIX-P1-048 OBS media-state 事件未进入 OBS lifecycle effects
+
+- 位置：`server/public/native/native-session-controller.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：OBS ingest start 成功后 media-agent 返回 `backend:"obs-ingest"`，但 renderer 的 `buildHostStartBeginEffects()` / `buildHostStartSuccessEffects()` 没有同步 `currentHostBackend=obs-ingest`，导致 host stats 仍按 native backend 输出；同时 `buildObsMediaStateEffects()` 虽然已实现 `obs-ingest-waiting/connected/obs-stream-running/ended` 的 UI、建房和 teardown effects，但 `applyMediaStateUpdate()` 没有调用它，OBS media-state 事件只打日志，不驱动 OBS lifecycle。
+- 影响：OBS 启动后诊断显示 `backend=native capture-plan-not-initialized` 等误导状态；OBS 推流状态变化可能无法触发 `ensureObsHostRoomCreated()`，表现为 OBS 功能异常、等待/建房状态不正确。
+- 建议：host start begin/success effects 必须同步当前 backend；`applyMediaStateUpdate()` 遇到 `obs-*` media-state 时进入 `buildObsMediaStateEffects()`，让 OBS 推流开始事件触发建房，断流事件触发 teardown。
+- 修改意见：按建议实施 renderer OBS lifecycle 修复，不改变 media-agent RPC，不改变 OBS SRT 监听和 manifest wire shape。
+- 处理结果：已处理。`buildHostStartBeginEffects()` 和 `buildHostStartSuccessEffects()` 均新增 `setCurrentHostBackend` effect，OBS start 后 renderer/backend state 立即同步为 `obs-ingest`；`buildMediaStateUpdateEffects()` 检测到 `params.state` 以 `obs-` 开头时改为返回 `buildObsMediaStateEffects(params)`，恢复 OBS waiting/connected/stream-running/ended 的 UI、建房和 teardown effects。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### RUNTIME-FIX-P1-047 native room-created 已更新状态但房主房间号 DOM 未注入
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-renderer-state-controller.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：房间创建 ACK 已由 `native-room-message-controller.js::handleRoomCreatedMessage()` 正常处理，并调用 `nativeRendererState.setHostRoomActiveUi({ roomId })`，但 `app-native-overrides.js` 创建 `nativeRendererState` 时没有注入 `elements.roomIdDisplay`。因此状态层 `currentRoomId/sessionRole` 正常、观众可加入观看，但房主侧 `#room-id-display` 没有被写入。
+- 影响：host 房间实际存在且观看正常，但房主界面显示房间号为空，复制房间号/公开房间状态判断容易造成误判。
+- 建议：补齐 native renderer state controller 所需 DOM 注入，至少包含 `roomIdDisplay`；同步补齐 viewer room UI 相关元素注入，避免已迁入 controller 的 facade 静默无效；新增 bridge 门禁禁止 `roomIdDisplay` 注入回退。
+- 修改意见：按建议实施 renderer 注入修复，不改变 `room-created` 消息处理，不改变建房 ACK 等待逻辑，不改变服务端房间状态。
+- 处理结果：已处理。`app-native-overrides.js` 创建 `nativeRendererState` 时补充注入 `roomIdDisplay`，并同步补齐 `joinForm/viewerStatus/viewerRoomId/btnLeave/chainPosition`，让已拆出的 `setHostRoomActiveUi()` 与 viewer UI facade 都能写到实际 DOM。`check-renderer-bridge.js` 新增正向检查，要求 app-native-overrides 必须向 nativeRendererState 注入 `roomIdDisplay`。
+- 补充处理结果：已处理。截图确认房间卡片已显示但 `#room-id-display` 为空，说明 `room-created` 状态路径正常但 DOM 写入仍不稳。`native-renderer-state-controller.js` 新增 `getElement(name, fallbackId)`，`setHostRoomActiveUi()` 和 `setRoomInfoHidden()` 在注入元素缺失时会按真实 DOM id 兜底查找；`setHostRoomState()` 现在写入 host room state 后同步调用 `setHostRoomActiveUi({ roomId })`，让 roomId 状态写入和房主 UI 写入绑定在同一入口。
+- 补充处理结果：已处理。快速体检发现 `native-room-message-controller.js` 仍调用 `setHostRoomActiveUi` 与 `setViewerConnectedState`，但 `app-native-overrides.js` 没有显式注入这两个 facade，虽已有其它兜底路径，但会让 room-created/session-resumed 的 UI 更新静默无效。已补齐 `setHostRoomActiveUi: nativeRendererState.setHostRoomActiveUi` 与 `setViewerConnectedState: nativeRendererState.setViewerConnectedState` 注入。
+- 验证结果：已执行 `node --check server/public/native/native-renderer-state-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-bridge`、`npm run check:renderer-syntax`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### WEB-RELAY-P1-046 web 上游下游握手成功后主状态停留在 relay 检测中
+
+- 位置：`vds_web/src/main.ts`、`server/public/vds_web/index.html`、`server/public/vds_web/assets/*`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：web viewer 作为链式 relay 上游收到 `connect-to-next` 后会把主状态设置为 `relay 检测中`，但下游 DataChannel `hello-ack` 成功、bootstrap keyframe 发送和后续帧转发只更新 `relayProtocolState`，没有推进用户可见的主 `status`。如果没有显式失败，界面会出现“下游已连接/转发但上游仍显示 P2P relay 检测中”的低信息密度状态。
+- 影响：web 上游实际可用时仍显示检测中，手工判断链式 relay 健康度困难；旧下游连接的超时/close 回调也可能晚到并污染当前连接状态。
+- 建议：把 web relay 下游状态收敛成显式阶段：`relay 检测中 -> relay 已连接 -> relay 转发中`；下游离开或正常关闭后回到上游观看态；所有 DataChannel open/message/error/close/timeout 回调先校验是否仍是当前下游。
+- 修改意见：按建议实施 web relay 状态修复，不改变信令 payload、不改变 DataChannel encoded relay 协议、不改变 WebCodecs 解码/转发语义。
+- 处理结果：已处理。`main.ts` 新增 `downstreamRelayForwarding`、`markDownstreamRelayReady()`、`markDownstreamRelayForwarding()`、`restoreWatchingStatusAfterRelay()` 和 `isCurrentDownstreamChannel()`；下游 `hello-ack` 成功后主状态推进为 `relay 已连接`，bootstrap keyframe 或首个转发帧成功后推进为 `relay 转发中`，并避免每帧重复刷新 UI。下游离开/正常关闭后回到 `观看中` 或 `等待上游`。旧 DataChannel 的 open/message/error/close/timeout 回调会先做当前下游校验，避免 stale 回调污染新连接。已运行 `npm run build:vds-web` 同步 `server/public/vds_web` 静态产物。
+- 验证结果：已执行 `npm run check:vds-web`、`npm run test:vds-web`、`npm run build:vds-web`，均通过。
+
+### RUNTIME-FIX-P1-045 native host create-room 未等待 ACK 导致半开播状态
+
+- 位置：`server/public/native/native-session-controller.js`、`server/public/app-native-overrides.js`、`server/public/room-client.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：native host session start 成功后，`createNativeCaptureHostRoom()` 只调用 `roomClient.createRoom()` 并立即返回，没有等待 `room-created` ACK 被客户端接受和写回 UI。若 create-room 失败、超时或 ACK 被 stale 校验忽略，renderer 会进入“media-agent 已开播但没有房间号”的半状态；停止共享和公开房间大厅也会受到影响。
+- 影响：开播后无房间号；点击停止共享按钮看起来无响应；即使勾选公开房间，服务端大厅也可能没有有效公开房间。
+- 建议：create-room 前确保 WebSocket 已连接；发送 create-room 后等待匹配当前 `mediaSessionId` 的 `room-created` ACK，错误或超时则 failfast 并停止 host session；公开房间字段必须读取 UI 设置，不得在 native session controller 内硬编码。
+- 修改意见：按建议实施 renderer runtime fix，不改服务端 wire shape，不改 `room-created` 消息结构。
+- 处理结果：已处理。`room-client.js` 新增 `waitForMessage(type, predicate, timeoutMs)`，ACK 等待能力下沉到 room-client 边界；`app-native-overrides.js` 新增 `waitForHostRoomCreated()`，只调用 room-client API，不直接注册 message handler；`native-session-controller.js::createNativeCaptureHostRoom()` 和 OBS 建房路径现在先 `waitForWsConnected()`，再发送 create-room，并等待 `room-created` ACK。native start catch 分支会在已启动 host session 后遇到建房失败/超时时调用 `stopHostSession()` 清理，避免半开播残留。`buildHostCreateRoomOptions()` 和 OBS 建房路径改为读取 `getPublicRoomEnabled()`，不再硬编码 `publicListing: true`。
+- 补充处理结果：已处理。日志确认服务端已创建房间但 ACK 被 `room-created:stale-ignored` 丢弃，原因是 native create-room 发送的 manifest 仍是旧扁平字段 `videoManifest/audioManifest`，服务端 `sanitizeMediaManifest()` 只接受结构化 `protocol/video/audio`，导致 ACK 中 `mediaManifest` 为空、`mediaSessionId` 缺失。`native-session-controller.js` 新增 `buildEncodedMediaManifest()`，native/OBS 建房 manifest 现在包含 `protocol: 'vds-media-encoded-v1'`、`video.codec/payloadFormat`、`audio.codec/payloadFormat` 和 `mediaSessionId`，并保留旧扁平字段作兼容。
+- 验证结果：已执行 `node --check server/public/room-client.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### RUNTIME-FIX-P1-044 host preview attach 条件未同步 previewRequested 且 attach 后缺少强制布局同步
+
+- 位置：`server/public/native/native-session-controller.js`、`server/public/native/native-surface-controller.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：native host session start 成功后，`buildHostStartSuccessEffects()` 只设置 preview element hidden/attached 状态，没有同步写回 `hostPreviewRequested`；而 `attachHostPreviewSurface()` 的 gate 依赖 `nativeSessionState.getHostPreviewRequested()`。同时 attach 成功后没有立即强制 resync surface layout。
+- 影响：capturePlan 已 ready，但 host preview attach 可能被 renderer 状态 gate 跳过，或者 attach 后需要等后续布局事件才显示，表现为“无预览”。
+- 建议：host start success effects 明确写入 `setHostPreviewRequested(previewRequested)`；host preview surface attach 成功后触发 `forceResyncBurst()`。
+- 修改意见：按建议实施 renderer runtime fix，不改 media-agent surface RPC。
+- 处理结果：已处理。`buildHostStartSuccessEffects()` 新增 `{ type: 'setHostPreviewRequested', requested: previewRequested }`；`native-surface-controller.js::attachHostPreviewSurface()` 在 attachSurface 成功后调用 `forceResyncBurst()`，立即刷新 embedded surface bounds。
+- 补充处理结果：已处理。`buildHostStartSuccessEffects()` 不再在 start success 阶段预置 `setHostPreviewAttached(true)`，改为先置 false，只由 `native-surface-controller.js::attachHostPreviewSurface()` 在 `attachSurface` 真实成功后写 true，避免“未附着但状态显示已附着”导致预览缺失难定位。
+- 补充处理结果：已处理。`buildNativePreviewStartState()` 不再用上一次残留的 `hostPreviewRequested` 决定本次是否 attach 预览，而是通过 `shouldRequestHostPreview('native')` 按当前 backend、native preview 开关和质量设置重新计算，并同步写回 session state；避免一次 stop/失败/无预览尝试把后续 display share 永久卡成不 attach。
+- 补充处理结果：已处理。`buildHostStartSuccessEffects()` 在 host start 成功后补充 `{ type: 'call', name: 'startHostStatsPolling' }`，恢复 host stats 轮询启动；`native-stats-controller` 会立即执行一次 `getStats()` 并刷新“采集资源”诊断面板，避免画面/预览已启动但诊断区长期停在“等待采集数据”。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-surface-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:logging`、`npm run check:architecture`，均通过。
+
+### UI-FIX-P1-043 源选择缩略图同步加载被禁用后缺少异步补图通道
+
+- 位置：`desktop/main.js`、`desktop/preload.js`、`server/public/source-selection.js`、`server/public/style.css`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：为避免 `desktopCapturer.getSources({ thumbnailSize: 320x180 })` 在源列表阶段阻塞或超时，源列表已改为 `thumbnailSize: { width: 0, height: 0 }`，但后续没有异步缩略图补充路径，导致窗口选择弹窗长期无缩略图。
+- 影响：源选择可用但可辨识度下降；恢复同步缩略图又会重新引入列表卡死风险。
+- 建议：保持 `listCaptureTargets()` 快速返回无缩略图，新增单源缩略图 IPC；弹窗渲染后并发受限地异步加载缩略图，失败只更新占位，不影响选择和开播。
+- 修改意见：按建议实施 UI/runtime 小修，不恢复同步 thumbnail list，不改变 source object schema。
+- 处理结果：已处理。`desktop/main.js` 新增 `media-engine-get-capture-target-thumbnail` IPC 和 `getCaptureTargetThumbnail()`，按 sourceId 单独请求 `320x180` thumbnail，并用 `VDS_CAPTURE_TARGET_THUMBNAIL_TIMEOUT_MS` 默认 1800ms 限时；synthetic/minimized source 返回无缩略图原因。`desktop/preload.js` 暴露 `mediaEngine.getCaptureTargetThumbnail()`。`source-selection.js` 在无 thumbnail 时渲染占位，弹窗显示后以 2 并发异步补图，结果回来后替换对应 item；失败只把占位改为“无缩略图”。`style.css` 新增 `.source-thumbnail-placeholder`。
+- 补充处理结果：已处理。缩略图 IPC 现在接收 `sourceId/hwnd/title/kind`，主进程按 Electron 原始 id 匹配失败时继续按 HWND、标题和类型回找 source，避免列表源对象和二次 `desktopCapturer` 源 id 不完全一致时全量无缩略图。`source-selection.js` 增加一次性摘要日志，只输出 queued/ready/unavailable，不逐帧刷屏。
+- 补充处理结果：已处理。`normalizeDesktopSource()` 现在会检查 `source.thumbnail.isEmpty()`；列表阶段 `thumbnailSize: 0` 返回的空 `NativeImage` 不再被转成 truthy data URL，从而 renderer 会渲染占位并启动异步补图。
+- 验证结果：已执行 `node --check desktop/main.js`、`node --check desktop/preload.js`、`node --check server/public/source-selection.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:logging`、`npm run check:architecture`，均通过。
+
+### RUNTIME-FIX-P1-042 native window capture start request 丢失 HWND 和 mediaSessionId
+
+- 位置：`server/public/native/native-session-controller.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`source-selection.js` 已把完整 source object 传给 `startScreenShareWithSource()`，但 `native-session-controller.js::prepareNativeCaptureHostStart()` 仍按字符串处理 `sourceId`，导致 native start request 的 `captureTargetId` 变成对象字符串或缺少 `captureHwnd`。同时 `startHostSession()` 没有确保请求携带 `mediaSessionId`。
+- 影响：media-agent WGC window authority 路径收到 window capture 但没有真实 HWND，返回 `wgc-window-handle-missing`，预览和发送都无法启动；建房 ACK 也可能因空 `mediaSessionId/currentMediaSessionId` 被 stale-ignore。
+- 建议：session controller 接收 source object/string 两种输入，统一提取 `captureTargetId`、`captureHwnd`、`captureKind`、`captureState`；`startHostSession()` 在调用 mediaEngine 前确保 `mediaSessionId` 存在并写入 request。
+- 修改意见：按建议实施 runtime fix，不改 source-selection 对外行为，不改 media-agent RPC 字段名。
+- 处理结果：已处理。`native-session-controller.js` 新增 `extractWindowHandleFromSourceId()` 与 `normalizeCaptureSourceInput()`；`prepareNativeCaptureHostStart()` 现在能从 source object 的 `id/hwnd/kind/state/isMinimized` 或字符串 `window:<hwnd>` 中提取 window handle，并写入 `captureHwnd/captureKind/captureState`。`startHostSession()` 现在统一构造 `sessionRequest`，补充 `mediaSessionId: ensureMediaSessionId()` 后再调用 mediaEngine。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### RUNTIME-FIX-P1-041 native authority 依赖 window 函数身份比较导致 override 误判缺失
+
+- 位置：`server/public/app.js`、`server/public/native/native-entry.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`app.js::getNativeAuthorityOverride(name, currentImpl)` 只从 `window[name]` 读取 hook，并用 `candidate === currentImpl` 判断是否仍是原实现。拆分后 `native-entry.registerLegacyGlobals()` 会覆盖 `window.startScreenShareWithSource`，而全局函数声明的 lexical binding 在浏览器里可能随同名 window 属性变化，导致传入的 `currentImpl` 也等于 override 函数。
+- 影响：即使 native hook 已注册，`candidate === currentImpl` 仍会误判为没有 override，继续抛 `native-authority-override-missing:startScreenShareWithSource`。
+- 建议：native-entry 注册 hook 时维护独立 `window.__vdsNativeAuthorityOverrides` registry；`app.js` 优先从 registry 取 override，registry 命中时不再做 window 函数身份比较，window fallback 才保留旧比较。
+- 修改意见：按建议实施 runtime fix，不改旧 hook 名称，不改调用方参数。
+- 处理结果：已处理。`native-entry.registerLegacyGlobals()` 现在同步维护 `window.__vdsNativeAuthorityOverrides`；`app.js::getNativeAuthorityOverride()` 在 installed guard 通过后优先读取该 registry，命中函数即返回，避免同名 window 函数覆盖导致的身份误判。`check-renderer-bridge.js` 新增门禁，要求 registry 存在且 app.js 优先通过 registry 解析 native authority。
+- 验证结果：已执行 `node --check server/public/app.js`、`node --check server/public/native/native-entry.js`、`node --check scripts/check-renderer-bridge.js`、native-entry authority registry VM smoke（确认 installed flag、registry binding、window binding 均存在）、`npm run check:renderer-bridge`、`npm run check:renderer-syntax`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### RUNTIME-FIX-P1-040 native authority install guard 早于 hook 注册导致假安装状态
+
+- 位置：`server/public/native/native-entry.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-entry.installLegacyOverrides()` 在调用 legacy installer 之前先执行 `markLegacyOverridesInstalled()`，即使 installer 返回 null、抛错前未注册 bindings，或返回值未被正常注册，`window.__vdsNativeAuthorityOverridesInstalled` 也已经为 true。
+- 影响：`app.js::requireNativeAuthorityOverride()` 会认为 native authority 已安装，但 `window.startScreenShareWithSource` 等 hook 仍是原函数，于是抛出 `native-authority-override-missing:startScreenShareWithSource`，表现为源选择后无法开始共享。
+- 建议：只有拿到 legacy hook map 并执行 `registerLegacyGlobals(bindings)` 后，才能标记 `__vdsNativeAuthorityOverridesInstalled=true`；installer 无 bindings 时返回 false 并保持未安装状态。
+- 修改意见：按建议实施 runtime fix，不改 app/native hook 名称，不改加载顺序。
+- 处理结果：已处理。`native-entry.installLegacyOverrides()` 改为先调用 installer，校验返回 bindings object，执行 `registerLegacyGlobals(bindings)`，最后才调用 `markLegacyOverridesInstalled()`；installer 无 bindings 时 `legacyInstallerCompleted=false` 并返回 false。`check-renderer-bridge.js` 新增门禁，禁止先 mark 后注册，并要求注册 globals 后再标记 installed。
+- 验证结果：已执行 `node --check server/public/native/native-entry.js`、`node --check scripts/check-renderer-bridge.js`、native-entry VM smoke（installer 返回 `startScreenShareWithSource` binding 后确认 installed flag 与 window hook 均存在）、`npm run check:renderer-bridge`、`npm run check:renderer-syntax`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### UI-FIX-P1-039 画质弹窗显示被 render/bind 异常阻断
+
+- 位置：`server/public/app.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`openQualityModal()` 先执行 `bindQualitySettingsUi()` 和 `renderQualitySettingsUi()`，最后才移除 `quality-modal.hidden`。如果 bind/render 中任一质量设置渲染路径抛错，弹窗完全不会显示，用户只能看到“点击后无反应”。
+- 影响：质量设置模块或能力检测中的局部异常会阻断整个开播入口，且没有明确 UI 反馈。
+- 建议：先显示 modal，再执行 bind/render；bind/render 异常要记录日志并显示 toast，异步能力刷新和 OBS 预检不得阻塞 modal 打开。
+- 修改意见：按建议实施入口 fail-open 修复，不改 quality settings 数据结构、不改开播确认逻辑。
+- 处理结果：已处理。`openQualityModal()` 现在先 `classList.remove('hidden')` 显示弹窗，再在 try/catch 中执行 bind/render；异常时写入 `debugLog('video', ...)` 并显示“画质设置渲染失败，请查看日志”。`refreshQualityCapabilities()` 和 `prepareObsIngestPreview()` 的异常改为异步日志，不再阻塞弹窗打开。
+- 验证结果：已执行 `node --check server/public/app.js`、`npm run check:renderer-syntax`、`npm run check:logging`，均通过。
+
+### UI-FIX-P1-038 画质选择弹窗内容超出视口且无法滚动
+
+- 位置：`server/public/style.css`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`quality-modal-content` 采用 flex column 并 `overflow:hidden`，但中间内容区 `.quality-settings-modern` 没有承担滚动容器职责；当窗口高度不足时，高级设置和底部按钮会被挤出可视范围，用户无法上下滚动。
+- 影响：画质选择弹窗在较小窗口或内容较多时无法完整操作，可能无法点击部分设置或确认按钮。
+- 建议：保持弹窗本体受 `max-height` 限制，header/backend tabs/footer 固定，中间 `.quality-settings-modern` 设置 `flex:1`、`min-height:0`、`overflow-y:auto`。
+- 修改意见：按建议实施 CSS 小修，不改 DOM、不改 quality settings JS 逻辑。
+- 处理结果：已处理。`quality-modal-content` 增加 `min-height:0`，header/backend tabs/footer 设为固定 flex item；`.quality-settings-modern` 变为滚动内容区，设置 `flex:1 1 auto`、`overflow-y:auto`、`overflow-x:hidden`、`overscroll-behavior:contain`；底部按钮保持在弹窗底部。移动窄屏下同步减小滚动区右 padding。
+- 验证结果：已执行 `npm run check:renderer-syntax`、`npm run check:logging`，均通过。
+
+### RUNTIME-FIX-P1-037 native-session-controller 导出未定义函数导致 native authority 安装失败
+
+- 位置：`server/public/native/native-session-controller.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-session-controller.js::createController()` 的 return object 导出了 `buildHostSessionStoppedEffects` 和 `buildObsMediaStateEffects`，但文件内没有对应函数定义。浏览器执行对象字面量时触发 `ReferenceError`，导致 `VDS.nativeSession.createController()` 失败，进而 `native-entry` 没能安装 authority overrides。
+- 影响：native authority override 缺失后，`startScreenShareWithSource` 走 `native-authority-override-missing`，表现为源选择后无法启动原生共享。
+- 建议：补齐这两个函数的实现，而不是删除导出；同时在 bridge 检查里加入正向门禁，避免 controller return 再引用未实现的兼容 API。
+- 修改意见：按建议实施 runtime fix，不改变信令协议、不改变 media-agent RPC，只恢复 renderer controller 初始化和旧兼容导出。
+- 处理结果：已处理。`native-session-controller.js` 新增 `buildHostSessionStoppedEffects()` 和 `buildObsMediaStateEffects(params = {})`；前者生成 host stopped/OBS flags reset effects，后者统一生成 OBS waiting/connected/running/ended 状态 effects，并通过现有 `call` effect 触发 `ensureObsHostRoomCreated` / `teardownObsHostRoom`。`check-renderer-bridge.js` 新增正向检查，要求这两个导出函数在 session controller 中实际定义。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-bridge`、`npm run check:renderer-syntax`、`npm run check:logging`、`npm run check:architecture`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-574 带音频共享高层流程仍在 native override 编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`scripts/check-renderer-bridge.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`startScreenShareWithAudio()` 仍在 legacy override 里先启动画面共享，再直接调用 `nativeSessionController.startNativeAudioForShare()`，并本地处理 native audio warning、recoverable warning 日志和降级提示。
+- 影响：native/OBS host start 主流程已进入 `native-session-controller.js` 后，带音频共享仍把 capture host start 与 audio start 的高层 lifecycle 拆在两个文件，R6 无法证明 session controller 是 share start lifecycle 的唯一 owner。
+- 建议：在 `native-session-controller.js` 提供 `runNativeCaptureHostStartWithAudio(sourceId, audioPid, context)`，由 controller 串联 native capture start、audio start、warning 展示和 recoverable warning；legacy `startScreenShareWithAudio()` 只保留兼容入口委托。
+- 修改意见：按建议实施 Renderer R6/R7 小切片，不改变 source/audioPid 参数、不改变“音频失败仅降级画面”的行为、不改变 native audio request payload。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `runNativeCaptureHostStartWithAudio()`，内部复用 `runNativeCaptureHostStart()` 和 `startNativeAudioForShare()`，并集中处理 audio warning、`native-audio-session:start-failed` recoverable warning 和中文降级提示；`app-native-overrides.js::startScreenShareWithAudio()` 已收薄为一行 controller 委托，只传入 `nativeHostSessionEnabled`、`nativeHostPreviewEnabled` 和 `clientId` context。`check-renderer-bridge.js` 新增防回退扫描，禁止 legacy override 再直接调用 `nativeSessionController.startNativeAudioForShare({` 或持有该异常降级文案/日志 scope。Renderer 完成度审计已更新为约 99.989%。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`rg -n "nativeSessionController\\.startNativeAudioForShare\\(\\{|native-audio-session:start-failed', error|showError\\('原生音频启动失败，将仅共享画面'\\)|验证结果：待执行" server/public/app-native-overrides.js scripts/check-renderer-bridge.js docs/CODE_AUDIT_FINDINGS.md`、`npm run check:renderer-bridge`、`npm run check:renderer-syntax`、`npm run check:logging`、`npm run check:architecture`、`npm run test:server`，均通过；`rg` 确认旧音频启动编排片段未回流到 runtime 文件，仅存在于门禁脚本和审计文档。
+
+### ARCH-SPLIT-P1-575 native audio start 结果校验被直通返回削弱
+
+- 位置：`server/public/native/native-session-controller.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`startNativeAudioForShare()` 在 session controller 内部直接返回 `mediaEngine.startAudioSession()` 结果，只靠上层判断 `result.ok !== true`。但 media-agent 的 `startAudioSession` 成功结果是音频状态 JSON，核心字段是 `captureActive` / `ready`，并不稳定携带 `ok:true`。
+- 影响：一方面旧判断会把无 `ok` 字段的正常结果误判为失败；另一方面如果返回明确 `captureActive:false` 或 `ready:false`，缺少统一原因归一化，带音频开播降级逻辑不够可靠。
+- 建议：在 `native-session-controller.js` 补回 `validateAudioStartResult(result)`，由 controller 统一识别 `ok:false`、`captureActive/audioCaptureActive:false`、`ready:false`，并让 `startNativeAudioForShare()` 返回归一化后的 `{ ok, warningText, validationReason }`。
+- 修改意见：按建议实施 Renderer R6 小切片，不改 media-agent RPC、不改 request payload，只修正 renderer 对 audio start result 的兼容校验。
+- 处理结果：已处理。`native-session-controller.js` 新增 `validateAudioStartResult(result = {})` 并导出；`startNativeAudioForShare()` 现在给 request 补充当前 `mediaSessionId`，调用 media engine 后统一返回原始字段加 `{ ok, warningText, validationReason }`，仅在明确 `ok:false`、明确 capture inactive 或明确 not ready 时降级，字段缺失不强行判失败。`check-renderer-bridge.js` 新增正向门禁，要求 session controller 持有 audio 校验函数、检查 `captureActive/audioCaptureActive` 与 `ready` 字段，并要求 `startNativeAudioForShare()` 消费校验结果。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-bridge`、`npm run check:renderer-syntax`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-513 Host/Audio/OBS 单 session registry 缺少可观测 active owner id
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/src/runtime_registry.h`、`media-agent/src/runtime_registry.cpp`、`media-agent/src/agent_status_json.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：Host/Audio/OBS registry 已通过 `runtime_registry` facade 固定边界，但三类 registry 仍只暴露 `current_session()` / `snapshot()`，外部无法观察当前 owner identity，后续多 session 化也缺少向前兼容的 active session id 字段。
+- 影响：M7 虽然把裸 runtime 字段访问挡住了，但 status/stats 仍无法区分“默认兼容 current”与未来真实 active session；多 session owner 演进时容易需要再改 JSON surface。
+- 建议：给三类单 session registry 增加 `active_session_id()` facade，并通过 `runtime_registry` 暴露 active id；`getStatus` / `getStats` 额外输出 `hostSessionId`、`audioSessionId`、`obsIngestSessionId`，不改变原字段。
+- 修改意见：按建议实施 media-agent M7 较大切片，不改变 JSON-RPC method，不删除既有 status/stats 字段，不改变 media 行为；新增字段作为 owner identity 观测面。
+- 处理结果：已处理。`HostSessionRegistry`、`AudioSessionRegistry`、`ObsIngestSessionRegistry` 新增默认 active session id；`runtime_registry` 新增 `active_host_session_id()`、`active_audio_session_id()`、`active_obs_ingest_session_id()`；`build_status_json()` 与 `build_stats_json()` 输出三类 session id。ownership 文档和完成度审计已同步，media-agent 粗略完成度更新为约 87%。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`npm run check:architecture`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 验证包含 media-agent build、unit tests 和 smoke test。`scripts/smoke-media-agent.ps1` 已新增断言，要求 `getStatus` 与 `getStats` 响应都包含非空 `hostSessionId`、`audioSessionId`、`obsIngestSessionId`。
+
+### ARCH-SPLIT-P1-512 queued remote ICE flush effects 仍由外层 controller 解释
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-message-controller.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`flushQueuedRemoteCandidates()` 已由 peer controller 负责取队列和逐条 apply，但 flush result 的 blocked relay 日志和 P2P UI 状态写回仍分别由 `app-native-overrides.js` 与 `native-peer-message-controller.js` 解释。
+- 影响：remote ICE flush 的执行 owner 和 effects owner 分裂，而且同一套 effects 解释器存在两份，容易在后续 answer/offer 分支修改时产生不一致。
+- 建议：在 `native-peer-controller.js` 中集中提供 `applyQueuedRemoteCandidateFlushResult()` 与 `applyRemoteIceCandidateEffects()`，通过注入的 `logNativeStep` 和 `setP2pStateForPeer` 执行动作；外层只调用 controller facade。
+- 修改意见：按建议实施 Renderer R5/R7 较大切片，一次性删除 legacy override 的无调用 flush/effects helper，并把 peer message controller 的重复 effects 解释器改为委托 controller。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `applyRemoteIceCandidateEffects()` 与 `applyQueuedRemoteCandidateFlushResult()`；`native-peer-message-controller.js` 的 flush/effects helper 改为轻量委托；`app-native-overrides.js` 删除无调用的 `flushQueuedRemoteCandidates()`、`applyQueuedRemoteCandidateFlushResult()` 和 `applyRemoteIceCandidateEffects()`。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-peer-message-controller.js`、`rg -n "function applyQueuedRemoteCandidateFlushResult|function applyRemoteIceCandidateEffects|function flushQueuedRemoteCandidates|验证结果：待执行" server/public/app-native-overrides.js server/public/native/native-peer-message-controller.js server/public/native/native-peer-controller.js docs/CODE_AUDIT_FINDINGS.md`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过；`rg` 确认 `app-native-overrides.js` 已无本地 flush/effects helper，peer message controller 仅保留轻量委托。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js server/public/native/native-peer-message-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error。
+
+### ARCH-SPLIT-P1-511 offer 前 P2P UI 状态仍在 native override 写入
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：offer message 构造和发送已经由 `native-peer-controller.js::createAndSendOffer()` 完成，但 `app-native-overrides.js::createAndSendPeerOffer()` 仍在调用前直接根据 `reconnect/iceRestart` 写入 `restart-attempting` 或 `gathering` P2P UI 状态。
+- 影响：peer offer lifecycle 的前置 UI 状态仍由 legacy glue 持有，导致 controller 无法完整表达“开始创建 offer”这一阶段。
+- 建议：把 offer 前 UI state 写入迁入 `native-peer-controller.js::createAndSendOffer()`，通过已注入的 `setP2pStateForPeer` 执行；legacy wrapper 只保留 native handle guard、参数整理和 controller 调用。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 `reconnect/iceRestart` 判断、不改变 `gathering/restart-attempting` 状态值、不改变 offer message payload。
+- 处理结果：已处理。`native-peer-controller.js::createAndSendOffer()` 在 `prepareOfferMessage()` 前统一写入 `restart-attempting` 或 `gathering`；`app-native-overrides.js::createAndSendPeerOffer()` 删除本地 P2P UI 状态写入，只负责兼容入口和调用 controller。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`rg -n "createAndSendPeerOffer[\\s\\S]*setP2pStateForPeer|setP2pStateForPeer\\(peerId, 'restart-attempting'\\)|setP2pStateForPeer\\(peerId, 'gathering'\\)" server/public/app-native-overrides.js server/public/native/native-peer-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过；`rg` 命中项仅剩 create peer 初始化和本地 ICE signal 统计路径，不在 `createAndSendPeerOffer()` 内。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+
+### ARCH-SPLIT-P1-510 NAT mapping 内部 helper 仍暴露在 peer controller API
+
+- 位置：`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-509 后 `attemptLastChanceNatMapping()` 已成为 NAT fallback 的唯一外部入口，但 `beginNatMappingAttempt()`、`applyNatMappingResult()`、`applyNatMappingError()`、`finishNatMappingAttempt()`、`sendNatMappedCandidatesAndArmWait()` 仍从 controller return API 暴露。
+- 影响：legacy 或其它 renderer 模块仍可绕过 NAT fallback lifecycle 直接调用内部步骤，后续容易重新把状态转移和信令动作拆散。
+- 建议：把这些 NAT helper 收回为 `native-peer-controller.js` 私有函数，只保留 `attemptLastChanceNatMapping()` 作为外部 facade。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变函数内部实现、不改变外部 `attemptLastChanceNatMapping()` 签名、不改变 NAT fallback 行为。
+- 处理结果：已处理。`native-peer-controller.js` 的 return API 删除 `beginNatMappingAttempt`、`applyNatMappingResult`、`applyNatMappingError`、`finishNatMappingAttempt` 和 `sendNatMappedCandidatesAndArmWait`，这些函数只在 controller 内部由 `attemptLastChanceNatMapping()` 调用；`app-native-overrides.js` 无相关直接调用。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`rg -n "nativePeerController\\.(beginNatMappingAttempt|applyNatMappingResult|applyNatMappingError|finishNatMappingAttempt|sendNatMappedCandidatesAndArmWait)|\\b(beginNatMappingAttempt|applyNatMappingResult|applyNatMappingError|finishNatMappingAttempt|sendNatMappedCandidatesAndArmWait)," server/public`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+
+### ARCH-SPLIT-P1-509 NAT mapping fallback 主体仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-508 后 mapped candidate 发送已迁入 peer controller，但 `attemptLastChanceNatMapping()` 仍在 legacy 中串联 `beginNatMappingAttempt()`、NAT UI、`mediaEngine.openNatMapping()`、6000ms timeout、result/error log、result/error 状态写入、finish 和诊断刷新。
+- 影响：P2P failure fallback 的核心动作仍散在 legacy 和 controller 两边，R5/R7 下 peer controller 仍不是 NAT fallback lifecycle 的唯一编排 owner。
+- 建议：把 `attemptLastChanceNatMapping(peerId, reason, options)` 整体迁入 `native-peer-controller.js`，通过注入的 `mediaEngine`、`setP2pStateForPeer`、`setViewerConnectionState`、`renderP2pDiagnosticReport` 和 `sendSignalMessage()` 完成原动作；legacy 保留一行委托。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 `openNatMapping()` request payload、不改变 6000ms timeout、不改变日志 scope/category、不改变 NAT UI 文案、不改变 mapped ICE candidate payload。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `attemptLastChanceNatMapping()`，内部完整串联 NAT mapping gate、start/result/failed 日志、P2P `nat-mapping` UI、viewer 端口映射提示、`mediaEngine.openNatMapping({ peerId, candidates, lifetimeSeconds: 180 })`、`nat-mapping-timeout`、result/error 状态写入、mapped candidate 发送、NAT wait arm、finish 和诊断刷新；`app-native-overrides.js::attemptLastChanceNatMapping()` 收薄为 `nativePeerController.attemptLastChanceNatMapping(peerId, reason, { roomId: currentRoomId })`。拆分地图和完成度审计已同步，Renderer 粗略完成度更新为约 98%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+
+### ARCH-SPLIT-P1-508 NAT mapped candidate 发送仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`attemptLastChanceNatMapping()` 已把 NAT mapping begin/result/error/finish 状态转移交给 peer controller，但映射成功后仍由 `app-native-overrides.js` 逐条发送 `natMapping: true` ICE candidate，并在 legacy 里 arm NAT wait timer。
+- 影响：NAT fallback 的状态 owner 和后续信令动作 owner 仍分裂，R5 中 peer controller 还不能证明 NAT mapped candidate 信令由同一个 peer lifecycle owner 发出。
+- 建议：在 `native-peer-controller.js` 新增 mapped candidate 发送 facade，内部复用 `sendSignalMessage()`，发送完成后默认调用 `armPeerNatMappingWait()`；legacy 只保留 `mediaEngine.openNatMapping()` 外部 RPC、结果校验和 UI/log。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 `ice-candidate` payload、不改变 `natMapping: true` 字段、不改变 `roomId/targetId`、不改变 NAT wait 默认行为。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `sendNatMappedCandidatesAndArmWait(peerId, candidates, { roomId })`，内部逐条发送 mapped ICE candidate 并默认 arm NAT wait timer；`app-native-overrides.js::attemptLastChanceNatMapping()` 删除本地 `sendMessage()` 循环和直接 `armPeerNatMappingWait()` 调用，改为单行委托 controller。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+
+### ARCH-SPLIT-P1-507 final P2P failure apply 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-229 后 `finalizeP2pConnectionFailure()` 已经由 peer controller 写 failed 状态并返回 `peer-connect-failed` payload / viewer message，但 NAT fallback 未启动后的最终 apply 仍由 `app-native-overrides.js` 负责 P2P failed UI、日志输出、viewer 失败文案和 close peer。
+- 影响：P2P 首连失败收尾路径仍有一段动作编排回到 legacy override，R5 无法证明最终 failure effects 已由 peer controller 持有。
+- 建议：在 `native-peer-controller.js` 新增 `finalizeP2pConnectionFailureAndApply(peerId, reason, source)`，由 controller 内部复用 `finalizeP2pConnectionFailure()` 并通过注入回调执行 UI/log/viewer message/close；legacy 只负责 NAT mapping fallback orchestration。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 NAT fallback 优先级、不改变 `peer-connect-failed` 字段、不改变 viewer 文案、不改变 close peer `{ clearRetryState: false }` 参数。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `finalizeP2pConnectionFailureAndApply()`，统一串联 failed 状态写入、`setP2pStateForPeer(peerId, 'failed')`、`peer-connect-failed` 日志、viewer 失败文案和 `closePeerConnection(peerId, { clearRetryState: false })`；`app-native-overrides.js::finalizeP2pFailureWithNatMapping()` 在 NAT fallback 未启动后只委托该 controller 方法。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+
 ### AUDIT-P1-001 旧 WebSocket 换绑后仍保留信令转发权限
 
 - 位置：`server/server-core.js:379`、`server/server-core.js:524`
@@ -2924,6 +3174,16 @@
 - 处理结果：已处理。`NativeLivePreview::thread_main()` 现在在 capture source 启动失败后仍将 preview surface 标记为 attached/running，渲染 `Host preview unavailable` 占位帧，并保留原始 `wgc-source-create-seh-error` 到 `lastError`。同时 `NativeLivePreview::capture_loop()` 对窗口 WGC source 初次创建失败增加一次 display WGC fallback；fallback 成功时保留 `live-preview-display-fallback-running`，后续帧渲染显示 `live-preview-display-fallback-frame-rendered`，失败时才进入稳定占位。这样 `attachSurface` 对前端返回成功，后续窗口移动只走 `updateSurface`，不会反复触发 WGC source 创建；真正的共享/发送链路不受影响。
 - 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、`vds-media-agent-unit-tests`、media-agent smoke test 均通过，并已复制新 `runtime/media-agent/vds-media-agent.exe`。
 
+### RUNTIME-FIX-P1-036 Web P2P 会把半 ready viewer 选为上游导致连接失败
+
+- 位置：`server/server-core.js:1527`、`server/server-core.js:971`、`server/server-core.js:1666`、`scripts/test-server-core.js`
+- 问题：web viewer 只靠接收上游 `offer` 建立上游连接；服务端拓扑选择里 `isUpstreamCandidateReady()` 只检查 `mediaReady` 和 WebSocket 是否在线，没有同步检查 `relayEstablished`。这会把刚开始收到媒体、但尚未完成 relay 可用闭环的 viewer 分配给后续 web viewer。当下游等待该半 ready 上游发起 `connect-to-next/offer` 时，就会表现为 web 端 `P2P 连接失败` 或长时间等待。
+- 影响：web v2/web v3 等链式观看场景容易被分配到不能稳定转发的 web 上游，尤其是在重连、拓扑重选或上游刚进入播放但 DataChannel relay 尚未完成 hello/ack 时。
+- 建议：服务端对“可作为上游”的定义统一为 `mediaReady && relayEstablished && socket open`；`notifyViewerCurrentUpstream()` 和 `notifyPendingDownstreams()` 也使用同一标准，避免半 ready 节点收到下游连接任务。
+- 修改意见：按建议修改
+- 处理结果：已处理。`isUpstreamCandidateReady()`、`notifyViewerCurrentUpstream()`、`notifyPendingDownstreams()` 已统一要求 viewer 同时满足 `mediaReady` 和 `relayEstablished` 才能作为下游上游；新增 `testHalfReadyViewerIsNotSelectedAsUpstream()` 覆盖半 ready viewer 不会被选为上游、也不会收到 `connect-to-next` 的场景。
+- 验证结果：已执行 `node --check server/server-core.js`、`node --check scripts/test-server-core.js`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
 ### RUNTIME-FIX-P1-035 WGC live preview source 创建 SEH 仍缺少阶段定位且更新间隔过激
 
 - 位置：`media-agent/src/wgc_capture.cpp`、`media-agent/src/wgc_capture.h`、`media-agent/src/native_live_preview.h`、`media-agent/src/surface_attachment_runtime.cpp`、`media-agent/src/host_capture_plan.cpp`
@@ -2973,3 +3233,5289 @@
 - 修改意见：按建议修改
 - 处理结果：已处理。`NativeLivePreviewConfig` 新增 `capture_title`，surface attach 传入 host capture title；`native_live_preview` 和 `agent_lifecycle` 在旧 HWND 仍 minimized 时会用 `resolve_window_handle_from_title()` 尝试解析新的 normal HWND 并更新 capture handle/state；`peer_video_sender` 在窗口恢复 normal 后直接切出 placeholder 并创建 WGC source，不再把 minimized 恢复挂到 soft refresh pending。
 - 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、`vds-media-agent-unit-tests`、media-agent smoke test 均通过，并已复制新 `runtime/media-agent/vds-media-agent.exe`。
+
+### ARCH-SPLIT-P1-037 Renderer/media-agent 架构拆分缺少可执行边界
+
+- 位置：`server/public/app.js`、`server/public/app-native-overrides.js`、`media-agent/src/agent_runtime.h`、`media-agent/src/agent_rpc_router.cpp`
+- 问题：renderer 两个大文件仍同时承担 UI、信令、native IPC、surface、诊断和重连状态机；media-agent 的 `AgentRuntimeState` / `PeerState` 仍是大共享状态容器，后续每次修媒体问题都容易跨 owner 写状态。
+- 影响：拆分计划如果只停留在文档，后续迁移仍缺少统一命名空间、状态订阅入口、session 生命周期和 registry helper，容易继续新增散落全局函数或直接写 runtime map。
+- 建议：先落 R0/M0 盘点和不改变行为的基础边界：renderer 新增 `window.VDS.state`；media-agent 新增 `SessionPhase`、`AgentContext`、peer/surface registry helper；再逐步迁移具体 owner。
+- 修改意见：按 Renderer 与 media-agent 架构拆分计划实施第一阶段。
+- 处理结果：已处理第一阶段。新增 `docs/RENDERER_SPLIT_MAP.md` 和 `docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`，明确 `app.js` 与 native override 的全局依赖、native hook、目标模块边界和 media-agent 当前 RPC/owner 映射；新增 `server/public/app-state.js`，通过 IIFE 暴露 `window.VDS.state` 的 `getSnapshot/patch/subscribe/nextGeneration/getGeneration/reset`，并在 `index.html` 中先于 `app.js` 加载；新增 `media-agent/src/session_lifecycle.h`、`agent_context.h`、`runtime_registry.h/cpp`，提供 session phase、AgentContext 和 peer/surface registry helper，`runtime_registry.cpp` 已加入 media-agent CMake 构建；`knip.json` 已加入 `server/public/app-state.js` entry。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`。`npm run verify:media-agent` 因当前 shell 未设置 `VDS_FFMPEG_SOURCE` 无法定位 FFmpeg SDK；已改用项目既有 fallback 命令 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback` 完成 Release 构建、单元测试和 smoke test。
+
+### ARCH-SPLIT-P1-038 Renderer room-client 状态边界和 media-agent controller 入口仍未落地
+
+- 位置：`server/public/app-state.js`、`server/public/room-client.js`、`server/public/app.js`、`server/public/app-native-overrides.js`、`media-agent/src/agent_rpc_router.cpp`
+- 问题：第一阶段只有状态脚手架和 ownership 文档时，后续模块仍没有稳定的 room-client 调用面；media-agent RPC 入口仍直接指向 peer/surface runtime helper，Peer/Surface owner 边界没有开始收口。
+- 影响：继续开发时容易绕过新边界，新增代码仍直接调用旧全局函数或直接写 runtime map，拆分计划难以逐步兑现。
+- 建议：在不改变行为的前提下，先让 `app.js` 把旧 session/room 状态镜像到 `VDS.state`，新增 `VDS.roomClient` legacy adapter；media-agent 新增 Peer/Surface controller 包装层，并把相关 RPC 入口切到 controller。
+- 修改意见：按建议继续实施 R2/M2/M3 的低风险前置切片。
+- 处理结果：已处理。`server/public/app-state.js` 增加 `upstreamPeerId` 和 `chainPosition` 字段；`app.js` 新增 `__vdsPatchAppState/__vdsSyncAppState`，在 WebSocket open/close、join request、stop share、viewer reset 等写点镜像状态；`app-native-overrides.js` 在 `room-created/room-joined/session-resumed/viewer-count/chain-reconnect/stop` 等 native authoritative 写点同步 renderer state。新增 `server/public/room-client.js`，以 `VDS.roomClient.installLegacyAdapter()` 暂时委托旧 WebSocket/房间函数，并在 `index.html` 中按 `app-state -> room-client -> app -> native override` 加载。media-agent 新增 `peer_session_controller.*` 和 `surface_session_controller.*`，已有 `host_session_controller.*` 增加 `HostSessionController` class 包装；`agent_rpc_router.cpp` 已把 host、peer、surface 相关 JSON-RPC 入口切到 controller 包装层；旧 helper 内部逻辑和 JSON-RPC wire shape 保持不变。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过。
+
+### ARCH-SPLIT-P1-039 Update UI 仍留在 app.js 且 media-agent helper 内部绕过 registry
+
+- 位置：`server/public/app.js`、`server/public/update-ui.js`、`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/surface_control_runtime.cpp`
+- 问题：上一阶段虽然有 `room-client` 和 controller 包装，但更新检查/下载/安装弹窗仍完整留在 `app.js`；media-agent 的旧 peer/surface helper 内部仍直接访问 `state.peers` 和 `state.attached_surfaces`，controller 只是外层入口。
+- 影响：renderer 大文件职责仍包含与媒体无关的 update UI；media-agent 后续如果继续在 helper 内直接读写 map，Peer/Surface controller ownership 会变成名义边界。
+- 建议：抽出 `update-ui.js` 持有 update 状态和 Electron updater listener；`app.js` 只保留薄 wrapper。media-agent 旧 helper 内部使用 `runtime_registry` 的 `find/ensure/erase` helper，减少直接 map 写入口。
+- 修改意见：按建议继续实施 R1/R2 与 M1/M2/M3。
+- 处理结果：已处理。新增 `server/public/update-ui.js`，通过 `VDS.updateUi.createController()` 接收 `elements/debugLog/electronAPI/serverBaseUrl` 依赖，持有 `currentVersion`、update listener、下载状态、安装定时器和日志尾部；`app.js` 删除旧 update 实现块，仅保留 `registerUpdateStatusListener/registerUpdateLogListener/initializeStartupTasks/getUpdateManifestUrl/hideUpdateModal/renderUpdateModal/applyUpdateStatus/requestQuitAndInstall/initVersion/checkForUpdates` 薄 wrapper。`index.html` 和 `knip.json` 已加入 `update-ui.js`。media-agent 中 `peer_control_runtime.cpp`、`peer_media_binding_runtime.cpp`、`surface_control_runtime.cpp` 已改为通过 `runtime_registry` 查找/创建/删除 peer 和 surface；`verify-media-agent` 已覆盖该迁移。
+- 验证结果：已执行 `node --check server/public/update-ui.js`、`node --check server/public/app.js`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`。
+
+### ARCH-SPLIT-P1-040 Quality settings 状态仍耦合在 app.js 顶层初始化
+
+- 位置：`server/public/app.js`、`server/public/quality-settings.js`、`server/public/index.html`、`knip.json`
+- 问题：质量设置的默认参数、OBS ingest 端口持久化、编码选项常量和能力探测共享状态仍定义在 `app.js` 顶层，导致后续迁出质量弹窗/配置控制器时必须继续依赖 `app.js` 初始化顺序，也让 native override 对 `qualitySettings` 的兼容读取缺少明确 owner。
+- 影响：Renderer R1 拆分如果不先迁出质量配置 owner，后续移动质量弹窗 UI 会混入启动共享 pending、源选择和 OBS 建房逻辑，风险过高。
+- 建议：新增 `quality-settings.js`，先承接默认值、OBS ingest prefs、质量选项常量和旧全局兼容名；`app.js` 暂保留质量弹窗渲染/确认流程，下一步再改为 controller wrapper。
+- 修改意见：按建议继续实施 Renderer R1。
+- 处理结果：已处理本阶段。新增 `server/public/quality-settings.js`，通过 IIFE 暴露 `window.VDS.qualitySettings` 并持有 `settings`、OBS ingest 端口 helper 和质量选项常量；`app.js` 删除对应顶层初始化和 OBS prefs helper 重复定义，改为从 `VDS.qualitySettings` 建立旧全局兼容 binding，仍保留 `renderQualitySettingsUi/openQualityModal/confirmQualitySelection` 等旧函数以保证本阶段行为不变；`index.html` 在 `app.js` 前加载 `quality-settings.js`，`knip.json` 已加入 entry。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-041 Peer/Surface session 缺少可观察生命周期字段
+
+- 位置：`media-agent/src/agent_runtime.h`、`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/surface_control_runtime.cpp`、`media-agent/src/agent_status_json.cpp`、`media-agent/src/surface_attachment_runtime.cpp`
+- 问题：虽然已有 `session_lifecycle.h` 和 Peer/Surface controller 包装入口，但 `PeerState` / `SurfaceAttachmentState` 仍只靠 `reason` 字符串表达状态，controller 拆分时无法稳定区分 created/configured/starting/running/draining/stopped/failed 等生命周期阶段。
+- 影响：后续把 `peer_control_runtime.*`、`surface_control_runtime.*` 降级为 controller helper 时，调试和迁移验证仍需要猜测运行阶段，容易把 failed/stopped/running 混在同一类 reason 里。
+- 建议：先给 Peer/Surface state 接入统一 `SessionPhase` 和 `phaseReason`，并在 create/attach/update/detach/close 关键路径维护；JSON 输出增加观测字段但不改变 RPC 请求结构。
+- 修改意见：按建议继续实施 M2/M3 前置切片。
+- 处理结果：已处理。`PeerState` 和 `SurfaceAttachmentState` 新增 `SessionPhase phase` 与 `phase_reason`；`createPeer` 在 request configured、transport starting/running/failed 阶段更新 peer phase，`closePeer` 在 draining/stopped 阶段更新；`attachSurface`、`updateSurface`、`detachSurface` 在 configured/starting/running/draining/stopped/failed 阶段维护 surface phase。`build_peer_state_json()`、`build_peer_result_json()`、`getStats().peers[]` 和 `surface_attachment_json()` 增加 `sessionPhase` / `phaseReason`，便于后续 controller ownership 迁移时观察生命周期。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`，编译通过；已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、`vds-media-agent-unit-tests`、media-agent smoke test 均通过并复制 runtime binary。
+
+### ARCH-SPLIT-P1-042 Quality settings 仍由 app.js 持有配置计算和能力探测
+
+- 位置：`server/public/app.js`、`server/public/quality-settings.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`quality-settings.js` 初始只持有默认值和常量，`app.js` 仍保留分辨率/码率归一化、OBS backend 判断、编码器能力筛选、H.265 可用性、硬件编码器提示文案和 capabilities 缓存。这会让质量设置 owner 仍然分裂，后续迁出弹窗渲染时必须继续跨文件读写同一状态。
+- 影响：Renderer R1 如果直接迁 DOM 渲染，会把能力探测、编码器判断和 UI 更新混在一个大搬迁里；更容易破坏 H.265 禁用、手动硬件编码器、OBS backend 可用性等现有行为。
+- 建议：先把配置计算、编码器能力判断和 capabilities 缓存迁到 `VDS.qualitySettings`，`app.js` 只保留旧函数名 wrapper 和质量弹窗流程；OBS preview 状态与 DOM 绑定留到下一步 controller 迁移。
+- 修改意见：按建议继续实施 Renderer R1。
+- 处理结果：已处理。`quality-settings.js` 新增分辨率/码率/host backend/OBS port helper、编码器能力筛选、H.265/H.264 encoder 判断、硬件编码器选项、提示文案 builder、segment markup builder 和 `refreshCapabilities()`；`app.js` 删除本地 `qualityCapabilities`/`qualityCapabilitiesPromise`/`qualityCapabilitiesChecked` 缓存，并将对应旧函数名改为调用 `qualitySettingsModule` 的薄 wrapper。质量弹窗 DOM 渲染、OBS preview prepare 状态和确认启动共享流程仍暂留 `app.js`，作为下一步 controller 迁移边界。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过。
+
+### ARCH-SPLIT-P1-083 viewer relay 发布路径直接调用 legacy relay_dispatch
+
+- 位置：`media-agent/src/viewer_video_pipeline.cpp`、`media-agent/src/viewer_audio_playback.cpp`、`media-agent/src/relay_dispatch.*`、`media-agent/src/encoded_frame_bus.*`、`media-agent/src/relay_hub.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M5 之前，viewer 收到上游音视频后直接调用 `fanout_relay_video_units()` / `fanout_relay_audio_frame()`，viewer decode/playback pipeline 知道 legacy relay dispatch API，EncodedFrameBus/RelayHub ownership 边界无法落地。
+- 影响：后续迁 subscriber、bootstrap、backpressure 或 QoS 时需要同时改 viewer pipeline、OBS ingest 和 relay dispatch，容易把本地播放、转发、bootstrap 分发逻辑继续绑在一起。
+- 建议：先新增 `EncodedFrameBus` 与 `RelayHub` 兼容边界，让新 publish 路径统一走 Hub；Hub 内部暂时委托 legacy `relay_dispatch`，保持现有行为和 wire shape。后续再把 OBS publish、subscriber registry 和 bootstrap ownership 迁入 Hub。
+- 修改意见：按建议实施 M5 小切片，不改变 relay 分发行为，不改变 encoded data channel payload，不删除旧 `relay_dispatch` API。
+- 处理结果：已处理本阶段。新增 `encoded_frame_bus.h/cpp` 和 `relay_hub.h/cpp`，并加入 `media-agent/CMakeLists.txt`；`RelayHub` 暴露 `publish_video_units()` / `publish_audio_frame()`，内部通过 `EncodedFrameBus` 委托到现有 `fanout_relay_*`。`viewer_video_pipeline.cpp`、`viewer_audio_playback.cpp` 和 `obs_ingest_runtime.cpp` 已改为调用 `relay_hub().publish_*`；viewer pipeline 与 OBS ingest 均不再直接 include `relay_dispatch.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已补充 M5 当前边界。
+- 验证结果：已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`；均通过。`verify-media-agent` 仅输出 FFmpeg 头文件和既有 `av_init_packet` warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-085 viewer audio RPC 与播放生命周期直接调用 playback helper
+
+- 位置：`media-agent/src/agent_rpc_router.cpp`、`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/viewer_audio_playback.*`、`media-agent/src/viewer_audio_session.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M6 之前，`setViewerVolume` / `getViewerVolume` / `setViewerAudioDelay` RPC、remote audio frame 消费和 viewer audio stop 路径都直接调用 `viewer_audio_playback` helper，viewer audio session ownership 没有独立入口。
+- 影响：后续迁播放队列、delay/volume 状态、WASAPI worker 或 relay audio bus 时，需要同时改 RPC router、peer callbacks 和 agent shutdown，容易把业务生命周期与底层 playback runtime 继续绑定。
+- 建议：新增 `ViewerAudioSession` facade，先包住现有 `viewer_audio_playback` helper；RPC、peer audio callback 和 shutdown 只通过 session facade 进入。后续再把队列/worker 真正下沉到 session/registry。
+- 修改意见：按建议实施 M6 小切片，不改变 viewer audio queue、延迟、音量、decode 或 relay audio 行为。
+- 处理结果：已处理并继续收窄。新增 `viewer_audio_session.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`agent_rpc_router.cpp` 的 viewer audio RPC 已改为调用 `ViewerAudioSession`；`peer_control_runtime.cpp` 的 remote audio frame 和 encoded datachannel audio frame 消费已改为 `ViewerAudioSession::consume_remote_peer_frame()`；close viewer-upstream peer 和 agent shutdown 停止 viewer audio 已改为 `ViewerAudioSession::stop()`。随后已把音量/延迟 request 解析、software volume fallback、WASAPI render session volume、relay audio publish、codec 归一化、PCM decode、startup random access gate 和 dispatched/drop 统计写入从 `viewer_audio_playback.cpp` 迁入 `viewer_audio_session.cpp`。`viewer_audio_playback.h/cpp` 公开面已收窄为 `stop_viewer_audio_playback_runtime()` 和 `queue_viewer_audio_pcm_block()`，只保留 PCM queue / WASAPI worker / queue buffering 底层 primitive。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已记录 M6 当前边界。
+- 验证结果：已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`；均通过。`verify-media-agent` 仅输出 FFmpeg 头文件 warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-087 native override 仍直接自执行安装，native-entry 缺失
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-entry.js`、`server/public/index.html`、`knip.json`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R7 目标要求 `native/native-entry.js` 作为 install guard 和 legacy bridge，但当前没有该文件，`app-native-overrides.js` 仍是自执行 IIFE，入口装配和业务逻辑完全耦合。
+- 影响：后续把 `app-native-overrides.js` 瘦成薄入口时缺少稳定装配点；也无法在不触碰 5000 行旧逻辑的情况下观察 native override installer 状态。
+- 建议：新增 `native/native-entry.js`，提供 `VDS.nativeEntry.installLegacyOverrides()` 和 `getState()`；先让旧 `app-native-overrides.js` 改为 legacy installer 函数并由 native-entry 调用，保持行为不变。
+- 修改意见：按建议实施 R7 起步小切片，不迁移 native override 业务逻辑，不改变 installer guard、不改变全局覆盖行为和加载顺序语义。
+- 处理结果：已处理。新增 `server/public/native/native-entry.js` 并加入 `index.html` 与 `knip.json`；`app-native-overrides.js` 已从自执行 IIFE 改为 `installNativeAuthorityOverrides` legacy installer 函数，并优先由 `VDS.nativeEntry.installLegacyOverrides()` 调用，缺少 native-entry 时保留直接调用 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新脚本顺序和 R7 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-entry.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`；均通过。`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-086 host audio transport registry 仍由业务文件直接调用 media_audio helper
+
+- 位置：`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/media_audio.*`、`media-agent/src/host_audio_dispatch_session.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M6 拆 `ViewerAudioSession` 后，host audio 下游 transport session 注册、注销和 reset 仍由 peer media binding / agent lifecycle 直接调用 `media_audio` helper，`HostAudioDispatchSession` ownership 入口缺失。
+- 影响：后续迁 host audio capture queue、Opus encoder 和 dispatch worker 时，还要同时改 peer media binding、agent shutdown 和 media_audio 内部调用点；host audio lifecycle 仍不是清晰 session 边界。
+- 建议：新增 `HostAudioDispatchSession` facade，并继续把 host audio capture active flag、capture packet queue、Opus encoder、dispatch worker 和 transport registry 从 `media_audio.*` / `agent_runtime.h` 收进 session 私有实现；业务文件只通过 session API 进入。
+- 修改意见：按建议实施 M6 小切片，不改变 host audio sender 配置、不改变 Opus 编码参数、不改变 dispatch worker 队列上限、不改变 transport 发送或 shutdown 顺序。
+- 处理结果：已处理并继续收窄。新增 `host_audio_dispatch_session.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`peer_media_binding_runtime.cpp` 中 host audio sender register/unregister 路径已改为 `HostAudioDispatchSession`；`agent_lifecycle.cpp` 的 agent shutdown host audio transport reset 已改为 `HostAudioDispatchSession::reset_transport_sessions()`。随后已把 host audio capture active flag、capture packet queue、Opus encoder、dispatch worker、transport session registry、PCM->Opus input conversion 和 capture packet dispatch 从 `media_audio.cpp` 迁入 `host_audio_dispatch_session.cpp` 私有实现；`media_audio.cpp` 的 WASAPI PCM callback、start/stop audio session 只通过 `HostAudioDispatchSession::dispatch_capture_packet()`、`set_capture_active()` 和 `reset_transport_sessions()` 进入。`media_audio.h` 已删除旧 `register_host_audio_transport_session()` / `unregister_host_audio_transport_session()` / `reset_host_audio_transport_sessions()` 声明，`agent_runtime.h` 已删除 `HostAudioDispatchState`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已记录 M6 当前边界。
+- 验证结果：已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`；均通过。`verify-media-agent` 仅输出 FFmpeg 头文件 warning。
+
+### ARCH-SPLIT-P1-088 viewer playback queue/worker 仍挂在 AgentRuntimeState 上
+
+- 位置：`media-agent/src/agent_runtime.h`、`media-agent/src/viewer_audio_playback.*`、`media-agent/src/viewer_audio_session.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`ViewerAudioSession` facade 接管 RPC 和 remote audio consume 后，PCM playback queue、WASAPI playback worker、software volume、delay 和 buffering 状态仍作为 `AgentRuntimeState::viewer_audio_playback` 字段暴露在全局 runtime 上。
+- 影响：M6 的 viewer audio owner 仍不完整；后续瘦身 `AgentRuntimeState` 时还会被 playback worker/queue 的锁、线程、队列细节牵制，其他业务文件也可能重新直接访问该字段。
+- 建议：把 viewer playback runtime 下沉为 `viewer_audio_playback.cpp` 私有状态，对外只暴露 `ViewerAudioSession` 需要的 facade：活跃状态、软件音量读写、延迟设置、停止和 PCM 入队。
+- 修改意见：按建议实施 M6 小切片，不改变 viewer 本地播放队列策略、不改变 startup buffer、不改变 delay 上限、不改变软件音量 fallback 或 WASAPI render session volume 逻辑。
+- 处理结果：已处理。`viewer_audio_playback.h/cpp` 已把 playback runtime 改为 cpp 私有静态状态，并暴露 `viewer_audio_playback_is_active()`、`set_viewer_audio_software_volume()`、`get_viewer_audio_software_volume()`、`set_viewer_audio_delay_ms()`、`stop_viewer_audio_playback_runtime()`、`queue_viewer_audio_pcm_block()` facade；`ViewerAudioSession` 已改为只调用这些 facade。`agent_runtime.h` 已删除 `ViewerAudioPlaybackRuntime`、`viewer_audio_playback` 字段和 `kViewerAudioRuntimeDefaultChannelCount`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M6 当前边界。
+- 验证结果：已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`；均通过。`verify-media-agent` 仅输出 FFmpeg 头文件 warning。
+
+### ARCH-SPLIT-P1-089 relay dispatch worker/cache 状态仍暴露在 agent_runtime.h
+
+- 位置：`media-agent/src/agent_runtime.h`、`media-agent/src/relay_dispatch.*`、`media-agent/src/relay_hub.*`、`media-agent/src/peer_video_sender.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M5 引入 `RelayHub` / `EncodedFrameBus` 后，`RelayDispatchState`、bootstrap cache、pending video dispatch queue、dispatch target 等 relay backend 细节仍定义在 `agent_runtime.h`，让全局 runtime 头文件继续暴露 relay worker 内部结构。
+- 影响：M7 瘦身 `AgentRuntimeState` 时，relay subscriber map、bootstrap GOP cache 和 video dispatch worker 会继续污染全局运行时边界；业务文件也可能误用 relay backend 结构，绕过 `RelayHub`。
+- 建议：把 `RelayDispatchState`、`RelayUpstreamVideoBootstrapState`、`QueuedRelayVideoDispatch`、`RelayDispatchTarget` 下沉到 `relay_dispatch.cpp` 私有实现；`RelaySubscriberState` 因 stats 查询需要公开 snapshot，移到 `relay_dispatch.h`。
+- 修改意见：按建议实施 M7 前置瘦身，不改变 relay subscriber 注册/注销、不改变 bootstrap 缓存、不改变 video dispatch worker/backpressure、不改变 `RelayHub` facade 行为。
+- 处理结果：已处理。`agent_runtime.h` 已删除 relay dispatch backend structs；`relay_dispatch.cpp` 私有持有 `RelayDispatchState`、`RelayUpstreamVideoBootstrapState`、`QueuedRelayVideoDispatch` 和 `RelayDispatchTarget`；`relay_dispatch.h` 公开 `RelaySubscriberState` snapshot 类型，`relay_hub.h` include 该公开 API 以保证调用方可查询 subscriber state。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 Relay/M5 当前边界。
+- 验证结果：已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`；均通过。`verify-media-agent` 仅输出 FFmpeg 头文件 warning 和既有 `av_init_packet` warning。
+
+### ARCH-SPLIT-P1-090 viewer media/upstream offer wait timer 仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/p2p-state-machine.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native/p2p-state-machine.js` 已承接 P2P UI label、peer meta UI state 和失败分类，但 viewer media wait timer、upstream offer wait timer 以及 upstream offer timeout 后的 reconnect-once 状态仍由 `app-native-overrides.js` 顶层变量持有。
+- 影响：P2P 状态机 owner 不完整；viewer 等待画面、等待上游 offer、超时触发 `viewer-reconnect-ready` 的逻辑仍散在大 legacy 文件里，后续拆 peer controller 时还要同时处理 timer id 和 reconnect sent 状态。
+- 建议：把 viewer media wait timer、viewer upstream offer wait timer 和 reconnect-sent peer id 迁入 `p2p-state-machine.js`，旧文件只注入状态快照、日志、信令发送和 UI 文案回调，并保留旧函数名 wrapper。
+- 修改意见：按建议实施 R3 小切片，不改变 timeout 时长，不改变 `viewer-reconnect-ready` payload，不改变 media-waiting UI 状态触发条件。
+- 处理结果：已处理。`p2p-state-machine.js` 新增 `clearViewerMediaWaitTimer()`、`clearViewerUpstreamOfferWaitTimer()`、`resetViewerUpstreamOfferReconnectPeer()`、`armViewerUpstreamOfferWaitTimer()`、`armViewerMediaWaitTimer()`，内部持有两个 timer id 和 reconnect-sent peer id；`app-native-overrides.js` 创建 controller 时注入 viewer wait snapshot、upstream offer wait snapshot、media wait UI callback 和 upstream offer timeout 信令 callback，旧 `clear/arm` 函数改为 controller wrapper，并移除了旧顶层 timer/reconnect 状态变量。`docs/RENDERER_SPLIT_MAP.md` 已更新 R3 当前边界。
+- 验证结果：已执行 `node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-084 subscriber lifecycle 仍由业务文件直接调用 relay_dispatch
+
+- 位置：`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/agent_status_json.cpp`、`media-agent/src/peer_video_sender.cpp`、`media-agent/src/obs_ingest_runtime.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/relay_hub.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：发布路径迁入 `RelayHub` 后，subscriber 注册/注销、bootstrap 清理、subscriber runtime 查询和 shutdown 仍在多个业务文件里直接调用 `relay_dispatch` API，RelayHub 还不是 relay lifecycle 的统一入口。
+- 影响：后续把 subscriber registry 和 bootstrap ownership 从 `relay_dispatch` 迁到 `RelayHub` 时，仍需要改 peer media binding、close peer、stats、sender refresh、OBS ingest 和 lifecycle 多处调用点，迁移面偏大。
+- 建议：在 `RelayHub` 上补齐 `register_subscriber()`、`unregister_subscriber()`、`clear_upstream_bootstrap_state()`、`query_subscriber_state()`、`subscriber_runtime_json()`、`shutdown_runtime()` facade，业务文件只依赖 Hub，旧 dispatch 继续作为兼容实现。
+- 修改意见：按建议实施 M5 小切片，不改变 subscriber 数据结构、不改变 stats JSON 字段、不改变 shutdown 顺序。
+- 处理结果：已处理。`RelayHub` 已补齐 subscriber lifecycle 和 shutdown facade；`peer_media_binding_runtime.cpp`、`peer_control_runtime.cpp`、`agent_status_json.cpp`、`peer_video_sender.cpp`、`obs_ingest_runtime.cpp`、`agent_lifecycle.cpp` 已改为通过 `relay_hub()` 调用，业务文件不再直接 include `relay_dispatch.h`。`relay_dispatch.*` 仍保留旧实现，供 `relay_hub.cpp` 内部委托。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M5 当前边界和后续规则。
+- 验证结果：已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`；均通过。`verify-media-agent` 仅输出 FFmpeg 头文件和既有 `av_init_packet` warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-074 remote description / ICE RPC wrapper 仍由 app-native-overrides.js 执行
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已迁出 peer handle、ready wait 和 media source attach 后，`setPeerRemoteDescription()` / `addPeerRemoteIceCandidate()` 仍在 `app-native-overrides.js` 直接调用 `mediaEngine.setRemoteDescription()` / `mediaEngine.addRemoteIceCandidate()`。
+- 影响：peer controller 仍不是 native peer RPC 的集中边界；后续迁移 handleOffer/handleAnswer/handleIceCandidate 时，会继续让旧大文件同时承担过滤、状态写回和底层 mediaEngine 调用。
+- 建议：把 remote description 和 remote ICE 的 mediaEngine RPC wrapper 迁入 `native-peer-controller.js`；`app-native-overrides.js` 保留候选过滤/去重、P2P UI 状态写回和本地 sessionDescription 字段更新。
+- 修改意见：按建议实施 R5 小切片，不改变 SDP/ICE payload、不改变 candidate 过滤与去重、不改变 `pc.remoteDescription` / `pc.signalingState` 写回。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `setRemoteDescription(peerId, handle, description, mediaManifest)` 和 `addRemoteIceCandidate(peerId, handle, candidate)`，统一复用 `ensurePeerReady()` 后调用 mediaEngine RPC 并保留原日志事件。`app-native-overrides.js` 的 `setPeerRemoteDescription()` / `addPeerRemoteIceCandidate()` 现在优先委托 controller，旧实现保留 fallback；candidate 过滤/去重、`setP2pStateForPeer(peerId, 'checking')`、remote candidate key 记录以及 `pc.remoteDescription/signalingState` 写回仍留在旧 wrapper。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-075 closePeer mediaEngine RPC 仍由 app-native-overrides.js 执行
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已迁出 peer handle registry 和信令 RPC wrapper 后，`closeNativePeerConnectionImpl()` 仍直接调用 `mediaEngine.detachPeerMediaSource()` / `mediaEngine.closePeer()` 并删除 native peer handle。
+- 影响：peer lifecycle 的底层 native RPC 仍散在旧大文件中；后续迁移 close/clear/recovery 时，旧文件会继续同时承担关闭策略、surface 清理、timer 清理和 native peer RPC。
+- 建议：把 close peer 的 mediaEngine RPC 和 handle registry 删除迁入 `native-peer-controller.js`；`app-native-overrides.js` 保留关闭时机、surface detach、meta/timer/backlog/diagnostic 外层清理。
+- 修改意见：按建议实施 R5 小切片，不改变关闭触发条件，不改变 detach surface 顺序，不改变关闭时吞掉 detach/close 错误的语义。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `closePeer(peerId, handle)`，内部标记 handle closed、尽力调用 `detachPeerMediaSource` 和 `closePeer`，最后删除 controller handle registry。`app-native-overrides.js` 的 `closeNativePeerConnectionImpl()` 现在在 detach native surface 后优先委托 controller，旧 mediaEngine 调用保留 fallback；peerConnections、peerConnectionMeta、pendingRemoteCandidates、signal backlog、failfast/reconnect timer、viewer media wait timer 和 diagnostic 刷新仍由旧 wrapper 清理。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-076 native peer signal state / media offer wait 仍由 app-native-overrides.js 执行
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：peer signal backlog 已迁入 `native-peer-controller.js` 后，收到 native signal 后写回 `handle.localDescription/signalingState` 的 `updateNativePeerSignalState()` 以及 `waitForNativeMediaOffer()` 仍留在旧大文件。
+- 影响：offer/answer 等待和 native peer handle 本地描述状态仍分裂；后续迁移 createOffer/handleOffer 时，旧文件会继续直接读写 native handle 内部字段。
+- 建议：把 native peer signal state update、media offer signal 判定和 media offer 等待迁入 `native-peer-controller.js`；`app-native-overrides.js` 保留同名 wrapper/fallback 和 sendMessage 编排。
+- 修改意见：按建议实施 R5 小切片，不改变 signal backlog 超时、不改变 m=video / encoded DataChannel offer 判定、不改变 localDescription/signalingState 写回字段。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `normalizeSessionDescription()`、`extractSignalSdpText()`、`isMediaOfferSignal()`、`updateSignalState()` 和 `waitForMediaOffer()`，复用 controller 内部 `waitForSignal()`。`app-native-overrides.js` 的 `updateNativePeerSignalState()`、`isMediaOfferSignal()` 和 `waitForNativeMediaOffer()` 现在优先委托 controller，旧逻辑保留 fallback；`createAndSendPeerOffer()` / `createAndSendPeerAnswer()` 仍负责 attach、P2P UI 状态和信令发送。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-077 createAndSendPeerOffer/Answer 的 native signal prepare 仍在 app-native-overrides.js
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：signal state 和 media offer wait 迁入 controller 后，`createAndSendPeerOffer()` / `createAndSendPeerAnswer()` 仍直接负责 drop stale offer、ensure ready、attach media source、等待 native offer/answer signal 并写回 localDescription。
+- 影响：offer/answer 的 native peer 准备阶段仍不属于 peer controller；后续迁移 createOffer/handleOffer 时，旧文件仍要理解 native handle ready、source attach 和 signal wait 的内部顺序。
+- 建议：在 `native-peer-controller.js` 增加 offer/answer signal prepare 方法，集中处理 ready、attach、等待 native signal 和 localDescription 写回；`app-native-overrides.js` 保留 P2P UI 状态和 sendMessage payload。
+- 修改意见：按建议实施 R5 小切片，不改变 offer stale queue 清理时机、不改变 attach 在等待 offer 前执行、不改变 sendMessage payload 和 P2P 状态切换。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `prepareOfferSignal(peerId, handle, options)` 和 `prepareAnswerSignal(peerId, handle, timeoutMs)`，内部复用 `dropQueuedSignals()`、`ensurePeerReady()`、`attachPeerMediaSources()`、`waitForMediaOffer()` / `waitForSignal()` 和 `updateSignalState()`。`app-native-overrides.js` 的 `createAndSendPeerOffer()` / `createAndSendPeerAnswer()` 现在优先委托 controller 准备 signal，旧实现保留 fallback；reconnect/gathering 状态、appendPeerAttempt 和 sendMessage 仍留在旧 wrapper。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-078 host/audio session RPC wrapper 仍由 app-native-overrides.js 执行
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`server/public/index.html`、`knip.json`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：进入 R6 前，native host/audio session 的 `startHostSession/stopHostSession/startAudioSession/stopAudioSession` mediaEngine RPC 仍散落在 `app-native-overrides.js` 的开播、失败清理、音频启动和停止共享路径中。
+- 影响：host session controller 没有实际入口；后续迁移 manifest owner、stop share cleanup、OBS lifecycle 时，旧文件仍直接操作底层 mediaEngine session 命令。
+- 建议：新增 `native/native-session-controller.js`，先承接 host/audio session start/stop RPC wrapper 和 stop host+audio 组合命令；`app-native-overrides.js` 保留 UI、manifest、房间生命周期和 fallback wrapper。
+- 修改意见：按建议实施 R6 起步小切片，不改变开播参数、不改变 stop 时吞掉 stop 错误的语义、不改变 room create/leave 和 manifest 流程。
+- 处理结果：已处理。新增 `server/public/native/native-session-controller.js`，通过 `VDS.nativeSession.createController()` 暴露 `startHostSession()`、`stopHostSession()`、`startAudioSession()`、`stopAudioSession()` 和 `stopHostAndAudioSessions()`。`index.html` 和 `knip.json` 已加入新模块；`app-native-overrides.js` 初始化 `nativeSessionController`，新增 `startNativeHostSession/stopNativeHostSession/startNativeAudioSession/stopNativeAudioSession/stopNativeHostAndAudioSessions` wrapper，并将 native/OBS host start、superseded cleanup、capture/pipeline validation failure cleanup、failed start cleanup、audio start 和 stop share session stop 改为优先走 session controller。UI、manifest、room create/leave、generation 防 stale 和 stats polling 仍留在旧文件。`docs/RENDERER_SPLIT_MAP.md` 已更新 R6 起步边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-079 host media manifest 构建仍由 app-native-overrides.js 执行
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R6 起步后，host/audio session RPC 已迁入 session controller，但 `ensureHostMediaSessionId()`、`buildHostMediaManifest()`、`buildHostMediaManifestFromStats()`、`buildHostMediaManifestFromObsIngest()` 仍由 `app-native-overrides.js` 直接持有。
+- 影响：manifest owner 仍不在 session controller；后续迁移 host start/stop lifecycle 时，mediaSessionId 生成、manifest shape、OBS stats manifest 和 native capture manifest 仍会绕回大文件。
+- 建议：把 mediaSessionId 生成/重置和 host media manifest 构建迁入 `native-session-controller.js`，通过注入 quality settings、当前 host backend、effective codec 和 mediaSessionId getter/setter 保持 legacy 状态镜像。
+- 修改意见：按建议实施 R6 小切片，不改变 manifest JSON shape、不改变 `rememberMediaManifest()` 状态同步、不改变 room create/OBS manifest 更新发送路径。
+- 处理结果：已处理。`native-session-controller.js` 新增 `ensureMediaSessionId()`、`resetMediaSessionId()`、`buildHostMediaManifest()`、`buildHostMediaManifestFromStats()`、`buildHostMediaManifestFromObsIngest()` 以及对应尺寸/codec 归一化 helper；`app-native-overrides.js` 初始化 controller 时注入 `getQualitySettings/getCurrentHostBackend/getEffectiveVideoCodec/getMediaSessionId/setMediaSessionId`。旧文件的 `ensureHostMediaSessionId()`、manifest builder 和 reset 路径现在优先委托 session controller，原实现保留 fallback；`rememberMediaManifest()` 继续负责 `currentMediaManifest` 和 `VDS.state` 同步。`docs/RENDERER_SPLIT_MAP.md` 已更新 R6 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、native-session manifest shape 检查脚本、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-080 host start generation / in-flight 仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R6 已迁入 session RPC 和 manifest builder 后，`nativeHostStartGeneration` / `nativeHostStartInFlight` 的递增、取消、完成和 stale 判断仍直接写在 `app-native-overrides.js` 的 native/OBS start 与 stop 入口里。
+- 影响：host session lifecycle 的并发保护仍不属于 session controller；后续迁移 start/stop 主流程时，防 stale 逻辑会继续和 UI、room create、preview attach 混在一起。
+- 建议：把 host start generation / in-flight 控制迁入 `native-session-controller.js`，通过注入 getter/setter 镜像旧变量，保持现有 media-state gate 不变。
+- 修改意见：按建议实施 R6 小切片，不改变 startGeneration 数值语义、不改变 stop 使 start 失效的行为、不改变 start finally 释放 in-flight 的行为。
+- 处理结果：已处理。`native-session-controller.js` 新增 `beginHostStart()`、`finishHostStart()`、`cancelHostStart()` 和 `isHostStartCurrent()`，通过注入 `getHostStartGeneration/setHostStartGeneration/setHostStartInFlight` 同步 legacy 变量。`app-native-overrides.js` 新增 `beginNativeHostStart/finishNativeHostStart/cancelNativeHostStart/isNativeHostStartCurrent` fallback wrapper，native/OBS start 入口改为由 controller 分配 generation，stale 判断改为 `isNativeHostStartCurrent()`，stop 入口改为 `cancelNativeHostStart()`。`docs/RENDERER_SPLIT_MAP.md` 已更新 R6 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、native-session manifest/generation 检查脚本、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-081 stop share 资源清理前半段仍由 app-native-overrides.js 编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R6 已迁入 session RPC、manifest 和 generation 后，`stopScreenShare()` 仍直接编排 stop host/viewer stats、detach host preview、close peers、stop host/audio sessions，并记录 stop 过程日志。
+- 影响：stop share 的资源清理顺序仍不属于 session controller；后续迁移 stop 主流程时，旧文件仍要同时持有资源清理、房间 leave 和 UI reset。
+- 建议：把 stop share 的资源清理前半段迁入 `native-session-controller.js`，通过注入 callback 保持旧顺序和日志；room leave、manifest reset、UI reset 暂留 `app-native-overrides.js`。
+- 修改意见：按建议实施 R6 小切片，不改变停止顺序、不改变 peer close 使用 `clearRetryState: true`、不改变 stop session 错误吞掉语义和日志事件。
+- 处理结果：已处理。`native-session-controller.js` 新增 `cleanupStopResources()`，按旧顺序执行 stop host stats、stop viewer stats、detach host preview、close all native peers、stop host/audio sessions，并保留 `stopScreenShare:preview-detached`、`stopScreenShare:peers-closed`、`stopScreenShare:peer-close-failures`、`stopScreenShare:sessions-stopped` 日志。`app-native-overrides.js` 初始化 controller 时注入 `stopHostStatsPolling/stopViewerStatsPolling/detachHostPreviewSurface/getPeerIds/closePeer/logNativeStep`，新增 `cleanupNativeStopResources()` fallback wrapper，`stopScreenShare()` 现在优先委托 session controller 清理资源；room leave、state reset、manifest reset 和 UI reset 仍留在旧文件。`docs/RENDERER_SPLIT_MAP.md` 已更新 R6 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、native-session cleanup 检查脚本、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-082 stop share 后半段状态/UI reset 仍由 app-native-overrides.js 编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：stop share 资源清理前半段迁入 session controller 后，`stopScreenShare()` 仍直接编排 host session stopped 标记、leave-room 发送、room state reset、mediaSessionId reset、playback state reset 和 UI reset。
+- 影响：session controller 仍不是 stop share 的统一清理入口；后续迁移完整 stop lifecycle 时，资源清理与状态/UI reset 会继续分裂。
+- 建议：把 stop 后半段的顺序编排迁入 `native-session-controller.js`，具体 DOM 写入、sendMessage 和 legacy 状态写入通过 callback 注入，保持旧字段和 UI 文案。
+- 修改意见：按建议实施 R6 小切片，不改变 leave-room payload、不改变 `stop-share-reset` state patch、不改变 UI 文案和 reset 顺序。
+- 处理结果：已处理。`native-session-controller.js` 新增 `finalizeStopState()`，按旧顺序执行 mark host stopped、可选 leave-room、room state reset、mediaSessionId reset、playback state reset 和 UI reset callback。`app-native-overrides.js` 初始化 controller 时注入 `markHostSessionStopped/getRoomSnapshot/sendLeaveRoom/resetRoomState/resetPlaybackState/resetStopUiState`，新增 `finalizeNativeStopState()` fallback wrapper，并将 `stopScreenShare()` 后半段改为优先委托 session controller；具体全局变量写入、DOM 写入和 sendMessage payload 构造仍由旧文件 callback 执行。`docs/RENDERER_SPLIT_MAP.md` 已更新 R6 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、native-session finalize 检查脚本、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-055 native 日志诊断 helper 仍完全内嵌在 app-native-overrides.js
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`server/public/index.html`、`scripts/check-logging-policy.ps1`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`app-native-overrides.js` 仍直接持有 native debug gate、日志节流、payload 摘要、日志分类和 recoverable warning helper，导致后续拆 native peer/session/surface controller 时都要继续依赖大文件内部函数。
+- 影响：诊断逻辑无法作为独立依赖注入给 native controllers；日志策略也只能按 `app-native-overrides.js` 白名单维护，R3 拆分没有实际落点。
+- 建议：先抽出 `native/native-diagnostics.js`，使用 IIFE 暴露 `VDS.nativeDiagnostics.create()`；`app-native-overrides.js` 保留同名 wrapper，优先委托 controller，旧实现作为 fallback，避免一次性搬动 P2P 诊断报告和 peer 时序。
+- 修改意见：按建议实施 Renderer R3 起步切片，不改变日志开关语义、不改变诊断报告内容、不改变 native event 处理。
+- 处理结果：已处理。新增 `server/public/native/native-diagnostics.js`，承接 `isDebugModeEnabled`、`shouldShowDebugLogsFor`、`shouldEmitNativeDebugLog`、`appendSuppressedDebugCount`、native scope/event 分类、`summarizeNativeLogValue`、`logNativeDebug`、`logNativeStep`、`logNativeStatsLine`、`logNativeWarningLine` 和 recoverable native warning throttle。`index.html` 已在 `app-native-overrides.js` 前加载该模块，`knip.json` 已加入 entry，`scripts/check-logging-policy.ps1` 已允许新模块中的受控 logging wrapper。`app-native-overrides.js` 同名函数优先委托 `nativeDiagnostics`，旧函数体保留 fallback。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-056 P2P UI 状态写入和失败分类仍完全内嵌在 app-native-overrides.js
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/p2p-state-machine.js`、`server/public/index.html`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：native override 中 P2P UI label、状态 DOM 写入、peer meta 的 `p2pUiState` 写入和失败原因分类仍内嵌在大文件里。虽然 viewer media wait/upstream offer timer 还不能安全移动，但纯 UI 状态写入已经可以先形成独立边界。
+- 影响：后续拆 peer controller 时仍要从大文件取 P2P 状态 helper；诊断和 UI 状态的 owner 边界不清，会继续把连接时序、DOM 写入和失败文案混在一起。
+- 建议：新增 `native/p2p-state-machine.js`，先承接 label、`setStatusElementState()`、`setP2pStateForPeer()` 和 `classifyFailure()`；timer/reconnect 发送保持在旧文件，等 native-peer-controller 拆分时再迁。
+- 修改意见：按建议实施 Renderer R3 小切片，不改变 viewer media wait/upstream offer timeout、不改变重连信令发送。
+- 处理结果：已处理。新增 `server/public/native/p2p-state-machine.js`，通过 `VDS.p2pStateMachine.create()` 提供 P2P label、状态 DOM 写入、peer meta `p2pUiState` 写入和失败原因分类。`index.html` 已在 `app-native-overrides.js` 前加载该模块，`knip.json` 已加入 entry；`app-native-overrides.js` 中 `setP2pStatusElementState()`、`setP2pStateForPeer()`、`classifyP2pFailure()` 现在优先委托 controller，旧实现保留 fallback。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-057 surface layout 计算仍完全内嵌在 app-native-overrides.js
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`server/public/index.html`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：native surface 的 element 描述、layout 构建和 layout key 计算仍在 `app-native-overrides.js` 内部，surface attach/update/detach 后续拆分缺少可复用的 controller 边界。
+- 影响：窗口跟随、全屏 underbar 保留空间、嵌入/非嵌入坐标和 sync key 逻辑继续和 peer/session 大状态混在一起；后续迁 surface controller 时需要同时搬 attach/update 循环，风险更高。
+- 建议：先新增 `native/native-surface-controller.js`，只承接 `describeSurfaceElement()`、`buildSurfaceLayout()` 和 `getSurfaceLayoutKey()`；attach/detach/update/sync loop 暂留旧文件，避免改变 surface 生命周期。
+- 修改意见：按建议实施 Renderer R4 起步切片，不改变 native surface attach/update RPC payload 结构，不改变窗口跟随调度。
+- 处理结果：已处理。新增 `server/public/native/native-surface-controller.js`，通过 `VDS.nativeSurface.createController()` 接收 `remoteVideoContainer`、fullscreen underbar、当前窗口 bounds、modal 可见性、surface embedding 开关和 diagnostics，集中实现 surface element 描述、layout 构建和 layout key 计算。`index.html` 已在 `app-native-overrides.js` 前加载该模块，`knip.json` 已加入 entry；`app-native-overrides.js` 中同名函数优先委托 controller，旧实现保留 fallback。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-073 native peer media source attach 仍由 app-native-overrides.js 执行
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：peer ready/stale 等待迁入 controller 后，`attachNativePeerMediaSources()` 仍在 `app-native-overrides.js` 区分 relay-viewer/host-downstream、检查 host session running，并调用 `mediaEngine.attachPeerMediaSource()`。
+- 影响：createPeer lifecycle 中 ready 后媒体源绑定仍不属于 peer controller；relay downstream 和 host downstream 的 source 选择逻辑仍散落在大文件。
+- 建议：把 peer media source attach 迁入 `native-peer-controller.js`，通过注入 `getUpstreamPeerId/isHost/isNativeHostSessionRunning` 保持旧状态读取；旧函数保留 wrapper/fallback。
+- 修改意见：按建议实施 R5 小切片，不改变 relay source 选择、不改变 host session running error、不改变 attach payload。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `attachPeerMediaSources(peerId, handle)`，复用 `ensurePeerReady()`，对 `relay-viewer` 使用 `peer-video:${relaySourcePeerId}`，对 host downstream 检查 host session running 后使用 `host-session-video`。`app-native-overrides.js` 初始化 peer controller 时注入 `getUpstreamPeerId/isHost/isNativeHostSessionRunning`，`attachNativePeerMediaSources()` 现在优先委托 controller，旧实现保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-072 native peer ready/stale 等待仍由 app-native-overrides.js 执行
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：peer handle 构造迁入 controller 后，`ensureNativePeerConnectionReady()` 仍在 `app-native-overrides.js` 检查当前 handle、等待 `__readyPromise` 并记录 ready 日志。
+- 影响：createPeer lifecycle 的 ready/stale 边界仍不属于 peer controller；后续迁 attach media source 或 offer/answer 时还需要绕回大文件判断 stale。
+- 建议：把 peer ready/stale 等待迁入 `native-peer-controller.js`，通过注入 `logNativeStep` 保持日志语义；旧函数保留 wrapper/fallback。
+- 修改意见：按建议实施 R5 小切片，不改变 stale error 文本、不改变 `createPeer:awaitReady` / `createPeer:ready` 日志 payload、不改变 ready promise 等待顺序。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `ensurePeerReady(peerId, handle)`，内部验证 native handle、检查 registry 当前值、记录 await/ready 日志并等待 `handle.__readyPromise`。`app-native-overrides.js` 初始化 peer controller 时注入 `logNativeStep`，`ensureNativePeerConnectionReady()` 现在优先委托 controller，旧实现保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-071 native peer handle 构造和 attempt 序列仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：peer handle registry 和 signal queue 迁入 controller 后，`createNativePeerConnectionImpl()` 仍直接递增 `nativePeerAttemptSeq`、计算 role、组装 handle 字段并调用 `mediaEngine.createPeer()`。
+- 影响：peer lifecycle 的 create 阶段仍由大 override 文件持有，后续迁 createPeer/closePeer 时 attempt id 和 handle 字段 owner 不清晰。
+- 建议：把 native peer handle 构造和 attempt 序列迁入 `native-peer-controller.js`，旧文件仍负责 peerConnections 兼容 map、meta 写回、P2P UI 和 failfast。
+- 修改意见：按建议实施 R5 小切片，不改变 handle 字段、不改变 `mediaEngine.createPeer()` payload、不改变 create 后 meta/UI/failfast 顺序。
+- 处理结果：已处理。`native-peer-controller.js` 新增内部 `peerAttemptSeq`、`nextPeerAttemptId()`、`getPeerRole()` 和 `createPeerHandle(params)`，按旧字段构造 native handle 并调用 `mediaEngine.createPeer()`，随后写入 controller handle registry。`app-native-overrides.js` 的 `createNativePeerConnectionImpl()` 现在优先调用 `nativePeerController.createPeerHandle()`，继续写 `peerConnections`、更新 peer meta attempt/edgeAttempt、设置 P2P gathering 和 arm failfast；旧 handle 构造保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-070 native peer signal backlog/waiter queue 仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：peer handle registry 迁入 controller facade 后，native peer signal backlog、waiters、TTL prune、wait timeout 和 drop queued signals 仍由 `app-native-overrides.js` 的裸 `Map` 管理。
+- 影响：offer/answer 等异步信令等待仍不是 peer controller owner；后续迁 handleOffer/handleAnswer/createOffer 时还要跨文件读写旧 backlog/waiter 状态。
+- 建议：把 signal backlog/waiter queue 迁入 `native-peer-controller.js`，通过注入保留 peerId 提取和原有限制常量；旧函数保留 wrapper/fallback，不改变等待/超时/TTL 语义。
+- 修改意见：按建议实施 R5 小切片，不改变 `NATIVE_PEER_SIGNAL_*` 限制、不改变 timeout error 文本、不改变 sanitize 去除 `__queuedAt` 的行为。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `signalBacklog/signalWaiters`、`pruneSignalBacklog()`、`clearSignalState()`、`enqueueSignal()`、`waitForSignal()`、`dropQueuedSignals()` 和 `sanitizeSignalPayload()`，通过注入 `getSignalPeerId` 和 `signalMaxBacklogPerPeer/signalMaxBacklogTotal/signalMaxWaitersPerKey/signalTtlMs` 保持旧参数。`app-native-overrides.js` 初始化时注入旧限制常量，`pruneNativePeerSignalBacklog()`、`sanitizeNativePeerSignalPayload()`、`clearNativePeerSignalState()`、`enqueueNativePeerSignal()`、`waitForNativePeerSignal()`、`dropQueuedNativePeerSignals()` 现在优先委托 controller，旧实现保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-069 native peer handle registry 仍由 app-native-overrides.js 直接持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js` 接管 peer meta 后，native peer handle map 的 get/set/delete/keys/entries/size 仍由 `app-native-overrides.js` 直接访问。
+- 影响：后续迁 createPeer/closePeer 时，handle registry owner 不清晰；offer/answer/ice、diagnostics 和 cleanup 都继续依赖大文件里的裸 Map。
+- 建议：让 `native-peer-controller.js` 持有 native peer handle registry facade，`app-native-overrides.js` 通过 wrapper 调用 controller；旧 Map 仅作为 fallback。暂不迁 createPeer/closePeer 的具体流程。
+- 修改意见：按建议实施 R5 小切片，不改变 handle 字段、不改变 create/ready/close 时序、不改变 diagnostics 枚举结果。
+- 处理结果：已处理。`native-peer-controller.js` 新增内部 `peerHandles` map 和 `getPeerHandle/setPeerHandle/deletePeerHandle/getPeerHandleCount/getPeerHandleEntries/getPeerHandleIds`。`app-native-overrides.js` 新增 `getNativePeerHandle/setNativePeerHandle/deleteNativePeerHandle/getNativePeerHandleCount/getNativePeerHandleEntries/getNativePeerHandleIds` wrapper，并将 create/ready/close/failfast/diagnostic/teardown/stop share 路径的直接 `nativePeerHandles` 访问改为 wrapper；旧 `nativePeerHandles` map 仅保留为 controller 不存在时的 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-068 peer meta 默认结构和 ensure 入口仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`server/public/index.html`、`knip.json`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：进入 R5 前，`ensurePeerMeta()` 仍在 `app-native-overrides.js` 直接创建 peer meta 默认结构，包含 attempt、candidate、NAT mapping、restart 和 UI 状态字段。
+- 影响：后续迁 createPeer/closePeer/offer/answer/ice 时，peer lifecycle 基础状态 owner 仍停留在大 override 文件，容易继续扩大共享状态写入口。
+- 建议：新增 `native/native-peer-controller.js`，先接管 peer meta 默认结构创建和 ensure facade；不改变 createPeer、offer/answer/ice 时序，不改变 peer meta 字段。
+- 修改意见：按建议实施 R5 起步小切片，保持 peer meta 字段逐项一致，旧 `ensurePeerMeta()` 保留 wrapper/fallback。
+- 处理结果：已处理。新增 `server/public/native/native-peer-controller.js`，通过 `VDS.nativePeer.createController()` 暴露 `createDefaultPeerMeta()` 和 `ensurePeerMeta()`；`app-native-overrides.js` 初始化 `nativePeerController`，通过注入 `getPeerMeta/setPeerMeta` 读写旧 `peerConnectionMeta` map，旧 `ensurePeerMeta()` 现在优先委托 controller，原实现保留 fallback。`index.html` 和 `knip.json` 已加入新脚本，`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-067 host preview / peer viewer surface lifecycle 仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：底层 surface attach/detach/update 和调度已迁入 controller 后，`attachNativeHostPreviewSurface()`、`detachNativeHostPreviewSurface()`、`attachNativePeerVideoSurface()`、`detachNativePeerVideoSurface()` 仍在 `app-native-overrides.js` 直接组织 surface id、target、容器和 legacy video hiding。
+- 影响：surface controller 尚未覆盖 host preview / peer viewer surface lifecycle；后续抽 native session/peer controller 时仍要跨过大 override 文件调用高层 surface wrapper。
+- 建议：把 host preview / peer viewer surface 高层 lifecycle 迁入 `native-surface-controller.js`，通过依赖注入读取 host preview 条件、同步 `hostPreviewSurfaceAttached` 标记和隐藏 legacy video 元素；旧函数保留 wrapper/fallback。
+- 修改意见：按建议实施 R4 小切片，不改变 host preview 条件、不改变 surface id/target、不改变 legacy video hide 时机。
+- 处理结果：已处理。`native-surface-controller.js` 新增 `attachHostPreviewSurface()`、`detachHostPreviewSurface()`、`attachPeerVideoSurface(peerId)`、`detachPeerVideoSurface(peerId)`，host preview 条件通过 `getHostPreviewState()` 注入读取，`hostPreviewSurfaceAttached` 通过 `setHostPreviewAttached()` 注入同步，legacy video hiding 通过 `hideLegacyVideoElements()` 注入执行。`app-native-overrides.js` 注入 host preview surface id/target/element、remote video container 和状态 callbacks；四个旧函数现在优先委托 controller，旧实现保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R4 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-066 强制 surface resync burst 仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：window bounds sync 调度迁入 controller 后，`forceEmbeddedSurfaceResync()` / `forceEmbeddedSurfaceResyncBurst()` 的多次 RAF/timeout pass 仍在 `app-native-overrides.js`。
+- 影响：fullscreen、restore、surface recovery 等需要强制刷新 layout 的路径仍回到大 override 文件；controller 不能统一管理 invalidate + schedule 的突发同步。
+- 建议：把强制 resync 的 pass 编排迁入 `native-surface-controller.js`，通过注入 `refreshWindowBounds` 保留旧 Electron bounds 刷新；旧函数只作为 wrapper/fallback。
+- 修改意见：按建议实施 R4 小切片，不改变 pass 次数和 40/120/260/80/180ms 时间点，不改变 window bounds 刷新来源。
+- 处理结果：已处理。`native-surface-controller.js` 新增 `refreshWindowBounds()`、`forceResync()` 和 `forceResyncBurst()`，保持旧 runPass、双 RAF、80/180ms final pass 以及 burst 的 40/120/260ms 时间点；`app-native-overrides.js` 注入 `refreshWindowBounds: refreshCurrentWindowBounds`，`forceEmbeddedSurfaceResync()` / `forceEmbeddedSurfaceResyncBurst()` 现在优先委托 controller，旧实现保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R4 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-065 window bounds surface sync 调度仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：surface tracking loop 迁入 controller 后，窗口 bounds 变化触发的 layout invalidate、首帧 RAF sync 和 120ms final sync timer 仍在 `app-native-overrides.js`。
+- 影响：窗口移动/缩放时 surface 跟随调度仍分裂；controller 虽然拥有 layout registry，但 window bounds 变化后的 invalidate/schedule owner 不完整。
+- 建议：让 `native-surface-controller.js` 接管 window bounds 变化后的 `invalidateSurfaceLayouts()`、RAF sync 和 final timer；旧文件继续负责从 Electron 接收 bounds 并更新 `currentWindowBounds`。
+- 修改意见：按建议实施 R4 小切片，不改变 120ms final timer、不改变 currentWindowBounds 来源、不改变 Electron bounds listener。
+- 处理结果：已处理。`native-surface-controller.js` 新增 `windowBoundsSyncRafId/windowBoundsSyncFinalTimerId` 和 `scheduleWindowBoundsSync()`，负责窗口 bounds 变化后的 layout invalidate、首帧 sync 和 120ms final sync。`app-native-overrides.js` 的 `scheduleWindowBoundsSurfaceSync(bounds)` 仍更新 `currentWindowBounds`，随后优先委托 `nativeSurfaceController.scheduleWindowBoundsSync()`；旧实现保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R4 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-064 surface tracking loop 定时器仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：surface sync 调度和滚轮 burst 已迁入 controller 后，周期性 tracking loop 的 `embeddedSurfaceTrackingRafId` 和 interval tick 仍由 `app-native-overrides.js` 持有。
+- 影响：surface attach/update/remove 已由 controller 管理，但 tracking loop owner 仍分裂；surface 被移除后停 loop、attach 后启 loop 需要跨文件回调。
+- 建议：让 `native-surface-controller.js` 持有 tracking timer 和 start/stop 逻辑；旧 start/stop 函数只作为 wrapper/fallback。移除旧 `removeEmbeddedSurfaceTracking` 回调短路，改用 `onSurfaceTrackingRemoved` 通知旧文件同步 host preview 标记和日志。
+- 修改意见：按建议实施 R4 小切片，不改变 tracking interval、不改变 remove reason、不改变 recovery reattach 流程。
+- 处理结果：已处理。`native-surface-controller.js` 新增 `trackingTimerId`、`getTrackingIntervalMs()`、`startTrackingLoop()` 和 `stopTrackingLoop()`，attach 后由 controller 启动 loop，remove 后 surface count 为 0 时由 controller 停 loop；`removeSurfaceTracking()` 不再短路调用旧 `removeEmbeddedSurfaceTracking`，而是在完成 controller registry 清理后通过 `onSurfaceTrackingRemoved` 通知旧文件。`app-native-overrides.js` 的 `startEmbeddedSurfaceTrackingLoop()`/`stopEmbeddedSurfaceTrackingLoop()` 优先委托 controller，旧实现保留 fallback；旧 `removeEmbeddedSurfaceTracking()` 在 controller 存在时只做兼容清理和通知。`docs/RENDERER_SPLIT_MAP.md` 已更新 R4 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-063 滚轮驱动 surface sync burst 仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：单次 surface sync RAF 调度迁入 controller 后，滚轮事件触发的 8 帧连续同步 burst 仍由 `app-native-overrides.js` 持有 `wheelDrivenSyncRafId/wheelDrivenSyncFramesRemaining`。
+- 影响：surface controller 仍无法独立管理常见 layout drift 触发源；viewer 滚轮导致 overlay surface 跟随时，状态继续分裂在大 override 文件。
+- 建议：把滚轮 burst 的 RAF 和剩余帧计数迁入 `native-surface-controller.js`，旧 `scheduleWheelDrivenSurfaceSync()` 只作为 wrapper；滚轮事件监听本身暂留旧初始化流程。
+- 修改意见：按建议实施 R4 小切片，不改变 8 帧 burst、不改变滚轮事件监听参数、不改变 sync 调度入口。
+- 处理结果：已处理。`native-surface-controller.js` 新增 `wheelDrivenSyncRafId/wheelDrivenSyncFramesRemaining`、`runWheelDrivenSyncBurst()` 和 `scheduleWheelDrivenSync()`，通过注入 `wheelDrivenSyncFrameCount: 8` 保持旧 burst 长度；`app-native-overrides.js` 的 `scheduleWheelDrivenSurfaceSync()` 现在优先委托 controller，旧实现保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R4 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-062 surface 单次 sync RAF 调度状态仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`syncAllSurfaces()` 迁入 surface controller 后，`scheduleEmbeddedSurfaceSync()` 的 RAF 去重、in-flight/pending 状态和 sync all 错误日志仍在 `app-native-overrides.js`。
+- 影响：surface controller 已是批量同步 owner，但单次调度状态还留在大 override 文件；窗口跟随、滚轮 burst 和 tracking loop 都需要绕回旧调度实现。
+- 建议：把单次 `requestAnimationFrame` 调度、in-flight/pending 合并逻辑迁入 `native-surface-controller.js`，旧文件只作为触发源调用 `scheduleSync()`；window bounds、wheel burst、tracking loop 暂不迁移。
+- 修改意见：按建议实施 R4 小切片，不改变 RAF 合并语义、不改变 sync-all recoverable warning key、不改变窗口事件监听。
+- 处理结果：已处理。`native-surface-controller.js` 新增内部 `surfaceSyncRafId/surfaceSyncInFlight/surfaceSyncPending` 和 `scheduleSync()`，负责单次 RAF 调度、in-flight 合并和调用 `syncAllSurfaces()`；通过注入 `logSyncAllError` 保持旧 `syncAllEmbeddedSurfaces:failed` 日志语义。`app-native-overrides.js` 的 `scheduleEmbeddedSurfaceSync()` 现在优先委托 `nativeSurfaceController.scheduleSync()`，旧实现保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新当前 R4 边界。
+- 验证结果：已执行 `node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-061 sync all surface 批量同步循环仍由 app-native-overrides.js 执行
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：单 surface update command flow 迁入 controller 后，`syncAllEmbeddedSurfaces()` 的遍历、批量 job、失败计数、连续失败阈值判断仍在 `app-native-overrides.js`，controller 只负责单个 surface。
+- 影响：surface controller 仍不是批量同步 owner；窗口跟随调度调用 sync all 时还要回到大 override 文件处理 registry 遍历和失败统计。
+- 建议：把 sync all 循环迁入 `native-surface-controller.js`，通过注入 `recoverSurface` 和 recoverable warning logger 保持旧恢复策略；调度 RAF、窗口事件和具体 reattach 行为暂留旧文件。
+- 修改意见：按建议实施 R4 小切片，不改变 `SURFACE_SYNC_MAX_CONSECUTIVE_FAILURES`、不改变 recovery reason、不改变 window bounds sync 调度。
+- 处理结果：已处理。`native-surface-controller.js` 新增 `syncAllSurfaces()`，内部遍历 controller registry、调用 `updateSurface()`、记录 recoverable warning、递增 controller 内失败计数，并在达到注入的 `maxConsecutiveSyncFailures` 后通过 `recoverSurface(surfaceId, entry, 'surface-sync-consecutive-failures')` 触发旧恢复流程。`app-native-overrides.js` 的 `syncAllEmbeddedSurfaces()` 现在优先委托 controller，旧循环保留 fallback；controller 初始化注入了旧 warning logger、recovery callback 和阈值。`docs/RENDERER_SPLIT_MAP.md` 已更新 R4 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-060 单 surface update command flow 仍由 app-native-overrides.js 执行
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：surface controller 已接管 attach/detach 后，单个 `updateSurface` 的 layout 比较、payload 构造、`mediaEngine.updateSurface`、`Surface is not attached` 清理和 layout key 写回仍在 `app-native-overrides.js` 中执行。
+- 影响：surface update lifecycle 仍不是 controller owner；后续迁 sync all/窗口跟随时还要跨文件调用 update 命令和 registry。
+- 建议：将单 surface update command flow 迁入 `native-surface-controller.js`，`app-native-overrides.js` 的 `syncEmbeddedSurface()` 只作为 wrapper/fallback；sync all、失败恢复、调度循环暂留旧文件。
+- 修改意见：按建议实施 R4 小切片，不改变 sync all 调度、不改变 recovery 阈值、不改变 update payload。
+- 处理结果：已处理。`native-surface-controller.js` 新增 `updateSurface(surfaceId)`，内部读取 registry entry、计算 layout/key、跳过未变化 layout、构造 update payload、调用 `mediaEngine.updateSurface`、处理 `Surface is not attached` 并 remove tracking、清 recoverable warning、写回 `lastLayoutKey`。`app-native-overrides.js` 的 `syncEmbeddedSurface()` 现在优先委托 controller，旧实现保留 fallback。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-059 embedded surface attach/detach command flow 仍由 app-native-overrides.js 执行
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：surface controller 已持有 registry/generation/failure count，但 `attachEmbeddedSurface()` 和 `detachEmbeddedSurface()` 仍在 `app-native-overrides.js` 中直接构造 payload、调用 `mediaEngine.attachSurface/detachSurface`、处理 stale generation 和写 registry。
+- 影响：surface controller 仍不是 attach/detach 生命周期入口；后续迁 update/sync loop 时还要跨文件协调 generation、registry 和 mediaEngine command。
+- 建议：把 attach/detach command flow 迁入 `native-surface-controller.js`，通过依赖注入使用 `mediaEngine`、recoverable warning cleanup、tracking loop start 和 remove tracking；`app-native-overrides.js` 保留同名 wrapper/fallback。
+- 修改意见：按建议实施 R4 小切片，不改变 attach/detach RPC payload，不移动 update/sync loop。
+- 处理结果：已处理。`native-surface-controller.js` 新增 `attachSurface()` 和 `detachSurface()`，内部负责 layout/key、generation、attach/detach payload、stale result cleanup、recoverable warning cleanup、registry 写入和 tracking loop start；`app-native-overrides.js` 创建 controller 时注入 `mediaEngine`、`clearRecoverableSurfaceSyncWarning`、`startEmbeddedSurfaceTrackingLoop`、`removeEmbeddedSurfaceTracking`，旧 `attachEmbeddedSurface()` / `detachEmbeddedSurface()` 现在优先委托 controller，旧实现保留 fallback。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-058 embedded surface registry 仍由 app-native-overrides.js 直接持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native/native-surface-controller.js` 已承接 layout 计算后，embedded surface registry、surface generation 和 sync failure count 仍由 `app-native-overrides.js` 直接读写，surface controller 还不是 surface 状态 owner。
+- 影响：后续迁 attach/update/detach 时仍要把 registry、generation、failure count 和跟随循环一起搬，迁移面过大；surface 生命周期状态也继续散落在大文件。
+- 建议：先让 `native-surface-controller` 持有 embedded surface registry、generation 和 failure count，并向旧文件暴露 helper；`app-native-overrides.js` 通过 helper 读写，旧 Map 只作为模块缺失 fallback。
+- 修改意见：按建议实施 R4 过渡切片，不改变 attach/detach/update RPC 调用，不改变 surface tracking 调度。
+- 处理结果：已处理。`native-surface-controller.js` 新增 `attachedSurfaces`、`surfaceGenerations`、`surfaceFailureCounts` 以及 `get/set/delete/forEach/invalidate` registry helper、generation helper 和 failure count helper。`app-native-overrides.js` 新增对应 wrapper，并把 remove tracking、sync all、invalidate layout、wheel/window bounds/tracking loop、attach generation 和 attached entry 写入改为走 wrapper；旧 `attachedEmbeddedSurfaces` / `embeddedSurfaceGenerations` / `surfaceSyncFailureCounts` 保留为 controller 缺失 fallback。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-054 viewer join/leave payload 仍由 app.js 手写
+
+- 位置：`server/public/app.js`、`server/public/room-client.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：WebSocket owner 已迁到 `room-client.js` 后，viewer `join-room` 和 `leave-room` 的 payload 仍在 `app.js` 手写，room-client 只负责底层发送。这让房间控制消息的 wire shape 继续散落在 UI 生命周期里。
+- 影响：后续迁 `joinRoomById/leaveRoom` 时容易同时碰 UI pending、viewer playback prefs、state sync 和信令 payload，增加回归面；server 协议字段也缺少集中 builder。
+- 建议：在 `room-client.js` 增加 `buildJoinRoomMessage()` / `buildLeaveRoomMessage()` 和发送 facade；`app.js` 继续负责校验、pending UI、viewer playback prefs 和 state sync，只调用 room-client facade。native override 中 host create/stop 路径等到 native-session-controller 拆分时再迁。
+- 修改意见：按建议继续实施 Renderer R2 小切片，不改变 `join-room` / `leave-room` wire shape，不移动 remote ICE candidate backlog。
+- 处理结果：已处理。`room-client.js` 新增 room id 归一化、`buildJoinRoomMessage()`、`buildLeaveRoomMessage()`、`joinRoomById()` 和 `leaveRoom()`，集中生成 viewer join/leave payload 并保留断线排队语义。`app.js` 的 viewer join、viewer leave 和 fallback host stop 已改为调用 `window.VDS.roomClient` facade；UI pending、`applyNativeViewerPlaybackPrefs()`、`syncAppState()` 和 `resetViewerState()` 仍留在 `app.js`。`docs/RENDERER_SPLIT_MAP.md` 已更新当前边界。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-049 Debug panel 运行路径仍由 app.js 直接持有
+
+- 位置：`server/public/app.js`、`server/public/debug-panel.js`、`server/public/index.html`、`knip.json`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`app.js` 仍直接持有 debug preset/config、菜单 render/bind、日志开关判断和 native debug hook 读取，继续让 renderer 入口承担诊断面板 owner 职责。
+- 影响：后续拆 native diagnostics 时，日志类别、菜单状态和 native hook 会继续绕回 `app.js`，不利于把诊断配置作为独立依赖注入给 native controllers。
+- 建议：新增 `debug-panel.js`，通过 `VDS.debugPanel.createController()` 接管 debug config、菜单 UI、日志 gate；`app.js` 保留旧函数名 wrapper，避免一次性改 native override 调用点。
+- 修改意见：按建议继续实施 Renderer R1，不改变日志类别/通道语义，不新增裸日志出口。
+- 处理结果：已处理本阶段。新增 `server/public/debug-panel.js`，以 IIFE 暴露 `window.VDS.debugPanel`，承接 debug preset/config 归一化、本地存储、菜单渲染/绑定、开关同步、`isDebugModeEnabled/isDebugLogEnabled` 和 renderer debug log gate。`app.js` 新增 `debugPanelController` 装配和 `getDebugPanelController()`，`syncDebugUi`、`setDebugConfig`、`debugLog`、`open/close/toggleDebugMenu`、`renderDebugMenu`、`bindDebugMenuUi` 已改为 thin wrapper；`window.__vdsIsDebugModeEnabled` 与 `window.__vdsShouldDebugLog` 继续兼容旧 hook。`index.html` 和 `knip.json` 已加入 `debug-panel.js`，`docs/RENDERER_SPLIT_MAP.md` 已更新当前边界。`app.js` 中旧 debug 常量/helper 暂留为后续 legacy 清理项，未声明 R7 完成。
+- 验证结果：已执行 `node --check server/public/debug-panel.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，除首次 `check:logging` 发现并修复 `debug-panel.js` 裸 `console.log` 外，最终均通过。
+
+### ARCH-SPLIT-P1-050 Debug panel 迁出后 app.js 仍保留不可达 legacy 代码
+
+- 位置：`server/public/app.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`debug-panel.js` 接管运行路径后，`app.js` 仍保留旧 debug 常量、config 读写 helper、菜单事件 helper、菜单 DOM 生成逻辑，以及多个 wrapper 内 return 之后的不可达旧函数体。
+- 影响：虽然运行时已经走 controller，但这些残留会误导后续拆分判断，也会让 R1/R7 的边界不清晰；后续移动 native diagnostics 时可能误用旧 helper。
+- 建议：保留旧函数名兼容面，删除不可达旧函数体和旧 debug owner 代码；`debugConfig` 只作为 `VDS.debugPanel` 当前配置的兼容快照，由 controller 初始化和变更回填。
+- 修改意见：按建议清理 legacy 残留，不改变 debug preset/config 存储 key，不改变 native debug hook 名称。
+- 处理结果：已处理。`app.js` 删除旧 `DEBUG_*` 常量、`readDebugConfig/normalizeDebugConfig/persistDebugConfig/scheduleDebugConfigFlush` 等 helper、旧 debug 菜单事件函数和旧菜单 DOM 模板；`syncDebugUi/setDebugConfig/debugLog/openDebugMenu/closeDebugMenu/toggleDebugMenu/renderDebugMenu/bindDebugMenuUi` 现在只保留 thin wrapper。`debugPanelController` 创建后会回填 `debugConfig = debugPanelController.getConfig()`，controller 的 `onConfigChanged` 也会同步兼容快照，保证 `isDebugLogEnabled(..., config)` 兼容路径仍可比较外部 config。`docs/RENDERER_SPLIT_MAP.md` 已更新为当前边界。
+- 验证结果：已执行 `node --check server/public/app.js`、`node --check server/public/debug-panel.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-051 room-client 仍只是 legacy adapter，未持有发送队列
+
+- 位置：`server/public/room-client.js`、`server/public/app.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`room-client.js` 仅把 `sendMessage/enqueue/flush/clear` 转发回 `app.js`，outbound pending message queue 仍由 `app.js` 持有，导致 R2 的 room-client owner 边界没有实际推进。
+- 影响：后续抽 WebSocket/房间生命周期时，发送队列、重连恢复去重和 native 信令发送仍混在 renderer 大入口里，容易继续把 room state、UI 和信令队列绑死。
+- 建议：先迁移低风险 outbound message queue，不动 WebSocket 创建和 `handleMessage` 分发；remote ICE candidate backlog 因 native override 仍直接访问，暂留 `app.js`，后续随 native peer controller 一起处理。
+- 修改意见：按建议实施 R2 小切片。
+- 处理结果：已处理。`room-client.js` 现在持有 `pendingMessages`、消息优先级、`enqueuePendingMessage/removePendingMessages/flushPendingMessages/clearPendingSignalingQueues/sendMessage`；`app.js` 删除本地 outbound queue 和 `MAX_PENDING_MESSAGES/pendingMessagePriority`，保留同名 wrapper 委托 `VDS.roomClient`，并向 adapter 注入 `sendRawMessage/isWebSocketOpen/debugLog/connectWebSocket`。`clearPendingSignalingQueues()` 现在由 `room-client` 清 outbound queue，`app.js` 只清 remote candidate backlog 并返回组合统计。`docs/RENDERER_SPLIT_MAP.md` 已更新当前边界。
+- 验证结果：已执行 `node --check server/public/room-client.js`、`node --check server/public/app.js`，并确认 `app.js` 不再包含 `pendingMessages/MAX_PENDING_MESSAGES/pendingMessagePriority`。
+
+### ARCH-SPLIT-P1-052 waitForWsConnected 仍由 app.js 持有等待/超时 facade
+
+- 位置：`server/public/app.js`、`server/public/room-client.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：outbound queue 迁到 `room-client.js` 后，`waitForWsConnected()` 仍在 `app.js` 直接判断 WebSocket open 状态并封装 timeout，这让连接等待 facade 仍由 renderer 入口持有。
+- 影响：后续抽 WebSocket connect/disconnect 时，等待连接的调用面和超时语义仍分裂在 `app.js`，native override 也继续通过全局函数绕过 `room-client`。
+- 建议：先把等待/超时 facade 移到 `room-client.js`，仍通过 adapter 调用旧 `connectWebSocket` 和 `isWebSocketOpen`，不改变 WebSocket open/close/onmessage 时序。
+- 修改意见：按建议实施 R2 小切片。
+- 处理结果：已处理。`room-client.js` 新增 `waitForWsConnected(timeoutMs)`，内部先用 adapter 的 `isWebSocketOpen()` 快速返回，否则 `Promise.race(connectWebSocket(), timeout)`；`app.js` 的同名全局函数改为 thin wrapper，adapter 不再暴露 `waitForWsConnected`，避免回调递归。`docs/RENDERER_SPLIT_MAP.md` 已更新当前边界。
+- 验证结果：已执行 `node --check server/public/room-client.js`、`node --check server/public/app.js`，并确认 `app-native-overrides.js` 仍可通过旧全局 `waitForWsConnected()` 进入 `room-client`。
+
+### ARCH-SPLIT-P1-053 WebSocket 对象和重连状态仍由 app.js 持有
+
+- 位置：`server/public/app.js`、`server/public/room-client.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`room-client.js` 已持有 outbound queue 和 wait facade，但 WebSocket 对象、connect/disconnect/onmessage/onclose/onerror、重连计时器和 session resume 触发仍完整留在 `app.js`。
+- 影响：room-client 仍不是 WebSocket owner；后续抽房间生命周期时，重连、session resume、UI 状态同步和消息分发仍绑在 renderer 入口里。
+- 建议：把 WebSocket 本体和重连状态迁入 `room-client.js`，但通过 adapter hooks 保留 `app.js` 的 UI/state 副作用：`onWebSocketOpen/onWebSocketClose/onWebSocketUnexpectedClose/onReconnectScheduled/consumeResumeSessionMessage`。消息分发和房间 create/join/leave 先继续委托旧函数。
+- 修改意见：按建议实施 R2，保持 WebSocket wire shape 和 native override 旧全局函数兼容。
+- 处理结果：已处理。`room-client.js` 现在持有 `ws/wsConnectPromise/wsReconnectAttempts/wsReconnectTimer/pendingReconnect/wsManualClose`，实现 `connectWebSocket/disconnectWebSocket/waitForWsConnected/sendRawMessage/scheduleReconnect` 和 `onmessage` JSON 分发。`app.js` 删除这些运行时状态和 `scheduleReconnect`，保留 `connectWebSocket/disconnectWebSocket/waitForWsConnected/sendRawMessage` thin wrapper；通过 adapter 提供 `getWebSocketUrl/debugLog/handleMessage`，并接收 `onWebSocketOpen/onWebSocketClose/onWebSocketUnexpectedClose/onWebSocketDisconnected/onReconnectScheduled/consumeResumeSessionMessage` 回调来同步 UI、`VDS.state` 和 session resume payload。`docs/RENDERER_SPLIT_MAP.md` 已更新当前边界。
+- 验证结果：已执行 `node --check server/public/room-client.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`，并确认 `app.js` 不再持有 `wsConnectPromise/wsReconnect*/pendingReconnect/wsManualClose/new WebSocket`。
+
+### ARCH-SPLIT-P1-046 Renderer 中间态恢复后需要校正当前有效边界
+
+- 位置：`server/public/app.js`、`server/public/app-state.js`、`server/public/room-client.js`、`server/public/source-selection.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：在继续拆 `debug-panel` 的机械迁移时，`app.js` 中间态曾被压缩成不完整文件。为恢复可运行状态，已使用打包产物中的完整 `server/public/app.js` 作为只读参照恢复主体，再重新套入低风险边界。恢复后需要明确当前有效事实：`app-state` hook、`room-client` legacy adapter、`source-selection` 已接入；`quality-settings` 与 `update-ui` 文件存在但当前未接管 `app.js` legacy 运行路径。
+- 影响：如果文档继续声称质量设置和更新 UI 已完全迁出，会误导后续阶段判断，可能在未接管的路径上继续拆 native session 或 debug panel，增加回归风险。
+- 建议：先保证当前 renderer 可运行和脚本顺序一致；补回 `__vdsPatchAppState/__vdsSyncAppState`、`VDS.roomClient.installLegacyAdapter()` 和 `source-selection` controller 装配；将拆分地图改为当前有效状态，后续重新按小步迁移 `quality-settings` / `update-ui`。
+- 修改意见：按建议执行，不继续推进未闭环的 `debug-panel` 拆分。
+- 处理结果：已处理。`app.js` 已恢复完整主体并通过语法检查；新增/保留 `buildLegacyAppStatePatch()`、`patchAppState()`、`syncAppState()`，暴露 `window.__vdsPatchAppState` 与 `window.__vdsSyncAppState`，在 WebSocket open/close、join request、viewer count、host/viewer reset 写点同步 `VDS.state`。`app.js` 已向 `VDS.roomClient` 安装 legacy adapter。`source-selection.js` 继续作为源选择 owner，`app.js` 只保留源选择 wrapper。`docs/RENDERER_SPLIT_MAP.md` 已改成当前有效状态，明确 `quality-settings.js` / `update-ui.js` 尚未接管 legacy 路径。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`；均通过，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-048 Quality settings controller 文件存在但 legacy 质量 owner 仍在 app.js
+
+- 位置：`server/public/app.js`、`server/public/quality-settings.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：恢复当前有效边界后，`quality-settings.js` 文件存在但 `app.js` 仍直接持有质量设置默认值、OBS ingest prefs、质量选项常量、编码器能力判断、capabilities 缓存、OBS preview prepare 状态、质量弹窗 render/bind 和 OBS 端口控件状态。
+- 影响：质量设置 owner 继续分裂会阻碍后续 native session controller 接管开播生命周期；OBS preview 状态和确认开播流程混在一起，也会增加 OBS/native 参数回归风险。
+- 建议：用 `VDS.qualitySettings` 接管配置 owner、能力判断、OBS preview prepare 状态和质量弹窗 render/bind；`app.js` 只保留跨模块流程，包括 `copyObsIngestUrl()` 和 `confirmQualitySelection()`。
+- 修改意见：按建议执行，不改 native 开播参数结构，不改 OBS ingest wire shape。
+- 处理结果：已处理。`app.js` 现在从 `VDS.qualitySettings` 获取 `qualitySettings`、OBS 常量和 `parseObsIngestPort`；新增 `qualitySettingsController` 装配和 `getQualitySettingsController()`。旧质量默认值、OBS prefs helper、能力缓存、编码器判断、OBS preview prepare 状态和质量弹窗 render/bind 大块已从 `app.js` 删除；`renderQualitySettingsUi()` / `bindQualitySettingsUi()` / `prepareObsIngestPreview()` / `refreshQualityCapabilities()` 改为 wrapper 调用 `quality-settings.js`。`copyObsIngestUrl()` 改为读取 controller 当前 OBS preview。`docs/RENDERER_SPLIT_MAP.md` 已更新当前有效边界。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`；均通过，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-047 Update UI controller 文件存在但未接管 legacy 路径
+
+- 位置：`server/public/app.js`、`server/public/update-ui.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：恢复当前有效边界后，`update-ui.js` 文件存在但 `app.js` 仍直接持有 updater listener、更新日志队列、自动隐藏定时器、静默安装定时器、下载状态、版本号、格式化 helper 和更新弹窗 DOM 写入。
+- 影响：更新 UI 与启动初始化仍耦合在 `app.js`，违背 Renderer R1 低风险模块拆分目标，也让 `app.js` 在继续拆 source/room/native 前保留与媒体无关的大块状态。
+- 建议：用 `VDS.updateUi.createController()` 接管更新状态和 Electron updater listener；`app.js` 只保留旧函数名 wrapper，避免改变按钮事件和启动初始化调用点。
+- 修改意见：按建议执行，不改更新 wire shape，不改 Electron preload API。
+- 处理结果：已处理。`app.js` 新增 `updateUiController` 装配和 `getUpdateUiController()`；删除旧 updater mutable 状态、日志队列、格式化 helper 和弹窗实现块；`registerUpdateStatusListener/registerUpdateLogListener/initializeStartupTasks/getUpdateManifestUrl/hideUpdateModal/renderUpdateModal/applyUpdateStatus/requestQuitAndInstall/initVersion/checkForUpdates` 均改为 thin wrapper 调用 `update-ui.js` controller。`docs/RENDERER_SPLIT_MAP.md` 已更新当前有效边界。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`；均通过，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-045 Source selection 仍由 app.js 持有枚举和音频匹配状态
+
+- 位置：`server/public/app.js`、`server/public/source-selection.js`、`server/public/index.html`、`knip.json`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：质量设置迁出后，`app.js` 仍直接持有源枚举/刷新并发控制、源选择弹窗渲染、缩略图列表、窗口音频进程匹配、确认源后启动共享的桥接流程。源选择和质量确认流程互相读写 `shareStartInFlight` / source pending 状态，继续留在大文件会阻碍后续拆 native session controller。
+- 影响：源列表刷新、音频匹配超时、确认源、取消源选择和共享启动按钮状态仍混在 `app.js`，后续修改源选择或 native 开播时容易误伤质量弹窗和房间生命周期。
+- 建议：新增 `source-selection.js`，通过 controller 持有源选择内部状态和 DOM 渲染；`app.js` 只保留旧函数名 wrapper，并通过 callback 调用 `startScreenShareWithSource/startScreenShareWithAudio/resetShareStartPendingUi`。
+- 修改意见：按建议继续实施 Renderer R1，先不改变源选择 UI 行为、不改变 native start-share wire shape。
+- 处理结果：已处理。新增 `server/public/source-selection.js`，通过 `VDS.sourceSelection.createController()` 接收 `elements/showError/debugLog/getMediaEngine/startScreenShareWithSource/startScreenShareWithAudio/resetShareStartPendingUi` 等依赖；源枚举、刷新序列、确认并发、源选择弹窗 DOM、缩略图列表、窗口音频候选匹配、音频候选选择 UI、确认源后按 PID 或纯画面启动共享均迁入 controller。`app.js` 删除旧实现块，仅保留 `showSourceSelection/refreshSources/showSourceModal/updateSourceAudioUi/confirmSourceAndShare/cancelSourceSelection` wrapper；`resetShareStartPendingUi()` 改为委托 source controller 恢复源选择按钮状态。`index.html` 和 `knip.json` 已加入 `source-selection.js`，`docs/RENDERER_SPLIT_MAP.md` 已更新脚本顺序和模块边界。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`；均通过，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-044 OBS preview prepare 状态仍由 app.js 持有
+
+- 位置：`server/public/app.js`、`server/public/quality-settings.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：质量弹窗 render/bind 迁入 controller 后，OBS preview 的 `obsIngestPreview`、`obsIngestPreparePromise`、`obsIngestPrepareRequestPort`、`obsIngestPrepareSeq` 仍留在 `app.js`，controller 只能通过 callback 读取。这让质量弹窗的状态 owner 仍然分裂。
+- 影响：OBS backend 切换、端口保存、弹窗状态刷新和确认开播之间仍有一部分状态绕回 `app.js`；后续拆 source selection/native session 时，OBS 质量配置状态不够独立。
+- 建议：把 OBS preview prepare 状态和 `prepareObsIngestPreview()` 迁入 `VDS.qualitySettings.createController()`，`app.js` 只保留同名 wrapper、复制 OBS URL 和确认开播流程。
+- 修改意见：按建议继续实施 Renderer R1。
+- 处理结果：已处理。`quality-settings.js` 的 controller 内部现在持有 `obsIngestPreview`、`obsIngestPreparePromise`、`obsIngestPrepareRequestPort`、`obsIngestPrepareSeq`，并暴露 `prepareObsIngestPreview()`、`getObsIngestPreview()`、`getObsIngestPrepareState()`；OBS preview prepare 的 unsupported/unsupported-method/cache/in-flight/refresh/error/finally render 流程已迁入 controller。`app.js` 删除对应状态变量，`prepareObsIngestPreview()` 改为调用 controller，`copyObsIngestUrl()` 从 controller 读取当前 preview。确认开播流程仍留在 `app.js`，因为它需要调用 source selection/native session。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过。
+
+### ARCH-SPLIT-P1-043 Quality modal DOM 渲染和控件绑定仍留在 app.js
+
+- 位置：`server/public/app.js`、`server/public/quality-settings.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：质量设置的配置计算和能力探测已迁出后，`app.js` 仍直接负责 `renderQualitySettingsUi()` 和 `bindQualitySettingsUi()` 的完整 DOM 渲染与事件绑定，包括 codec/resolution/fps/preset/tune/keyframe 段控件、硬件编码器 select、OBS 端口输入和保存按钮。
+- 影响：`app.js` 仍承担大量质量弹窗 UI 职责；后续拆 source selection 和 native session 时，质量 UI 的 DOM 更新仍会和启动共享流程缠在一起。
+- 建议：在 `quality-settings.js` 内新增 `createController()`，接收 `elements`、OBS preview 状态读取和必要 callback；由 controller 管理质量弹窗 render/bind，`app.js` 只保留旧函数名 wrapper 和跨模块确认开播流程。
+- 修改意见：按建议继续实施 Renderer R1。
+- 处理结果：已处理。`quality-settings.js` 新增 `createController()`，内部持有质量弹窗 `render()` 和 `bind()`；质量 backend/codec/resolution/fps/preset/tune/keyframe 段控件、硬件加速/预览开关、硬件编码器 select、码率按钮/input、OBS 自定义端口开关、OBS 端口输入与保存按钮的 DOM 更新和事件绑定已迁入 controller。`app.js` 新增 `qualitySettingsController` 装配和 `getQualitySettingsController()`，`renderQualitySettingsUi()` / `bindQualitySettingsUi()` 改为薄 wrapper；`confirmQualitySelection()`、`cancelQualitySelection()`、OBS preview prepare 状态和启动共享流程暂留 `app.js`，因为它们跨 source selection/native session。
+- 验证结果：已执行 `node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过。
+
+### ARCH-SPLIT-P1-091 peer connect timeout ownership 仍散落在 app.js/app-native-overrides.js
+
+- 位置：`server/public/app.js`、`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已迁出 peer handle、signal queue 和 mediaEngine RPC 后，peer 建连 failfast / NAT mapping connect-wait 的 `connectTimeoutId` 仍由 `app-native-overrides.js` 直接写入，并通过 `app.js` 的全局 `clearPeerConnectionTimeout()` 清理。
+- 影响：peer controller 无法成为 peer lifecycle 的实际 owner；关闭 peer、连接成功、NAT mapping fallback 和 failfast 之间继续跨文件共享 timer 字段，后续拆 close/reconnect 时容易遗漏清理或形成旧 timeout 回调。
+- 建议：把 peer connect timeout 的 arm/clear facade 迁入 `native-peer-controller.js`；`app-native-overrides.js` 只保留 failfast/NAT mapping 的策略回调和 legacy fallback。
+- 修改意见：按建议实施 R5 小切片，不改变 `P2P_CONNECT_FAILFAST_MS` / `P2P_NAT_MAPPING_CONNECT_WAIT_MS`，不改变 NAT mapping fallback、失败 UI 文案和关闭 peer 行为。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `clearPeerConnectTimeout(peerId)` 和 `armPeerConnectTimeout(peerId, timeoutMs, onTimeout)`，由 controller 负责写入/清除 `meta.connectTimeoutId`。`app-native-overrides.js` 新增 `clearNativePeerConnectTimeout()` wrapper，failfast 和 NAT mapping connect-wait 优先调用 controller arm/clear，旧 `window.setTimeout` 写 meta 的逻辑保留 fallback；连接成功、失败 finalize、close peer 路径的清理也改为 wrapper。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-092 disconnected recovery timer ownership 仍散落在 app.js/app-native-overrides.js
+
+- 位置：`server/public/app.js`、`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：connect timeout 迁入 peer controller 后，已连接 peer 的 ICE disconnected recovery timer 仍由 `app-native-overrides.js` 直接写 `meta.disconnectTimerId`，并通过 `app.js` 的全局 `clearPeerDisconnectTimer()` 清理。
+- 影响：peer controller 仍无法统一管理 peer lifecycle 里的 timer 资源；连接成功、close peer 和 disconnected recovery 之间跨文件清理，后续迁 close/reconnect 时容易留下旧 timer 回调。
+- 建议：把 disconnected recovery timer 的 arm/clear facade 迁入 `native-peer-controller.js`；`app-native-overrides.js` 保留恢复策略、attempt 选择和 recovery 信令发送。
+- 修改意见：按建议实施 R5 小切片，不改变 `NATIVE_DISCONNECTED_RECOVERY_GRACE_MS` / `P2P_RECONNECT_DELAYS_MS`，不改变 host force offer、viewer reconnect-ready 和 recovery 失败日志行为。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `clearPeerDisconnectTimer(peerId)` 和 `armPeerDisconnectTimer(peerId, timeoutMs, onTimeout)`，由 controller 负责写入/清除 `meta.disconnectTimerId`。`app-native-overrides.js` 新增 `clearNativePeerDisconnectTimer()` wrapper，`scheduleDisconnectedPeerRecovery()` 继续负责 restart attempts、日志、`requestPeerRecovery()` 和失败处理，但优先通过 controller arm timer；连接成功和 close peer 路径改为 wrapper 清理。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-093 relay offer retry timer 仍由 app.js peerReconnectState 持有
+
+- 位置：`server/public/app.js`、`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：peer connect/disconnect timer 迁入 peer controller 后，relay 下游 `connect-to-next` 失败重试仍直接读写 `app.js` 的 `peerReconnectState`，`app-native-overrides.js` 负责创建、清理和全量删除 retry timer。
+- 影响：relay downstream 也是 peer lifecycle 的一部分，但 retry timer 存储仍在 renderer 入口的 legacy Map；后续关闭 peer、切换链路或清理 relay 时仍可能跨文件遗漏 timer。
+- 建议：把 relay offer retry timer 的存储和清理 facade 迁入 `native-peer-controller.js`；`app-native-overrides.js` 保留 retry 次数、延迟选择、非重试错误和 exhausted 日志策略。
+- 修改意见：按建议实施 R5 小切片，不改变最大重试次数 2，不改变 `P2P_RECONNECT_DELAYS_MS`，不改变 `createOfferToNextViewer()` 和失败日志行为。
+- 处理结果：已处理。`native-peer-controller.js` 新增内部 `peerReconnectState`，并导出 `getPeerReconnectState()`、`schedulePeerReconnect()`、`clearPeerReconnect()`、`clearAllPeerReconnects()`；`app-native-overrides.js` 新增 wrapper，`scheduleRelayOfferRetry()` 继续负责策略判断，但 timer 存储/清理由 controller 接管，fallback 仍保留旧 `peerReconnectState`。`createOfferToNextViewer()` 成功后、peer connected/close、清全部 relay retries 路径均改为 wrapper 清理。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-094 remote ICE duplicate registry 仍由 app-native-overrides.js 直接写 meta
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：remote ICE RPC wrapper 已迁入 `native-peer-controller.js` 后，remote candidate key 构造、重复判断和 `meta.remoteCandidateKeys` 截断仍由 `app-native-overrides.js` 直接执行。
+- 影响：ICE 去重属于 peer lifecycle 的输入状态，但 owner 仍留在大 override 文件；后续迁 `handleIceCandidate()` 或 close/cleanup 时仍需要跨文件理解 remote candidate registry。
+- 建议：把 remote candidate key 构造、重复判断和 registry 写入迁入 `native-peer-controller.js`；`app-native-overrides.js` 保留 relay candidate 过滤和 P2P UI 状态写回。
+- 修改意见：按建议实施 R5 小切片，不改变 remote ICE payload、不改变 relay candidate 过滤、不改变 `setP2pStateForPeer(peerId, 'checking')`。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `buildRemoteCandidateKey(candidate)`、`hasRemoteCandidate(peerId, candidateKey)`、`rememberRemoteCandidate(peerId, candidateKey)`，并保持 64/48 的旧截断策略。`app-native-overrides.js` 的 `addPeerRemoteIceCandidate()` 现在优先委托 controller 构造 key、判断重复和记录 key；旧逻辑仅作为 fallback，relay candidate 过滤、mediaEngine remote ICE RPC 委托和 P2P UI checking 状态保持不变。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-095 local ICE candidate tracking 仍由 app-native-overrides.js 直接写 meta
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：remote ICE duplicate registry 迁入 controller 后，本地 ICE candidate 的计数、类型集合和 NAT mapping 备用 host UDP candidate cache 仍由 `app-native-overrides.js` 的 `rememberLocalIceCandidate()` 直接写 `meta.localCandidateCount/localCandidateTypes/localHostUdpCandidates`。
+- 影响：本地候选统计和 NAT mapping 输入属于 peer lifecycle 状态，但 owner 仍在大 override 文件；后续迁 failfast/NAT mapping 策略时还需要跨文件理解候选缓存格式。
+- 建议：把 local ICE candidate tracking 和 NAT mapping candidate cache 迁入 `native-peer-controller.js`；`app-native-overrides.js` 保留 gathering UI 状态和 NAT mapping 策略调用。
+- 修改意见：按建议实施 R5 小切片，不改变候选类型解析、不改变 host UDP cache 16 条限制、不改变 NAT mapping 最大候选数和 mapped candidate 发送。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `rememberLocalIceCandidate(peerId, candidate)` 和 `getLocalHostUdpCandidates(peerId, limit)`，集中维护 `localCandidateCount`、`localCandidateTypes`、`localHostUdpCandidates`，并保持旧 host/udp 去重 key 和 16 条 cache 限制。`app-native-overrides.js` 的 `rememberLocalIceCandidate()` 现在先定位 peerId、保留 `setP2pStateForPeer(peerId, 'gathering')`，随后优先委托 controller；`attemptLastChanceNatMapping()` 优先从 controller 读取 NAT mapping candidates，旧逻辑保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-096 peer edge snapshot 仍由 app-native-overrides.js 拼装
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：peer handle/meta registry、attempt 序列和 timer ownership 已逐步迁入 controller 后，`getPeerEdgeState()` 仍在 `app-native-overrides.js` 直接拼装 handle、meta、attemptId、edgeAttemptId、role/kind 和 connected/restart 状态。
+- 影响：`requestPeerRecovery()` 等高层策略仍依赖旧大文件构造 peer lifecycle snapshot；后续迁 recovery/close 时 snapshot owner 不清晰，容易继续把 peer 内部状态访问留在 UI/native glue 层。
+- 建议：把 peer attempt helper 和 edge snapshot 构造迁入 `native-peer-controller.js`；`app-native-overrides.js` 保留 recovery 策略和信令发送。
+- 修改意见：按建议实施 R5 小切片，不改变 attemptId/edgeAttemptId 取值规则，不改变 recovery 条件和日志 payload。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `getCurrentPeerAttemptId(peerId)`、`getCurrentPeerEdgeAttemptId(peerId)` 和 `getPeerEdgeState(peerId)`，统一从 controller handle registry 和 injected meta registry 生成 edge snapshot。`app-native-overrides.js` 的 `getPeerEdgeState()` 现在优先委托 controller，旧拼装逻辑保留 fallback；`requestPeerRecovery()` 的 host force offer、viewer reconnect-ready 和日志行为保持不变。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-097 peer attempt helper 仍由 app-native-overrides.js 直接读 meta
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：peer edge snapshot 迁入 controller 后，`getCurrentPeerAttemptId()`、`getCurrentPeerEdgeAttemptId()`、`isCurrentPeerAttempt()` 和 `appendPeerAttempt()` 仍在 `app-native-overrides.js` 直接读取 `peerConnectionMeta`。
+- 影响：offer/answer/candidate 的 attempt 过滤和 payload 附加仍由旧大文件掌握，后续迁 `handleAnswer()` / `handleIceCandidate()` 时会继续跨文件访问 peer attempt 状态。
+- 建议：把 attempt helper 迁入 `native-peer-controller.js`；`app-native-overrides.js` 只保留 wrapper/fallback，不改变信令 payload。
+- 修改意见：按建议实施 R5 小切片，不改变空 attempt 视为 current 的规则，不改变 `payload.attemptId` 原地附加语义。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `isCurrentPeerAttempt(peerId, attemptId)` 和 `appendPeerAttempt(payload, peerId)`，复用 controller 内部 `getCurrentPeerEdgeAttemptId()`；`app-native-overrides.js` 的四个 attempt helper 现在优先委托 controller，旧 meta 读取逻辑保留 fallback。offer/answer/candidate 发送与 stale attempt 过滤调用点未改。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-098 remote ICE candidate backlog 仍由 app.js 持有
+
+- 位置：`server/public/app.js`、`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：remote ICE RPC 和 candidate duplicate registry 已迁入 controller 后，远端 candidate 在 peer/remoteDescription 未 ready 时的 backlog 仍由 `app.js` 顶层 `pendingRemoteCandidates` Map 持有，`app-native-overrides.js` 直接读取/删除该 Map。
+- 影响：remote ICE 接收路径的 owner 分裂在 `app.js`、`app-native-overrides.js` 和 `native-peer-controller.js` 三处；reset/close/flush 清理也容易遗漏 controller 内部状态。
+- 建议：把 native remote ICE candidate backlog 存储迁入 `native-peer-controller.js`；`app.js` 只保留 legacy fallback 和 clear hook，`app-native-overrides.js` 只保留 queue/flush wrapper。
+- 修改意见：按建议实施 R5 小切片，不改变 backlog 每 peer 32 条限制，不改变 candidate 去重 key，不改变 flush 后逐条调用 `addPeerRemoteIceCandidate()` 的时序。
+- 处理结果：已处理。`native-peer-controller.js` 新增内部 `pendingRemoteCandidates` Map，并导出 `queuePendingRemoteCandidate()`、`takePendingRemoteCandidates()`、`clearPendingRemoteCandidates()`、`clearAllPendingRemoteCandidates()`；`app-native-overrides.js` 新增 `queueNativeRemoteCandidate()` / `clearNativePendingRemoteCandidates()` wrapper，`handleIceCandidate()` 的 no-peer/no-remoteDescription 分支优先写入 controller backlog，`flushQueuedRemoteCandidates()` 优先从 controller 取出队列。`app.js` 的 `clearPendingSignalingQueues()` 新增 `window.__vdsClearNativePendingRemoteCandidates` hook，用于 reset/disconnect 时同步清理 controller backlog；旧 `pendingRemoteCandidates` Map 仅保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-099 native peer-state event 仍由 app-native-overrides.js 直接改 handle/meta
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：peer handle registry、meta、timer 和 reconnect storage 已迁入 controller 后，native `peer-state` event 仍在 `app-native-overrides.js` 直接写 `handle.connectionState/iceConnectionState/closed`、`meta.hasConnected/restartInProgress`，并直接清 connect/disconnect/reconnect timer。
+- 影响：peer lifecycle 的核心状态写入口仍留在大 override 文件；后续拆 recovery、close 和 diagnostics 时仍要跨文件追踪状态变化。
+- 建议：把 peer-state event 的 handle/meta 写入和 timer 清理迁入 `native-peer-controller.js`；`app-native-overrides.js` 保留 P2P UI 状态、viewer media wait timer 和 recovery/failure 策略。
+- 修改意见：按建议实施 R5 小切片，不改变 connected/checking/restart/failed UI 状态，不改变 disconnected recovery 和 ICE failed finalize 触发。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `applyPeerStateEvent(params)`，统一处理 `connected/connecting/disconnected/failed/closed` 的 handle 状态写入、`meta.hasConnected/restartInProgress` 写入和 connect/disconnect/reconnect timer 清理，并返回 UI/recovery/failure callback hints。`app-native-overrides.js` 的 `handleNativePeerStateEvent()` 现在优先委托 controller，旧直接写状态逻辑保留 fallback；P2P UI 状态、viewer media wait timer、`scheduleDisconnectedPeerRecovery()` 和 `finalizeP2pFailureWithNatMapping()` 调用保持在旧文件。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-100 disconnected recovery attempt/delay preparation 仍由 app-native-overrides.js 直接写 meta
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：peer-state event 和 disconnected timer arm/clear 已迁入 controller 后，`scheduleDisconnectedPeerRecovery()` 仍在 `app-native-overrides.js` 直接读取 `peerConnectionMeta`、计算 recovery attempt/delay，并写 `meta.restartAttempts/restartInProgress`。
+- 影响：disconnected recovery 的调度状态和执行策略混在旧大文件里；后续迁 recovery 策略或 close/reconnect 时，attempt 状态仍可能和 controller 内部 timer/handle 状态分裂。
+- 建议：把 disconnected recovery 的可调度性判断、attempt 递增、delay 选择和 meta 写入迁入 `native-peer-controller.js`；`app-native-overrides.js` 只保留 `requestPeerRecovery()`、日志和信令恢复策略。
+- 修改意见：按建议实施 R5 小切片，不改变 `NATIVE_DISCONNECTED_RECOVERY_GRACE_MS` / `P2P_RECONNECT_DELAYS_MS`，不改变 attemptId 校验，不改变 host force offer、viewer reconnect-ready 和失败日志行为。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `prepareDisconnectedRecovery(peerId, handle, options)`，统一执行 missing/closed/meta/hasConnected/restartInProgress/disconnectTimer gate，按旧延迟序列计算 `nextAttempt/delayMs` 并写入 `meta.restartAttempts/restartInProgress`。`app-native-overrides.js` 的 `scheduleDisconnectedPeerRecovery()` 现在优先委托 controller 获取 recovery snapshot，旧 direct meta 写入仅作为 fallback；实际 recovery 回调、`requestPeerRecovery()` 和 timer arm 语义保持不变。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-101 peer recovery decision 仍由 app-native-overrides.js 拼装
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`requestPeerRecovery()` 已统一恢复入口后，旧文件仍直接读取 edge snapshot、校验 attempt、拼 `peer:recovery-requested` 日志 payload，并按 role 构造 viewer `viewer-reconnect-ready` 消息。
+- 影响：恢复入口虽然统一，但 peer lifecycle decision owner 仍不清晰；后续迁更多 recovery 来源时，每个入口仍可能在旧文件里重新拼 role/action/message。
+- 建议：把 recovery gate、attempt 校验、日志 payload、host/viewer action decision 和 viewer reconnect payload 构造迁入 `native-peer-controller.js`；`app-native-overrides.js` 只执行 `createOffer()`、`closePeer()` 和 `sendMessage()`。
+- 修改意见：按建议实施 R5 小切片，不改变日志字段、不改变 attemptId 比较规则、不改变 host 强制 offer 和 viewer reconnect-ready payload shape。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `preparePeerRecoveryRequest(peerId, reason, options)`，复用 controller edge snapshot 执行 peer/attempt gate，返回 `host-force-offer`、`viewer-reconnect-ready` 或 `none` action，并在 viewer 场景构造原有 `viewer-reconnect-ready` payload。`app-native-overrides.js` 的 `requestPeerRecovery()` 现在优先委托 controller 获取 decision snapshot，只保留日志写出和具体恢复动作执行；旧决策逻辑保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-102 remote ICE intake decision 仍由 app-native-overrides.js 分发
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：remote ICE backlog、attempt helper 和 addRemoteIce RPC wrapper 已迁入 controller 后，`handleIceCandidate()` 仍在旧文件直接判断 stale attempt、peer 是否存在、remoteDescription 是否 ready，并决定 queue/apply。
+- 影响：ICE 接收路径仍把 peer lifecycle readiness 判断留在 native glue 层；后续迁 `handleIceCandidate()` 高层入口时，还需要跨文件理解 attempt 和 peer handle readiness。
+- 建议：把 remote ICE intake 的 ignore/queue/apply decision 迁入 `native-peer-controller.js`；旧文件只保留日志、队列写入和调用 `addPeerRemoteIceCandidate()` 的执行动作。
+- 修改意见：按建议实施 R5 小切片，不改变缺 candidate 直接返回、不改变 stale attempt 日志、不改变 queue 时机、不改变 relay candidate 过滤和 duplicate registry。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `prepareRemoteIceCandidate(peerId, candidate, attemptId)`，统一根据当前 native handle、attemptId 和 remoteDescription 状态返回 `ignore`、`queue` 或 `apply`。`app-native-overrides.js` 的 `handleIceCandidate()` 现在优先委托 controller 决策，再执行原有 queue/apply；旧分发逻辑保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-103 remote answer intake decision 仍由 app-native-overrides.js 分发
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：remote description RPC wrapper、attempt helper 和 queued ICE flush 已迁入 controller/封装后，`handleAnswer()` 仍在旧文件直接判断 stale attempt、是否缺 local offer、是否重复 remoteDescription，并决定 flush/apply。
+- 影响：answer 接收路径的 peer readiness 与信令时序判断仍在 native glue 层；后续迁 offer/answer 高层分发时，需要继续跨文件追踪 `localDescription/remoteDescription` 的状态语义。
+- 建议：把 remote answer intake 的 ignore/flush/apply decision 迁入 `native-peer-controller.js`；旧文件保留原有日志、`setPeerRemoteDescription()` 和 queued ICE flush 执行动作。
+- 修改意见：按建议实施 R5 小切片，不改变 stale attempt 日志、不改变 stale answer without local offer 日志、不改变重复 answer 只 flush 队列的行为。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `prepareRemoteAnswer(peerId, description, attemptId)` 和内部 `isSameSessionDescription()`，统一根据当前 handle、attempt、local offer 和 remoteDescription 返回 `ignore`、`flush` 或 `apply`。`app-native-overrides.js` 的 `handleAnswer()` 现在优先委托 controller 决策，再执行原有日志、remote description 应用和 queued ICE flush；旧分发逻辑保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-104 remote offer intake decision 仍由 app-native-overrides.js 分发
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：offer/answer signal prepare、peer handle/meta 和 remote description wrapper 已迁入 controller 后，`handleOffer()` 仍在旧文件直接判断旧 attempt、是否需要 recreate peer、是否重复 remoteDescription，并决定 ignore/recreate/flush/reuse。
+- 影响：offer 接收路径仍把 peer lifecycle readiness 和 attempt ordering 留在 native glue 层；后续迁 `handleOffer()` 高层入口时容易继续把状态机判断、UI 切换和信令执行混在一起。
+- 建议：把 remote offer intake 的 ignore/recreate/flush/reuse decision 迁入 `native-peer-controller.js`；旧文件保留上游切换 UI、具体 close/create、set remote description、surface attach、answer 发送等执行动作。
+- 修改意见：按建议实施 R5 小切片，不改变旧 attempt 忽略日志、不改变 disconnected/non-connected peer 收到新 offer 时重建 peer 的规则、不改变重复 offer 只 flush 队列并启动 viewer stats 的行为。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `prepareRemoteOffer(peerId, description, attemptId)`，统一根据当前 handle/meta、edgeAttemptId、connectionState 和 remoteDescription 返回 `ignore`、`recreate`、`flush` 或 `reuse`。`app-native-overrides.js` 的 `handleOffer()` 现在优先委托 controller 决策，再执行原有 close/create、queued ICE flush、remote description 应用、surface attach 和 answer 发送；旧分发逻辑保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-105 offer/answer send payload 仍由 app-native-overrides.js 拼装
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：offer/answer signal prepare 和 attempt helper 已迁入 controller 后，`createAndSendPeerOffer()` / `createAndSendPeerAnswer()` 仍在旧文件手工拼 `offer` / `answer` sendMessage payload，并直接调用 `appendPeerAttempt()`。
+- 影响：peer controller 仍不是信令 payload shape 的唯一 owner；后续迁 createOffer/createAnswer 高层执行时，attemptId 附加和 payload 字段容易继续散落在旧文件里。
+- 建议：把 offer/answer send message builder 迁入 `native-peer-controller.js`；旧文件只保留 P2P UI 状态更新和 `sendMessage()` 执行。
+- 修改意见：按建议实施 R5 小切片，不改变 offer/answer payload 字段，不改变 `isRelay/reconnect/iceRestart` 条件字段，不改变 attemptId 附加语义。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `buildOfferMessage(peerId, signal, options)` 和 `buildAnswerMessage(peerId, signal, options)`，内部复用 controller 的 `appendPeerAttempt()` 构造原有 send payload。`app-native-overrides.js` 的 `createAndSendPeerOffer()` / `createAndSendPeerAnswer()` 现在优先委托 controller 构造 message，再调用原有 `sendMessage()`；旧 payload 拼装保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已更新 R5 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-106 getStats peer 聚合仍直接遍历 AgentRuntimeState::peers
+
+- 位置：`media-agent/src/agent_status_json.cpp`、`media-agent/src/peer_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：media-agent 已有 `PeerSessionController` 包装 RPC 入口后，`build_stats_json()` 仍直接遍历 `state.peers` 拼 `peers[]` JSON，`build_status_json()` 也直接读取 `state.peers.size()`。
+- 影响：M7 RuntimeState 瘦身仍缺少 stats/read snapshot 边界；即使写入口逐步迁入 controller，状态查询路径仍穿透 peer map，后续改 PeerSessionRegistry 时会继续牵动 status 聚合器。
+- 建议：先把 peer count 和 peer stats JSON 聚合迁入 `PeerSessionController`，保持 JSON 字段不变；host/surface/audio stats 后续再分阶段迁入对应 session/controller。
+- 修改意见：按建议实施 M7 小切片，不改变 `getStats.peers[]` 字段，不改变 `status.peerCount` 数值来源语义。
+- 处理结果：已处理。`PeerSessionController` 新增 `count()` 和 `stats_json()`；`agent_status_json.cpp` 的 `build_status_json()` 改为通过 `PeerSessionController::count()` 输出 `peerCount`，`build_stats_json()` 改为通过 `PeerSessionController::stats_json()` 输出 `peers[]`。`stats_json()` 暂仍在 controller 内部遍历 `runtime_state_.peers`，作为 M7 中间态；后续继续下沉为 registry snapshot。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-123 Peer/Surface controller 读路径仍直接穿透 runtime map
+
+- 位置：`media-agent/src/runtime_registry.*`、`media-agent/src/peer_session_controller.cpp`、`media-agent/src/surface_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M7 已把 peer/surface stats 聚合入口迁入 controller，但 `PeerSessionController::count()/stats_json()` 仍直接访问 `runtime_state_.peers`，`SurfaceSessionController::count()/stats_json()` 仍直接访问 `runtime_state_.attached_surfaces`。
+- 影响：controller 读路径仍知道 runtime map 结构；后续把 map 替换为 PeerSessionRegistry/SurfaceSessionRegistry snapshot 时，controller 聚合逻辑仍会被容器结构牵动。
+- 建议：在 `runtime_registry` 增加 count/for_each read facade，controller 只通过 registry facade 聚合，作为迁向 registry snapshot 的中间层。
+- 修改意见：按建议实施 M7 小切片，不改变 `status.peerCount/surfaceCount` 或 `getStats.peers[]/surfaces[]` JSON 内容。
+- 处理结果：已处理。`runtime_registry.*` 新增 `peer_count()`、`surface_count()`、`for_each_peer()`、`for_each_surface()`；`PeerSessionController` 和 `SurfaceSessionController` 的 count/stats 聚合改为通过这些 read facade，不再直接访问 `runtime_state_.peers` 或 `runtime_state_.attached_surfaces`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展和剩余中间态。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-124 业务生命周期路径仍直接遍历 runtime peer/surface map
+
+- 位置：`media-agent/src/runtime_registry.*`、`media-agent/src/host_session_controller.cpp`、`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/agent_lifecycle.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-123 已把 controller stats 读路径切到 registry facade，但 host session attach/detach、peer media refresh、closePeer surface cleanup、agent lifecycle surface/peer shutdown 仍直接 `for (state.peers)` 或 `for (state.attached_surfaces)`。
+- 影响：业务生命周期代码仍知道 runtime map 容器结构；后续引入 PeerSessionRegistry/SurfaceSessionRegistry 时，这些非 stats 路径仍会被容器替换牵动，且 surface 清理路径容易继续分散。
+- 建议：在 `runtime_registry` 增加显式 mutable traversal facade 和带 id 的 surface traversal facade；业务代码只通过 facade 遍历，删除直接 map 遍历。保持遍历顺序、stop/erase 顺序和 RPC JSON 不变。
+- 修改意见：按建议实施 M7 小切片，不改变 host stop/start、peer close、surface restart、transport refresh 或 shutdown 行为。
+- 处理结果：已处理。`runtime_registry.*` 新增 `for_each_mutable_peer()` 和带 `surface_id` 的 `for_each_surface()` facade；`host_session_controller.cpp`、`peer_media_binding_runtime.cpp`、`peer_control_runtime.cpp`、`agent_lifecycle.cpp` 的业务遍历已改为通过 registry facade。`closePeer` 仍保持先收集 surface id、停止 surface、再 erase 的原顺序。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-125 surface 批量生命周期仍由 agent_lifecycle.cpp 持有
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/surface_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-124 已把 direct map traversal 切到 registry facade，但 host capture surface refresh、stop all surfaces、restart host capture surfaces 的实际 lifecycle 决策仍留在 `agent_lifecycle.cpp`。
+- 影响：SurfaceSessionController 虽已接管 RPC attach/update/detach 和 stats 聚合，但批量 surface lifecycle owner 仍分散；后续修改 surface recovery 或 host preview 重启策略时仍会牵动 agent lifecycle。
+- 建议：把三个批量 surface 操作迁入 `SurfaceSessionController`，`agent_lifecycle.cpp` 只保留兼容 wrapper，保持 refresh/stop/restart 判断和顺序不变。
+- 修改意见：按建议实施 M3/M7 小切片，不改变 host capture artifact refresh、surface auto restart、host session start/stop 或 agent shutdown 行为。
+- 处理结果：已处理。`SurfaceSessionController` 新增 `refresh_host_capture_surfaces()`、`stop_all()`、`restart_host_capture_surfaces()`；`agent_lifecycle.cpp` 的 `refresh_host_capture_runtime()`、`stop_all_surface_attachments()`、`restart_host_capture_surface_attachments()` 改为调用 controller，并删除不再需要的 surface helper include/using。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M3/M7 当前进展。
+- 验证结果：首次执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback` 暴露 `agent_lifecycle.cpp` 缺少 `surface_session_controller.h` include，已修复后重跑通过；随后执行 `npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-126 shutdown peer 批量关闭仍由 agent_lifecycle.cpp 持有
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/peer_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-124 已把 shutdown peer 遍历改为 registry facade，但 receiver handles close 和 transport sessions close 的实际批量 peer lifecycle 仍在 `agent_lifecycle.cpp`。
+- 影响：PeerSessionController 虽已接管 RPC 和 stats 聚合，但 shutdown peer cleanup owner 仍分散；后续把 peer map 下沉为 registry/snapshot 时，agent lifecycle 仍需要知道 peer receiver/transport 关闭细节。
+- 建议：把 shutdown receiver handles close 和 transport sessions close 迁入 `PeerSessionController`，`agent_lifecycle.cpp` 只按原顺序调用 controller。
+- 修改意见：按建议实施 M2/M7 小切片，不改变 shutdown 顺序、host audio dispatch reset、viewer audio stop、OBS stop 或 relay shutdown 行为。
+- 处理结果：已处理。`PeerSessionController` 新增 `close_all_receiver_handles()` 和 `close_all_transport_sessions()`；`agent_lifecycle.cpp` 的 shutdown 流程保留原顺序，改为通过同一个 controller 实例执行两段 peer cleanup，并删除不再需要的 `peer_receiver_runtime.h` / `runtime_registry.h` include。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M2/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-127 host downstream peer 批量绑定仍由 HostSessionController 持有
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`media-agent/src/peer_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-124 已把 host start/stop 中的 peer 遍历切到 registry facade，但 host-downstream peer media binding attach/detach、peer-state event emit、transport local description fallback 仍由 `HostSessionController` 的局部 helper 持有。
+- 影响：Host owner 仍承担 downstream peer lifecycle 细节；后续把 `peer_control_runtime.*` 降级为 `PeerSessionController` helper 时，host start/stop 仍会牵动 peer transport 和 peer state 输出细节。
+- 建议：把 host-downstream peer 批量 attach/detach 迁入 `PeerSessionController`，继续复用 `HostSessionControllerCallbacks`，保持 attach/detach 回调、renegotiation 判断和 event 输出不变。
+- 修改意见：按建议实施 M2/M4/M7 小切片，不改变 startHostSession/stopHostSession result JSON、host capture lifecycle、peer media binding attach/detach 行为或 SDP 生成时机。
+- 处理结果：已处理。`PeerSessionController` 新增 `attach_host_downstream_media_bindings()` 和 `detach_host_downstream_media_bindings()`；`host_session_controller.cpp` 删除局部 `emit_host_downstream_peer_attach_events()` / `detach_host_downstream_peers()` helper，start/stop 仅实例化 peer controller 并调用对应方法，同时移除不再需要的 peer runtime include。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M2/M4/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-128 closePeer surface cleanup 仍由 peer_control_runtime.cpp 持有
+
+- 位置：`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/surface_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-124 已把 closePeer surface cleanup 改为 registry facade，但按 peer id 停止 surface attachment、收集 surface id、erase surface 的 owner 仍在 `peer_control_runtime.cpp`。
+- 影响：peer close 路径继续直接管理 surface lifecycle 和 surface map 删除；后续把 surface map 下沉为 SurfaceSessionRegistry 时，peer runtime 仍会牵动 surface 容器细节。
+- 建议：新增 `SurfaceSessionController::detach_peer_surfaces(peerId, reason)`，内部保持先停止、收集 id、再 erase 的原顺序；`closePeer` 只调用 surface controller。
+- 修改意见：按建议实施 M2/M3/M7 小切片，不改变 closePeer 顺序、surface stop reason、peer media binding cleanup、receiver close 或 transport close 行为。
+- 处理结果：已处理。`SurfaceSessionController` 新增 `detach_peer_surfaces()`；`peer_control_runtime.cpp` 的 closePeer surface cleanup 改为实例化 surface controller 并调用该方法，删除对 `erase_surface()` / `for_each_surface()` 和 `surface_attachment_runtime.h` 的直接依赖。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M3/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-129 批量 peer refresh 入口仍绕过 PeerSessionController
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/media_audio.cpp`、`media-agent/src/peer_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-126/P1-127 已把部分批量 peer lifecycle 收进 `PeerSessionController`，但 agent refresh 仍直接调用 `refresh_peer_transport_runtime()` / `perform_host_video_sender_soft_refresh()`，audio start/stop 仍直接调用 `refresh_host_audio_senders()`。
+- 影响：外层 lifecycle/audio 模块仍知道 peer media binding 的批量 helper；后续把 `peer_media_binding_runtime.*` 降级为 controller 内部 helper 时，调用点还会分散在非 peer owner 文件。
+- 建议：在 `PeerSessionController` 增加批量 refresh facade，外层模块只调用 controller；底层 free function 暂保留为兼容 helper，行为不变。
+- 修改意见：按建议实施 M2/M6/M7 小切片，不改变 transport refresh 次序、host sender soft refresh 次序、audio sender refresh 或 WASAPI start/stop 行为。
+- 处理结果：已处理。`PeerSessionController` 新增 `refresh_transport_runtime()`、`perform_host_video_sender_soft_refresh()`、`refresh_host_audio_senders()`；`agent_lifecycle.cpp` 改为通过 controller 执行原来的 refresh -> soft refresh -> refresh 顺序，`media_audio.cpp` 的 start/stop audio session 改为通过 controller 刷新 host audio senders，并删除局部 free function forward declaration。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M2/M6/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-130 SurfaceSessionController 公共头仍暴露 legacy surface runtime 头
+
+- 位置：`media-agent/src/surface_control_result.h`、`media-agent/src/surface_control_runtime.h`、`media-agent/src/surface_session_controller.h`、`media-agent/src/surface_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`SurfaceSessionController` 已接管 surface RPC 入口，但其公共头仍 include `surface_control_runtime.h`，而 result 类型也定义在 legacy runtime helper 头里。
+- 影响：外部只想使用 `SurfaceSessionController` 时仍被迫看到 legacy surface runtime helper 声明；后续把 `surface_control_runtime.*` 降级为 controller 内部 helper 会继续受头文件依赖牵动。
+- 建议：拆出 `SurfaceControlCommandResult` 到独立 result 头；`surface_session_controller.h` 只 include result 头并使用前置声明，`surface_control_runtime.h` 仅供 controller 实现文件内部 include。
+- 修改意见：按建议实施 M3/M7 小切片，不改变 attach/update/detach RPC result JSON、RPC router 调用方式或 surface lifecycle 行为。
+- 处理结果：已处理。新增 `surface_control_result.h` 持有 `SurfaceControlCommandResult`；`surface_control_runtime.h` 改为 include result 头并只保留 legacy helper 声明；`surface_session_controller.h` 不再 include `surface_control_runtime.h` 或 `agent_runtime.h`，改为 include result 头并前置声明 `AgentRuntimeState` / `SurfaceAttachmentState`；`surface_session_controller.cpp` 内部 include `surface_control_runtime.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M3/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-131 PeerSessionController 公共头仍暴露 legacy peer runtime 头
+
+- 位置：`media-agent/src/peer_control_result.h`、`media-agent/src/peer_media_binding_result.h`、`media-agent/src/peer_control_runtime.h`、`media-agent/src/peer_media_binding_runtime.h`、`media-agent/src/peer_session_controller.h`、`media-agent/src/peer_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`PeerSessionController` 已接管 peer RPC 入口和批量 peer lifecycle facade，但其公共头仍 include `agent_runtime.h`、`peer_control_runtime.h`、`peer_media_binding_runtime.h`，而 peer RPC result 类型也定义在 legacy runtime helper 头里。
+- 影响：外部只想使用 `PeerSessionController` 时仍被迫看到 legacy peer helper 声明和大 runtime 结构；后续把 `peer_control_runtime.*` / `peer_media_binding_runtime.*` 降级为 controller 内部 helper 会继续受头文件依赖牵动。
+- 建议：拆出 `PeerControlCommandResult` 和 `PeerMediaBindingCommandResult` 到独立 result 头；`peer_session_controller.h` 只 include result 头并使用前置声明，legacy peer runtime helper 头仅在 controller 实现文件内部 include。
+- 修改意见：按建议实施 M2/M7 小切片，不改变 create/close/setRemoteDescription/addIceCandidate/attach/detach RPC result JSON、RPC router 调用方式或 peer lifecycle 行为。
+- 处理结果：已处理。新增 `peer_control_result.h` 持有 `PeerControlCommandResult`，新增 `peer_media_binding_result.h` 持有 `PeerMediaBindingCommandResult`；`peer_control_runtime.h` / `peer_media_binding_runtime.h` 改为 include 对应 result 头并只保留 legacy helper 声明；`peer_session_controller.h` 不再 include `agent_runtime.h`、`peer_control_runtime.h` 或 `peer_media_binding_runtime.h`，改为 include result 头并前置声明 `AgentRuntimeState` / `HostSessionControllerCallbacks` / `PeerState`；`peer_session_controller.cpp` 内部 include legacy helper 头。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M2/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-132 Audio/Surface JSON helper 公共头仍暴露 agent_runtime.h
+
+- 位置：`media-agent/src/audio_state_json.h`、`media-agent/src/audio_state_json.cpp`、`media-agent/src/surface_state_json.h`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`audio_state_json.h` 和 `surface_state_json.h` 只声明 JSON helper，却直接 include `agent_runtime.h`，导致调用方为了格式化 audio/surface snapshot 被迫拉入完整 runtime 状态定义。
+- 影响：M6/M7 已把 audio/surface 输出格式迁到专属 helper 后，公共头仍把大 runtime 作为传递依赖暴露出去；后续瘦身 `AgentRuntimeState` 时，这些只需要 snapshot 引用的 helper 会继续放大 include 影响面。
+- 建议：公共 JSON helper 头只保留 `AudioSessionState` / `SurfaceAttachmentState` 前置声明；需要字段定义的 `.cpp` 自行 include runtime/具体 helper 头。
+- 修改意见：按建议实施 M6/M7 小切片，不改变 `audioBackend`、surface attach/update result 或 `getStats.surfaces[]` JSON 字段。
+- 处理结果：已处理。`audio_state_json.h` 改为前置声明 `AudioSessionState`，`audio_state_json.cpp` 自行 include `agent_runtime.h`；`surface_state_json.h` 改为前置声明 `SurfaceAttachmentState`，完整结构依赖留在 `surface_state_json.cpp` 现有实现 include 链内。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M6/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-133 RuntimeRegistry 公共头仍暴露 agent_runtime.h
+
+- 位置：`media-agent/src/runtime_registry.h`、`media-agent/src/runtime_registry.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`runtime_registry.h` 只声明 peer/surface registry 查找、计数和遍历 facade，却直接 include `agent_runtime.h`。
+- 影响：任何只想调用 registry facade 的文件都会通过公共头拉入完整 `AgentRuntimeState`、`PeerState` 和 `SurfaceAttachmentState` 定义；M7 后续把 map 下沉为 registry/snapshot 时，include 影响面仍偏大。
+- 建议：`runtime_registry.h` 使用前置声明，完整 runtime 容器访问只留在 `runtime_registry.cpp`。调用方需要读写字段时应显式 include 自己实际依赖的 runtime/helper 头。
+- 修改意见：按建议实施 M1/M7 小切片，不改变 find/ensure/erase/count/for_each 行为，不改变 peer/surface owner 当前中间态。
+- 处理结果：已处理。`runtime_registry.h` 移除 `agent_runtime.h` include，改为前置声明 `AgentRuntimeState` / `PeerState` / `SurfaceAttachmentState`；`runtime_registry.cpp` 显式 include `agent_runtime.h` 后继续持有唯一底层 map 访问实现。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M1/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-134 ffmpeg_probe 公共头仍暴露 agent_runtime.h
+
+- 位置：`media-agent/src/ffmpeg_probe.h`、`media-agent/src/ffmpeg_probe.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`ffmpeg_probe.h` 只是声明 FFmpeg 探测、encoder 选择和 self-test API，却通过 `agent_runtime.h` 暴露完整 runtime 状态定义。
+- 影响：host pipeline、status 和 lifecycle 调用 probe API 时会获得不必要的大 runtime 传递依赖；后续把 `FfmpegProbeResult` 从 `AgentRuntimeState` 周边结构中拆出时，公共头边界仍会放大改动。
+- 建议：`ffmpeg_probe.h` 只前置声明 `FfmpegProbeResult`，保留 `process_runner.h` 提供 `CommandResult` 定义；需要 probe/result 字段的实现文件自行 include `agent_runtime.h`。
+- 修改意见：按建议实施 M1/M7 小切片，不改变 FFmpeg 探测、encoder self-test、probe JSON 或 host pipeline 行为。
+- 处理结果：已处理。`ffmpeg_probe.h` 移除 `agent_runtime.h` include，改为按现有类型归属前置声明全局 `FfmpegProbeResult`；`ffmpeg_probe.cpp` 显式 include `agent_runtime.h` 以访问 probe/result 字段。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M1/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-135 host_capture_plan 公共头仍暴露 agent_runtime/wgc_capture
+
+- 位置：`media-agent/src/host_capture_plan.h`、`media-agent/src/host_capture_plan.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`host_capture_plan.h` 只是声明 capture plan 构建、WGC source config 构建和 plan 校验接口，却直接 include `agent_runtime.h` 和 `wgc_capture.h`。
+- 影响：调用方只需要 host capture plan API 声明时会被迫拉入完整 runtime 与 WGC backend 定义；后续把 HostCapturePlan/HostPipelineState/WGC probe 分拆为 session snapshot 或 backend capability 时，公共头会继续放大改动范围。
+- 建议：`host_capture_plan.h` 改用 `FfmpegProbeResult`、`HostCapturePlan`、`HostPipelineState`、`WgcCaptureProbe`、`WgcFrameSourceConfig` 前置声明；完整字段访问和 WGC backend 依赖留在实现文件。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 capture plan JSON、WGC capture planning、尺寸校验或 encoder 校验行为。
+- 处理结果：已处理。`host_capture_plan.h` 移除 `agent_runtime.h` / `wgc_capture.h` include，改为全局前置声明相关状态和 WGC config/probe 类型；`host_capture_plan.cpp` 显式 include `agent_runtime.h` 与 `wgc_capture.h` 以访问完整字段和 backend 类型。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M4/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-136 host_capture_process 公共头仍暴露 agent_runtime.h
+
+- 位置：`media-agent/src/host_capture_process.h`、`media-agent/src/host_capture_process.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`host_capture_process.h` 只是声明 host capture process/artifact lifecycle API，却直接 include `agent_runtime.h`；其中 `probe_host_capture_artifact(..., previous_probe = {})` 的默认参数也迫使公共头需要完整 `HostCaptureArtifactProbe` 定义。
+- 影响：HostSessionController/agent lifecycle 调用 capture process API 时会继续通过公共头获得完整 runtime 传递依赖；后续把 HostCaptureProcessState/HostCaptureArtifactProbe 下沉为 HostSessionSnapshot 时，头文件边界会继续放大改动范围。
+- 建议：`host_capture_process.h` 改用 host capture/process/pipeline/probe 类型前置声明；把默认空 probe 改为 `.cpp` 内两参 overload，三参 overload 保留原有 previous_probe 逻辑。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 host capture process start/stop、artifact probing、manifest persistence 或返回 JSON 行为。
+- 处理结果：已处理。`host_capture_process.h` 移除 `agent_runtime.h` include，改为前置声明 `FfmpegProbeResult`、`HostCaptureArtifactProbe`、`HostCapturePlan`、`HostCaptureProcessState`、`HostPipelineState`；`probe_host_capture_artifact` 拆成两参 overload 和三参 overload，避免公共头默认参数依赖完整 probe 类型；`host_capture_process.cpp` 显式 include `agent_runtime.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M4/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-137 Audio session state/result 仍内嵌在大 runtime/运行逻辑头
+
+- 位置：`media-agent/src/audio_session_state.h`、`media-agent/src/audio_session_result.h`、`media-agent/src/agent_runtime.h`、`media-agent/src/media_audio.h`、`media-agent/src/audio_state_json.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`AudioSessionState` 仍定义在 `agent_runtime.h`，`AudioSessionCommandResult` 仍定义在 `media_audio.h`，导致 audio stats/result 的轻量结构和大 runtime、音频运行逻辑头绑定。
+- 影响：M6 已把 host/viewer audio lifecycle 收进 session facade 后，audio snapshot/result 类型仍不能独立复用；后续把 `AgentRuntimeState::audio_session` 下沉为 AudioSessionRegistry 或 snapshot cache 时会继续牵动 `agent_runtime.h` 和 `media_audio.h`。
+- 建议：新增独立 audio session state/result 头；`agent_runtime.h` 只 include state 类型用于兼容字段，`media_audio.h` 只 include result/state 类型，不再自己定义 command result。
+- 修改意见：按建议实施 M6/M7 小切片，不改变 start/stop audio RPC result、`getStats.audioBackend` 字段、WASAPI capture 或 host audio dispatch 行为。
+- 处理结果：已处理。新增 `audio_session_state.h` 持有 `AudioSessionState`，新增 `audio_session_result.h` 持有 `AudioSessionCommandResult`；`agent_runtime.h` 删除内嵌 `AudioSessionState` 定义并 include state 头；`media_audio.h` 删除内嵌 `AudioSessionCommandResult` 定义并 include result/state 头；`audio_state_json.cpp` 改为依赖 `audio_session_state.h` 而不是 `agent_runtime.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M6/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-138 PeerVideoReceiverRuntime 嵌套在 PeerState 阻塞 receiver/audio/surface 头解耦
+
+- 位置：`media-agent/src/peer_video_receiver_state.h`、`media-agent/src/agent_runtime.h`、`media-agent/src/media_audio.h`、`media-agent/src/peer_receiver_runtime.h`、`media-agent/src/viewer_audio_session.h`、`media-agent/src/viewer_video_pipeline.h`、`media-agent/src/surface_attachment_runtime.h`、相关 `.cpp` 显式 include 调整、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`PeerVideoReceiverRuntime` 作为 `PeerState` 嵌套类型存在，导致 audio decode、viewer video pipeline、surface attachment、peer receiver runtime 等公共头必须 include `agent_runtime.h` 才能声明 `PeerState::PeerVideoReceiverRuntime` 参数。
+- 影响：receiver/session 相关 API 无法独立于大 peer/runtime map 复用；后续把 PeerSessionController/PeerReceiverSession 继续拆分时，头文件层仍会把完整 `PeerState` 暴露给 audio/surface/viewer pipeline。
+- 建议：新增顶层 `PeerVideoReceiverRuntime` 状态头，`PeerState` 内保留同名 alias 兼容旧代码；公共 API 改用顶层类型并按需前置声明/轻量 include，完整 runtime 访问由实现文件显式 include。
+- 修改意见：按建议实施 M2/M3/M6/M7 交叉小切片，不改变 receiver runtime 字段、对象布局语义、surface/audio/video 消费路径或 stats 输出。
+- 处理结果：已处理。新增 `peer_video_receiver_state.h` 承接原 `PeerState::PeerVideoReceiverRuntime` 字段和内部 `PeerAudioDecoderRuntime`；`agent_runtime.h` 删除嵌套定义并保留 `using PeerVideoReceiverRuntime = ::PeerVideoReceiverRuntime` 兼容名，同时 `SurfaceAttachmentState::peer_runtime` 改为顶层 shared_ptr；`media_audio.h`、`peer_receiver_runtime.h`、`viewer_audio_session.h`、`viewer_video_pipeline.h`、`surface_attachment_runtime.h` 改为使用顶层 `PeerVideoReceiverRuntime`，其中多个公共头不再 include `agent_runtime.h`；实现文件补充显式 `agent_runtime.h` include。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 receiver/runtime 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-139 PeerVideoSenderRuntime/MediaBindingState 嵌套在 PeerState 阻塞 peer JSON 头解耦
+
+- 位置：`media-agent/src/peer_video_sender_state.h`、`media-agent/src/peer_media_binding_state.h`、`media-agent/src/agent_runtime.h`、`media-agent/src/peer_state_json.h`、`media-agent/src/peer_state_json.cpp`、`media-agent/src/peer_video_sender.cpp`、`media-agent/src/peer_media_binding_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`PeerVideoSenderRuntime` 与 `MediaBindingState` 仍作为 `PeerState` 嵌套类型存在，导致 `peer_state_json.h` 为了声明 `peer_media_binding_json(const PeerState::MediaBindingState&)` 必须 include `agent_runtime.h`。
+- 影响：peer stats/result JSON helper 的公共头继续暴露完整 runtime map；后续把 PeerSessionController/PeerSessionRegistry 继续下沉时，轻量 JSON helper 仍会把大 runtime 传递给调用方。
+- 建议：新增顶层 sender runtime 和 media binding state 头；`PeerState` 内保留 alias 兼容旧代码；`peer_state_json.h` 只前置声明 `PeerState` / `PeerMediaBindingState`，完整字段访问留在 `.cpp`。
+- 修改意见：按建议实施 M2/M7 小切片，不改变 sender runtime 字段、media binding stats 字段、peer stats JSON 输出或 host/relay media binding 行为。
+- 处理结果：已处理。新增 `peer_video_sender_state.h` 承接原 `PeerState::PeerVideoSenderRuntime` 字段，新增 `peer_media_binding_state.h` 承接原 `PeerState::MediaBindingState` 字段；`agent_runtime.h` 删除两个嵌套定义并保留 `using PeerVideoSenderRuntime = ::PeerVideoSenderRuntime` / `using MediaBindingState = ::PeerMediaBindingState` 兼容名；`peer_state_json.h` 移除 `agent_runtime.h` include，改为前置声明并接收顶层 `PeerMediaBindingState`；实现文件补充显式 include。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 sender/media binding 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-140 AgentContext 公共头仍暴露完整 AgentRuntimeState 定义
+
+- 位置：`media-agent/src/agent_context.h`、`media-agent/src/runtime_registry.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-139 后，`agent_context.h` 是 media-agent 公共头里最后一个直接 include `agent_runtime.h` 的文件，但它只保存 `AgentRuntimeState&` 并内联 `emit()`，并不需要完整 runtime 定义。
+- 影响：只要引入 AgentContext，就会把完整 `AgentRuntimeState`、host/peer/surface/audio 兼容字段和相关重依赖继续传递给调用方；这和 M1/M7 期望的轻量 context/registry 边界不一致。
+- 建议：`agent_context.h` 改为全局前置声明 `AgentRuntimeState`；需要完整字段访问的实现文件自行 include `agent_runtime.h`。
+- 修改意见：按建议实施 M1/M7 小切片，不改变 `AgentContext::runtime` 引用语义、事件发送方式或 runtime registry 行为。
+- 处理结果：已处理。`agent_context.h` 移除 `agent_runtime.h` include，改为全局 `struct AgentRuntimeState;` 前置声明；`AgentContext` 构造函数和 `runtime` 引用保持原签名。当前 `rg '#include "agent_runtime\.h"' media-agent/src -g '*.h'` 已无命中，media-agent 普通公共头不再直接暴露大 runtime 头。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M1/M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-141 FFmpeg probe state 仍内嵌在 AgentRuntimeState 大头文件
+
+- 位置：`media-agent/src/ffmpeg_probe_state.h`、`media-agent/src/ffmpeg_probe.cpp`、`media-agent/src/agent_runtime.h`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`VideoEncoderProbeResult` 与 `FfmpegProbeResult` 仍定义在 `agent_runtime.h`，而 `ffmpeg_probe.h` 已经只需要前置声明；FFmpeg probe 的轻量 snapshot 类型仍和完整 runtime 组合头绑定。
+- 影响：host pipeline/capture/surface 等只关心 FFmpeg probe snapshot 的实现文件需要通过大 runtime 头获得定义；后续把 capabilities/probe state 下沉为 shared services 或 snapshot cache 时还会牵动 `agent_runtime.h`。
+- 建议：新增独立 `ffmpeg_probe_state.h` 承接 probe snapshot 类型；`agent_runtime.h` 仅 include 该 state 头保留兼容字段，`ffmpeg_probe.cpp` 直接 include state 头，不再为 probe 实现依赖完整 runtime。
+- 修改意见：按建议实施 M1/M7 小切片，不改变 FFmpeg 探测、encoder self-test、host pipeline 选择或 JSON 输出。
+- 处理结果：已处理。新增 `ffmpeg_probe_state.h` 持有 `VideoEncoderProbeResult` 和 `FfmpegProbeResult`；`agent_runtime.h` 删除两个内嵌定义并 include state 头；`ffmpeg_probe.cpp` 改为 include `ffmpeg_probe_state.h`，不再 include `agent_runtime.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 probe/state 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-142 Host pipeline/capture/process 状态仍内嵌在 AgentRuntimeState 大头文件
+
+- 位置：`media-agent/src/host_session_state.h`、`media-agent/src/agent_runtime.h`、`media-agent/src/host_state_json.cpp`、`media-agent/src/host_capture_plan.cpp`、`media-agent/src/host_pipeline.cpp`、`media-agent/src/host_capture_process.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`HostPipelineState`、`HostCapturePlan`、`HostCaptureProcessState`、`HostCaptureArtifactProbe` 仍定义在 `agent_runtime.h`，但 host capture/pipeline/process 公共头已经主要通过前置声明使用这些类型。
+- 影响：host pipeline/capture/process 的轻量状态和完整 runtime 组合头绑定；后续把 HostSessionController 收紧为 HostSessionSnapshot/registry 时，状态定义仍会被大 runtime 头牵制。
+- 建议：新增独立 host session state 头承接 host pipeline/capture/process/artifact 状态；`agent_runtime.h` 只 include 该 state 头保留兼容字段；实现文件直接 include 轻量 state 头，减少对完整 runtime 的实现侧依赖。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 host pipeline 选择、capture plan 校验、host capture artifact probe、host stats JSON 或 start/stop 行为。
+- 处理结果：已处理。新增 `host_session_state.h` 持有 `HostPipelineState`、`HostCapturePlan`、`HostCaptureProcessState`、`HostCaptureArtifactProbe`；`agent_runtime.h` 删除这些内嵌定义并 include host state 头；`host_state_json.cpp`、`host_capture_plan.cpp`、`host_pipeline.cpp`、`host_capture_process.cpp` 改为直接 include 轻量 state/probe 头，不再为了字段访问 include 完整 `agent_runtime.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 host state 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-143 SurfaceAttachmentState 仍内嵌在 AgentRuntimeState 大头文件
+
+- 位置：`media-agent/src/surface_attachment_state.h`、`media-agent/src/agent_runtime.h`、`media-agent/src/surface_attachment_runtime.cpp`、`media-agent/src/surface_state_json.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`SurfaceAttachmentState` 仍定义在 `agent_runtime.h`，虽然 surface runtime、surface JSON、SurfaceSessionController 公共头已经通过前置声明使用该类型。
+- 影响：surface session 状态和完整 agent runtime 组合头绑定；后续把 `attached_surfaces` 下沉为 SurfaceSessionRegistry 时，surface state 仍无法独立复用。
+- 建议：新增独立 `surface_attachment_state.h` 承接 surface state；`agent_runtime.h` 只 include 该 state 头保留兼容 map 字段；surface runtime/JSON 实现文件直接 include state 头，避免为字段访问依赖完整 runtime。
+- 修改意见：按建议实施 M3/M7 小切片，不改变 surface attach/update/detach、peer surface sync、host preview surface 或 JSON 输出字段。
+- 处理结果：已处理。新增 `surface_attachment_state.h` 持有 `SurfaceAttachmentState`；`agent_runtime.h` 删除内嵌 surface state 定义并 include surface state 头；`surface_attachment_runtime.cpp` 与 `surface_state_json.cpp` 改为直接 include `surface_attachment_state.h`，其中 surface runtime 实现同时显式 include `host_session_state.h` / `ffmpeg_probe_state.h` 获取所需轻量状态。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 surface state 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-144 ObsIngestState 仍内嵌在 AgentRuntimeState 大头文件
+
+- 位置：`media-agent/src/obs_ingest_session_state.h`、`media-agent/src/obs_ingest_state.cpp`、`media-agent/src/agent_runtime.h`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`ObsIngestState` 仍定义在 `agent_runtime.h`，但 `obs_ingest_state.h` 已是轻量 helper 入口，只需要前置声明 OBS ingest 状态。
+- 影响：OBS ingest session 状态和完整 agent runtime 组合头绑定；后续把 OBS ingest lifecycle 收口进 HostSessionController/ObsIngestSession 时，状态仍无法独立复用。
+- 建议：新增独立 OBS ingest session state 头；`agent_runtime.h` 只 include 该 state 头保留兼容字段；OBS JSON helper 实现直接 include state 头，不再为了字段访问依赖完整 runtime。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 OBS ingest 准备、监听、推流包处理、relay publish 或 JSON 输出字段。
+- 处理结果：已处理。新增 `obs_ingest_session_state.h` 持有 `ObsIngestState`；`agent_runtime.h` 删除内嵌 OBS ingest state 定义并 include OBS state 头；`obs_ingest_state.cpp` 改为直接 include `obs_ingest_session_state.h`，不再 include 完整 `agent_runtime.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 OBS ingest state 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-145 PeerState 仍内嵌在 AgentRuntimeState 大头文件
+
+- 位置：`media-agent/src/peer_session_state.h`、`media-agent/src/agent_runtime.h`、`media-agent/src/peer_state_json.cpp`、`media-agent/src/peer_video_sender.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：前序拆分已把 peer sender/receiver/media binding 子状态移出，但 `PeerState` 本体仍定义在 `agent_runtime.h`，使 peer session state 继续和完整 agent runtime 组合头绑定。
+- 影响：PeerSessionController/RuntimeRegistry 的 peer map 仍不能独立于 `AgentRuntimeState` 复用；后续把 `runtime_state.peers` 下沉为 PeerSessionRegistry 时，peer session snapshot 仍缺少独立定义边界。
+- 建议：新增独立 `peer_session_state.h` 承接 `PeerState`；`agent_runtime.h` 只 include peer state 头保留兼容 `peers` map；peer JSON 和 peer video sender 实现文件直接 include peer/host/probe state 头，减少对完整 runtime 的实现侧依赖。
+- 修改意见：按建议实施 M2/M7 小切片，不改变 create/close peer、offer/answer/ICE、media binding、sender/receiver runtime 或 peer stats JSON 字段。
+- 处理结果：已处理。新增 `peer_session_state.h` 持有 `PeerState`；`agent_runtime.h` 删除内嵌 `PeerState` 定义并 include peer state 头；`peer_state_json.cpp` 改为直接 include `peer_session_state.h`，`peer_video_sender.cpp` 改为显式 include `peer_session_state.h`、`host_session_state.h`、`ffmpeg_probe_state.h` 和 sender/media binding state 头。`AgentRuntimeState` 当前只剩组合字段定义，peer state 已具备后续下沉到 PeerSessionRegistry 的独立类型边界。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 peer state 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-146 AgentRuntimeState 仍直接持有 peer/surface map 容器
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/src/agent_runtime.h`、`media-agent/src/runtime_registry.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-145 后 peer/surface state 类型已经独立，但 `AgentRuntimeState` 仍直接持有 `std::map<std::string, PeerState>` 和 `std::map<std::string, SurfaceAttachmentState>` 容器字段。
+- 影响：runtime registry facade 虽已收口访问点，但 `AgentRuntimeState` 仍暴露底层容器形态；后续替换为 PeerSessionRegistry/SurfaceSessionRegistry snapshot 时还需要修改 runtime 组合字段。
+- 建议：新增 `PeerSessionRegistry` / `SurfaceSessionRegistry` 包装类型；`AgentRuntimeState` 持有 registry 字段，`runtime_registry.cpp` 内部访问 registry 的兼容 map，外部 facade 和调用方不变。
+- 修改意见：按建议实施 M2/M3/M7 小切片，不改变 peer/surface 创建、查找、遍历、删除行为，不改变外部 `runtime_registry` API。
+- 处理结果：已处理。新增 `session_registries.h`，定义 `PeerSessionRegistry` 与 `SurfaceSessionRegistry`；`AgentRuntimeState` 的 `peers` / `attached_surfaces` 字段替换为 `peer_sessions` / `surface_sessions` registry；`runtime_registry.cpp` 内部改为访问 `runtime_state.peer_sessions.peers` 和 `runtime_state.surface_sessions.surfaces`，现有 `find/ensure/erase/count/for_each` facade 保持不变。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 registry 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`git diff --check`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-107 getStats surface 聚合仍直接穿透 AgentRuntimeState::attached_surfaces
+
+- 位置：`media-agent/src/agent_status_json.cpp`、`media-agent/src/surface_session_controller.*`、`media-agent/src/surface_attachment_runtime.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：peer stats 聚合迁入 `PeerSessionController` 后，`build_status_json()` 仍直接读取 `state.attached_surfaces.size()`，`build_stats_json()` 仍调用 legacy `build_surface_attachments_json(state)`，后者直接遍历 `AgentRuntimeState::attached_surfaces`。
+- 影响：SurfaceSessionController 虽已接管 surface RPC 入口，但查询路径仍绕过 controller；后续把 surface map 变成 registry/snapshot cache 时，status 聚合器仍会被迫了解 surface runtime 内部容器。
+- 建议：把 surface count 和 surface stats JSON 聚合迁入 `SurfaceSessionController`，保持 `status.surfaceCount` 和 `getStats.surfaces[]` JSON 字段不变。
+- 修改意见：按建议实施 M7 小切片，不改变 `surface_attachment_json()` 输出，不改变 surface runtime refresh/sync 行为。
+- 处理结果：已处理。`SurfaceSessionController` 新增 `count()` 和 `stats_json()`；`agent_status_json.cpp` 的 `build_status_json()` 改为通过 `SurfaceSessionController::count()` 输出 `surfaceCount`，`build_stats_json()` 改为通过 `SurfaceSessionController::stats_json()` 输出 `surfaces[]`。`stats_json()` 暂仍在 controller 内部遍历 `runtime_state_.attached_surfaces` 并复用 `surface_attachment_json()`，作为 M7 中间态；后续继续下沉为 SurfaceSessionRegistry snapshot。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-108 host session JSON 仍由 agent_status_json.cpp 持有
+
+- 位置：`media-agent/src/agent_status_json.cpp`、`media-agent/src/host_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：HostSessionController 已接管 host start/stop RPC 后，host start/stop 返回的 session JSON 仍由 `agent_status_json.cpp` 的 `build_host_session_json()` 直接读取 host runtime 字段生成。
+- 影响：host session 的读 snapshot owner 仍在通用 status 聚合器里；后续把 host runtime 收敛到 HostSessionSnapshot 时，还需要反向修改 status 聚合器。
+- 建议：把 host session JSON 生成迁入 `HostSessionController` 所在实现文件，并提供 `session_json()` read facade；保持 start/stop result JSON 字段不变。
+- 修改意见：按建议实施 M7/M4 小切片，不改变 host session result JSON 字段，不改变 start/stop 行为。
+- 处理结果：已处理。`host_session_controller.cpp` 新增内部 `host_session_json()`，并新增 `HostSessionController::session_json()`；`start_host_session_from_request()` 和 `stop_host_session()` 改为返回 controller 内部 host session JSON。`agent_status_json.cpp/h` 删除 `build_host_session_json()` 实现/声明，不再持有 host session result JSON 生成逻辑。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-109 getStats host 聚合仍由 agent_status_json.cpp 直接拼装
+
+- 位置：`media-agent/src/agent_status_json.cpp`、`media-agent/src/host_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：host start/stop result JSON 已迁入 `HostSessionController` 后，`build_stats_json()` 仍直接读取 `AgentRuntimeState::host_session_running/host_pipeline/host_capture_plan` 并拼 `getStats` 顶层 host 字段。
+- 影响：host session 的 stats read facade 仍不完整；后续把 host runtime 改为 HostSessionSnapshot/registry 时，通用 status 聚合器还会继续依赖 host 内部字段。
+- 建议：在 `HostSessionController` 增加 host stats 字段输出 facade，`agent_status_json.cpp` 只负责调用 controller 并拼接 audio/surface/peer 顶层对象；保持 `getStats.hostSessionRunning/hostPipeline/hostCapturePlan` 字段不变。
+- 修改意见：按建议实施 M7 小切片，不改变 `getStats` 字段名、字段顺序和 host pipeline/capture plan JSON 内容。
+- 处理结果：已处理。`HostSessionController` 新增 `append_stats_json_fields(std::ostream&)`，统一输出 `hostSessionRunning/hostPipeline/hostCapturePlan`；`build_stats_json()` 改为通过该 facade 获取 host stats 字段，`agent_status_json.cpp` 不再直接 include `host_state_json.h` 或直接拼 host pipeline/capture plan。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-110 getStats audioBackend 聚合仍由 agent_status_json.cpp 直接读取 runtime
+
+- 位置：`media-agent/src/agent_status_json.cpp`、`media-agent/src/host_audio_dispatch_session.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：host/peer/surface stats 已迁到 controller/session facade 后，`build_stats_json()` 仍直接读取 `AgentRuntimeState::audio_session` 并调用 `audio_session_json()` 拼 `getStats.audioBackend`。
+- 影响：audio stats read ownership 仍穿透大 runtime；后续把 host audio dispatch 拆成独立 session snapshot 时，通用 status 聚合器仍会依赖 audio 内部字段。
+- 建议：让 `HostAudioDispatchSession` 暴露 audio stats read facade；`agent_status_json.cpp` 只调用 facade，保持 `getStats.audioBackend.captureActive/packetsCaptured/framesCaptured` 字段不变。
+- 修改意见：按建议实施 M7/M6 小切片，不改变 audio capture、dispatch、encoder、relay 行为，不改变 `audioBackend` JSON 内容。
+- 处理结果：已处理。`HostAudioDispatchSession` 保留默认构造兼容现有调用点，新增带 `AgentRuntimeState&` 的构造和 `stats_json()`；`build_stats_json()` 改为通过 `HostAudioDispatchSession::stats_json()` 输出 `audioBackend`，不再直接 include `media_audio.h` 或读取 `state.audio_session`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-111 getStatus host 状态仍由 agent_status_json.cpp 直接拼装
+
+- 位置：`media-agent/src/agent_status_json.cpp`、`media-agent/src/host_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`getStats` 的 host/audio/peer/surface 读聚合已迁入 facade 后，`build_status_json()` 仍直接读取 `AgentRuntimeState::host_session_running/host_backend` 并拼 `hostSessionRunning/hostBackend`。
+- 影响：status 查询路径仍知道 host runtime 字段；后续把 host session 下沉为 snapshot/registry 时，通用 status 聚合器仍会被 host 内部结构牵动。
+- 建议：在 `HostSessionController` 增加 host status 字段输出 facade；`agent_status_json.cpp` 保持总状态拼接，但不直接读取 host runtime 字段。
+- 修改意见：按建议实施 M7 小切片，不改变 `getStatus.hostSessionRunning/hostBackend` 字段名、顺序和取值语义。
+- 处理结果：已处理。`HostSessionController` 新增 `append_status_json_fields(std::ostream&)`，统一输出 `hostSessionRunning/hostBackend`；`build_status_json()` 改为通过该 facade 获取 host status 字段，保留 peer/surface count controller 聚合和 peer transport 字段原行为。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-112 peer event/result JSON builder 仍由 agent_status_json.cpp 持有
+
+- 位置：`media-agent/src/agent_status_json.*`、`media-agent/src/peer_state_json.*`、`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/peer_media_binding_runtime.cpp`
+- 问题：peer stats 聚合已迁入 `PeerSessionController` 后，`peer-state` event 和 peer RPC result 的 JSON builder 仍声明/实现于通用 `agent_status_json.*`。
+- 影响：通用 status 聚合器仍持有 peer lifecycle 输出格式；后续继续收紧 PeerSessionController/PeerSessionRegistry 时，peer event/result 字段还需要跨通用 status 文件迁移。
+- 建议：把 `build_peer_state_json()` 和 `build_peer_result_json()` 迁入 peer 专属 JSON helper，旧调用点只改 include，不改变 event/result JSON 字段。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 `peer-state` event 字段，不改变 create/attach/detach peer RPC result JSON 内容。
+- 处理结果：已处理。`build_peer_state_json()` 和 `build_peer_result_json()` 已迁入 `peer_state_json.*`；`agent_status_json.h/cpp` 删除对应声明和实现；`host_session_controller.cpp`、`peer_control_runtime.cpp`、`peer_media_binding_runtime.cpp` 改为 include `peer_state_json.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-113 surface JSON builder 仍由 surface_attachment_runtime.* 持有
+
+- 位置：`media-agent/src/surface_attachment_runtime.*`、`media-agent/src/surface_state_json.*`、`media-agent/src/surface_control_runtime.cpp`、`media-agent/src/surface_session_controller.cpp`、`media-agent/CMakeLists.txt`
+- 问题：SurfaceSessionController 已接管 surface RPC 入口和 stats 聚合后，`surface_attachment_runtime.*` 仍同时持有 surface start/stop/sync 行为和 surface result/stats JSON builder；无调用方的 `build_surface_attachments_json()` 也仍保留在头文件和实现中。
+- 影响：surface runtime helper 仍承担状态序列化职责，后续把 `surface_control_runtime.*` 降级为 controller helper 或引入 SurfaceSessionSnapshot 时会继续牵动 runtime 行为文件；无用聚合函数也可能被新代码误用回旧路径。
+- 建议：新增 surface 专属 JSON helper 文件承接 `surface_attachment_json()` / `build_surface_result_json()`，调用方只切 include；删除无调用方的 `build_surface_attachments_json()`，保持 attach/update/getStats 输出字段不变。
+- 修改意见：按建议实施 M7/M3 小切片，不改变 surface attach/update/detach 行为，不改变 surface JSON 字段。
+- 处理结果：已处理。新增 `surface_state_json.h/cpp` 并加入 media-agent CMake；`surface_attachment_runtime.*` 删除 surface JSON builder 和无用 `build_surface_attachments_json()`；`surface_control_runtime.cpp`、`surface_session_controller.cpp` 改为 include `surface_state_json.h` 获取 result/stats JSON builder。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-114 native driver active/handle 判断仍由 app-native-overrides.js 持有核心实现
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-entry.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R7 已有 `native-entry` 承接 legacy installer，但 `window.__vdsNativeAuthorityOverridesInstalled` 写入、native peer driver active flag 和 native peer handle 判断的核心实现仍留在 `app-native-overrides.js`。
+- 影响：entry/peer controller 边界仍不完整；后续瘦身 `app-native-overrides.js` 时，install guard、runtime flag 和 peer handle 判断容易继续作为旧文件私有状态被新调用点依赖。
+- 建议：让 `native-entry` 承接 install guard 写入和 native peer driver active flag，让 `native-peer-controller` 暴露 `isNativePeerHandle()`；旧文件只保留同名全局 wrapper 和 fallback。
+- 修改意见：按建议实施 R7 小切片，不改变全局 hook 名，不改变 native override 安装顺序，不改变 handle 标记字段。
+- 处理结果：已处理。`native-entry.js` 新增 `markLegacyOverridesInstalled()`、`setRuntimeFlags()`、`isNativePeerDriverActive()`，并在 `getState()` 中暴露 `nativePeerTransportEnabled`；`app-native-overrides.js` 安装时优先委托 entry 写 install guard 和 runtime flag，`isNativePeerDriverActive()` wrapper 优先读 entry；`native-peer-controller.js` 暴露已有 `isNativePeerHandle()`，旧 wrapper 优先委托 controller。`docs/RENDERER_SPLIT_MAP.md` 已更新 R7 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-115 legacy window hook 注册仍逐行散落在 app-native-overrides.js
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-entry.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R7 已把 install guard 和 native peer driver active flag 迁入 `native-entry` 后，`app-native-overrides.js` 末尾仍逐行执行二十个 `window.*` legacy hook 赋值。
+- 影响：entry 仍不是 legacy bridge 的统一 owner；后续继续迁出 `start/stop/share`、peer handler 和诊断 hook 时，需要在旧文件中维护分散的全局注册列表。
+- 建议：在 `native-entry` 增加统一 `registerLegacyGlobals()`，旧文件只提交 hook map；缺少 native-entry 时保留直接写 window fallback。
+- 修改意见：按建议实施 R7 小切片，不改变任何全局 hook 名、函数引用或注册时机。
+- 处理结果：已处理。`native-entry.js` 新增 `registerLegacyGlobals(bindings)`；`app-native-overrides.js` 末尾改为构造 `legacyGlobalBindings` 并优先调用 entry 统一注册，fallback 仍逐项写入 `window`。`docs/RENDERER_SPLIT_MAP.md` 已更新 R7 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-116 legacy hook 注册动作仍由 app-native-overrides.js 主动触发
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-entry.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-115 已把 legacy hook 收敛成 map 并提供 `native-entry.registerLegacyGlobals()`，但旧大文件仍主动调用 entry 注册 hook；`native-entry.installLegacyOverrides()` 只调用 installer，不掌握 installer 输出。
+- 影响：entry 的 legacy bridge ownership 仍不完整；后续把 `app-native-overrides.js` 瘦身成薄入口时，安装流程仍需要旧文件知道注册动作和 fallback 行为。
+- 建议：让 legacy installer 返回 hook map；`native-entry.installLegacyOverrides()` 调用 installer 后统一注册返回的 hook map。缺少 native-entry 的 fallback 仍在旧文件底部注册返回 map，保持传统脚本兼容。
+- 修改意见：按建议实施 R7 小切片，不改变全局 hook 名、函数引用、Electron/native gating 或 mediaEngine RPC 行为；接受 hook 注册从 installer 内部移到 installer 返回后立即执行。
+- 处理结果：已处理。`native-entry.installLegacyOverrides()` 现在接收 installer 返回值并通过 `registerLegacyGlobals()` 注册 hook map；`app-native-overrides.js` 不再主动调用 `nativeEntry.registerLegacyGlobals()`，安装成功后返回 `legacyGlobalBindings`，缺少 native-entry 时仍由底部 fallback 注册返回 map。`docs/RENDERER_SPLIT_MAP.md` 已更新 R7 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-117 native-entry 托管路径仍由旧 installer 写 install guard
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-entry.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-116 已让 `native-entry.installLegacyOverrides()` 统一注册 installer 返回的 hook map，但托管路径里 `window.__vdsNativeAuthorityOverridesInstalled` 仍由旧 installer 通过 `markLegacyOverridesInstalled()` 写入。
+- 影响：native-entry 仍不是安装生命周期的完整 owner；后续把旧文件继续瘦身时，installer 内部仍需要理解 install guard 的主路径职责。
+- 建议：在 `native-entry.installLegacyOverrides()` 中先写 install guard，再用带标记的 options 调用旧 installer；旧 installer 只在没有 native-entry 的 fallback 路径自行写 guard。
+- 修改意见：按建议实施 R7 小切片，不改变重复安装判断、非 Electron 早退、mediaEngine 缺失早退和 hook map 注册结果。
+- 处理结果：已处理。`native-entry.installLegacyOverrides()` 现在先调用 `markLegacyOverridesInstalled()`，再用 `{ installManagedByEntry: true }` 调用旧 installer；`app-native-overrides.js` 在托管路径下跳过 install guard 写入，仅在 fallback 直接执行时保留原 guard 写入。`docs/RENDERER_SPLIT_MAP.md` 已更新 R7 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-118 audio stats JSON builder 仍由 media_audio.* 持有
+
+- 位置：`media-agent/src/media_audio.*`、`media-agent/src/audio_state_json.*`、`media-agent/src/host_audio_dispatch_session.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M6 已把 host audio dispatch lifecycle 收进 `HostAudioDispatchSession`，但 `audio_session_json()` 仍声明/实现于 `media_audio.*`，导致音频运行逻辑文件继续承担 stats/result JSON 序列化职责。
+- 影响：`media_audio.*` 仍被 `HostAudioDispatchSession::stats_json()` 为了 JSON builder 反向依赖；后续继续把 codec/helper 与 session owner 分离时，音频状态输出格式会继续牵动运行逻辑文件。
+- 建议：新增 audio 专属 JSON helper 文件承接 `audio_session_json()`；`media_audio.cpp` 和 `HostAudioDispatchSession` 只改 include，不改变 start/stop audio result 或 `getStats.audioBackend` 字段。
+- 修改意见：按建议实施 M7/M6 小切片，不改变 WASAPI capture、host audio dispatch、Opus encode、viewer audio playback 或 JSON 字段内容。
+- 处理结果：已处理。新增 `audio_state_json.h/cpp` 并加入 media-agent CMake；`audio_session_json()` 已从 `media_audio.*` 迁出，`media_audio.cpp` 和 `host_audio_dispatch_session.cpp` 改为 include `audio_state_json.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-119 peer OK result JSON builder 仍由 peer_control_runtime.cpp 持有
+
+- 位置：`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/peer_state_json.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-112 已把 peer state/result JSON 迁入 `peer_state_json.*`，但 `peer_control_runtime.cpp` 仍保留 `peer_ok_json()`，用于 setRemoteDescription/addIceCandidate 的 OK payload。
+- 影响：peer runtime 行为文件仍承载一段 peer RPC result JSON 输出格式；后续把 `peer_control_runtime.*` 降级为 `PeerSessionController` helper 时，这类输出格式会继续分散。
+- 建议：把 `peer_ok_json()` 迁入 `peer_state_json.*` 并命名为 `build_peer_ok_json()`；旧调用点只切函数名，不改变 JSON 字段。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 setRemoteDescription/addIceCandidate 行为和 `ok/implementation` JSON 内容。
+- 处理结果：已处理。`build_peer_ok_json()` 已新增到 `peer_state_json.*`；`peer_control_runtime.cpp` 删除局部 `peer_ok_json()`，两个调用点改为 `build_peer_ok_json(*peer)`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-120 peer close result JSON builder 仍由 peer_control_runtime.cpp 手拼
+
+- 位置：`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/peer_state_json.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-119 已把 setRemoteDescription/addIceCandidate 的 OK payload builder 迁入 `peer_state_json.*`，但 closePeer 成功返回的 `{closed:true, implementation}` 仍在 `peer_control_runtime.cpp` 里手工拼接。
+- 影响：peer runtime 行为文件仍承担 peer RPC result JSON 输出格式；后续把 `peer_control_runtime.*` 降级为 controller helper 时，close result 字段仍会留在旧行为文件中。
+- 建议：把 closePeer result builder 迁入 `peer_state_json.*`，旧 closePeer 逻辑只传入 transport backend readiness，保持 JSON 字段不变。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 closePeer lifecycle、erase peer 行为或 `closed/implementation` JSON 内容。
+- 处理结果：已处理。`peer_state_json.*` 新增 `build_peer_closed_result_json(bool transport_ready)`；`peer_control_runtime.cpp` 删除 closePeer 局部 JSON 拼接，改为 `ok_result(build_peer_closed_result_json(state.peer_transport_backend.transport_ready))`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-121 surface detach result JSON builder 仍由 surface_control_runtime.cpp 持有
+
+- 位置：`media-agent/src/surface_control_runtime.cpp`、`media-agent/src/surface_state_json.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-113 已把 surface attachment/result JSON 迁入 `surface_state_json.*`，但 detachSurface 成功返回的 `{detached:true, implementation}` 仍硬编码在 `surface_control_runtime.cpp`。
+- 影响：surface runtime 行为文件仍持有一段 RPC result JSON 输出格式；后续把 `surface_control_runtime.*` 降级为 `SurfaceSessionController` helper 时，detach result 字段仍会分散在行为文件里。
+- 建议：把 detachSurface result builder 迁入 `surface_state_json.*`，旧 detach 逻辑只调用 builder，保持 JSON 字段不变。
+- 修改意见：按建议实施 M7/M3 小切片，不改变 detachSurface stop/erase 行为或 `detached/implementation` JSON 内容。
+- 处理结果：已处理。`surface_state_json.*` 新增 `build_surface_detached_result_json()`；`surface_control_runtime.cpp` 的 detachSurface 返回值改为 `ok_result(build_surface_detached_result_json())`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-122 peer stats 对象 JSON 字段仍由 PeerSessionController 拼接
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_state_json.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M7 已让 `PeerSessionController::stats_json()` 承接 `getStats.peers[]` 聚合，但单个 peer stats 对象的字段仍在 controller 中手工拼接。
+- 影响：PeerSessionController 同时承担 map 聚合和输出格式 ownership；后续把 peer map 下沉为 registry snapshot 时，stats 字段格式仍会混在 controller 聚合逻辑里。
+- 建议：把单 peer stats 对象 builder 迁入 `peer_state_json.*`；controller 暂保留遍历聚合职责，只调用 `build_peer_stats_json(peer)`。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 `getStats.peers[]` 字段、顺序或 relay subscriber/receiver/transport stats 内容。
+- 处理结果：已处理。`peer_state_json.*` 新增 `build_peer_stats_json(const PeerState&)`，内部持有单 peer stats 对象字段拼接；`PeerSessionController::stats_json()` 改为只遍历 peer map 并调用该 builder，删除对 `json_protocol`、`peer_receiver_runtime`、`peer_transport` 和 `relay_hub` 的直接 include。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；media-agent build 仅输出既有 FFmpeg/MSVC warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-147 legacy native diagnostics 状态仍滞留在 app-native-overrides.js
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R3 已新增 `native/native-diagnostics.js` 后，旧大文件仍保留顶层 `nativeDebugRateLimitState` 和 `recoverableNativeWarnings`，同名日志 helper 虽逐步存在 controller 版本，但实际状态 owner 仍可能停留在 legacy 文件。
+- 影响：后续 surface/peer/session controller 继续依赖旧文件内部日志状态，`native-diagnostics.js` 无法成为诊断 gate、节流和 warning 去重的稳定 owner。
+- 建议：在 legacy installer 初始化时统一创建 diagnostics bridge；正常路径调用 `VDS.nativeDiagnostics.create()`，旧文件仅保留极端缺失模块时的局部 fallback；同名 helper 只委托 diagnostics 对象。
+- 修改意见：按建议实施 R3/R7 小切片，不改变日志开关、节流间隔、payload 摘要和 recoverable warning 输出语义。
+- 处理结果：已处理。`app-native-overrides.js` 现在通过 `createNativeDiagnosticsBridge({ verboseNativeLogs })` 初始化 `nativeDiagnostics`，正常路径使用 `VDS.nativeDiagnostics.create()`；顶层 `nativeDebugRateLimitState` / `recoverableNativeWarnings` 已删除，旧实现仅保留在 `createFallbackNativeDiagnostics()` 内部；`isDebugModeEnabled/shouldShowDebugLogsFor/shouldEmitNativeDebugLog/appendSuppressedDebugCount/getNativeDebugCategoryFromScope/getNativeDebugCategoryFromEvent/summarizeNativeLogValue/logNativeDebug/logNativeStep/logNativeStatsLine/logNativeWarningLine/logRecoverableNativeWarning` 均改为委托 diagnostics 对象。`docs/RENDERER_SPLIT_MAP.md` 已更新 R3 当前边界。
+- 验证结果：已执行 `node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-150 host capture surface 仍直接读取 AgentRuntimeState host 字段
+
+- 位置：`media-agent/src/host_session_controller.*`、`media-agent/src/surface_session_controller.cpp`、`media-agent/src/surface_control_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：SurfaceSessionController 已接管 host capture surface refresh/restart 后，内部仍直接读取 `runtime_state_.host_session_running`、`host_capture_plan`、`host_capture_process`、`host_capture_artifact` 和 `ffmpeg`；legacy attach helper 也直接把这些 host 字段传给 surface attachment。
+- 影响：host capture surface lifecycle 仍穿透 HostSession owner；后续把 host runtime 下沉为 HostSessionSnapshot/registry 时，surface owner 会继续依赖 host 内部字段。
+- 建议：在 `HostSessionController` 增加 host capture surface 所需的只读 facade，surface 代码只读取 host owner 暴露的 snapshot/reference，不改变 surface 启动参数和 JSON 输出。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 host preview/host capture surface 启动、artifact wait/restart 条件或 surface JSON 字段。
+- 处理结果：已处理。`HostSessionController` 新增 `is_running()`、`capture_artifact_ready()`、`ffmpeg_probe()`、`capture_plan()`、`capture_process()`、`capture_artifact()`；`SurfaceSessionController::refresh_host_capture_surfaces()` / `restart_host_capture_surfaces()` 和 `attach_surface_from_request()` 的 host surface 分支已改为通过 host controller facade 读取 host capture snapshot，原 `start_surface_attachment()` 参数和 surface lifecycle 条件保持不变。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-151 host capture runtime refresh 仍由 agent_lifecycle.cpp 写 host 状态
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/host_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M7 前序已让 surface 通过 HostSessionController 读取 host capture snapshot，但 `refresh_host_capture_runtime()` 仍在 `agent_lifecycle.cpp` 中直接写 `host_capture_state`、`host_capture_plan`、`host_capture_process`、`host_capture_artifact`，并持有窗口恢复检测与 manifest persist 逻辑。
+- 影响：HostSessionController 仍不是 host capture runtime 的唯一写 owner；后续把 host runtime 改成 HostSessionSnapshot/registry 时，lifecycle 编排层还会继续依赖 host 内部字段。
+- 建议：把窗口恢复检测、capture plan re-validate、capture process refresh、artifact probe 和 manifest persist 迁入 `HostSessionController::refresh_capture_runtime()`；`agent_lifecycle.cpp` 只保留调用 host refresh 后触发 surface refresh 的顺序。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 refresh 调用顺序、不改变窗口恢复/最小化判断、不改变 artifact probing 和 manifest persist 行为。
+- 处理结果：已处理。`HostSessionController` 新增 `refresh_capture_runtime()`，接管 Windows WGC 窗口恢复检测、host capture handle/state 更新、capture plan validate、host capture process refresh、artifact probe 和 manifest persist；相关 Windows helper 从 `agent_lifecycle.cpp` 移入 `host_session_controller.cpp`。`agent_lifecycle.cpp::refresh_host_capture_runtime()` 现在只调用 `HostSessionController::refresh_capture_runtime()`，再按原顺序调用 `SurfaceSessionController::refresh_host_capture_surfaces()`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`rg` 确认 `agent_lifecycle.cpp` 不再保留窗口恢复 helper 或直接写 host capture refresh 字段；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-152 agent shutdown 仍直接停止 host capture process
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/host_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M4/M7 已把 host capture refresh 写入口迁入 `HostSessionController`，但 `shutdown_agent_runtime()` 仍直接调用 `stop_host_capture_process()`，并把 `host_capture_process`、`host_pipeline`、`host_capture_plan`、`host_capture_artifact` 四个 host 内部字段传入 legacy helper。
+- 影响：agent lifecycle 编排层仍持有一个 host capture 写入口；后续把 host runtime 下沉为 HostSessionSnapshot/registry 时，shutdown 路径会继续穿透 HostSession owner。
+- 建议：在 `HostSessionController` 增加 shutdown 可复用的 `stop_capture_process(reason)` facade；`shutdown_agent_runtime()` 保持原有 shutdown 顺序，只调用 host owner 的 facade。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 shutdown 顺序、不改变 stop reason `agent-shutdown`、不改变 `stop_host_capture_process()` 内部行为。
+- 处理结果：已处理。`HostSessionController` 新增 `stop_capture_process(const std::string& reason)`，内部继续调用原 `stop_host_capture_process()`；`shutdown_agent_runtime()` 在 relay shutdown 后创建 host controller 并调用 `host_session.stop_capture_process("agent-shutdown")`，不再直接传入 host capture 内部字段。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-164 agent shutdown 仍直接停止 OBS ingest runtime
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/host_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M4/M7 已把 host start/stop 的 OBS runtime 停止路径收进 `HostSessionController` 内部 helper，但 `shutdown_agent_runtime()` 仍直接 include `obs_ingest_runtime.h` 并调用 `stop_obs_ingest_runtime(state)`。
+- 影响：agent shutdown 仍可绕过 host owner 操作 OBS ingest runtime；后续把 OBS ingest 下沉为 Host/Obs session owner 时，shutdown 路径会继续依赖 legacy free function。
+- 建议：在 `HostSessionController` 暴露 shutdown 可用的 `stop_obs_ingest_session()` facade；`shutdown_agent_runtime()` 保持原 shutdown 顺序，通过 host owner 停 OBS runtime，并删除 `obs_ingest_runtime.h` 直接依赖。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 shutdown 顺序、不改变 relay shutdown 和 capture stop 时机。
+- 处理结果：已处理。`HostSessionController` 新增 `stop_obs_ingest_session()`，内部委托 `host_session_controller.cpp` 的 OBS stop command helper；`shutdown_agent_runtime()` 在 close transport 后创建 host controller，先调用 `host_session.stop_obs_ingest_session()`，再按原顺序 `relay_hub().shutdown_runtime()` 和 `host_session.stop_capture_process("agent-shutdown")`。`agent_lifecycle.cpp` 已删除 `obs_ingest_runtime.h` include。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-163 drain helper 内部仍直接混合 OBS/capture/peer 命令
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-162 已把 host restart/stop 资源 drain 顺序收进 `drain_running_host_session()`，但 helper 内部仍直接混合 `stop_obs_ingest_runtime()`、`stop_host_capture_process()` 和 host downstream peer detach。
+- 影响：drain helper 仍承担三类 owner 的底层命令细节；后续继续拆 OBS session、capture session、peer session owner 时，顺序表达和具体命令仍耦合在同一函数里。
+- 建议：把 OBS runtime stop、host capture stop 和 host downstream peer detach 分别提取为内部命令 helper；`drain_running_host_session()` 只保留 restart/stop 的顺序编排和 breadcrumb。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 restart/stop 顺序、不改变 stop reason、不改变 breadcrumb 输出和 peer detach 时机。
+- 处理结果：已处理。`host_session_controller.cpp` 新增匿名 namespace 内部 `stop_host_capture_session_for_reason()`、`stop_obs_ingest_session_runtime()`、`detach_host_downstream_peer_sessions()`；`drain_running_host_session()` 改为调用这些命令 helper，并继续显式保留 restart 顺序 `stop_all_surface_attachments -> stop_host_capture_session_for_reason -> stop_obs_ingest_session_runtime` 与 stop 顺序 `stop_all_surface_attachments -> stop_obs_ingest_session_runtime -> detach_host_downstream_peer_sessions -> stop_host_capture_session_for_reason`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-162 host restart/stop 资源 drain 顺序仍内联在两个编排路径
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-161 后 start/stop backend 分支已经拆出，但 host restart 和 stop share 仍分别内联停止 surface、OBS runtime、peer media binding 和 host capture process 的资源 drain 逻辑。
+- 影响：两个路径的停止顺序不同：restart 必须保持 stop surfaces -> stop host capture process -> stop OBS runtime；stop share 必须保持 stop surfaces -> stop OBS runtime -> detach host downstream peers -> stop host capture process。若继续分散内联，后续重构容易把两条顺序误合并。
+- 建议：提取 `drain_running_host_session()` 内部 helper，显式区分 `host-session-restart` 和 `host-session-stopped` 两条顺序；start/stop 编排层只调用 drain helper。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 breadcrumb 顺序、不改变 stop reason、不改变 peer detach 时机、不改变 stop capture/OBS 调用顺序。
+- 处理结果：已处理。`host_session_controller.cpp` 新增匿名 namespace 内部 `drain_running_host_session()`；`start_host_session_from_request()` 用 `host-session-restart` 调用该 helper，保留原 start restart 顺序 `stop_all_surface_attachments -> stop_host_capture_process -> stop_obs_ingest_runtime`；`stop_host_session()` 用 `host-session-stopped` 调用该 helper，保留原 stop 顺序 `stop_all_surface_attachments -> stop_obs_ingest_runtime -> detach_host_downstream_media_bindings -> stop_host_capture_process`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-161 host start 的 OBS/native 分支仍内联在 start 编排层
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-160 已把 start request apply 和 stop reset 拆成 lifecycle helper，但 `start_host_session_from_request()` 仍内联 OBS ingest 分支、native capture pipeline/plan/process 启动、host-session-started 事件和 warning 输出。
+- 影响：host start 编排层仍承担 backend 具体启动细节；后续把 OBS/native host session 下沉为独立 HostSessionSnapshot/registry 时，分支逻辑会继续和通用 start 编排、资源停止顺序混在一起。
+- 建议：提取 `start_obs_ingest_host_session()` 和 `start_native_capture_host_session()` 内部 helper；`start_host_session_from_request()` 只负责停止旧资源、应用请求配置、按 backend 分派。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 breadcrumb 顺序、不改变 OBS prepare/worker 行为、不改变 native pipeline/capture process 启动、不改变 media-state/warning/result JSON。
+- 处理结果：已处理。`host_session_controller.cpp` 新增匿名 namespace 内部 `start_obs_ingest_host_session()` 和 `start_native_capture_host_session()`；OBS 分支继续负责清空 host pipeline/plan/artifact、刷新 host capture runtime/surface、prepare OBS session、启动 OBS worker 并返回原 host session JSON；native 分支继续负责清理 OBS prepared session、选择 pipeline、构建/验证 capture plan、启动 capture process、刷新 surface、附加 host downstream peers、发 `host-session-started` 和 warning 事件。`start_host_session_from_request()` 现在只保留通用 restart cleanup、`apply_host_session_start_request()`、backend 判断和 helper 调用。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-153 agent 初始化仍直接写默认 host capture runtime
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/host_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M4/M7 已把 host capture refresh 和 shutdown stop 写入口迁入 `HostSessionController`，但 `initialize_agent_runtime()` 仍直接写 `host_capture_process`、`host_pipeline`、`host_capture_plan`，并直接调用默认 capture plan 构建/验证 helper。
+- 影响：agent 初始化阶段仍绕过 HostSession owner 建立默认 host runtime；后续把 host runtime 下沉为 HostSessionSnapshot/registry 时，初始化路径会继续保留大 runtime 字段写入。
+- 建议：在 `HostSessionController` 增加 `initialize_default_capture_runtime()`，接管默认 host capture process/pipeline/plan 构建；`initialize_agent_runtime()` 继续负责 FFmpeg/WGC/audio/transport probe 顺序，probe 完成后调用 host owner 初始化默认 capture runtime。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 FFmpeg/WGC probe 顺序、不改变默认 pipeline/plan 构建参数、不改变初始化后 refresh 调用。
+- 处理结果：已处理。`HostSessionController` 新增 `initialize_default_capture_runtime()`，内部设置 `host_capture_process = build_host_capture_process_state()` 并复用原 `refresh_default_native_host_plan()` 构建/验证默认 pipeline 和 capture plan；`initialize_agent_runtime()` 在 probe 完成后调用该 facade，不再直接 include 或调用 host capture plan/process/pipeline helper。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-154 host video sender soft refresh 仍直接 revalidate host capture plan
+
+- 位置：`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/host_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M4/M7 已把 host capture 初始化、refresh 和 shutdown stop 写入口收进 `HostSessionController`，但 `perform_host_video_sender_soft_refresh()` 仍直接执行 `state.host_capture_plan = validate_host_capture_plan(state.ffmpeg, state.host_capture_plan)`，并读取该字段决定是否等待有效 plan。
+- 影响：peer media binding runtime 仍拥有一个 host capture plan 写入口；后续把 host plan 下沉为 HostSessionSnapshot/registry 时，soft refresh 路径会继续穿透 host owner。
+- 建议：在 `HostSessionController` 增加 `revalidate_capture_plan()`；soft refresh 只调用 host owner revalidate，并通过 `capture_plan()` 只读 facade 判断 ready/validated 和 last_error。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 soft refresh 遍历条件、不改变 force restart attachment 行为、不改变等待有效 plan 的 reason/error。
+- 处理结果：已处理。`HostSessionController` 新增 `revalidate_capture_plan()`；`perform_host_video_sender_soft_refresh()` 创建 host controller，使用 `is_running()` 判断 host session，触发 `revalidate_capture_plan()` 后读取 `capture_plan()` snapshot 设置 `peer-media-soft-refresh-waiting-for-valid-plan` 和 last_error，不再直接写 `state.host_capture_plan`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-155 peer media binding 仍直接读取 host runtime 字段
+
+- 位置：`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/host_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M4/M7 已把 host 写入口逐步迁入 `HostSessionController`，但 `attach_host_video_media_binding()` / `attach_obs_ingest_media_binding()` 仍直接读取 `state.host_session_running`、`host_codec`、`host_bitrate_kbps`、`host_width/height/frame_rate`、`host_pipeline`、`host_capture_plan`、`host_capture_artifact` 和 `ffmpeg`。
+- 影响：peer media binding runtime 仍和 host runtime 内部字段耦合；后续把 host runtime 下沉为 HostSessionSnapshot/registry 时，host-to-peer media source 绑定路径会继续穿透 HostSession owner。
+- 建议：补齐 `HostSessionController` 的只读 facade，让 peer binding 只通过 host owner 获取 codec、尺寸、码率、pipeline、capture plan/artifact 和 ffmpeg probe；OBS ingest 自身状态先保持原 owner，不在同一切片迁移。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 host/OBS media binding 条件、不改变 video track config、不改变 `start_peer_video_sender()` 参数语义。
+- 处理结果：已处理。`HostSessionController` 新增 `video_codec()`、`width()`、`height()`、`frame_rate()`、`bitrate_kbps()`、`pipeline()` facade；`attach_host_video_media_binding()` 和 `attach_obs_ingest_media_binding()` 改为通过 host controller 读取 host session 状态、codec、尺寸、码率、pipeline、capture plan/artifact 和 ffmpeg probe。`rg` 确认 `peer_media_binding_runtime.cpp` 已无直接 `state.host_*` / `state.ffmpeg` 访问。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-156 createPeer 仍直接读取 host_session_running
+
+- 位置：`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/host_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M4/M7 已让 peer media binding 通过 `HostSessionController` 获取 host snapshot，但 createPeer 后对 host-downstream 自动 attach 的判断仍直接读取 `state.host_session_running`。
+- 影响：peer creation 路径仍穿透 host runtime 内部字段；后续将 host state 下沉为 HostSessionSnapshot/registry 时，createPeer 的自动媒体绑定判断会继续依赖 legacy 大 runtime 字段。
+- 建议：在 createPeer 自动 attach 判断处创建 `HostSessionController`，使用 `is_running()` 判断 host session 状态；保持 attach、negotiate 和 store peer 顺序不变。
+- 修改意见：按建议实施 M4/M2 小切片，不改变 createPeer 生命周期、不改变 host-downstream 自动 attach 条件除读取来源外的任何语义。
+- 处理结果：已处理。`peer_control_runtime.cpp` 已 include `host_session_controller.h`，createPeer 中 host-downstream 自动 `attach_host_video_media_binding()` 的条件从 `state.host_session_running` 改为 `HostSessionController(state).is_running()`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-157 OBS ingest runtime 仍直接读写 host session 字段
+
+- 位置：`media-agent/src/obs_ingest_runtime.cpp`、`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/host_session_controller.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M4/M7 已让 peer media binding 和 createPeer 通过 `HostSessionController` 读取 host 状态，但 OBS ingest runtime 仍直接读取 `state.host_backend` / `state.host_capture_target_id` 构造 media-state，直接读取 `state.host_session_running` 判断 prepare 冲突，并在收到 video packet 后直接写 `state.host_codec`。
+- 影响：OBS ingest 路径仍绕过 HostSession owner 更新 host manifest/source 字段；后续把 host runtime 下沉为 HostSessionSnapshot/registry 时，OBS worker 会继续依赖 legacy 大 runtime 字段。
+- 建议：在 `HostSessionController` 增加 OBS ingest 所需 facade：`backend()`、`capture_target_id()`、`is_obs_ingest()`、`set_video_codec()`；OBS runtime 只通过 host owner 读写 host session 字段，OBS 自身状态继续留在 OBS runtime owner。
+- 修改意见：按建议实施 M4 小切片，不改变 OBS prepare/worker 行为、不改变 media-state JSON 字段、不改变 video packet relay 和 codec 归一化逻辑。
+- 处理结果：已处理。`HostSessionController` 新增 `backend()`、`capture_target_id()`、`is_obs_ingest()` 和 `set_video_codec()`；`obs_ingest_media_state_payload()` 通过 host controller 输出 backend/target，`prepare_obs_ingest_from_request()` 通过 host controller 判断 native host session 冲突，`obs_ingest_worker()` 在 video packet 到达后通过 `set_video_codec()` 更新 host codec；`peer_media_binding_runtime.cpp` 的 OBS backend 判断也改为 `host_session.is_obs_ingest()`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；C++ 编译仅输出既有 FFmpeg 头文件与 `av_init_packet` deprecation warning。
+
+### ARCH-SPLIT-P1-160 host start/stop 内部仍是大段匿名 runtime 写入
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-159 已把 host start/stop legacy free function 降为内部 helper，但 `start_host_session_from_request()` 和 `stop_host_session()` 内部仍直接包含一大段 host config apply/reset 写入，生命周期步骤没有清晰命名。
+- 影响：HostSessionController 虽然是公共入口，但 start/stop 过程仍难以继续拆成 HostSessionSnapshot/registry；后续迁移 OBS/native 分支或默认 native reset 时容易把写入顺序打散。
+- 建议：先提取内部 `apply_host_session_start_request()` 和 `reset_host_session_to_default_native()`，把请求配置应用和 stop 后默认 native reset 变成明确 lifecycle step；保持原写入顺序、默认值和 JSON 返回不变。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 start/stop 行为、不改变 OBS/native 分支、不改变 host session result JSON。
+- 处理结果：已处理。`host_session_controller.cpp` 新增匿名 namespace 内部 `apply_host_session_start_request(AgentRuntimeState&, const std::string&)`，集中处理 start 请求的 backend、capture target、codec、尺寸、码率和 capture process 初始化，并返回请求的 OBS 端口；新增 `reset_host_session_to_default_native(AgentRuntimeState&)`，集中处理 stop 后 host 字段恢复默认 native 状态、清理 OBS prepared session 和刷新默认 capture plan。`start_host_session_from_request()` / `stop_host_session()` 现在只编排停止旧资源、调用 lifecycle helper、启动 OBS/native 分支和发事件。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-158 OBS backend 判定 helper 暴露在 obs_ingest_runtime 公共 API
+
+- 位置：`media-agent/src/obs_ingest_runtime.h`、`media-agent/src/obs_ingest_runtime.cpp`、`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-157 已让 OBS ingest 业务路径通过 `HostSessionController::is_obs_ingest()` 判断 backend，但 `is_obs_ingest_backend(const AgentRuntimeState&)` 仍定义并暴露在 `obs_ingest_runtime.h`，实际调用方只剩 HostSessionController。
+- 影响：host backend 判定的 owner 仍反向挂在 OBS runtime 公共 API 上；后续其他模块可能继续 include OBS runtime 头并穿透 host backend 字段。
+- 建议：删除 `obs_ingest_runtime.h/.cpp` 中的公共 `is_obs_ingest_backend()`，在 `host_session_controller.cpp` 内保留私有 helper，外部只使用 `HostSessionController::is_obs_ingest()`。
+- 修改意见：按建议实施 M4 小切片，不改变 backend 判定逻辑，仅改变 helper 所属模块和可见范围。
+- 处理结果：已处理。`is_obs_ingest_backend()` 已从 `obs_ingest_runtime.h` 声明和 `obs_ingest_runtime.cpp` 定义中删除；`host_session_controller.cpp` 新增私有 `is_obs_ingest_backend_state()`，`start_host_session_from_request()` 和 `HostSessionController::is_obs_ingest()` 均调用该内部 helper。`rg` 确认项目内已无 `is_obs_ingest_backend(` 调用或声明。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；C++ 编译仅输出既有 FFmpeg 头文件与 `av_init_packet` deprecation warning。
+
+### ARCH-SPLIT-P1-159 host session legacy free functions 仍暴露为公共 API
+
+- 位置：`media-agent/src/host_session_controller.h`、`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：RPC router 已通过 `HostSessionController::start_from_request()` / `stop()` 操作 host lifecycle，但 `start_host_session_from_request()` 和 `stop_host_session()` 仍声明在 `host_session_controller.h`，外部模块仍可绕过 controller class 直接调用 legacy free function。
+- 影响：HostSessionController 作为 host lifecycle owner 的边界不够明确；后续迁移 HostSessionSnapshot/registry 时，公共 free function 会继续保留旧入口形态。
+- 建议：从公共头删除两个 legacy free function 声明，把实现移动到 `host_session_controller.cpp` 匿名 namespace 内部；外部只保留 class 方法。
+- 修改意见：按建议实施 M4 小切片，不改变 start/stop 行为、不改变 JSON/RPC 返回和事件输出，只改变 helper 可见性。
+- 处理结果：已处理。`start_host_session_from_request()` / `stop_host_session()` 已从 `host_session_controller.h` 删除并收进 `host_session_controller.cpp` 匿名 namespace；`HostSessionController::start_from_request()` / `stop()` 继续调用这些内部 helper，RPC router 调用路径不变。`rg` 确认这两个 free function 不再有公共声明或外部调用。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；C++ 编译仅输出既有 FFmpeg 头文件与 `av_init_packet` deprecation warning。
+
+### ARCH-SPLIT-P1-149 P2P 诊断报告格式化仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：host capture 报告 builder 迁出后，复制 P2P 诊断报告仍在 `app-native-overrides.js` 中手工拼接 peer 摘要、候选类型、DataChannel、NAT mapping、收发帧和 receiver runtime 字段。
+- 影响：P2P 诊断输出格式继续和 peer/session 状态机、DOM 状态、stats polling 混在旧大文件里；后续压缩 R3/R5 边界时，诊断报告格式会继续依赖 legacy closure。
+- 建议：把纯文本格式化迁入 `native-diagnostics.js`，旧文件只收集当前 session/peer/meta/stats 快照并传给 diagnostics builder；保留旧正文作为 fallback。
+- 修改意见：按建议实施 R3 小切片，不改变报告字段名、字段顺序、健康 peer 折叠逻辑和候选摘要格式。
+- 处理结果：已处理。`native-diagnostics.js` 新增 `normalizeDiagnosticNumber()`、候选摘要 helper 和 `buildP2pDiagnosticReport(snapshot)`；`app-native-overrides.js` 的 `buildP2pDiagnosticReport()` 现在优先组装 `role/roomId/clientId/mediaManifest/peer handle/meta/stats` 快照并委托 diagnostics builder，缺少该方法时继续走原 legacy fallback 正文。
+- 验证结果：已执行 `node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-148 host capture 诊断报告格式化仍由 app-native-overrides.js 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：native 日志 helper 迁入 `native-diagnostics.js` 后，host capture 复制诊断报告的字段格式化仍完整留在 `app-native-overrides.js`，包括 backend、capture plan、FPS、surface、encoder 和 audioBackend 字段拼接。
+- 影响：复制诊断输出的字段 owner 仍和 host stats polling/UI 状态混在旧大文件中；后续压缩 legacy override 时，诊断报告格式会继续阻塞 R3 收口。
+- 建议：把纯格式化的 `buildHostCaptureDiagnosticReportFromStats()` 下沉到 `native-diagnostics.js`，legacy 文件只传入 `stats`、FPS 快照和当前 backend；保留旧正文作为 fallback。
+- 修改意见：按建议实施 R3 小切片，不改变报告字段名、字段顺序和空值格式。
+- 处理结果：已处理。`native-diagnostics.js` 新增 `formatDiagnosticValue()` 和 `buildHostCaptureDiagnosticReportFromStats(stats, fpsSnapshot, { currentHostBackend })`；`app-native-overrides.js` 的同名函数现在优先委托 diagnostics builder，缺少该方法时继续走原 legacy fallback 正文。
+- 验证结果：已执行 `node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/app.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-165 P2P 诊断 fallback 正文仍留在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-149 已把 P2P 诊断格式化迁入 `native-diagnostics.js`，但 `app-native-overrides.js` 中仍保留完整 legacy fallback 正文，并且在中间态删除候选摘要 helper 后会引用已不存在的 `summarizeSelectedCandidate()` / `normalizeDiagnosticNumber()`。
+- 影响：R3 边界未真正收口，旧大文件仍持有重复诊断格式；同时缺失 diagnostics 模块时会走到不完整 fallback，造成复制诊断报错。
+- 建议：让 `buildP2pDiagnosticReport()` 只收集当前 role/room/manifest/peer/meta/stats 快照并委托 `nativeDiagnostics.buildP2pDiagnosticReport()`；缺少 diagnostics 模块时返回简短 unavailable 文本，不再保留重复格式化正文。
+- 修改意见：按建议实施 R3 收口切片，不改变诊断正常路径字段、不改变 peer/state/signaling 行为。
+- 处理结果：已处理。`app-native-overrides.js` 的 `buildP2pDiagnosticReport()` 已删除 legacy fallback 拼接正文，正常路径继续向 `native-diagnostics.js` 传入同一快照；缺少 diagnostics builder 时返回 `P2P diagnostic unavailable`。`rg` 确认旧 helper 引用已不存在。`docs/RENDERER_SPLIT_MAP.md` 已更新当前 R3 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-166 host capture 诊断 fallback 正文仍留在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-148 已把 host capture 诊断格式化迁入 `native-diagnostics.js`，但 `app-native-overrides.js` 中仍保留完整 fallback 正文和仅供该 fallback 使用的 `formatDiagnosticValue()`。
+- 影响：host capture 诊断输出 owner 仍有双份实现，继续阻塞 R3 收口；旧大文件保留纯格式化 helper 会增加后续删除 legacy override 的噪声。
+- 建议：让 `buildHostCaptureDiagnosticReportFromStats()` 只委托 `nativeDiagnostics.buildHostCaptureDiagnosticReportFromStats()`；缺少 diagnostics 模块时返回简短 unavailable 文本，并删除 legacy-only 格式化 helper。
+- 修改意见：按建议实施 R3 收口切片，不改变 host stats 获取、不改变诊断正常路径字段、不改变 capture/preview 行为。
+- 处理结果：已处理。`app-native-overrides.js` 的 host capture 诊断 fallback 正文已删除，缺少 diagnostics builder 时返回 `Host capture diagnostic unavailable`；legacy-only `formatDiagnosticValue()` 已删除，诊断格式化只由 `native-diagnostics.js` 持有。`docs/RENDERER_SPLIT_MAP.md` 已更新当前 R3 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-167 legacy override 仍保留完整 diagnostics fallback 实现
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R3 已把日志 gate、节流、payload 摘要和 recoverable warning 状态迁入 `native-diagnostics.js`，但 legacy override 仍保留 `createFallbackNativeDiagnostics()` 的完整第二套实现。
+- 影响：diagnostics owner 仍有两份实现，后续删除 `app-native-overrides.js` 时会继续搬运/比对日志分类和节流语义；同时 fallback 状态不受 `native-diagnostics.js` 管理，和目标边界不一致。
+- 建议：依赖既定脚本顺序加载 `native/native-diagnostics.js`，legacy 文件只在模块缺失时创建极小 no-op bridge，避免运行时报缺方法，但不再复制 diagnostics 业务逻辑。
+- 修改意见：按建议实施 R3/R7 收口切片，不改变正常路径日志输出、不改变 debug panel gate、不改变诊断报告 builder。
+- 处理结果：已处理。`app-native-overrides.js` 已删除 `createFallbackNativeDiagnostics()`、fallback rate limit map、fallback recoverable warning map 和重复日志分类/摘要实现；`createNativeDiagnosticsBridge()` 在模块缺失时只返回 no-op bridge。`rg` 确认旧 fallback 函数和状态已不存在。`docs/RENDERER_SPLIT_MAP.md` 已更新 R3 当前边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-168 native pending candidate 清理 hook 仍散落注册全局
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-entry.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R7 已引入 `native-entry.registerLegacyGlobals()` 统一注册 legacy hooks，但 `app-native-overrides.js` 初始化 controller 后仍直接写 `window.__vdsClearNativePendingRemoteCandidates`。
+- 影响：全局 hook 注册 owner 仍不完全统一，后续瘦身 `app-native-overrides.js` 时需要继续追踪散落 `window.*` 写入口；也和“不新增散落全局函数，只在 entry/glue 桥接”的拆分规则不一致。
+- 建议：把 `__vdsClearNativePendingRemoteCandidates` 移入 `legacyGlobalBindings` 返回对象，让 native-entry 主路径和 fallback 路径都通过同一 hook map 注册。
+- 修改意见：按建议实施 R7 小切片，不改变调用方 `app.js` 的 hook 名称、不改变 pending remote candidate 清理语义。
+- 处理结果：已处理。`app-native-overrides.js` 不再直接写 `window.__vdsClearNativePendingRemoteCandidates`；该 hook 已随 `legacyGlobalBindings` 返回，由 `native-entry.registerLegacyGlobals()` 或 fallback 注册循环统一安装。`docs/RENDERER_SPLIT_MAP.md` 已更新 R7 当前边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；并用 `rg` 确认 hook 只保留在 `legacyGlobalBindings` 和 `app.js` 调用方。
+
+### ARCH-SPLIT-P1-169 AgentRuntimeState 仍直接暴露 host session 顶层字段
+
+- 位置：`media-agent/src/agent_runtime.h`、`media-agent/src/host_session_state.h`、`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M7 已把 peer/surface registry 下沉为 `PeerSessionRegistry` / `SurfaceSessionRegistry`，但 host running/backend/capture target/codec/encoder/capture plan/process/artifact 仍作为大量顶层 `AgentRuntimeState::host_*` 字段暴露。
+- 影响：大 runtime 仍直接承载 host session 内部细节；后续迁成 HostSessionSnapshot/registry 时，需要一次性处理大量顶层字段，且 controller 内部和 runtime 结构边界不清。
+- 建议：先引入 `HostSessionState` 聚合，把现有 host session 字段收进 `AgentRuntimeState::host_session`；本切片不改变 JSON/RPC wire shape 和 host lifecycle 行为，后续再把该聚合下沉为真正 HostSessionRegistry/snapshot。
+- 修改意见：按建议实施 M7 小切片，不改变 host start/stop 返回 JSON、不改变 stats/status 字段、不改变 capture/OBS/preview 行为。
+- 处理结果：已处理。`host_session_state.h` 新增 `HostSessionState`，聚合 running/backend/capture target/codec/encoder/capture config/pipeline/capture plan/capture process/capture artifact；`AgentRuntimeState` 顶层 host 字段已替换为 `HostSessionState host_session`；`host_session_controller.cpp` 已迁移到 `state.host_session.*` / `state_.host_session.*` 访问路径。`rg` 确认旧 `state.host_*` / `state_.host_*` 顶层访问已清零。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展和未完成项。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；C++ 编译仅输出既有 FFmpeg/CRT warning。
+
+### ARCH-SPLIT-P1-170 HostSessionState 仍未进入 registry 形态
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/src/agent_runtime.h`、`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-169 已把 host 顶层字段聚成 `HostSessionState host_session`，但该字段仍直接挂在 `AgentRuntimeState` 上，和 peer/surface 已采用的 registry 形态不一致。
+- 影响：后续把 runtime 瘦成 registry + shared services 时，host 仍需要单独迁移字段形态；controller 内部也继续依赖一个特殊的 `host_session` 字段，而不是统一的 session registry。
+- 建议：新增 `HostSessionRegistry`，先以 `current` 单 session 兼容字段承载现有 `HostSessionState`；`AgentRuntimeState` 改为持有 `host_sessions`，host controller 访问路径迁为 `host_sessions.current`。
+- 修改意见：按建议实施 M7 小切片，不改变 host lifecycle、不改变 JSON/RPC wire shape、不改变 stats/status 字段。
+- 处理结果：已处理。`session_registries.h` 新增 `HostSessionRegistry`；`AgentRuntimeState` 已从 `HostSessionState host_session` 改为 `HostSessionRegistry host_sessions`；`host_session_controller.cpp` 已迁移到 `state.host_sessions.current.*` / `state_.host_sessions.current.*` 访问路径。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展和未完成项。
+- 验证结果：已执行 `rg -n "\b(state|state_)\.host_session\b|HostSessionState host_session|AgentRuntimeState::host_session" media-agent/src docs\MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs\CODE_AUDIT_FINDINGS.md`，代码侧无旧字段访问；已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；C++ 编译仅输出既有 FFmpeg/CRT warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-171 AgentRuntimeState 仍直接持有 audio session 字段
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/src/agent_runtime.h`、`media-agent/src/media_audio.cpp`、`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/host_audio_dispatch_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M6 已把 viewer playback 和 host audio dispatch 下沉到 session facade，但 `AgentRuntimeState` 仍直接持有 `AudioSessionState audio_session`，和 host/peer/surface registry 形态不一致。
+- 影响：audio start/stop、host audio sender 判断和 audio stats 仍依赖特殊顶层字段；后续瘦身 runtime 时还需要单独迁移 audio session 形态。
+- 建议：新增 `AudioSessionRegistry`，先以 `current` 单 session 兼容字段承载现有 `AudioSessionState`；`AgentRuntimeState` 改为持有 `audio_sessions`，现有访问路径迁为 `audio_sessions.current`。
+- 修改意见：按建议实施 M7 小切片，不改变 audio RPC、不改变 audio stats JSON、不改变 WASAPI start/stop 和 host audio sender 行为。
+- 处理结果：已处理。`session_registries.h` 新增 `AudioSessionRegistry`；`AgentRuntimeState` 已从 `AudioSessionState audio_session` 改为 `AudioSessionRegistry audio_sessions`；`agent_lifecycle.cpp`、`media_audio.cpp`、`peer_media_binding_runtime.cpp` 和 `host_audio_dispatch_session.cpp` 已迁移到 `audio_sessions.current` 访问路径。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展和未完成项。
+- 验证结果：已执行 `rg -n "\b(state|state_|runtime_state|runtime_state_)\.audio_session\b|state_->audio_session\b|AudioSessionState audio_session\b|AgentRuntimeState::audio_session\b" media-agent/src`，代码侧无旧字段访问；已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；C++ 编译仅输出既有 FFmpeg/CRT warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-172 AgentRuntimeState 仍直接持有 OBS ingest 字段
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/src/agent_runtime.h`、`media-agent/src/obs_ingest_runtime.cpp`、`media-agent/src/host_session_controller.cpp`、`media-agent/src/peer_media_binding_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：Host/Audio 已进入 registry 兼容形态后，OBS ingest prepared/worker/stream 状态仍以 `ObsIngestState obs_ingest` 直接挂在 `AgentRuntimeState` 上，和目标 runtime registry 形态不一致。
+- 影响：host session start/stop、OBS prepare/worker 和 peer media binding 继续依赖一个特殊顶层字段；后续拆 OBS ingest session owner 时还要先迁字段形态。
+- 建议：新增 `ObsIngestSessionRegistry`，先以 `current` 单 session 兼容字段承载现有 `ObsIngestState`；`AgentRuntimeState` 改为持有 `obs_ingest_sessions`，现有访问路径迁为 `obs_ingest_sessions.current`。
+- 修改意见：按建议实施 M7 小切片，不改变 OBS ingest RPC、不改变 host session JSON 的 `obsIngest` 字段、不改变 OBS worker/stream/pending Annex-B 行为。
+- 处理结果：已处理。`session_registries.h` 新增 `ObsIngestSessionRegistry`；`AgentRuntimeState` 已从 `ObsIngestState obs_ingest` 改为 `ObsIngestSessionRegistry obs_ingest_sessions`；`obs_ingest_runtime.cpp`、`host_session_controller.cpp` 和 `peer_media_binding_runtime.cpp` 已迁移到 `obs_ingest_sessions.current` 访问路径。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新 M7 当前进展和未完成项。
+- 验证结果：已执行 `rg -n "\b(state|state_|runtime_state|runtime_state_)\.obs_ingest\b|state_->obs_ingest\b|ObsIngestState obs_ingest\b|AgentRuntimeState::obs_ingest\b" media-agent/src`，代码侧无旧字段访问；已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；C++ 编译仅输出既有 FFmpeg/CRT warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-173 peer media binding 仍直接读取 OBS ingest registry
+
+- 位置：`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/host_session_controller.h`、`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-172 已把 OBS ingest 状态包进 `obs_ingest_sessions.current`，但 `peer_media_binding_runtime.cpp` 的 OBS host binding 路径仍直接读取 prepared、stream_running、codec、尺寸、帧率和音频采样率。
+- 影响：peer binding 仍穿透 OBS runtime 内部状态；后续把 OBS ingest 升级为真正 session owner 时，需要同时修改 peer binding 业务逻辑。
+- 建议：在 `HostSessionController` 暴露 OBS ingest 只读 snapshot，peer binding 只依赖 host owner facade，不直接读取 `obs_ingest_sessions.current`。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 OBS host binding 的 ready 判断、codec fallback、音视频 track 配置和 relay subscriber 行为。
+- 处理结果：已处理。新增 `ObsIngestSessionSnapshot` 和 `HostSessionController::obs_ingest_snapshot()`；`attach_obs_ingest_media_binding()` 已改为从 host controller 获取 OBS snapshot，并使用 snapshot 计算 prepared/stream/video codec/size/fps/audio codec/audio sample rate。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新当前进展。
+- 验证结果：已执行 `rg -n "obs_ingest_sessions|state\.obs_ingest|state_\.obs_ingest|state->obs_ingest" media-agent/src/peer_media_binding_runtime.cpp`，peer binding 侧无 OBS registry 直连；已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；C++ 编译仅输出既有 FFmpeg/CRT warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-174 HostSessionController 仍直接调用 OBS runtime helper
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`media-agent/src/obs_ingest_session.h`、`media-agent/src/obs_ingest_session.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：OBS ingest 状态进入 registry 后，`host_session_controller.cpp` 仍直接 include `obs_ingest_runtime.h`，并直接调用 `prepare_obs_ingest_session()`、`clear_obs_ingest_prepared_session()`、`stop_obs_ingest_runtime()`，还直接写 `stop_requested` 和 `worker` 启动线程。
+- 影响：HostSessionController 仍了解 OBS runtime 细节；后续把 OBS ingest 迁成真正 session owner 时，host lifecycle 编排层会继续耦合 worker/state 细节。
+- 建议：新增 `ObsIngestSession` facade，先封装 session JSON、prepare、clear、start worker 和 stop；host controller 只调用 facade，不直接 include legacy runtime helper。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 OBS prepare/start/stop 顺序、不改变 host session JSON、不改变 worker 参数和 stop 语义。
+- 处理结果：已处理。新增 `obs_ingest_session.h/cpp` 并加入 CMake；`HostSessionController` 已改为通过 `ObsIngestSession::session_json()`、`prepare()`、`clear_prepared()`、`start_worker()` 和 `stop()` 操作 OBS ingest，`host_session_controller.cpp` 不再直接 include `obs_ingest_runtime.h` 或直接写 OBS worker/stop_requested。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新当前进展和未完成项。
+- 验证结果：已执行 `rg -n "obs_ingest_runtime|prepare_obs_ingest_session|clear_obs_ingest_prepared_session|stop_obs_ingest_runtime|obs_ingest_worker|obs_ingest_sessions\.current\.worker|stop_requested\.store\(false\)" media-agent/src/host_session_controller.cpp`，host controller 侧无 legacy OBS runtime 直连；已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；C++ 编译仅输出既有 FFmpeg/CRT warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-175 OBS runtime 公共头仍暴露 legacy session helper
+
+- 位置：`media-agent/src/obs_ingest_runtime.h`、`media-agent/src/obs_ingest_runtime.cpp`、`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-174 新增 `ObsIngestSession` facade 后，`obs_ingest_runtime.h` 仍公开 `prepare_obs_ingest_session()`、`clear_obs_ingest_prepared_session()`、`stop_obs_ingest_runtime()` 和 `obs_ingest_worker()` legacy helper。
+- 影响：其他模块仍能绕过 `ObsIngestSession` 直接调用 legacy helper，OBS session owner 边界不够硬；后续迁移 worker/stream metadata ownership 时容易新增反向依赖。
+- 建议：从 `obs_ingest_runtime.h` 删除 legacy helper 声明，只保留 RPC 入口和 virtual upstream 常量；`ObsIngestSession` 实现文件内部前置声明并委托这些 helper，作为兼容过渡。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 helper 实现、不改变 RPC wire shape、不改变 worker 启停行为。
+- 处理结果：已处理。`obs_ingest_runtime.h` 已移除 prepare/clear/stop/worker legacy helper 声明，仅保留 `prepare_obs_ingest_from_request()` 和 `kObsIngestVirtualUpstreamPeerId`；`obs_ingest_runtime.cpp` 为自身前向调用补内部声明；`obs_ingest_session.cpp` 在实现文件内声明 legacy helper 并继续通过 facade 委托。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新当前进展。
+- 验证结果：已执行 `rg -n "prepare_obs_ingest_session|clear_obs_ingest_prepared_session|stop_obs_ingest_runtime|obs_ingest_worker" media-agent/src/obs_ingest_runtime.h media-agent/src/host_session_controller.cpp media-agent/src -g "*.h"`，公共头和 host controller 侧无 legacy helper 暴露/直连；已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；C++ 编译仅输出既有 FFmpeg/CRT warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-176 OBS prepare/clear/stop 实现仍留在 runtime 文件
+
+- 位置：`media-agent/src/obs_ingest_runtime.cpp`、`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-175 收窄公共头后，OBS prepared session reset、UDP port validation/prepare 和 stop cleanup 实现仍在 `obs_ingest_runtime.cpp`，`ObsIngestSession` 只是内部前置声明后委托 helper。
+- 影响：OBS session lifecycle 仍不由 `ObsIngestSession` 实际拥有；后续迁 worker/stream metadata 时会继续跨 runtime/session 文件拆状态写入。
+- 建议：把 prepared reset、port validation/prepare、worker start 和 stop cleanup 实现迁入 `ObsIngestSession`；`obs_ingest_runtime.cpp` 的 RPC prepare 入口也通过 facade 调用，runtime 文件暂时只保留 RPC glue、media-state payload 和 worker loop。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 OBS prepare 返回、不改变端口检测语义、不改变 stop cleanup 和 relay bootstrap 清理。
+- 处理结果：已处理。`ObsIngestSession` 已接管 `prepare()`、`clear_prepared()`、`start_worker()` 和 `stop()` 的实际实现，包括 UDP loopback port validation、prepared URL 写入、prepared reset、worker 启动、stop_requested/join、stream 状态清理和 relay bootstrap 清理；`prepare_obs_ingest_from_request()` 已改为调用 facade，`obs_ingest_runtime.cpp` 已删除 prepare/clear/stop helper 实现。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已更新当前进展和未完成项。
+- 验证结果：已执行 `rg -n "prepare_obs_ingest_session|clear_obs_ingest_prepared_session|stop_obs_ingest_runtime|ensure_winsock_started|is_loopback_udp_port_available|ObsIngestSession::prepare|ObsIngestSession::clear_prepared|ObsIngestSession::stop" media-agent/src/obs_ingest_runtime.cpp media-agent/src/obs_ingest_session.cpp`，prepare/clear/stop 实现已集中在 `obs_ingest_session.cpp`；已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；C++ 编译仅输出既有 FFmpeg/CRT warning，`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-177 OBS worker 主循环仍留在 runtime 文件
+
+- 位置：`media-agent/src/obs_ingest_runtime.cpp`、`media-agent/src/obs_ingest_session.cpp`、`media-agent/src/obs_ingest_session.h`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-176 已把 prepare/clear/stop 实现迁入 `ObsIngestSession`，但 OBS ingest worker 主循环、FFmpeg 打开/探测/packet read、media-state payload 和 relay publish 仍留在 `obs_ingest_runtime.cpp`。
+- 影响：runtime 文件仍实际拥有 OBS stream lifecycle，`ObsIngestSession` 只是外层启动器；后续把 OBS ingest 升级为真正 session owner 时会继续跨文件拆状态写入。
+- 建议：把 worker 主循环、media-state payload 和 FFmpeg/relay 处理迁入 `ObsIngestSession` 私有实现；`obs_ingest_runtime.cpp` 只保留 `prepare_obs_ingest_from_request()` RPC glue。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 OBS 监听参数、不改变 stream probe 规则、不改变 media-state 事件名、不改变 relay publish 和 bootstrap cleanup 行为。
+- 处理结果：已处理。`ObsIngestSession::run_worker()` 已接管 OBS ingest worker 主循环，`obs_ingest_media_state_payload()`、FFmpeg open/probe/read、Annex-B/AAC frame publish、stream metadata 更新和 `obs-stream-running/obs-ingest-ended` 事件发射均迁入 `obs_ingest_session.cpp`；`obs_ingest_runtime.cpp` 现只保留 RPC prepare glue 并通过 `ObsIngestSession::prepare()` 返回原 `obsIngest` JSON。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-178 OBS virtual upstream 常量仍挂在 runtime RPC 头
+
+- 位置：`media-agent/src/obs_ingest_runtime.h`、`media-agent/src/obs_ingest_constants.h`、`media-agent/src/obs_ingest_session.cpp`、`media-agent/src/peer_media_binding_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-177 后 `obs_ingest_runtime.h` 已只剩 RPC prepare glue，但 `kObsIngestVirtualUpstreamPeerId` 仍定义在这个 runtime RPC 头里，导致 `peer_media_binding_runtime.cpp` 和 `obs_ingest_session.cpp` 为了常量继续 include OBS runtime 头。
+- 影响：业务模块仍能通过常量依赖反向接触 runtime RPC API；后续继续拆 OBS session owner 时，runtime 头的职责边界不够纯粹。
+- 建议：新增轻量 `obs_ingest_constants.h` 持有 virtual upstream id；runtime 头只保留 `ObsIngestCommandResult` 和 `prepare_obs_ingest_from_request()`。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 virtual upstream 字符串、不改变 relay subscriber key、不改变 OBS prepare RPC。
+- 处理结果：已处理。新增 `obs_ingest_constants.h` 并迁入 `kObsIngestVirtualUpstreamPeerId`；`obs_ingest_runtime.h` 不再暴露该常量；`obs_ingest_session.cpp` 和 `peer_media_binding_runtime.cpp` 改为 include 常量头，`ObsIngestSession` 不再 include `obs_ingest_runtime.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `rg -n 'obs_ingest_runtime\.h|kObsIngestVirtualUpstreamPeerId|prepare_obs_ingest_from_request' media-agent/src/obs_ingest_runtime.h media-agent/src/obs_ingest_runtime.cpp media-agent/src/obs_ingest_session.cpp media-agent/src/peer_media_binding_runtime.cpp media-agent/src/agent_rpc_router.cpp media-agent/src/obs_ingest_constants.h`，确认仅 RPC router/runtime 仍引用 `obs_ingest_runtime.h`，业务文件只引用常量；已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-179 OBS prepare RPC 仍经由 legacy runtime wrapper
+
+- 位置：`media-agent/src/agent_rpc_router.cpp`、`media-agent/src/obs_ingest_session.h`、`media-agent/src/obs_ingest_session.cpp`、`media-agent/src/obs_ingest_runtime.h`、`media-agent/src/obs_ingest_runtime.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-178 后 `obs_ingest_runtime.*` 已只剩 `prepare_obs_ingest_from_request()` 包装层；RPC router 仍 include legacy runtime 头并通过 free function 进入 `ObsIngestSession::prepare()`。
+- 影响：OBS ingest session owner 仍留有一个无实际 ownership 的 runtime 文件和公共 RPC 头；后续迁移时容易继续把新逻辑放回 legacy runtime wrapper。
+- 建议：把 prepare request 解析和返回 JSON 迁入 `ObsIngestSession::prepare_from_request()`，RPC router 直接调用 session facade；删除 `obs_ingest_runtime.h/.cpp` 并从 CMake 移除。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 `prepareObsIngest` method、不改变 error code、不改变返回 JSON 字段、不改变 OBS prepare 端口语义。
+- 处理结果：已处理。`ObsIngestCommandResult` 和 `ObsIngestSession::prepare_from_request()` 已迁入 `obs_ingest_session.h/cpp`；`agent_rpc_router.cpp` 直接 include `obs_ingest_session.h` 并调用 session facade；`media-agent/CMakeLists.txt` 已移除 `src/obs_ingest_runtime.cpp`；`obs_ingest_runtime.h/.cpp` 已删除。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `rg -n "obs_ingest_runtime|prepare_obs_ingest_from_request" media-agent/src media-agent/CMakeLists.txt`，确认源码和 CMake 已无 legacy runtime wrapper 引用；已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-180 OBS snapshot 读取仍由 HostSessionController 直接锁 registry
+
+- 位置：`media-agent/src/host_session_controller.h`、`media-agent/src/host_session_controller.cpp`、`media-agent/src/obs_ingest_session.h`、`media-agent/src/obs_ingest_session.cpp`、`media-agent/src/peer_media_binding_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-179 删除 legacy runtime wrapper 后，`HostSessionController::obs_ingest_snapshot()` 仍直接锁 `state_.obs_ingest_sessions.current.mutex` 并逐字段读取 prepared、stream、codec、尺寸和音频采样率。
+- 影响：HostSessionController 仍知道 OBS session registry 内部字段布局；后续把 OBS registry 升级为真正 session owner/snapshot 时，host owner 仍会保留一处跨 owner 读取。
+- 建议：把 `ObsIngestSessionSnapshot` 类型和 snapshot 构建逻辑迁入 `ObsIngestSession`，HostSessionController 只保留兼容 facade 并转调用 `ObsIngestSession::snapshot()`。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 peer OBS binding 的 ready 判断、codec fallback、尺寸/帧率和音频采样率读取语义。
+- 处理结果：已处理。`ObsIngestSessionSnapshot` 已迁入 `obs_ingest_session.h`，`ObsIngestSession::snapshot()` 统一负责锁定和读取 `obs_ingest_sessions.current`；`HostSessionController::obs_ingest_snapshot()` 改为 `ObsIngestSession(state_).snapshot()`，`peer_media_binding_runtime.cpp` 显式 include `obs_ingest_session.h` 使用 snapshot 类型。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `rg -n "obs_ingest_sessions\.current" media-agent/src --glob "!obs_ingest_session.cpp" --glob "!agent_runtime.h" --glob "!session_registries.h"`，确认 OBS registry 直接访问仅保留在 session owner 和 registry/runtime 定义侧；已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-181 Host drain 仍保留无 ownership 的 OBS stop wrapper
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-180 后 OBS stop 已由 `ObsIngestSession::stop()` 实际拥有，但 `host_session_controller.cpp` 仍保留 `stop_obs_ingest_session_runtime()` 一行包装，restart/stop/shutdown 路径通过该 legacy helper 停 OBS。
+- 影响：Host drain 层仍显示一个旧 runtime 命名的中间 owner；后续阅读 lifecycle 时容易误判 OBS stop 仍由 runtime helper 持有。
+- 建议：删除 `stop_obs_ingest_session_runtime()`，在保持原调用顺序和 breadcrumb 文本不变的前提下，直接调用 `ObsIngestSession(state).stop()`。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 restart/stop/shutdown 的 OBS stop 顺序、不改变 breadcrumb 文本、不改变 OBS stop 行为。
+- 处理结果：已处理。`stop_obs_ingest_session_runtime()` 已删除；`drain_running_host_session()` 的 restart 分支和 stop 分支直接调用 `ObsIngestSession(state).stop()`；`HostSessionController::stop_obs_ingest_session()` 直接调用 `ObsIngestSession(state_).stop()`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `rg -n "stop_obs_ingest_session_runtime" media-agent/src`，代码侧无旧 helper 残留；已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-182 Host audio ready 判断仍直接读取 audio registry
+
+- 位置：`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/host_audio_dispatch_session.h`、`media-agent/src/host_audio_dispatch_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M6/M7 已引入 `HostAudioDispatchSession`，但 peer media binding 仍直接读取 `state.audio_sessions.current.capture_active && ready` 判断是否配置 host audio sender；agent lifecycle refresh/init 也直接写 `audio_sessions.current` 同步 WASAPI status。
+- 影响：audio registry 的 read/write owner 仍分散到 peer binding 和 agent lifecycle；后续把 `AudioSessionRegistry` 升级为真正 session owner 时，这些外部访问点会阻碍收口。
+- 建议：在 `HostAudioDispatchSession` 增加 `capture_ready()` 和 `refresh_session_status()` facade；peer binding 只通过 `capture_ready()` 判断音频发送条件，agent lifecycle 只通过 `refresh_session_status()` 同步 WASAPI 状态。
+- 修改意见：按建议实施 M6/M7 小切片，不改变 audio sender 配置条件、不改变 start/stop audio session RPC、不改变 stats JSON。
+- 处理结果：已处理。`HostAudioDispatchSession` 新增 `capture_ready()` 和 `refresh_session_status()`；`peer_media_binding_runtime.cpp` 三处 host audio sender ready 判断改为通过 `capture_ready()`；`agent_lifecycle.cpp` 的 refresh/init audio status sync 改为 `HostAudioDispatchSession(state).refresh_session_status()`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `rg -n "audio_sessions\.current" media-agent/src --glob "!media_audio.cpp" --glob "!host_audio_dispatch_session.cpp" --glob "!agent_runtime.h" --glob "!session_registries.h"`，确认 audio registry 外部直接访问已清零；已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过。
+
+### ARCH-SPLIT-P1-183 Audio start/stop RPC 仍由 media_audio.cpp 直接写 audio registry
+
+- 位置：`media-agent/src/media_audio.cpp`、`media-agent/src/media_audio.h`、`media-agent/src/host_audio_dispatch_session.h`、`media-agent/src/host_audio_dispatch_session.cpp`、`media-agent/src/agent_rpc_router.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-182 已把 host audio ready/status refresh 收进 `HostAudioDispatchSession`，但 `startAudioSession` / `stopAudioSession` RPC 仍经由 `media_audio.cpp` 的 free function 解析 request、启动/停止 WASAPI、写 `audio_sessions.current` 并触发 peer audio sender refresh。
+- 影响：audio session owner 边界仍有一条重要写入口留在 codec/回调业务文件里；后续把 `AudioSessionRegistry` 升级为真正 session owner/snapshot 时，还需要再次迁移 RPC 写路径。
+- 建议：把 start/stop audio request 解析、WASAPI start/stop、状态写入、事件发射和 peer sender refresh 迁入 `HostAudioDispatchSession`；`media_audio.*` 只保留音频 codec/callback helper，RPC router 直接调用 session facade。
+- 修改意见：按建议实施 M6/M7 小切片，不改变 `startAudioSession` / `stopAudioSession` method 名称、不改变 result JSON、不改变 WASAPI capture start/stop 和 host audio sender refresh 行为。
+- 处理结果：已处理。`HostAudioDispatchSession` 新增 `start_from_request()` 和 `stop_from_request()`，承接原 audio RPC 的 request 解析、WASAPI start/stop、`audio_sessions.current` 状态写入、`audio-session-started/stopped` 事件、warning 事件和 `PeerSessionController::refresh_host_audio_senders()` 调用；`agent_rpc_router.cpp` 的 `startAudioSession` / `stopAudioSession` 已直接实例化 `HostAudioDispatchSession` 并调用 facade；`media_audio.h/cpp` 已删除旧 `start_audio_session_from_request()` / `stop_audio_session_from_request()` 声明和实现。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "start_audio_session_from_request|stop_audio_session_from_request" media-agent/src`，确认旧 free function 已无残留；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-184 WASAPI callback 挂接仍由 media_audio.cpp 承担
+
+- 位置：`media-agent/src/media_audio.cpp`、`media-agent/src/media_audio.h`、`media-agent/src/host_audio_dispatch_session.h`、`media-agent/src/host_audio_dispatch_session.cpp`、`media-agent/src/agent_lifecycle.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-183 后 `media_audio.*` 已不再持有 audio start/stop RPC，但仍暴露 `attach_wasapi_audio_callbacks(AgentRuntimeState&)`，并在音频 codec/helper 文件中绑定 WASAPI event/PCM callback、间接调用 host audio dispatch。
+- 影响：`media_audio.*` 继续承担 host audio capture callback lifecycle，且公共头为了一个初始化入口暴露 `AgentRuntimeState` 前置声明；后续把 `media_audio.*` 收窄为 codec conversion/encode/decode helper 时会继续残留 owner 混杂。
+- 建议：把 WASAPI callback 挂接和 callback 函数迁入 `HostAudioDispatchSession`；agent 初始化通过 host audio owner 安装 callback，`media_audio.*` 只保留 decode/reset/state conversion helper。
+- 修改意见：按建议实施 M6 小切片，不改变 WASAPI callback 类型、不改变 event 转发、不改变 PCM packet 进入 host audio dispatch queue 的路径。
+- 处理结果：已处理。`HostAudioDispatchSession` 新增 `attach_wasapi_callbacks()`，负责调用 `set_wasapi_event_callback()` 和 `set_wasapi_pcm_packet_callback()`；WASAPI event callback 和 PCM callback 已迁入 `host_audio_dispatch_session.cpp`，PCM 包仍通过 `HostAudioDispatchSession::dispatch_capture_packet()` 进入原 dispatch 队列；`initialize_agent_runtime()` 改为调用 `HostAudioDispatchSession(state).attach_wasapi_callbacks()`；`media_audio.h/cpp` 已删除 `attach_wasapi_audio_callbacks()`，并移除对 `AgentRuntimeState`、`agent_events.h`、`host_audio_dispatch_session.h` 的依赖。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n 'attach_wasapi_audio_callbacks|attach_wasapi_callbacks|#include "media_audio\\.h"' media-agent/src -g '*.cpp' -g '*.h'` 和 `rg -n '#include "agent_runtime\\.h"|#include "agent_events\\.h"|#include "host_audio_dispatch_session\\.h"' media-agent/src/media_audio.cpp media-agent/src/media_audio.h`，确认旧 callback 入口已删除且 `media_audio.*` 无大 runtime/event/session include；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-185 peer media binding 为音频传输常量依赖 media_audio.h
+
+- 位置：`media-agent/src/media_audio.h`、`media-agent/src/audio_transport_config.h`、`media-agent/src/peer_media_binding_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-184 后 `media_audio.*` 已收窄到音频 decode/reset/state conversion helper，但 `peer_media_binding_runtime.cpp` 仍为了 `kTransportAudioSampleRate` / `kTransportAudioBitrateKbps` include `media_audio.h`。
+- 影响：peer media binding 对音频 codec/helper 头形成不必要依赖；后续继续把 `media_audio.*` 解耦为纯 helper 时，传输常量和解码 helper 会被错误绑定在一起。
+- 建议：新增轻量 `audio_transport_config.h` 承接 transport audio sample rate/channel count/bitrate 常量；`media_audio.h` 继续 include 该轻量头保持旧调用方兼容，peer media binding 直接 include 常量头。
+- 修改意见：按建议实施 M6/M7 小切片，不改变常量值、不改变 audio sender/receiver 配置、不改变 JSON/RPC wire shape。
+- 处理结果：已处理。新增 `audio_transport_config.h`，迁入 `kTransportAudioSampleRate`、`kTransportAudioChannelCount`、`kTransportAudioBitrateKbps`；`media_audio.h` 删除常量定义并 include 新头维持兼容；`peer_media_binding_runtime.cpp` 改为 include `audio_transport_config.h`，不再 include `media_audio.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n '#include "media_audio\\.h"|kTransportAudioSampleRate|kTransportAudioChannelCount|kTransportAudioBitrateKbps|audio_transport_config' media-agent/src -g '*.cpp' -g '*.h'`，确认 peer media binding 只依赖轻量常量头；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-186 WASAPI 状态转换仍由 media_audio.cpp 暴露
+
+- 位置：`media-agent/src/media_audio.cpp`、`media-agent/src/media_audio.h`、`media-agent/src/host_audio_dispatch_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-185 后 `media_audio.*` 已逐步收窄，但 `build_audio_session_state(const WasapiSessionStatus&)` 仍在 `media_audio.cpp` 暴露，host audio owner 为了把 WASAPI status 转成 `AudioSessionState` 继续 include `media_audio.h`。
+- 影响：host audio session 状态写入仍依赖 codec/helper 文件；`media_audio.h` 为此继续暴露 `AudioSessionState` / `WasapiSessionStatus` 相关声明，和“media_audio 只保留 decode/reset helper”的目标不一致。
+- 建议：把 WASAPI status -> `AudioSessionState` 转换迁入 `HostAudioDispatchSession` 内部 helper；`media_audio.*` 删除该声明/实现和相关状态/backend include。
+- 修改意见：按建议实施 M6/M7 小切片，不改变转换字段、不改变 `startAudioSession` / `stopAudioSession` result JSON、不改变 `getStats.audioBackend` 字段。
+- 处理结果：已处理。`build_audio_session_state()` 已迁入 `host_audio_dispatch_session.cpp` 匿名 namespace，`HostAudioDispatchSession::refresh_session_status()`、`start_from_request()`、`stop_from_request()` 仍使用同一字段映射；`media_audio.h/cpp` 已删除 `build_audio_session_state()` 声明/实现，并移除 `audio_session_state.h`、`audio_state_json.h`、`wasapi_backend.h` 依赖；`host_audio_dispatch_session.cpp` 改为直接 include `audio_transport_config.h`，不再 include `media_audio.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n 'build_audio_session_state|#include "media_audio\\.h"|#include "audio_state_json\\.h"|#include "wasapi_backend\\.h"|#include "audio_session_state\\.h"' media-agent/src/host_audio_dispatch_session.cpp media-agent/src/media_audio.cpp media-agent/src/media_audio.h media-agent/src -g '*.cpp' -g '*.h'`，确认状态转换只保留在 host audio owner 内；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-187 media_audio.h 仍顺带暴露 transport audio config
+
+- 位置：`media-agent/src/media_audio.h`、`media-agent/src/media_audio.cpp`、`media-agent/src/audio_transport_config.h`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-186 后 `media_audio.h` 已基本只剩 decode/reset API，但仍 include `audio_transport_config.h`，导致所有包含 `media_audio.h` 的调用方间接看到 transport sample rate/channel/bitrate 常量。
+- 影响：codec helper 公共头仍泄露传输配置职责；后续若调整传输常量 owner，会继续牵动不需要该配置的 audio decode 调用方。
+- 建议：从 `media_audio.h` 移除 `audio_transport_config.h` include，只有实际使用常量的 `.cpp` 直接 include 轻量配置头。
+- 修改意见：按建议实施 M6/M7 小切片，不改变常量值、不改变 decode API、不改变 host sender/peer binding 行为。
+- 处理结果：已处理。`media_audio.h` 已移除 `audio_transport_config.h` include；`media_audio.cpp` 因自身 decode 初始化仍使用 sample rate/channel count，改为直接 include `audio_transport_config.h`；host audio dispatch 和 peer media binding 已继续直接 include 常量头。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n 'audio_transport_config|kTransportAudioSampleRate|kTransportAudioChannelCount|kTransportAudioBitrateKbps|#include "media_audio\\.h"' media-agent/src/media_audio.cpp media-agent/src/media_audio.h media-agent/src/peer_media_binding_runtime.cpp media-agent/src/host_audio_dispatch_session.cpp media-agent/src/viewer_audio_session.cpp media-agent/src/peer_receiver_runtime.cpp`，确认 `media_audio.h` 不再暴露 transport config；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-188 surface recoverable warning 节流状态仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R4 已把 embedded surface registry、generation、sync failure count 和 sync loop 迁入 `native-surface-controller.js`，但 recoverable surface sync warning 的 5 秒节流 map 仍由 `app-native-overrides.js` 持有，并通过 option 回调注入 controller。
+- 影响：surface controller 的错误状态和日志节流状态分属两个 owner；后续删除 legacy override 时，还要回搬 warning map 和 debug/warning 分流语义。
+- 建议：把 recoverable surface sync warning map、debug step/warning 分流和 clear 行为迁入 `native-surface-controller.js`；`app-native-overrides.js` 保留同名 wrapper，只在正常路径委托 controller。
+- 修改意见：按建议实施 R4/R7 小切片，不改变 updateSurface 失败处理、不改变连续失败恢复、不改变 debug 开关下的 step 日志和普通模式 5 秒 warning 节流。
+- 处理结果：已处理。`native-surface-controller.js` 新增 `recoverableSurfaceSyncWarnings` map，`logRecoverableSurfaceSyncWarning()` 现在在 controller 内保持原 debug/nativeSteps 分流和普通模式 5 秒节流，`clearRecoverableSurfaceSyncWarning()` 同时清 warning map 与 surface failure count，并通过 controller API 暴露给 legacy wrapper；`app-native-overrides.js` 删除 `recoverableSurfaceSyncWarnings` 本地 map，不再向 surface controller 注入 log/clear warning 回调，正常路径的同名函数只委托 controller。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R4 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-253 detach media binding helper 仍留在 peer media binding runtime
+
+- 位置：`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/peer_media_binding_runtime.h`、`media-agent/src/peer_media_detach_binding.h`、`media-agent/src/peer_media_detach_binding.cpp`、`media-agent/src/peer_close_pipeline.cpp`、`media-agent/src/peer_media_source_pipeline.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：attach/detach request body 已迁入 `peer_media_source_pipeline.*`，host/relay attach binding 也已拆出，但底层 `detach_peer_media_binding()` 与 `prepare_peer_media_binding_for_transport_close()` 仍留在 `peer_media_binding_runtime.*`。
+- 影响：peer media binding runtime 仍同时承担 refresh glue 和 detach cleanup；close peer、detach source、agent shutdown 等路径继续依赖旧 runtime 头，影响后续把 refresh/cleanup 归并到明确 owner。
+- 建议：新增 `peer_media_detach_binding.*` 承接 detach binding 与 transport-close cleanup；调用方只 include 新 helper，`peer_media_binding_runtime.*` 继续收窄为 refresh/soft-refresh/host-audio-refresh glue。
+- 修改意见：按建议实施 M7 小切片，不改变 detach failure、relay subscriber unregister、host audio unregister、video sender stop、transport sender clear、media binding state 写回和 close peer cleanup 时序。
+- 处理结果：已处理。新增 `peer_media_detach_binding.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`detach_peer_media_binding()` 与 `prepare_peer_media_binding_for_transport_close()` 已从 `peer_media_binding_runtime.*` 迁入新 helper；`agent_lifecycle.cpp`、`peer_close_pipeline.cpp`、`peer_media_source_pipeline.cpp` 改为 include/use `peer_media_detach_binding.h`；`peer_media_binding_runtime.*` 删除相关声明/实现和不再需要的 event/state/relay include。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent unit tests、smoke test 和 runtime binary copy 均通过；残留扫描确认两个 helper 的声明/实现只在 `peer_media_detach_binding.*`，调用方已转向新头。
+
+### ARCH-SPLIT-P1-202 viewer upstream stale peer 选择仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 remote offer intake decision 和 peer handle registry 迁入 peer controller 后，`closeStaleViewerUpstreamPeers()` 仍在 legacy override 中直接从 `peerConnections.keys()` 选择 stale peer。
+- 影响：viewer 切换上游后的 peer 清理范围仍由旧大文件判断；后续 peer handle registry 瘦身时，legacy map 与 controller registry 可能产生分叉。
+- 建议：由 `native-peer-controller.js` 导出 stale peer id 选择方法，legacy 只保留延迟关闭和 active upstream 二次校验。
+- 修改意见：按建议实施 R5 小切片，不改变 250ms 延迟关闭、不改变当前 active upstream 保护、不改变缺模块 fallback。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `getStalePeerIds(activePeerId)`，按 controller 的 peer handle registry 返回非 active peer id；`app-native-overrides.js::closeStaleViewerUpstreamPeers()` 正常路径委托 controller，仍保留延迟关闭和 `peerId === upstreamPeerId` 二次校验，缺模块时继续使用 `peerConnections.keys()` fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-203 queued remote ICE flush 仍在 legacy override 执行
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 remote ICE queue/apply/duplicate/block 迁入 peer controller，但 `flushQueuedRemoteCandidates()` 仍在 legacy override 中取出 pending queue 并逐条调用 `addPeerRemoteIceCandidate()`。
+- 影响：remote offer/answer apply 后的 queued ICE flush 仍有一段执行顺序留在旧大文件；后续删除 legacy pending queue 时容易遗漏 flush 路径。
+- 建议：在 `native-peer-controller.js` 增加 `flushQueuedRemoteCandidates(peerId, handle)`，由 controller 负责取队列和逐条 apply；legacy 只消费每条结果做 blocked 日志和 P2P UI 状态写回。
+- 修改意见：按建议实施 R5 小切片，不改变 flush 触发点、不改变候选 apply 顺序、不吞掉 apply 错误、不改变 blocked relay 日志和 `checking` UI 状态。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `flushQueuedRemoteCandidates()`，内部复用 `takePendingRemoteCandidates()` 与 `applyRemoteIceCandidate()` 并返回每条结果；`app-native-overrides.js::flushQueuedRemoteCandidates()` 正常路径委托 controller，只根据结果写 blocked 日志和 P2P UI 状态，缺模块 fallback 保留旧队列路径。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-204 offer message 发送路径仍在 legacy override 编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 offer signal 等待和 offer message builder 放进 peer controller，但 `createAndSendPeerOffer()` 仍在 legacy override 中手动串起 `prepareOfferSignal()`、`buildOfferMessage()` 和 `sendMessage()`。
+- 影响：offer 输出路径与 answer 输出路径不对称；后续把 peer lifecycle 迁入 controller 时，host/viewer relay offer 发送仍需要回到旧大文件拼接协议消息。
+- 建议：在 `native-peer-controller.js` 增加 `prepareOfferMessage()` / `createAndSendOffer()` / `sendSignalMessage()` facade；legacy 保留 P2P UI 状态切换，发送执行优先委托 controller。
+- 修改意见：按建议实施 R5 小切片，不改变 offer message 字段、不改变 `gathering` / `restart-attempting` UI 状态切换时机、不改变返回 SDP、不改变缺模块 fallback。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `prepareOfferMessage()`、`createAndSendOffer()` 和 `sendSignalMessage()`，统一复用 `prepareOfferSignal()` 与 `buildOfferMessage()`；`app-native-overrides.js::createAndSendPeerOffer()` 正常路径调用 `prepareOfferMessage()`，在保持原 UI 状态切换后通过 controller `sendSignalMessage()` 发信令，旧 `prepareOfferSignal/buildOfferMessage/sendMessage` 路径保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-205 本地 ICE candidate 发送执行仍直接走 legacy sendMessage
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-195 已把本地 ICE candidate payload 构造、attemptId 附加和 relay block 决策迁入 peer controller，但 `forwardNativeMediaSignal()` 在正常路径仍直接调用 legacy `sendMessage()`。
+- 影响：offer/answer 发送 facade 已统一到 peer controller 后，本地 candidate 发送路径仍绕过 controller 的 roomClient/sendMessage facade，后续切换 room-client 注入点时会留下分叉。
+- 建议：正常路径复用 `nativePeerController.sendSignalMessage()` 发 candidate payload；legacy 继续保留 blocked 日志、本地候选统计和缺模块 fallback。
+- 修改意见：按建议实施 R5 小切片，不改变 candidate payload、不改变本地候选统计时机、不改变 blocked relay 日志、不改变缺模块 fallback。
+- 处理结果：已处理。`app-native-overrides.js::forwardNativeMediaSignal()` 在 `prepareLocalIceCandidateSignal()` 正常返回后，先保持原本地候选统计，再优先通过 `nativePeerController.sendSignalMessage()` 发送 payload；缺少 controller facade 时继续调用旧 `sendMessage()`。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-206 remote offer 后续 flush+answer 仍由 legacy 串联
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 remote offer decision/apply、queued ICE flush 和 answer 发送分别迁入 peer controller，但 `handleOffer()` 在 surface attach 后仍由 legacy 文件手动按 `flushQueuedRemoteCandidates()` -> `createAndSendPeerAnswer()` 串联。
+- 影响：offer 收到后的纯 peer 信令收尾仍散落在旧大文件；后续迁移 `handleOffer()` 时还要再次保持 flush-before-answer 的时序。
+- 建议：在 `native-peer-controller.js` 增加 `flushQueuedAndCreateAnswer(peerId, handle, options)`，由 controller 负责 queued ICE flush 后立刻创建并发送 answer；legacy 继续保留 surface attach、stats polling 和 stale upstream cleanup。
+- 修改意见：按建议实施 R5 小切片，不改变 surface attach 时机、不改变 flush-before-answer 顺序、不改变 answer message 字段、不吞掉 queued ICE apply 错误。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `flushQueuedAndCreateAnswer()`，内部复用 `flushQueuedRemoteCandidates()` 与 `createAndSendAnswer()`；`app-native-overrides.js::handleOffer()` 在 surface attach 后优先调用该组合 facade，并通过新增 `applyQueuedRemoteCandidateFlushResult()` 消费 flush 结果做 blocked 日志和 P2P UI 状态写回，缺模块 fallback 保留原两步流程。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-207 ObsIngestSession 非静态方法仍反复直接访问 current registry
+
+- 位置：`media-agent/src/obs_ingest_session.h`、`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M5/M6 后 OBS ingest 已有 session facade，但 `ObsIngestSession` 的 `session_json()`、`snapshot()`、`prepare()`、`clear_prepared()`、`start_worker()`、`stop()` 仍到处拼写 `state_.obs_ingest_sessions.current`。
+- 影响：`ObsIngestSessionRegistry.current` 兼容容器的访问面过大；后续把 OBS registry 升级为真正 session owner/snapshot 时，需要在大量方法里重复改访问路径。
+- 建议：让 `ObsIngestSession` 构造时绑定 `ObsIngestState& session_`，非静态方法都通过 session 引用访问当前 OBS session state；静态 worker 入口暂保留旧路径，作为下一步迁移边界。
+- 修改意见：按建议实施 M7 前置小切片，不改变 OBS prepare/start/stop 行为，不改变 JSON 字段，不改变 worker thread 启动参数。
+- 处理结果：已处理。`ObsIngestSession` 新增 `ObsIngestState& session_` 成员并在构造函数中绑定 `state.obs_ingest_sessions.current`；`session_json()`、`snapshot()`、`prepare()`、`clear_prepared()`、`start_worker()`、`stop()` 均改为通过 `session_` 访问 OBS session state。静态 `run_worker(AgentRuntimeState*)` 保持原访问方式，避免本切片改变 worker 生命周期。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 前置边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-214 OBS media-state payload helper 仍从 AgentRuntimeState 重建 OBS session
+
+- 位置：`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-209 后 OBS worker 入口已显式接收 `ObsIngestState* session`，但 `obs_ingest_media_state_payload()` 仍只接收 `AgentRuntimeState&`，内部再构造 `ObsIngestSession(state)` 来输出 `obsIngest` JSON。
+- 影响：worker 状态事件路径仍隐含依赖 `obs_ingest_sessions.current`；后续把 OBS registry 升级为真正 session owner 或多 session registry 时，media-state payload helper 还会穿透全局 runtime。
+- 建议：让 `obs_ingest_media_state_payload()` 显式接收 worker 已绑定的 `ObsIngestState& session`，输出 `obsIngest` 时直接调用 `obs_ingest_json(session)`；`AgentRuntimeState&` 暂保留给 host snapshot、transport ready 和跨 session 服务。
+- 修改意见：按建议实施 M7 前置小切片，不改变 `media-state` 事件名，不改变 payload 字段和值，不改变 OBS worker lifecycle。
+- 处理结果：已处理。`obs_ingest_media_state_payload()` 签名改为接收 `AgentRuntimeState& state, ObsIngestState& session`；worker 的 `obs-ingest-waiting`、`obs-ingest-connected`、`obs-stream-running`、`obs-ingest-ended` 四处事件均传入同一个显式 session 引用；payload 内部不再构造 `ObsIngestSession(state)`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`rg -n "obs_ingest_media_state_payload\([^\n]*state\)|ObsIngestSession obs_ingest\(state\)" media-agent/src/obs_ingest_session.cpp` 仅剩 `prepare_from_request()` 的正常 facade 构造，不再有 worker payload helper 重建 OBS session；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-215 OBS media-state payload formatter 仍接收完整 AgentRuntimeState
+
+- 位置：`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-214 后 `obs_ingest_media_state_payload()` 已显式接收 OBS session 引用，但 payload formatter 仍接收完整 `AgentRuntimeState&`，只为读取 host snapshot 和 `peer_transport_backend.transport_ready`。
+- 影响：状态事件 formatter 的依赖面仍偏大；后续把 worker context 拆小时，payload formatter 仍会把完整 runtime 拉回格式化层。
+- 建议：把 `obs_ingest_media_state_payload()` 参数收窄为 `HostSessionController& host_session`、`bool transport_ready` 和 `ObsIngestState& session`；完整 `AgentRuntimeState&` 只留在 worker 编排层。
+- 修改意见：按建议实施 M7 前置小切片，不改变 `media-state` payload 字段和值，不改变 host backend/capture target/transportReady 的取值来源。
+- 处理结果：已处理。`obs_ingest_media_state_payload()` 不再接收 `AgentRuntimeState&`，改为接收 `HostSessionController&` 和 `transport_ready` snapshot；worker 四处 media-state 事件调用点均传入既有 `host_session` controller 和 `state.peer_transport_backend.transport_ready`，完整 runtime 依赖只保留在 worker 编排层。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。已执行 `rg -n "obs_ingest_media_state_payload\([^\n]*AgentRuntimeState|obs_ingest_media_state_payload\([^\n]*state,|HostSessionController& host_session|bool transport_ready" media-agent/src/obs_ingest_session.cpp`，确认 formatter 只剩显式 host controller 和 transport snapshot 参数；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-216 HostAudioDispatchSession 仍反复直接访问 audio registry current
+
+- 位置：`media-agent/src/host_audio_dispatch_session.h`、`media-agent/src/host_audio_dispatch_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M6/M7 已让 host audio start/stop/status/stats 走 `HostAudioDispatchSession`，但类方法内部仍反复拼写 `state_->audio_sessions.current`，audio registry current 的访问面过大。
+- 影响：后续把 `AudioSessionRegistry` 升级为真正 session owner/snapshot 时，需要在多个方法内重复替换同一个 current 访问路径，也容易让新代码绕过 session owner。
+- 建议：让 `HostAudioDispatchSession` 构造时绑定 `AudioSessionState* session_`，非静态方法统一通过 `session_` 读写 audio session；`AgentRuntimeState*` 暂保留给 peer controller refresh 和 transport ready snapshot。
+- 修改意见：按建议实施 M6/M7 小切片，不改变 audio start/stop RPC result JSON，不改变 media-state/warning 事件字段，不改变 WASAPI start/stop 或 host audio sender refresh 行为。
+- 处理结果：已处理。`HostAudioDispatchSession` 新增 `AudioSessionState* session_` 并在构造函数中绑定 `state.audio_sessions.current`；`capture_ready()`、`refresh_session_status()`、`start_from_request()`、`stop_from_request()` 和 `stats_json()` 均改为通过 `session_` 访问 audio state。`state_` 仍只用于 peer sender refresh 与 `peer_transport_backend.transport_ready` 输出。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。已执行 `rg -n "audio_sessions\.current" media-agent/src/host_audio_dispatch_session.cpp media-agent/src/host_audio_dispatch_session.h`，确认只剩构造函数绑定位置；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-217 ViewerAudioSession 持有无实际用途的 AgentRuntimeState 引用
+
+- 位置：`media-agent/src/viewer_audio_session.h`、`media-agent/src/viewer_audio_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M6 已把 viewer playback runtime 下沉为私有状态并让 `ViewerAudioSession` 只调用 playback/relay/WASAPI facade，但 `ViewerAudioSession` 类仍保存 `AgentRuntimeState& state_`，构造函数里仅 `(void)state_`，实际没有使用 runtime。
+- 影响：viewer audio session facade 看起来仍依赖完整 runtime，给后续调用点和 include 边界造成误导，也不利于最终把 audio session owner 与 `AgentRuntimeState` 解耦。
+- 建议：删除 `ViewerAudioSession::state_` 成员，构造函数暂保留 `AgentRuntimeState&` 参数以兼容现有调用点，函数体只显式忽略参数。
+- 修改意见：按建议实施 M6/M7 小切片，不改变 viewer volume/delay RPC，不改变 remote audio relay/local playback 行为，不改变现有构造调用点。
+- 处理结果：已处理。`ViewerAudioSession` 已删除 `AgentRuntimeState& state_` 成员和空 `private` 区块；构造函数保留 `AgentRuntimeState& state` 参数并显式 `(void)state`，内部不再持有 runtime 引用。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。已执行 `rg -n "state_|private:|AgentRuntimeState& state" media-agent/src/viewer_audio_session.h media-agent/src/viewer_audio_session.cpp`，确认仅剩兼容构造函数参数，无 `state_` 成员和空 `private` 区块；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-218 HostSessionController 成员方法仍反复直接访问 host registry current
+
+- 位置：`media-agent/src/host_session_controller.h`、`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M4/M7 已让 host status/stats、capture runtime refresh、host snapshot getter/setter 走 `HostSessionController`，但类成员方法内部仍反复拼写 `state_.host_sessions.current`。
+- 影响：`HostSessionRegistry.current` 兼容容器的访问面偏大；后续把 host registry 升级为真正 HostSession owner/snapshot 时，需要在多个成员方法里重复替换同一个 current 访问路径。
+- 建议：让 `HostSessionController` 构造时绑定 `HostSessionState& session_`，已进入 controller 的成员方法统一通过该 session 引用读写 host state；namespace lifecycle helper 暂保留旧路径，作为下一步更大 start/stop helper 收口边界。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 host start/stop RPC result JSON，不改变 capture runtime refresh、窗口恢复检测、capture process manifest persist 和 host snapshot getter/setter 语义。
+- 处理结果：已处理。`HostSessionController` 新增 `HostSessionState& session_` 并在构造函数中绑定 `state.host_sessions.current`；`append_status_json_fields()`、`append_stats_json_fields()`、`initialize_default_capture_runtime()`、`revalidate_capture_plan()`、`refresh_capture_runtime()`、`stop_capture_process()` 和 host snapshot getter/setter 均改为通过 `session_` 访问 host state。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。已执行 `rg -n "state_\.host_sessions\.current|session_" media-agent/src/host_session_controller.cpp media-agent/src/host_session_controller.h`，确认 controller 成员方法不再直接访问 `state_.host_sessions.current`，仅保留构造绑定与 namespace lifecycle helper 的兼容路径；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-219 host lifecycle helper 仍直接写 host registry current
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-218 后 `HostSessionController` 成员方法已绑定 `HostSessionState& session_`，但 `host_session_json()`、`refresh_default_native_host_plan()`、`apply_host_session_start_request()`、`reset_host_session_to_default_native()`、`start_obs_ingest_host_session()`、`start_native_capture_host_session()`、`stop_host_capture_session_for_reason()`、`drain_running_host_session()` 等 namespace lifecycle helper 仍直接拼写 `state.host_sessions.current`。
+- 影响：host start/stop 的配置应用、默认 reset、pipeline/plan 构建和 capture stop 写入口仍隐含依赖兼容 registry current；后续升级 HostSessionRegistry 时还要在这些 helper 中逐处拆全局 runtime 依赖。
+- 建议：把这些 helper 的 host state 参数改为显式 `HostSessionState& session`；`AgentRuntimeState&` 仅保留给 FFmpeg/WGC/OBS/peer transport 等跨服务依赖。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 host start/stop 时序，不改变 media-state/warning/result JSON 字段，不改变 OBS prepare/start worker 和 native capture process 行为。
+- 处理结果：已处理。相关 namespace lifecycle helper 已改为显式接收 `HostSessionState&` 并通过该 session 参数读写 host state；`host_sessions.current` 在 `host_session_controller.cpp` 内只剩 start/stop 入口局部绑定和 controller 构造绑定。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。已执行 `rg -n "host_sessions\.current" media-agent/src/host_session_controller.cpp`，确认仅剩 start/stop 入口局部绑定和 controller 构造绑定；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-220 host start/stop helper 仍自行绑定 registry current
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-219 后 host lifecycle helper 已显式接收 `HostSessionState&`，但 `start_host_session_from_request()` / `stop_host_session()` 内部仍自行从 `state.host_sessions.current` 绑定当前 host session。
+- 影响：start/stop 编排层仍知道兼容 registry current 的位置；后续替换为真正 HostSessionRegistry owner 时，还需要再次改这两个入口。
+- 建议：让 `HostSessionController::start_from_request()` / `stop()` 把构造时绑定的 `session_` 传入内部 start/stop helper；内部 helper 不再自行解析 current。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 host start/stop 行为、参数解析、事件顺序或返回 JSON。
+- 处理结果：已处理。`start_host_session_from_request()` / `stop_host_session()` 已新增 `HostSessionState& session` 参数，由 `HostSessionController` 传入 `session_`；`host_session_controller.cpp` 中 `host_sessions.current` 访问只剩构造函数绑定。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。已执行 `rg -n "host_sessions\.current" media-agent/src/host_session_controller.cpp`，确认 `host_sessions.current` 只剩构造函数绑定；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-221 session controller 构造绑定仍直接知道 registry current 字段
+
+- 位置：`media-agent/src/runtime_registry.h`、`media-agent/src/runtime_registry.cpp`、`media-agent/src/host_session_controller.cpp`、`media-agent/src/host_audio_dispatch_session.cpp`、`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-220 后 host controller 只剩构造函数直接绑定 `host_sessions.current`，同时 `HostAudioDispatchSession` / `ObsIngestSession` 构造函数也分别直接绑定 `audio_sessions.current` / `obs_ingest_sessions.current`。
+- 影响：业务/session controller 仍知道兼容 registry 的 `current` 字段布局；后续替换为真正 session registry owner 时，需要逐个改构造函数。
+- 建议：在 `runtime_registry` 增加 `current_host_session()`、`current_audio_session()`、`current_obs_ingest_session()` facade，业务/session controller 只通过 facade 获取当前 session。
+- 修改意见：按建议实施 M7 小切片，不改变 registry 数据结构，不改变 session 生命周期和外部 JSON，只集中 current session 获取位置。
+- 处理结果：已处理。`runtime_registry.h/cpp` 新增 host/audio/OBS current session facade；`HostSessionController`、`HostAudioDispatchSession`、`ObsIngestSession` 构造绑定改为调用对应 facade。`host_sessions.current` / `audio_sessions.current` / `obs_ingest_sessions.current` 的直接访问集中到 `runtime_registry.cpp`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。已执行 `rg -n "host_sessions\.current|audio_sessions\.current|obs_ingest_sessions\.current" media-agent/src -g "*.cpp" -g "*.h"`，确认三类 current 直接访问仅剩 `runtime_registry.cpp` facade 内部；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-222 单 session registry 仍公开 current 字段布局
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/src/runtime_registry.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-221 后业务/session controller 已通过 `runtime_registry` facade 获取 host/audio/OBS current session，但 `HostSessionRegistry`、`AudioSessionRegistry`、`ObsIngestSessionRegistry` 仍公开 `current` 字段。
+- 影响：registry 的内部布局仍暴露给任何包含 `session_registries.h` 的代码；后续升级为真正 session owner 或多 session registry 时，外部仍可能绕过 facade 直接读写 current 字段。
+- 建议：把三类单 session registry 的状态字段私有化为 `current_`，对外只暴露 `current_session()`；`runtime_registry` facade 改为调用该方法。
+- 修改意见：按建议实施 M7 小切片，不改变 `AgentRuntimeState` 字段结构、不改变 session 默认构造、不改变任何 JSON 或 RPC 行为。
+- 处理结果：已处理。`HostSessionRegistry`、`AudioSessionRegistry`、`ObsIngestSessionRegistry` 已将单 session 状态私有化为 `current_`，并暴露 const/non-const `current_session()`；`runtime_registry.cpp` 的 current session facade 改为调用 `current_session()`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。已执行 `rg -n "host_sessions\.current|audio_sessions\.current|obs_ingest_sessions\.current|\.current;| current;" media-agent/src -g "*.cpp" -g "*.h"`，确认源码不再公开访问三类 registry 的 `.current` 字段；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-223 P2P 失败 finalize 前置判断仍在 legacy override 读取 peer meta
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 connect failfast timer guard 和 NAT mapping wait timer 迁入 `native-peer-controller.js`，但 `finalizeP2pFailureWithNatMapping()` 进入 NAT fallback 前仍在 legacy 中直接读取 `peerConnectionMeta` 和 native handle 判断是否可 finalize。
+- 影响：P2P failed/timeout 到 NAT fallback 的关键边界仍有一段 peer/meta/handle 判定散落在大 override 文件；后续调整 stale/connected/closed 判断时需要同步 legacy 和 controller。
+- 建议：在 `native-peer-controller.js` 增加 `prepareP2pFailureFinalization(peerId)`，由 controller 统一判断 missing/closed/already-connected，legacy 只消费准备结果并执行 NAT fallback、UI/log 和 close 动作。
+- 修改意见：按建议实施 R5 小切片，不改变 NAT mapping fallback 时机，不改变失败日志/UI，不改变 close 动作。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `prepareP2pFailureFinalization()`；`app-native-overrides.js::finalizeP2pFailureWithNatMapping()` 正常路径委托该方法获取 `meta/handle`，缺模块 fallback 保留原判断。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-224 peer-state failed 的 failure reason/source 仍由 legacy 固定传入
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-223 后 P2P failure finalize 的 peer/meta/handle 前置判断已迁入 controller，但 `handleNativePeerStateEvent()` 消费 `applyPeerStateEvent()` 的 `failed` 结果时仍在 legacy 中硬编码 `ICE failed` / `ice-failed`。
+- 影响：peer-state 到 failure finalize 的语义仍分裂；后续如果 controller 调整 failed 状态来源或文案/source，legacy 仍会覆盖成固定值。
+- 建议：让 `native-peer-controller.js::applyPeerStateEvent()` 在 failed 状态返回 `failureFinalization: { reason, source }`，legacy 只消费该 payload 调用 finalize。
+- 修改意见：按建议实施 R5 小切片，不改变默认 reason/source 值，不改变 failed 状态后清理 viewer media wait 或 NAT fallback 行为。
+- 处理结果：已处理。`applyPeerStateEvent()` 的 failed 分支现在返回 `failureFinalization` payload；`app-native-overrides.js::handleNativePeerStateEvent()` 消费该 payload 调用 `finalizeP2pFailureWithNatMapping()`，缺字段时保留原默认值。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-225 disconnected recovery 到点后的 stale 校验仍在 legacy override 读取 peer handle/meta
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-224 后 peer-state failed 的 failure payload 已由 controller 返回，但 disconnected recovery 定时器触发时，`scheduleDisconnectedPeerRecovery()` 仍在 legacy 文件里直接读取 native peer handle、比较 attemptId、判断 connected/closed，并手动复位 `meta.restartInProgress`。
+- 影响：断线恢复路径的二次 stale 校验仍有一段 peer 状态 owner 留在大 override 文件；后续调整 attempt 语义、连接态枚举或 recovery skip 规则时，legacy 与 controller 容易分叉。
+- 建议：在 `native-peer-controller.js` 增加 retry-time decision helper，统一判断 missing/closed/stale/already-connected，并负责 skip 时复位 `restartInProgress`；legacy 只消费 ready/log payload 并执行实际 recovery 动作。
+- 修改意见：按建议实施 R5 小切片，不改变初次 recovery 调度延迟、不改变 restartAttempts 推进、不改变 host force offer 或 viewer reconnect-ready 的实际发送行为。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `prepareDisconnectedRecoveryRetry()`，统一执行 disconnected recovery 定时器到点后的 handle/meta 二次校验、stale/closed/connected skip 和 `restartInProgress` 复位；`app-native-overrides.js::scheduleDisconnectedPeerRecovery()` 的定时器回调正常路径委托该 helper，只保留日志、`requestPeerRecovery()` 外部动作和缺模块 fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-226 本地 ICE candidate 统计入口仍在 legacy 直接读取 peer meta
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-195 后本地 ICE signal payload 构造已迁入 peer controller，但 `forwardNativeMediaSignal()` 在发送 candidate 前仍直接 `peerConnectionMeta.get(peerId)`，再调用 legacy `rememberLocalIceCandidate(meta, candidate)`。
+- 影响：本地 candidate 计数、candidate type 统计和 NAT mapping host UDP candidate cache 的入口仍暴露为 meta 对象级调用；后续 peer meta owner 收进 controller 时，legacy 仍有一处直接依赖 map 结构。
+- 建议：在 legacy 侧新增 peerId facade，正常路径直接调用 `nativePeerController.rememberLocalIceCandidate(peerId, candidate)`，缺模块时再回落到旧 meta 统计函数。
+- 修改意见：按建议实施 R5 小切片，不改变 candidate 发送 payload、不改变 `gathering` UI 状态、不改变 local candidate count/type/NAT mapping candidate cache 规则。
+- 处理结果：已处理。`app-native-overrides.js` 新增 `rememberLocalIceCandidateForPeer(peerId, candidate)`，`forwardNativeMediaSignal()` 的 controller 路径和 fallback 路径都改为通过该 facade 记录本地 candidate；正常路径不再直接读取 meta 后调用 legacy 统计函数，而是设置 `gathering` 后委托 `nativePeerController.rememberLocalIceCandidate()`。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-227 P2P 诊断 peer entries 仍在 legacy override 直接组装
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P2P 诊断报告格式化已迁入 `native-diagnostics.js`，但 `buildP2pDiagnosticReport()` 仍在 legacy override 里遍历 peer handle entries、读取 `peerConnectionMeta`、计算 candidate type counts，并把 stats peer 拼成诊断 entries。
+- 影响：诊断只读路径仍知道 peer handle/meta 的内部组合方式；后续 peer controller 进一步隐藏 meta map 或 handle registry 时，诊断入口仍会牵连 legacy 文件。
+- 建议：在 `native-peer-controller.js` 增加 peer diagnostic entries builder，统一输出 `{ peerId, handle, meta, candidateCounts, statsPeer }`；legacy 仅传入 stats peers 并把结果交给 diagnostics。
+- 修改意见：按建议实施 R5 只读小切片，不改变诊断报告文本字段、不改变 healthy peer 展示条件、不改变 stats peer 匹配规则。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `getCandidateTypeCounts(peerId)` 与 `buildPeerDiagnosticEntries(statsPeers)`；`app-native-overrides.js::buildP2pDiagnosticReport()` 正常路径调用 controller 生成 peer entries，缺模块 fallback 保留旧 map/meta/counts 逻辑。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-228 NAT mapping 状态写入仍集中在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P2P failfast/ICE failed 后的 NAT mapping 外部调用应继续由 renderer 驱动，但 `attemptLastChanceNatMapping()` 仍直接写 `peerConnectionMeta` 上的 `natMappingAttempted`、`natMappingInProgress`、开始/完成时间、结果原因、协议、mapped candidate 数和错误信息。
+- 影响：peer meta 的 NAT mapping 生命周期 owner 仍在大 override 文件；后续隐藏 peer meta 或调整 NAT mapping 状态语义时，需要同时修改 legacy 外部 I/O 和 peer 状态机。
+- 建议：把 NAT mapping begin/result/error/finish 的状态转移迁入 `native-peer-controller.js`，legacy 只负责 `mediaEngine.openNatMapping()`、UI、日志和 mapped candidate 信令发送。
+- 修改意见：按建议实施 R5 小切片，不改变 NAT mapping 触发时机、不改变 timeout、不改变 `openNatMapping()` 参数、不改变 mapped candidate 的 `ice-candidate` 信令 payload。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `beginNatMappingAttempt()`、`applyNatMappingResult()`、`applyNatMappingError()`、`finishNatMappingAttempt()`；`app-native-overrides.js::attemptLastChanceNatMapping()` 正常路径委托 controller 执行 NAT mapping 状态 gate 与 meta 写入，legacy 只保留外部 NAT mapping RPC、UI/log、mapped candidate 发送和缺模块 fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-229 failfast / NAT mapping wait 超时二次判断仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-228 后 NAT mapping begin/result/error/finish 状态写入已迁入 peer controller，但 `armPeerConnectFailfast()` 的超时回调仍在 legacy 中直接判断 `timeoutMeta.hasConnected`、读取 native handle 并判断 closed/connected；NAT mapping wait timeout 也仍在 legacy 中直接读取 handle/meta 判断是否应进入 failed/close。
+- 影响：P2P failfast 与 NAT mapping wait 的二次 gate 仍散落在大 override 文件；后续调整 connected/closed/stale 判定或隐藏 meta/handle registry 时，还会牵动 legacy 逻辑。
+- 建议：在 `native-peer-controller.js` 增加 `prepareConnectFailfastTimeout(peerId)` 与 `prepareNatMappingWaitTimeout(peerId)`，由 controller 输出 ready/meta/handle decision；legacy 只保留失败原因分类、UI、finalize/close 外部动作。
+- 修改意见：按建议实施 R5 小切片，不改变 failfast 超时时间、不改变 NAT mapping wait 超时时间、不改变失败 UI 文案、不改变 close 参数。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `prepareConnectFailfastTimeout()` 和 `prepareNatMappingWaitTimeout()`；`app-native-overrides.js` 的 connect failfast 与 NAT mapping wait timeout 回调正常路径委托 controller 进行 meta/handle 二次判断，legacy 只消费 ready decision 后执行 `classifyP2pFailure()`、`finalizeP2pFailureWithNatMapping()`、失败 UI 和 close。缺模块 fallback 保留旧判断。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-230 最终 P2P failed 状态写入和失败日志 payload 仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-229 后 failfast 与 NAT mapping wait 的二次 ready 判断已迁入 peer controller，但 `finalizeP2pFailureWithNatMapping()` 在 NAT fallback 未启动后，仍由 legacy 直接把 handle 标为 `failed`、组装 `peer-connect-failed` 日志 payload，并根据 NAT mapping 状态拼 viewer 文案。
+- 影响：最终失败状态落盘和诊断字段仍不属于 peer controller；后续隐藏 peer meta/handle 或调整失败日志字段时，legacy 仍会保留状态 owner。
+- 建议：在 `native-peer-controller.js` 增加 `finalizeP2pConnectionFailure(peerId, reason, source)`，由 controller 写入 failed 状态并返回 log payload/viewer message；legacy 只负责 P2P UI、日志输出、viewer 状态和 close 外部动作。
+- 修改意见：按建议实施 R5 小切片，不改变 NAT fallback 优先级、不改变 `peer-connect-failed` 字段、不改变 viewer 文案、不改变 close 参数。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `finalizeP2pConnectionFailure()`，统一写入 `handle.connectionState = 'failed'` / `iceConnectionState = 'failed'`，并返回 `logPayload` 与 `viewerMessage`；`app-native-overrides.js::finalizeP2pFailureWithNatMapping()` 在 NAT fallback 未启动后正常路径委托该方法，legacy 仅保留 `setP2pStateForPeer()`、`logNativeStep()`、viewer UI 和 `closeNativePeerConnectionImpl()`。缺模块 fallback 保留旧状态写入和 payload 构造。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-231 peer/surface registry 仍公开底层 map 字段
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/src/runtime_registry.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-222 后 host/audio/OBS 单 session registry 已隐藏 `current` 字段，但 `PeerSessionRegistry::peers` 与 `SurfaceSessionRegistry::surfaces` 仍是 public map，虽然当前直接访问集中在 `runtime_registry.cpp`，外部仍可绕过 facade 读写 map。
+- 影响：peer/surface registry 仍不是明确 owner；后续升级为 PeerSession/SurfaceSession command/snapshot API 时，public map 字段会继续暴露内部布局并增加新调用点绕过 controller 的风险。
+- 建议：将 peer/surface 底层 map 私有化，registry 对外只暴露 `find/ensure/erase/count/for_each` 方法；`runtime_registry.cpp` 改为调用 registry 方法，保持现有 facade API 不变。
+- 修改意见：按建议实施 M7 小切片，不改变 `AgentRuntimeState` 字段名、不改变 runtime_registry 对外函数、不改变 stats/status/RPC JSON 行为。
+- 处理结果：已处理。`PeerSessionRegistry` / `SurfaceSessionRegistry` 已将底层 map 私有化为 `peers_` / `surfaces_`，并新增 `find()`、`ensure()`、`erase()`、`count()`、`for_each()` / `for_each_mutable()` 方法；`runtime_registry.cpp` 的 peer/surface facade 已全部改为调用 registry 方法。`rg -n "peer_sessions\.peers|surface_sessions\.surfaces|\.peers;|\.surfaces;" media-agent/src -g "*.cpp" -g "*.h"` 确认源码不再直接访问 public map 字段。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。已执行 `git diff --check`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-232 peer/surface controller 仍公开未使用的可变 state 指针入口
+
+- 位置：`media-agent/src/peer_session_controller.h`、`media-agent/src/peer_session_controller.cpp`、`media-agent/src/surface_session_controller.h`、`media-agent/src/surface_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-231 后 peer/surface registry map 已私有化，但 `PeerSessionController::find()` 与 `SurfaceSessionController::find()` 仍作为 public API 暴露可变 `PeerState*` / `SurfaceAttachmentState*`，且当前没有调用方。
+- 影响：即使 registry map 已私有化，controller 仍保留绕过命令方法直接修改 session state 的入口；后续新增调用点可能重新扩大共享状态写入面。
+- 建议：删除未使用的 public `find()` 指针 API；后续如确需查询 peer/surface，新增只读 snapshot 或明确 command，而不是暴露可变 state 指针。
+- 修改意见：按建议实施 M7 小切片，不改变 RPC、stats、lifecycle 行为，不改变 runtime_registry facade。
+- 处理结果：已处理。`PeerSessionController` 和 `SurfaceSessionController` 已删除 public `find()` 声明与实现，并移除对应未使用前置声明；当前 controller 调用方只能使用现有命令方法、lifecycle 方法、`count()` 和 `stats_json()`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。已执行 `rg -n "PeerSessionController::find|SurfaceSessionController::find|PeerState\\* find\\(|SurfaceAttachmentState\\* find\\(|struct PeerState;|struct SurfaceAttachmentState;" media-agent/src/peer_session_controller.h media-agent/src/peer_session_controller.cpp media-agent/src/surface_session_controller.h media-agent/src/surface_session_controller.cpp`，无命中；已执行 `git diff --check`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-233 peer request command 仍暴露为全局 free-function API
+
+- 位置：`media-agent/src/peer_control_runtime.h`、`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/peer_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-232 后 peer controller 不再公开可变 state 指针，但 `peer_control_runtime.h` 仍声明 `create_peer_from_request`、`close_peer_from_request`、`set_peer_remote_description_from_request`、`add_peer_remote_ice_candidate_from_request` 四个全局 free functions；虽然当前只有 `PeerSessionController` 调用，新增代码仍可以绕过 controller 直接调用 request command。
+- 影响：peer request command ownership 仍不够明确；后续继续迁 create/close registry 写入时，旧全局 API 容易成为新的绕行入口。
+- 建议：把四个 request backend 改为 controller 内部实现语义，放入 `vds::media_agent::internal` 命名空间并加 `_impl` 后缀；`PeerSessionController` 保持唯一外部 command 入口。
+- 修改意见：按建议实施 M7 小切片，不改变 JSON-RPC wire shape、不改变 create/close/setRemoteDescription/addIce 行为、不移动 RPC 路由。
+- 处理结果：已处理。`peer_control_runtime.h/.cpp` 的四个全局 free-function 名称已删除；后续 P1-234/P1-235/P1-236/P1-237 已把 closePeer/addRemoteIceCandidate/setRemoteDescription/createPeer 真实写入迁入 `PeerSessionController`，`peer_control_runtime.h/cpp` 已删除并从 CMake 移除。已扫描确认旧入口无残留。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。
+
+### ARCH-SPLIT-P1-234 closePeer 真实写入 owner 仍留在 peer_control_runtime helper
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_control_runtime.h`、`media-agent/src/peer_control_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-233 后 close request 入口名已变成 internal helper，但 `PeerSessionController::close_from_request()` 仍只是转发；实际 peer registry `find/erase`、surface detach、transport/receiver close、relay bootstrap 清理和 viewer audio stop 还在 `peer_control_runtime.cpp`。
+- 影响：closePeer 是 peer lifecycle 的核心 owner 边界，如果真实写入仍在 runtime helper，后续 PeerSession owner 迁移时还会继续绕过 controller。
+- 建议：把 closePeer command body 迁入 `PeerSessionController::close_from_request()`，保持原清理顺序和 result JSON；`peer_control_runtime.*` 暂只保留 create/setRemoteDescription/addIce 后端。
+- 修改意见：按建议实施 M7 小切片，不改变 closePeer 请求/响应字段、不改变 surface/media binding/receiver/transport/audio/relay cleanup 顺序。
+- 处理结果：已处理。`PeerSessionController::close_from_request()` 已直接执行 peerId 解析、peer lookup、surface detach、media binding close prepare、receiver runtime close、transport session close、viewer-upstream relay bootstrap 清理、viewer audio stop、closed peer-state event 和 peer erase；`peer_control_runtime.h/.cpp` 已删除 `close_peer_from_request_impl`。`rg -n "close_peer_from_request_impl|close_peer_from_request\\b" media-agent/src -g "*.cpp" -g "*.h"` 已确认 close helper 无残留。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。
+
+### ARCH-SPLIT-P1-235 addRemoteIceCandidate 真实写入 owner 仍留在 peer_control_runtime helper
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_control_runtime.h`、`media-agent/src/peer_control_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-234 后 closePeer 已由 `PeerSessionController` 直接拥有，但 `addRemoteIceCandidate` 仍由 controller 转发到 `peer_control_runtime` internal helper；peer lookup、transport candidate apply 和 snapshot 刷新仍不在 peer command owner 内。
+- 影响：ICE 写入是 peer signaling lifecycle 的核心路径，保留在 runtime helper 会让 PeerSessionController 的 command ownership 仍不完整。
+- 建议：把 addRemoteIceCandidate command body 迁入 `PeerSessionController::add_remote_ice_candidate_from_request()`，保持原 PEER_NOT_FOUND/NATIVE_TRANSPORT_ERROR/OK result 和 fallback peer-state event。
+- 修改意见：按建议实施 M7 小切片，不改变请求字段、不改变 transport add candidate 参数、不改变错误码和 result JSON。
+- 处理结果：已处理。`PeerSessionController::add_remote_ice_candidate_from_request()` 已直接执行 peerId/candidate/sdpMid 解析、peer lookup、`add_peer_transport_remote_candidate()`、transport snapshot refresh、无 transport fallback peer-state event 和 OK/error result；`peer_control_runtime.h/.cpp` 已删除 `add_peer_remote_ice_candidate_from_request_impl`。`rg -n "add_peer_remote_ice_candidate_from_request_impl|add_peer_remote_ice_candidate_from_request\\b" media-agent/src -g "*.cpp" -g "*.h"` 已确认 addIce helper 无残留。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。
+
+### ARCH-SPLIT-P1-236 setRemoteDescription 真实写入 owner 仍留在 peer_control_runtime helper
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_control_runtime.h`、`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/peer_media_manifest.h`、`media-agent/src/peer_media_manifest.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-235 后 addRemoteIceCandidate 已由 `PeerSessionController` 直接拥有，但 `setRemoteDescription` 仍由 controller 转发到 `peer_control_runtime` internal helper；peer lookup、manifest apply、transport remote description apply 和 snapshot 刷新仍不在 peer command owner 内。
+- 影响：remote description 写入和 media manifest 应用是 peer signaling lifecycle 的核心路径，继续留在 runtime helper 会阻碍 PeerSessionController 成为 peer command owner。
+- 建议：先把 media manifest apply/codec normalization 拆成独立 helper，再把 setRemoteDescription command body 迁入 `PeerSessionController::set_remote_description_from_request()`，保持原错误码、fallback event 和 result JSON。
+- 修改意见：按建议实施 M7 小切片，不改变请求字段、不改变 manifest 写入语义、不改变 transport remote description 参数、不改变错误码和 result JSON。
+- 处理结果：已处理。新增 `peer_media_manifest.h/cpp` 并加入 `media-agent/CMakeLists.txt`，承接 `apply_media_manifest_to_peer()` 与 `normalize_manifest_codec()`；`PeerSessionController::set_remote_description_from_request()` 已直接执行 peerId/type/sdp 解析、peer lookup、manifest apply、`set_peer_transport_remote_description()`、transport snapshot refresh、无 transport fallback peer-state event 和 OK/error result；`peer_control_runtime.h/.cpp` 已删除 `set_peer_remote_description_from_request_impl`。`rg -n "set_peer_remote_description_from_request_impl|set_peer_remote_description_from_request\\b|add_peer_remote_ice_candidate_from_request_impl|close_peer_from_request_impl" media-agent/src -g "*.cpp" -g "*.h"` 已确认 setRemoteDescription/addIce/close helper 无残留。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。
+
+### ARCH-SPLIT-P1-237 createPeer 真实写入 owner 仍留在 peer_control_runtime helper
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_control_runtime.h`、`media-agent/src/peer_control_runtime.cpp`、`media-agent/src/peer_media_manifest.h`、`media-agent/src/peer_media_manifest.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-236 后 closePeer/addRemoteIceCandidate/setRemoteDescription 已由 `PeerSessionController` 直接拥有，但 createPeer 仍作为 `peer_control_runtime` internal helper 存在；peer 初始化、transport callback 构造、host-downstream attach、initial negotiation 和 registry ensure 仍绕过 controller 成员实现。
+- 影响：createPeer 是 PeerSession 生命周期的入口，保留在 runtime helper 会让 peer command ownership 最后一段仍不完整，并保留一个空壳 legacy 文件边界。
+- 建议：把 createPeer command body 迁入 `PeerSessionController::create_from_request()`，保持原 transport callback、manifest、host attach、negotiation、warning 和 result JSON；随后删除 `peer_control_runtime.h/cpp` 并从 CMake 移除。
+- 修改意见：按建议实施 M7 小切片，不改变 createPeer 请求字段、不改变 callback payload、不改变 media manifest/encoded data channel/host-downstream attach 语义、不改变 result JSON。
+- 处理结果：已处理。`PeerSessionController::create_from_request()` 已直接执行 peer state 初始化、receiver runtime 创建、manifest apply、transport callback 构造、远端音视频消费回调、transport session 创建、host-downstream media binding attach、initial local description negotiation、registry ensure、peer-state/warning event 和 result JSON；`peer_control_runtime.h/cpp` 已删除，`media-agent/CMakeLists.txt` 不再编译 `src/peer_control_runtime.cpp`。`rg -n "peer_control_runtime|create_peer_from_request_impl|set_peer_remote_description_from_request_impl|close_peer_from_request_impl|add_peer_remote_ice_candidate_from_request_impl" media-agent/src media-agent/CMakeLists.txt -g "*.cpp" -g "*.h" -g "CMakeLists.txt"` 已确认源码/CMake 无残留。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：首次执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback` 发现缺少 `viewer_video_pipeline.h` include，已补充；复跑同一命令通过，verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。
+
+### ARCH-SPLIT-P1-238 createPeer transport callback 构造仍压在 PeerSessionController 内
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_transport_callback_factory.h`、`media-agent/src/peer_transport_callback_factory.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-237 后 createPeer 真实写入已迁入 `PeerSessionController`，但 transport callbacks 的构造仍是一大块 lambda：local description/candidate signal、peer-state event、warning event、remote audio/video 消费、encoded datachannel manifest gate 都压在 controller 方法内。
+- 影响：PeerSessionController 虽然成为 command owner，但 create 方法仍过大；后续调整 transport callback 或 encoded datachannel 时会继续牵动 peer lifecycle command。
+- 建议：抽出 `peer_transport_callback_factory.*`，由 factory 接收 peer callback context 并返回 `PeerTransportCallbacks`；controller 只负责准备 context、创建 transport session 和执行 create pipeline。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 callback payload、不改变 remote frame/audio/datachannel 消费逻辑、不改变 manifest mismatch 统计和 warning。
+- 处理结果：已处理。新增 `peer_transport_callback_factory.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`PeerSessionController::create_from_request()` 中的 callback lambda 块已替换为 `create_peer_transport_callbacks({ ... })`。factory 负责 local SDP/candidate signal、state/warning event、remote video/audio frame 入口、encoded datachannel RTP timestamp 转换、manifest codec mismatch gate 和 audio/video frame 分发。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。
+
+### ARCH-SPLIT-P1-239 createPeer 收尾 pipeline 仍压在 PeerSessionController 内
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_create_pipeline.h`、`media-agent/src/peer_create_pipeline.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-238 后 transport callback 构造已拆出，但 createPeer 后半段仍由 `PeerSessionController::create_from_request()` 直接执行 host-downstream media attach、initial local description negotiation、registry ensure、created peer-state event、warning event 和 result JSON。
+- 影响：controller 仍承担 create pipeline 的多个 lifecycle 细节；后续调整 host-downstream attach 或 initial negotiation 时仍会牵动 create request 方法。
+- 建议：抽出 `peer_create_pipeline.*`，由 pipeline helper 承接 host-downstream attach、initial negotiation 和 finalize-created 输出；controller 只保留 request parse、transport session create 和 pipeline 调用。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 host attach 条件、不改变 negotiation gate、不改变 registry write、created/warning event 或 result JSON。
+- 处理结果：已处理。新增 `peer_create_pipeline.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`PeerSessionController::create_from_request()` 已改为调用 `attach_host_downstream_media_if_running()`、`ensure_initial_peer_negotiation()`、`finalize_created_peer()`。pipeline helper 负责 host-downstream attach、initial local description negotiation、registry ensure、transport runtime refresh、created peer-state event、transport warning event 和 result JSON。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。
+
+### ARCH-SPLIT-P1-240 closePeer cleanup pipeline 仍压在 PeerSessionController 内
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_close_pipeline.h`、`media-agent/src/peer_close_pipeline.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-239 后 create pipeline 已拆出，但 `PeerSessionController::close_from_request()` 仍直接执行 closePeer 的 surface detach、media binding close prepare、receiver/transport cleanup、relay bootstrap 清理、viewer audio stop、closed event、registry erase 和 result JSON。
+- 影响：close lifecycle 仍压在 controller 内；后续调整 close cleanup 或 viewer-upstream 清理时仍会牵动 peer command 入口。
+- 建议：抽出 `peer_close_pipeline.*`，由 close pipeline helper 承接全部 close cleanup 和 result 输出；controller 只委托 close command。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 close cleanup 顺序、不改变 closed peer-state event、不改变 viewer-upstream relay/audio 清理或 close result JSON。
+- 处理结果：已处理。新增 `peer_close_pipeline.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`PeerSessionController::close_from_request()` 已改为 `return close_peer_session_from_request(runtime_state_, request_json)`。close pipeline helper 负责 peer lookup、surface detach、media binding close prepare、receiver close begin/handles close、transport close、viewer-upstream relay bootstrap 清理、viewer audio stop、closed peer-state event、registry erase 和 close result JSON。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。
+
+### ARCH-SPLIT-P1-241 peer signaling write pipeline 仍压在 PeerSessionController 内
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_signaling_pipeline.h`、`media-agent/src/peer_signaling_pipeline.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-240 后 close pipeline 已拆出，但 `PeerSessionController::set_remote_description_from_request()` 和 `add_remote_ice_candidate_from_request()` 仍直接执行 peer lookup、manifest apply、transport remote description/candidate write、snapshot refresh、fallback peer-state event 和 OK/error result。
+- 影响：信令写入细节仍压在 controller 内；后续调整 manifest 应用、transport signaling 写入或 fallback event 时仍会牵动 peer command 入口。
+- 建议：抽出 `peer_signaling_pipeline.*`，由 signaling pipeline helper 承接 setRemoteDescription/addRemoteIceCandidate 的 request parse、peer lookup、transport write 和 result 输出；controller 只委托 signaling command。
+- 修改意见：按建议实施 M7/M2 小切片，不改变请求字段、不改变 PEER_NOT_FOUND/NATIVE_TRANSPORT_ERROR 错误码、不改变 fallback peer-state event 或 OK result JSON。
+- 处理结果：已处理。新增 `peer_signaling_pipeline.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`PeerSessionController::set_remote_description_from_request()` 已改为 `set_peer_remote_description_from_request(runtime_state_, request_json)`，`add_remote_ice_candidate_from_request()` 已改为 `add_peer_remote_ice_candidate_from_request(runtime_state_, request_json)`。signaling pipeline helper 负责 peer lookup、media manifest apply、transport remote description/candidate write、transport snapshot refresh、fallback peer-state event 和 OK/error result JSON。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。
+
+### ARCH-SPLIT-P1-242 host-downstream media binding 批量操作仍压在 PeerSessionController 内
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_host_binding_pipeline.h`、`media-agent/src/peer_host_binding_pipeline.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-241 后 signaling pipeline 已拆出，但 host start/stop 触发的 host-downstream peer media binding attach/detach 仍在 `PeerSessionController` 中直接遍历 peer、调用 host video attach/detach callback、写 media binding 状态和重新生成 local description。
+- 影响：controller 仍承担 host session 与 peer media binding 的跨 owner 编排细节；后续调整 host-downstream attach/detach 时仍会牵动 peer command facade。
+- 建议：抽出 `peer_host_binding_pipeline.*`，由 host binding pipeline helper 承接 host-downstream peer 遍历、media binding callback、failure state 写入、local description 重新生成和 attach success event；controller 只委托批量 binding command。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 host-downstream 筛选条件、不改变 attach/detach callback 调用、不改变 renegotiation gate、不改变 media-source-attached event。
+- 处理结果：已处理。新增 `peer_host_binding_pipeline.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`PeerSessionController::attach_host_downstream_media_bindings()` 和 `detach_host_downstream_media_bindings()` 已改为分别委托 `vds::media_agent::attach_host_downstream_media_bindings(runtime_state_, callbacks)` / `detach_host_downstream_media_bindings(runtime_state_, callbacks)`。pipeline helper 负责 host-downstream peer 遍历、attach/detach callback、media binding failure state、local description renegotiation 和 attach success event。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。
+
+### ARCH-SPLIT-P1-243 peer stats/count 聚合仍压在 PeerSessionController 内
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_snapshot_aggregator.h`、`media-agent/src/peer_snapshot_aggregator.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-242 后 host binding 批量操作已拆出，但 `PeerSessionController::count()` 和 `stats_json()` 仍直接遍历 peer registry 并拼接 `peers[]` JSON。
+- 影响：controller 仍混合 command facade 和只读 snapshot 聚合职责；后续升级 PeerSessionSnapshot 或 `getStats.peers[]` 字段时仍会牵动 command controller。
+- 建议：抽出 `peer_snapshot_aggregator.*`，由只读 aggregation helper 承接 peer count 和 stats JSON 拼接；controller 只委托 snapshot facade。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 `getStats.peers[]` JSON 字段、不改变 peer registry 遍历顺序、不改变 `PeerSessionController` 对外方法名。
+- 处理结果：已处理。新增 `peer_snapshot_aggregator.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`PeerSessionController::count()` 已委托 `peer_session_count(runtime_state_)`，`stats_json()` 已委托 `peer_session_stats_json(runtime_state_)`。aggregation helper 只通过 `runtime_registry` facade 读取 peer registry，并复用既有 `build_peer_stats_json(peer)`，controller 不再直接 include `peer_state_json.h` 或拼接 peer stats JSON。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-244 peer shutdown 批量关闭仍压在 PeerSessionController 内
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_lifecycle_pipeline.h`、`media-agent/src/peer_lifecycle_pipeline.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-243 后 snapshot 聚合已拆出，但 agent shutdown 调用的 `close_all_receiver_handles()` / `close_all_transport_sessions()` 仍在 `PeerSessionController` 内直接遍历 peer registry 并关闭 receiver/transport。
+- 影响：controller 仍承担 shutdown lifecycle 批处理细节；后续调整 receiver/transport drain 顺序或 peer close-all snapshot 时仍会牵动 command facade。
+- 建议：抽出 `peer_lifecycle_pipeline.*`，由 lifecycle helper 承接全量 receiver handle close 和 transport session close；controller 只保留兼容入口。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 agent shutdown 调用顺序、不改变 receiver handle close 条件、不改变 transport close 语义。
+- 处理结果：已处理。新增 `peer_lifecycle_pipeline.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`PeerSessionController::close_all_receiver_handles()` 已委托 `close_all_peer_receiver_handles(runtime_state_)`，`close_all_transport_sessions()` 已委托 `close_all_peer_transport_sessions(runtime_state_)`。lifecycle helper 通过 `runtime_registry` facade 遍历 peer，并分别调用既有 `close_peer_video_receiver_handles()` / `close_peer_transport_session()`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-245 peer refresh 批处理入口仍压在 PeerSessionController 内
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_refresh_pipeline.h`、`media-agent/src/peer_refresh_pipeline.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-244 后 shutdown close-all 已拆出，但 agent refresh、host video sender soft refresh、host audio sender refresh 仍由 `PeerSessionController` 直接调用 `peer_media_binding_runtime` 的 legacy helper。
+- 影响：controller 仍混合 command facade 与批量 runtime refresh 编排；后续调整 refresh 时机、sender refresh 统计或 lifecycle 阶段时仍会牵动 controller。
+- 建议：抽出 `peer_refresh_pipeline.*`，由 refresh pipeline helper 承接 transport refresh、host video sender refresh、host audio sender refresh；controller 只保留兼容入口。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 refresh 调用顺序、不改变底层 legacy helper、不改变 host audio/video sender refresh 语义。
+- 处理结果：已处理。新增 `peer_refresh_pipeline.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`PeerSessionController::refresh_transport_runtime()` 已委托 `refresh_all_peer_transport_runtime(runtime_state_)`，`perform_host_video_sender_soft_refresh()` 已委托 `refresh_all_host_video_senders(runtime_state_)`，`refresh_host_audio_senders()` 已委托 `refresh_all_host_audio_senders(runtime_state_)`。refresh pipeline 暂时复用既有 `refresh_peer_transport_runtime()`、`perform_host_video_sender_soft_refresh()`、`refresh_host_audio_senders()`，为后续替换 legacy runtime helper 留出单一边界。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-246 createPeer transport session 创建仍压在 PeerSessionController 内
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_transport_session_factory.h`、`media-agent/src/peer_transport_session_factory.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-245 后 refresh 批处理已拆出，但 `PeerSessionController::create_from_request()` 仍直接构造 transport callback holder、创建 `PeerTransportSession`、写 transport snapshot 和 create failure 状态。
+- 影响：createPeer command facade 仍包含 transport session owner 细节；后续将 transport 独立成 session/dll/进程边界时，这段 callback holder 和 snapshot 写回会继续绑在 controller 上。
+- 建议：抽出 `peer_transport_session_factory.*`，由 transport session factory 承接 callback holder、transport session 创建、成功/失败状态写回；controller 只传入 peer state、request JSON 和 encoded datachannel 设置。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 createPeer request 字段、不改变 callback context、不改变 transport 成功/失败 phase/reason、不改变 manifest apply 时机。
+- 处理结果：已处理。新增 `peer_transport_session_factory.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`PeerSessionController::create_from_request()` 的 transport 创建块已替换为 `create_transport_for_peer_session(runtime_state_, peer, request_json, encoded_media_data_channel)`。factory 内部继续使用 `create_peer_transport_callbacks()`、`create_peer_transport_session()`、`get_peer_transport_snapshot()` 和既有 success/failure 状态写回，create pipeline 和 result JSON 保持不变。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-247 createPeer request configure 仍压在 PeerSessionController 内
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_create_request_config.h`、`media-agent/src/peer_create_request_config.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-246 后 transport session 创建已拆出，但 `PeerSessionController::create_from_request()` 仍直接解析 createPeer request、初始化 `PeerState`、创建 receiver runtime、写初始 phase/reason 和应用 media manifest。
+- 影响：controller 仍承担 PeerSession configure 阶段；后续要支持多 PeerSession owner、跨进程 create command 或 request schema 校验时，仍会牵动 controller。
+- 建议：抽出 `peer_create_request_config.*`，由 configure helper 承接 request parse、BAD_REQUEST result、初始 PeerState 配置、receiver runtime 创建和 media manifest apply；controller 只调用 configure -> transport factory -> create pipeline。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 request 字段、不改变 BAD_REQUEST 错误码、不改变初始 phase/reason、不改变 receiver local playback 条件、不改变 media manifest apply。
+- 处理结果：已处理。新增 `peer_create_request_config.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`PeerSessionController::create_from_request()` 现在调用 `configure_peer_create_request(runtime_state_, request_json)`，失败时直接返回原 BAD_REQUEST result，成功后只保留 transport factory、host-downstream attach、initial negotiation 和 finalize 调用。controller 中不再直接 include `json_protocol.h`、`peer_media_manifest.h`、`peer_transport.h`、`peer_transport_callback_factory.h` 等 create 配置细节头。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-248 attach/detach media source command 仍直接挂在 legacy runtime helper
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_media_source_pipeline.h`、`media-agent/src/peer_media_source_pipeline.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-247 后 createPeer configure 已拆出，但 `PeerSessionController::attach_media_source_from_request()` / `detach_media_source_from_request()` 仍直接调用 `peer_media_binding_runtime.*` 中的 legacy request helper。
+- 影响：PeerSessionController 仍暴露对 legacy media binding runtime 的直接依赖；后续把 attach/detach command 迁成真正 PeerSession pipeline 时，controller 和 legacy helper 之间没有单一替换边界。
+- 建议：新增 `peer_media_source_pipeline.*`，先由 PeerSession 侧 pipeline 包住 attach/detach media source command；controller 只依赖 pipeline，pipeline 内部暂时复用原 legacy helper。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 attach/detach request 字段、不改变错误码、不改变 media binding attach/detach 内部顺序、不改变 result JSON。
+- 处理结果：已处理。新增 `peer_media_source_pipeline.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`PeerSessionController::attach_media_source_from_request()` 已委托 `attach_peer_media_source_command(runtime_state_, request_json)`，`detach_media_source_from_request()` 已委托 `detach_peer_media_source_command(runtime_state_, request_json)`。pipeline 内部暂时调用既有 `attach_peer_media_source_from_request()` / `detach_peer_media_source_from_request()`，为后续逐步搬迁 request parse、peer lookup、renegotiation 和 result JSON 留出稳定边界。controller 不再直接 include `peer_media_binding_runtime.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-249 detachPeerMediaSource request body 仍留在 legacy runtime
+
+- 位置：`media-agent/src/peer_media_source_pipeline.cpp`、`media-agent/src/peer_media_binding_runtime.h`、`media-agent/src/peer_media_binding_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-248 先建立了 `peer_media_source_pipeline.*` 边界，但 `detachPeerMediaSource` 的 request parse、peer lookup、detach error 写回、renegotiation、refresh、peer-state event 和 result JSON 仍由 legacy `peer_media_binding_runtime.cpp` 实现。
+- 影响：detach command ownership 仍不完整；后续真正替换 legacy media binding runtime 时，detach request body 还会从 runtime 文件中牵出 signal/state/result 逻辑。
+- 建议：把 detach request body 迁入 `peer_media_source_pipeline.cpp`；legacy runtime 只保留底层 `detach_peer_media_binding()` helper，pipeline 负责 request-level command。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 `peerId` 解析、不改变 `PEER_NOT_FOUND` / `MEDIA_SOURCE_DETACH_FAILED` 错误码、不改变 detach 后 renegotiation 和 peer-state event。
+- 处理结果：已处理。`detach_peer_media_source_command()` 现在直接执行 detach request body：解析 `peerId`、通过 registry facade 查找 peer、调用 `detach_peer_media_binding()`、处理 detach failure 状态、必要时重新生成 local description、刷新 transport runtime、发送 `media-source-detached` peer-state event，并返回既有 peer result JSON。`peer_media_binding_runtime.h/cpp` 已删除 `detach_peer_media_source_from_request()` 声明和实现，只保留底层 media binding helper。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`rg -n "detach_peer_media_source_from_request|detach_peer_media_source_command|media-source-detached" ...` 已确认源码中不再存在 `detach_peer_media_source_from_request()` 声明/实现。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-250 attachPeerMediaSource request body 仍留在 legacy runtime
+
+- 位置：`media-agent/src/peer_media_source_pipeline.cpp`、`media-agent/src/peer_media_binding_runtime.h`、`media-agent/src/peer_media_binding_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-249 已把 detach request body 迁入 pipeline，但 `attachPeerMediaSource` 的 request parse、source 校验、peer lookup、attach snapshot 比较、renegotiation、refresh、peer-state event 和 result JSON 仍由 legacy `peer_media_binding_runtime.cpp` 实现。
+- 影响：attach command ownership 仍不完整；host/relay source binding 与 request-level state/result 写入继续混在 legacy runtime 文件里。
+- 建议：把 attach request body 迁入 `peer_media_source_pipeline.cpp`；legacy runtime 只保留底层 `attach_host_video_media_binding()` / `attach_relay_video_media_binding()` helper。
+- 修改意见：按建议实施 M7/M2 小切片，不改变 source 支持范围、不改变 `PEER_NOT_FOUND` / `BAD_REQUEST` / `MEDIA_SOURCE_ATTACH_FAILED` 错误码、不改变 attachment_requires_negotiation 判定或 peer-state event。
+- 处理结果：已处理。`attach_peer_media_source_command()` 现在直接执行 attach request body：解析 `peerId/source`、校验 source、通过 registry facade 查找 peer、记录 attach 前 snapshot、调用底层 host/relay attach helper、计算 renegotiation gate、必要时生成 local description、刷新 transport runtime、发送 `media-source-attached` peer-state event，并返回既有 peer result JSON。`peer_media_binding_runtime.h/cpp` 已删除 `attach_peer_media_source_from_request()` 声明和实现，只保留底层 media binding helper；`attach_relay_video_media_binding()` 已作为底层 helper 在 header 中声明给 pipeline 使用。`rg -n "attach_peer_media_source_from_request|detach_peer_media_source_from_request" media-agent/src -g "*.cpp" -g "*.h"` 已确认源码无残留。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`rg -n "attach_peer_media_source_from_request|detach_peer_media_source_from_request|attach_peer_media_source_command|detach_peer_media_source_command" ...` 已确认源码仅保留 pipeline command 和 controller 调用，旧 request helper 无残留。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-251 relay source binding helper 仍留在 peer media binding runtime
+
+- 位置：`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/peer_media_binding_runtime.h`、`media-agent/src/peer_relay_source_binding.h`、`media-agent/src/peer_relay_source_binding.cpp`、`media-agent/src/peer_media_source_pipeline.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-250 已把 attach request body 迁入 pipeline，但底层 relay source binding 仍在 `peer_media_binding_runtime.cpp` 中实现，并通过旧 runtime header 暴露给 pipeline。
+- 影响：relay source owner 不清晰；后续拆 RelayHub / EncodedFrameBus 或 relay-source session 时，仍会从 media binding runtime 中牵出 upstream peer lookup、relay subscriber 注册、audio/video track config 和 relay media binding state 写入。
+- 建议：抽出 `peer_relay_source_binding.*`，由 relay source helper 承接 `attach_relay_video_media_binding()`；pipeline 直接依赖 relay source helper，legacy media binding runtime 不再持有 relay attach 实现和声明。
+- 修改意见：按建议实施 M7/M5 小切片，不改变 upstream readiness 判定、不改变 codec/audio 支持范围、不改变 encoded datachannel/track sender 分支、不改变 relay subscriber 注册和 media binding state 写入。
+- 处理结果：已处理。新增 `peer_relay_source_binding.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`attach_relay_video_media_binding()` 的实现已从 `peer_media_binding_runtime.cpp` 迁入新 helper，`peer_media_source_pipeline.cpp` 改为 include `peer_relay_source_binding.h`。`peer_media_binding_runtime.h` 不再声明 relay attach helper，`peer_media_binding_runtime.cpp` 也清理了由该迁移遗留的 `json_protocol.h`、`surface_target.h`、`extract_string_value`、`find_peer` 依赖。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7/M5 边界。
+- 验证结果：首次执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback` 发现新 helper 缺少 `video_access_unit.h`，已补充；复跑同一命令通过，verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`rg -n "attach_relay_video_media_binding|peer_relay_source_binding|surface_target.h|json_protocol.h|extract_string_value|find_peer" ...` 已确认 relay attach 实现只在新 helper 内，旧 runtime 不再包含 request parse/source target 依赖。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-252 host source binding helper 仍留在 peer media binding runtime
+
+- 位置：`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/peer_media_binding_runtime.h`、`media-agent/src/peer_host_source_binding.h`、`media-agent/src/peer_host_source_binding.cpp`、`media-agent/src/peer_media_source_pipeline.cpp`、`media-agent/src/peer_create_pipeline.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-251 已拆出 relay source binding，但底层 host source binding、OBS ingest host binding、host audio sender configure/clear 仍在 `peer_media_binding_runtime.cpp` 中实现，并通过旧 runtime header 暴露给多个调用方。
+- 影响：host source owner 不清晰；host capture/OBS/audio/peer sender 的绑定逻辑继续和 peer refresh/detach runtime 混在同一文件中，后续拆 HostSession source interface 或多 dll/多 exe 边界时会继续牵动 legacy media binding runtime。
+- 建议：抽出 `peer_host_source_binding.*`，由 host source helper 承接 `attach_host_video_media_binding()`、OBS ingest host binding、`configure_host_audio_sender()` 和 `clear_host_audio_sender()`；调用方直接依赖 host source helper。
+- 修改意见：按建议实施 M7/M4/M6 小切片，不改变 host/OBS readiness 判定、不改变 encoded DataChannel/track sender 分支、不改变 host audio sender register/clear、不改变 soft refresh 调用语义。
+- 处理结果：已处理。新增 `peer_host_source_binding.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`attach_host_video_media_binding()`、OBS ingest host binding、`configure_host_audio_sender()`、`clear_host_audio_sender()` 已从 `peer_media_binding_runtime.cpp` 迁入新 helper。`agent_lifecycle.cpp`、`peer_create_pipeline.cpp`、`peer_media_source_pipeline.cpp` 已改为 include `peer_host_source_binding.h`；`peer_media_binding_runtime.h` 不再声明 host attach helper，旧 runtime 只在 soft refresh、host audio refresh 和 detach cleanup 中调用 host-source helper。`peer_media_binding_runtime.cpp` 已清理迁移后不再需要的 OBS/audio transport/string/video access 相关 include。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7/M4/M6 边界。
+- 验证结果：首次执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback` 发现 `peer_create_pipeline.cpp` 之前依赖旧 runtime header 间接获得 `refresh_peer_transport_runtime()` 声明；已改为 include `peer_refresh_pipeline.h` 并调用 `refresh_all_peer_transport_runtime(state)`。复跑同一命令通过，verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`rg -n "attach_host_video_media_binding|configure_host_audio_sender|clear_host_audio_sender|peer_host_source_binding|..." ...` 已确认 host source 实现只在新 helper 内，旧 runtime 不再声明 host attach helper。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-208 OBS ingest worker 仍在函数体内重复拼写 current registry
+
+- 位置：`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-207 后 `ObsIngestSession` 非静态方法已通过 `session_` 引用访问 current state，但静态 `run_worker()` 函数体内仍大量直接拼写 `state.obs_ingest_sessions.current`。
+- 影响：OBS worker 的状态写入范围仍难以向真正 session owner/snapshot 过渡；后续改 worker 参数或隔离 state owner 时，需要逐处改 waiting、connected、metadata、pending Annex-B 和 stop flag 访问。
+- 建议：在 `run_worker()` 开头绑定局部 `ObsIngestState& session = state.obs_ingest_sessions.current`，函数体内统一通过该引用读写 OBS ingest state；保留 `AgentRuntimeState& state` 用于事件 payload 和 HostSessionController。
+- 修改意见：按建议实施 M7 前置小切片，不改变 worker 参数、不改变事件 payload、不改变 stop flag 语义、不改变 host codec 写回。
+- 处理结果：已处理。`run_worker()` 现在在获取 `AgentRuntimeState& state` 后绑定局部 `ObsIngestState& session`；worker 内的 stop flag、listen URL、waiting/connected/running 状态、metadata、pending Annex-B cache 和 video packet counter 均通过 `session` 访问。`state` 仍只用于 media-state payload、HostSessionController 和跨 session 服务。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-209 OBS ingest worker 入口仍从 AgentRuntimeState 解析 current session
+
+- 位置：`media-agent/src/obs_ingest_session.h`、`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-208 后 `run_worker()` 函数体内部已统一使用局部 `session` 引用，但 worker 入口仍只接收 `AgentRuntimeState*`，并在入口处自行读取 `state.obs_ingest_sessions.current`。
+- 影响：OBS worker 生命周期仍隐含依赖 registry current 字段；后续把 `ObsIngestSessionRegistry` 升级为真正 owner 时，worker 入口还需要从 AgentRuntimeState 中拆出 session 依赖。
+- 建议：让 worker 入口显式接收 `ObsIngestState* session`，`start_worker()` 传入 `&session_`；`AgentRuntimeState*` 暂保留给 media-state payload、HostSessionController 和 relay/global 服务。
+- 修改意见：按建议实施 M7 前置小切片，不改变 worker 线程启动时机、不改变事件 payload、不改变 stop flag 生命周期。
+- 处理结果：已处理。`ObsIngestSession::run_worker()` 签名改为 `run_worker(AgentRuntimeState* state, ObsIngestState* session)`；`start_worker()` 启动线程时传入 `&session_`。worker 内部只解引用显式 session 参数，不再从 `state.obs_ingest_sessions.current` 解析 current session。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前边界。
+- 验证结果：已执行 `cmake --build media-agent/build --config Release --target vds-media-agent vds-media-agent-tests`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；verify 已完成 Release 构建、单元测试、smoke test 并复制 runtime binary。`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-210 remote offer recreate 关闭旧 peer 的范围仍由 legacy 判断
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js::prepareRemoteOffer()` 已返回 `shouldCloseExisting`，但 `app-native-overrides.js::handleOffer()` 在 recreate 分支仍只按本地 `pc` 是否存在来决定关闭旧 peer。
+- 影响：recreate decision 的 owner 已在 controller，但关闭旧 peer 的范围仍有一份 legacy 判断；后续如果 controller 调整 recreate 条件或 handle registry，legacy 分支容易分叉。
+- 建议：legacy recreate 分支使用 controller/decision 返回的 `shouldCloseExisting` 执行关闭，仍保留关闭动作和新 peer 创建动作在 legacy，以维持 UI/failfast/NAT 外部效果。
+- 修改意见：按建议实施 R5 小切片，不改变 recreate 条件，不改变关闭动作，不改变 createPeerConnection 调用参数。
+- 处理结果：已处理。`handleOffer()` 的 `handleRemoteOffer()` 与 `prepareRemoteOffer()` 两条 recreate 分支均改为依据 `result.shouldCloseExisting` / `decision.shouldCloseExisting` 且存在 `pc` 时关闭旧 peer；新 peer 创建仍走原 `createPeerConnection(fromId, false, 'upstream', { mediaManifest })`。`docs/RENDERER_SPLIT_MAP.md` 已同步当前边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-211 create peer 后 attempt meta 初始化仍在 legacy override 写入
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：peer handle 创建和 attempt id 生成已由 `native-peer-controller.js` 拥有，但 `createNativePeerConnectionImpl()` 仍在 legacy override 中手动写 `meta.attemptId` 和 `meta.edgeAttemptId`。
+- 影响：peer attempt 的 owner 边界仍分裂；后续如果 controller 调整 attempt/edgeAttempt 语义，legacy 文件还会保留一份同步写入规则。
+- 建议：在 `native-peer-controller.js` 增加 `initializePeerMetaForHandle(peerId, handle, isInitiator, kind)`，由 controller 在 create peer 后统一把 handle attempt 写入 meta；legacy 只保留 UI 状态和 failfast timer。
+- 修改意见：按建议实施 R5 小切片，不改变 attemptId 取值，不改变 initiator 时 edgeAttemptId 写入，不改变 `gathering` UI 状态和 failfast arm 时机。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `initializePeerMetaForHandle()`，内部复用 `ensurePeerMeta()` 并按 handle attempt 写入 `attemptId` / `edgeAttemptId`；`app-native-overrides.js::createNativePeerConnectionImpl()` 正常路径委托该方法，fallback 保留旧写入逻辑。`docs/RENDERER_SPLIT_MAP.md` 已同步当前边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-212 connect failfast timer guard 仍在 legacy override 读取 meta
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 `connectTimeoutId` 的 arm/clear 迁入 peer controller，但 `armPeerConnectFailfast()` 仍先在 legacy override 中读取 `peerConnectionMeta` 并判断 `connectTimeoutId`，再调用通用 `armPeerConnectTimeout()`。
+- 影响：connect failfast timer 的 guard 仍有一份留在旧大文件；后续若 controller 调整 timer owner 或 meta 结构，legacy 还要同步修改。
+- 建议：在 `native-peer-controller.js` 增加语义化 `armPeerConnectFailfast(peerId, timeoutMs, onTimeout)` facade，由 controller 执行 meta/timer guard；legacy 只保留超时后的失败分类、NAT fallback 和 UI 外部动作。
+- 修改意见：按建议实施 R5 小切片，不改变 `P2P_CONNECT_FAILFAST_MS`、不改变超时回调内容、不改变缺模块 fallback。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `armPeerConnectFailfast()`，内部复用 `armPeerConnectTimeout()`；`app-native-overrides.js::armPeerConnectFailfast()` 正常路径不再预读 meta，而是直接委托 controller facade。旧 meta/timer 写入只保留在缺模块 fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-213 NAT mapping wait timer 仍只走通用 connect timeout facade
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 `connectTimeoutId` 写入迁入 peer controller，并已为 connect failfast 增加语义化 facade，但 NAT mapping 后等待直连成功的 timer 仍直接调用通用 `armPeerConnectTimeout()`。
+- 影响：同一个 `connectTimeoutId` owner 下还有一条 NAT-specific timer 缺少语义入口；后续调整 NAT mapping 等待策略时，legacy 和 controller 的边界不够清晰。
+- 建议：在 `native-peer-controller.js` 增加 `armPeerNatMappingWait(peerId, timeoutMs, onTimeout)`，内部复用 connect timeout owner；legacy 只保留等待超时后的失败 UI、关闭 peer 和缺模块 fallback。
+- 修改意见：按建议实施 R5 小切片，不改变 `P2P_NAT_MAPPING_CONNECT_WAIT_MS`，不改变 NAT mapped candidate 发送，不改变等待超时后的 UI 和关闭动作。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `armPeerNatMappingWait()`，内部复用 `armPeerConnectTimeout()`；`app-native-overrides.js` 在 NAT mapping 成功并发送 mapped candidates 后，优先调用 `armPeerNatMappingWait()`，旧通用 `armPeerConnectTimeout()` 和直接 `setTimeout` 写 meta 均保留 fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-199 remote offer decision/apply 路径仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-198 已把 answer decision 和 remote description apply 收入 peer controller，但 `handleOffer()` 仍在 legacy 文件中手写 prepareRemoteOffer 后的 ignore/flush/reuse/recreate 分支和 reuse remote description apply。
+- 影响：offer 信令生命周期仍有关键分支留在 legacy；后续拆 `handleOffer()` 时，controller 和 legacy 之间仍会重复维护 remote offer decision 语义。
+- 建议：新增 `native-peer-controller.js::handleRemoteOffer()`，由 controller 负责 ignore/flush/reuse/recreate decision，并在 reuse 分支中直接 apply remote description；legacy 继续保留 viewer 上游切换、recreate peer 创建、surface attach、answer 发送和 stale upstream cleanup。
+- 修改意见：按建议实施 R5 小切片，不改变 stale attempt 忽略、不改变重复 offer 只 flush、不改变 recreate 创建新 peer、不改变 viewer 切换 UI 和后续 answer 发送。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `handleRemoteOffer()`；`app-native-overrides.js::handleOffer()` 正常路径委托 controller，reuse 分支不再由 legacy apply remote description，recreate/flush/ignore 行为保持原时序。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-201 answer message 发送仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-200 已把 answer signal 等待和 message 构造迁入 peer controller，但 `createAndSendPeerAnswer()` 仍由 legacy 文件调用 `sendMessage()` 完成发送。
+- 影响：peer controller 尚未成为 answer 信令输出的完整 owner；后续把 `handleOffer()` 收进 controller 时仍需要回到 legacy 发 answer。
+- 建议：向 `native-peer-controller.js` 注入 `sendMessage` / roomClient facade，新增 `createAndSendAnswer()`，由 controller 调用 `prepareAnswerMessage()` 并发送 message；legacy 只保留兼容入口和 fallback。
+- 修改意见：按建议实施 R5 小切片，不改变 answer message 字段、不改变 `sendMessage` 底层实现、不改变返回 SDP、不改变缺模块 fallback。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `sendSignalMessage()` 和 `createAndSendAnswer()`，优先使用注入的 roomClient/sendMessage facade；`app-native-overrides.js` 创建 peer controller 时注入 `sendMessage`，`createAndSendPeerAnswer()` 正常路径委托 `createAndSendAnswer()`。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-200 answer message preparation 仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-199 后 offer decision/apply 已进入 peer controller，但 offer 后的 `createAndSendPeerAnswer()` 仍在 legacy 文件里串起 answer signal 等待、answer message 构造和发送。
+- 影响：answer 信令输出的 payload 构造仍由 legacy 编排；后续继续拆 `handleOffer()` 时，answer 发送路径仍会牵出 prepare/build 两个 controller helper。
+- 建议：在 `native-peer-controller.js` 增加 `prepareAnswerMessage()`，由 controller 内部复用 `prepareAnswerSignal()` 和 `buildAnswerMessage()`，legacy 只负责调用 `sendMessage()` 和返回 SDP。
+- 修改意见：按建议实施 R5 小切片，不改变 answer wait timeout、不改变 answer message 字段、不改变 `sendMessage()` 调用位置、不改变返回 SDP。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `prepareAnswerMessage()`；`app-native-overrides.js::createAndSendPeerAnswer()` 正常路径调用该方法，只保留发送 message 和返回 SDP，fallback 保留。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-191 信令 attemptId 解析仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 peer attempt 序列、edge attempt snapshot、remote offer/answer/ICE intake decision 迁入 `native-peer-controller.js`，但 `getSignalAttemptId()` 仍由 `app-native-overrides.js` 本地解析。
+- 影响：offer/answer/ICE 对 stale attempt 的判断仍有一处信令字段解析 owner 留在 legacy 文件；后续把 handleOffer/handleAnswer/handleIceCandidate 高层流程迁移到 peer controller 时，还要再次搬迁该 helper。
+- 建议：把 `attemptId` 正整数解析迁入 `native-peer-controller.js` 并作为 controller API 暴露；legacy wrapper 正常路径委托 controller，缺模块 fallback 保留原逻辑。
+- 修改意见：按建议实施 R5 小切片，不改变 attemptId 字段名、不改变空值/非法值返回 `null` 的语义、不改变 stale signal 过滤行为。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `getSignalAttemptId(data)`，保持原 `Number()` 转换、正整数校验和 `null` fallback；`app-native-overrides.js::getSignalAttemptId()` 现在优先委托 controller，模块缺失时保留原解析逻辑。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-198 remote answer apply 路径仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 `prepareRemoteAnswer()` 的 ignore/flush/apply decision 放进 peer controller，但 `handleAnswer()` 仍在 legacy 文件中执行 remote description apply、handle remoteDescription/signalingState 写回和 queued candidate flush 分支。
+- 影响：answer 信令生命周期仍跨 controller 和 legacy 文件分裂；后续迁移 `handleAnswer()` 时，remote description apply 规则还需要再次移动。
+- 建议：在 peer controller 中新增 `applyRemoteDescription()` 和 `handleRemoteAnswer()`，由 controller 负责 answer decision 与 remote description apply；legacy 只保留 signal 日志、ignore 日志和 queued candidate flush 调用。
+- 修改意见：按建议实施 R5 小切片，不改变 stale attempt 和 stale-answer-without-local-offer 忽略语义、不改变重复 answer 时只 flush queued candidates、不改变 apply 后 flush queued candidates。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `applyRemoteDescription()` 与 `handleRemoteAnswer()`；`setPeerRemoteDescription()` 正常路径也委托 `applyRemoteDescription()`，避免 remote description 状态写回继续留在 legacy；`app-native-overrides.js::handleAnswer()` 正常路径委托 controller，仍保留 legacy fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-197 remote ICE candidate 执行路径仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-191 到 P1-196 已把 remote ICE 的 attemptId 解析、candidate key、relay 过滤、pending queue 和本地 signal payload 构造迁入 peer controller，但 `handleIceCandidate()` 仍在 legacy 文件中手写 prepare decision 后的 queue/apply/duplicate/block 执行分支。
+- 影响：remote ICE 的 owner 边界仍不完整；后续迁移 `handleIceCandidate()` 时，legacy 和 controller 两侧都可能维护 queue/apply/duplicate 规则。
+- 建议：在 `native-peer-controller.js` 增加 `handleRemoteIceCandidate()` 和 `applyRemoteIceCandidate()`，由 controller 统一执行 prepare、queue、apply、duplicate 和 block；legacy 仅保留信号日志、blocked/stale 日志和 P2P UI 状态写回。
+- 修改意见：按建议实施 R5 小切片，不改变 missing candidate 早退、不改变 stale attempt 日志、不改变 relay candidate block、不改变重复 candidate 忽略、不改变 apply 后 UI 进入 `checking`。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `applyRemoteIceCandidate()` 与 `handleRemoteIceCandidate()`，复用既有 `prepareRemoteIceCandidate()`、`queuePendingRemoteCandidate()`、`addRemoteIceCandidate()` 和 `rememberRemoteCandidate()`；`app-native-overrides.js::handleIceCandidate()` 正常路径委托 controller，`addPeerRemoteIceCandidate()` 也委托 `applyRemoteIceCandidate()`，legacy fallback 保留。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-196 native signal peer id 解析仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js` 内部已经通过 `getSignalPeerId()` 统一按 `peerId -> targetId -> remotePeerId` 解析 native signal peer id，但该 helper 未导出，`app-native-overrides.js::getNativeSignalPeerId()` 仍保留一份本地实现。
+- 影响：signal queue、signal state update 和 media engine event 分发入口仍有一处 peer id 解析规则留在 legacy 文件；后续移动 event signal path 时会重复搬迁。
+- 建议：导出 `nativePeerController.getSignalPeerId()`，legacy wrapper 正常路径委托 controller，缺模块 fallback 保持原顺序。
+- 修改意见：按建议实施 R5 小切片，不改变 `peerId` / `targetId` / `remotePeerId` 的优先级，不改变缺失时返回空字符串。
+- 处理结果：已处理。`native-peer-controller.js` 现在导出 `getSignalPeerId()`；`app-native-overrides.js::getNativeSignalPeerId()` 优先委托 controller，模块缺失时继续执行原 fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-195 本地 ICE signal payload 构造仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-194 后 ICE candidate 文本提取和 relay candidate 判断已迁入 peer controller，但 `forwardNativeMediaSignal()` 仍在 legacy 文件里手写本地 candidate signal payload、`targetId` 推导、`trickle` 标记、`attemptId` 附加和 relay candidate block 分支。
+- 影响：本地 ICE 发送路径的协议 payload 构造仍不属于 peer controller；后续迁移 signal forwarding 时还要把这段构造逻辑整体搬迁，且容易与 controller 内 remote ICE intake 规则分叉。
+- 建议：在 `native-peer-controller.js` 增加 `prepareLocalIceCandidateSignal(params, { roomId })`，只负责纯决策和 payload 构造；legacy 继续负责 blocked 日志、本地候选统计和实际 `sendMessage()`，不改变发送时序。
+- 修改意见：按建议实施 R5 小切片，不改变 candidate-only 转 `ice-candidate` 的协议字段、不改变 `targetId` 推导顺序、不改变 relay candidate 被阻断、不改变 reconnect/iceRestart/isRelay 标记透传。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `prepareLocalIceCandidateSignal()`，统一执行 candidate signal payload 构造、`appendPeerAttempt()` 和 relay candidate block 决策；`app-native-overrides.js::forwardNativeMediaSignal()` 在正常路径调用该 controller 方法，仍保留原 fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-194 ICE 过滤和 stale peer error 分类仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已让 peer controller 承接 ICE intake decision、remote candidate queue 和 recovery decision，但 ICE candidate 文本提取、pure P2P relay-candidate 过滤，以及 `PEER_NOT_FOUND` / stale peer error 分类仍由 `app-native-overrides.js` 本地 helper 承担。
+- 影响：peer 信令输入校验和 recoverable stale error 判断仍散落在 legacy 文件；后续把 `handleIceCandidate()`、`viewer-joined` offer 错误处理和 `offer` 消息错误处理迁进 controller 时，还会带着这些 helper 再搬一次。
+- 建议：把 `getIceCandidateText()`、`isAllowedPureP2pCandidate()`、`isStaleNativePeerError()` 迁入 `native-peer-controller.js` 并导出；legacy 同名 helper 正常路径委托 controller，缺模块 fallback 保持原逻辑。
+- 修改意见：按建议实施 R5 小切片，不改变 relay candidate 禁止规则、不改变空 candidate 拒绝规则、不改变 stale native peer error 的 message/code 匹配条件。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `getIceCandidateText()`、`isAllowedPureP2pCandidate()` 和 `isStaleNativePeerError()`；`app-native-overrides.js` 同名 helper 优先委托 controller，缺模块时继续执行原 fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-193 remote ICE candidate key helper 仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 pending remote ICE queue、remote candidate duplicate registry 和 `buildRemoteCandidateKey()` 实现放进 `native-peer-controller.js`，但 `app-native-overrides.js` 仍保留本地 candidate key 构造，并且部分调用点需要手动判断 controller 是否存在。
+- 影响：ICE 去重 key 的字段选择和 fallback 语义仍存在两处 owner；后续迁移 `handleIceCandidate()` 时容易出现 key 规则不一致。
+- 建议：legacy `buildRemoteCandidateKey()` 正常路径委托 `nativePeerController.buildRemoteCandidateKey()`，缺模块 fallback 保留原 `{ candidate, sdpMid, sdpMLineIndex }` 规则。
+- 修改意见：按建议实施 R5 小切片，不改变 string candidate trim 规则、不改变 object candidate JSON key 字段、不改变 pending remote candidate 去重行为。
+- 处理结果：已处理。`app-native-overrides.js::buildRemoteCandidateKey()` 现在优先委托 `nativePeerController.buildRemoteCandidateKey()`，模块缺失时继续使用原 fallback；`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-192 remote description helper 仍在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 remote offer/answer intake decision 迁入 `native-peer-controller.js`，但 SDP 描述归一化和 remote description 相等判断仍由 `app-native-overrides.js` 本地 helper 承担。
+- 影响：重复 offer/answer 过滤语义分散在 peer controller 和 legacy override 两侧；后续迁移 `handleOffer()` / `handleAnswer()` 时，仍需搬迁这些纯信令 helper。
+- 建议：导出 controller 内已有 `normalizeSessionDescription()` 和 `isSameSessionDescription()`，legacy wrapper 正常路径委托 controller，缺模块 fallback 保留原逻辑。
+- 修改意见：按建议实施 R5 小切片，不改变 description `{ type, sdp }` 归一化规则、不改变空 description 返回、不改变重复 remote description 判断语义。
+- 处理结果：已处理。`native-peer-controller.js` 现在导出 `normalizeSessionDescription()` 和 `isSameSessionDescription()`；`app-native-overrides.js::normalizeNativeSessionDescription()` 与 `isSameRemoteDescription()` 优先委托 controller，模块缺失时保留原 fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-189 surface tracking 移除流程仍在 legacy override 手写
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R4 已把 surface registry、generation、failure count、warning clear 和 tracking loop 迁入 `native-surface-controller.js`，但 `app-native-overrides.js::removeEmbeddedSurfaceTracking()` 在 controller 存在时仍手写 `incrementSurfaceGeneration`、`deleteSurfaceEntry`、`clearRecoverableSurfaceSyncWarning`、`getSurfaceCount`、`stopTrackingLoop` 顺序。
+- 影响：surface 生命周期移除路径有两套 owner 表达；后续调整 warning/failure 清理或 tracking loop 停止条件时，仍需同步 legacy wrapper 和 controller。
+- 建议：暴露 controller 内部已有 `removeSurfaceTracking(surfaceId, reason)`，legacy wrapper 在正常路径直接委托 controller，由 controller 统一执行 generation/delete/warning clear/failure clear/loop stop 和 removed callback。
+- 修改意见：按建议实施 R4 小切片，不改变 detach/recover/updateSurface 触发时机、不改变 `onSurfaceTrackingRemoved` callback 行为。
+- 处理结果：已处理。`native-surface-controller.js` 返回对象新增 `removeSurfaceTracking`；`app-native-overrides.js::removeEmbeddedSurfaceTracking()` 在 controller 存在时直接调用该方法，不再手写 generation、entry 删除、warning/failure 清理和 tracking loop stop 顺序。controller 内部继续调用注入的 `onSurfaceTrackingRemoved`，legacy fallback 路径保留以支持模块缺失。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R4 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-190 surface recovery/reattach 流程仍回调 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R4 已把 sync loop 和 remove tracking 收进 `native-surface-controller.js`，但连续 updateSurface 失败后的 recovery 仍通过 `options.recoverSurface` 回调到 `app-native-overrides.js::recoverEmbeddedSurface()`，再执行 remove、best-effort detach 和 reattach。
+- 影响：surface controller 在判断需要恢复后仍把关键 lifecycle 交还 legacy 文件；后续调整 recovery 时序、reattach 日志或 host preview attached 状态时仍有双 owner。
+- 建议：把 recovery/reattach 实现迁入 `native-surface-controller.js`，syncAll 失败达到阈值后直接调用 controller 内部 `recoverSurface()`；legacy `recoverEmbeddedSurface()` 只作为缺模块 fallback。
+- 修改意见：按建议实施 R4 小切片，不改变连续失败阈值、不改变 best-effort detach、不改变 reattach target/element、不改变 host preview attached 状态恢复。
+- 处理结果：已处理。`native-surface-controller.js` 新增并暴露 `recoverSurface(surfaceId, entry, reason)`，内部执行 remove tracking、best-effort `mediaEngine.detachSurface()`、`surface-tracking:reattach` 日志、重新 `attachSurface()`，并在 host preview recover 成功后恢复 attached 标记；`syncAllSurfaces()` 达到连续失败阈值后直接调用 controller 内部 recovery，不再依赖 `options.recoverSurface`；`app-native-overrides.js` 不再向 controller 注入 recovery 回调，`recoverEmbeddedSurface()` 正常路径只委托 `nativeSurfaceController.recoverSurface()`，fallback 路径保留。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R4 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-254 peer media binding runtime 仍作为 refresh glue 存在
+
+- 位置：`media-agent/src/peer_media_binding_runtime.cpp`、`media-agent/src/peer_media_binding_runtime.h`、`media-agent/src/peer_refresh_pipeline.cpp`、`media-agent/src/peer_media_source_pipeline.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-253 后 detach cleanup 已拆出，但 `peer_media_binding_runtime.*` 仍保留 peer transport refresh、host video sender soft refresh 和 host audio sender refresh 的真实实现；`peer_refresh_pipeline.*` 只是转调旧 runtime。
+- 影响：`PeerSessionController -> peer_refresh_pipeline` 的 owner 边界不真实，media source pipeline 与 lifecycle 仍要 include legacy runtime；后续继续拆 registry/snapshot 时会保留不必要的历史入口。
+- 建议：把三个 refresh 实现迁入 `peer_refresh_pipeline.cpp`，让 media source pipeline 调用 `refresh_all_peer_transport_runtime()`；删除 `peer_media_binding_runtime.*` 并从 CMake 移除。
+- 修改意见：按建议实施 M7 小切片，不改变 transport snapshot refresh、receiver decoder refresh、encoded DataChannel active 判断、soft refresh revalidate、host audio sender renegotiation 和 breadcrumb 内容。
+- 处理结果：已处理。`peer_refresh_pipeline.cpp` 现在直接持有 `refresh_all_peer_transport_runtime()`、`refresh_all_host_video_senders()`、`refresh_all_host_audio_senders()` 的真实实现；`peer_media_source_pipeline.cpp` 改为 include `peer_refresh_pipeline.h` 并调用正式 refresh API；`agent_lifecycle.cpp` 删除旧 runtime include；`media-agent/CMakeLists.txt` 移除 `src/peer_media_binding_runtime.cpp`；`peer_media_binding_runtime.h/cpp` 已删除。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步旧 runtime 删除状态。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent unit tests、smoke test 和 runtime binary copy 均通过；`rg -n -F "peer_media_binding_runtime" media-agent/src media-agent/CMakeLists.txt` 无源码/CMake 残留引用。
+
+### ARCH-SPLIT-P1-255 surface control runtime 仍作为 request command glue 存在
+
+- 位置：`media-agent/src/surface_control_runtime.cpp`、`media-agent/src/surface_control_runtime.h`、`media-agent/src/surface_command_pipeline.cpp`、`media-agent/src/surface_command_pipeline.h`、`media-agent/src/surface_session_controller.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`SurfaceSessionController` 已接管 surface RPC 入口和批量 lifecycle，但 attach/update/detach request command 仍放在 `surface_control_runtime.*`，controller 实现文件仍 include legacy runtime 头。
+- 影响：surface owner 边界仍带历史 runtime 命名，后续把 command 内部的 `find_surface()` / `ensure_surface()` / `erase_surface()` 收进 controller 私有方法时还要先处理文件边界。
+- 建议：把 `surface_control_runtime.*` 改为 `surface_command_pipeline.*`，由 command pipeline 承接 request-level attach/update/detach；API 放入 `vds::media_agent` namespace，CMake 和 controller include 切到新文件。
+- 修改意见：按建议实施 M7 小切片，不改变 attach/update/detach request 字段、错误码、surface start/stop、peer receiver binding、event payload 和 result JSON。
+- 处理结果：已处理。新增 `surface_command_pipeline.h`，`surface_control_runtime.cpp` 已移动为 `surface_command_pipeline.cpp` 并改为 include 新头；三条 request command 已纳入 `vds::media_agent` namespace；`surface_session_controller.cpp` 改为 include `surface_command_pipeline.h`；`media-agent/CMakeLists.txt` 改为编译 `src/surface_command_pipeline.cpp`；旧 `surface_control_runtime.h` 已删除。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 surface 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent unit tests、smoke test 和 runtime binary copy 均通过；`rg -n -F "surface_control_runtime" media-agent/src media-agent/CMakeLists.txt` 无源码/CMake 残留引用。
+
+### ARCH-SPLIT-P1-256 surface update/detach command 仍绕过 SurfaceSessionController 本体
+
+- 位置：`media-agent/src/surface_command_pipeline.cpp`、`media-agent/src/surface_command_pipeline.h`、`media-agent/src/surface_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-255 后旧 `surface_control_runtime.*` 已删除，但 updateSurface/detachSurface 的 request-level 逻辑仍在 `surface_command_pipeline.*`，直接调用 `find_surface()` / `erase_surface()` 并更新 surface phase。
+- 影响：SurfaceSessionController 虽是 RPC 入口，但 update/detach 两条最典型的 surface registry 写路径仍不在 controller 本体，后续收紧 surface registry owner 时还要跨 command pipeline 修改。
+- 建议：先把 update/detach request command 迁入 `SurfaceSessionController::update_from_request()` / `detach_from_request()`，保留 attach request 在 command pipeline，避免一次性移动 peer receiver binding 的高风险路径。
+- 修改意见：按建议实施 M7 小切片，不改变 update/detach request 字段、错误码、surface layout 更新、peer surface stop、event payload、phase/reason 写回和 result JSON。
+- 处理结果：已处理。`SurfaceSessionController::update_from_request()` 已直接解析 request、查找 surface、更新 layout、维护 phase/reason、发送 `surface-updated` media-state 并返回原 result JSON；`SurfaceSessionController::detach_from_request()` 已直接查找 surface、进入 draining/stopped、停止 peer/native surface、更新 peer decoder state、发送 `surface-detached` media-state、erase surface 并返回原 detached result。`surface_command_pipeline.h/cpp` 删除 update/detach 声明和实现，当前只保留 attach request command；迁移后不再使用的 `erase_surface` using 已移除。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 surface 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent unit tests、smoke test 和 runtime binary copy 均通过。
+
+### ARCH-SPLIT-P1-257 surface attach command 仍留在中间 command pipeline
+
+- 位置：`media-agent/src/surface_command_pipeline.cpp`、`media-agent/src/surface_command_pipeline.h`、`media-agent/src/surface_session_controller.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-256 后 update/detach 已迁入 `SurfaceSessionController`，但 attachSurface 仍留在中间 `surface_command_pipeline.*`，继续直接调用 `find_surface()` / `ensure_surface()` / `find_peer()` 并配置 peer receiver runtime。
+- 影响：surface request command 的 ownership 仍分裂；最关键的 attach 路径仍不在 controller 本体，`surface_command_pipeline.*` 只为一个函数存在，后续收紧 surface registry owner 时还要再跨文件迁移。
+- 建议：把 attach request command 完整迁入 `SurfaceSessionController::attach_from_request()`，保持原 request 解析、peer receiver binding、host surface start、waiting-for-artifact 存储、event payload 和 result JSON；删除 `surface_command_pipeline.*` 和 CMake 条目。
+- 修改意见：按建议实施 M7 小切片，不改变 attach request 字段、错误码、peer receiver runtime 创建、host capture surface 启动、warning/media-state event、phase/reason 写回和 result JSON。
+- 处理结果：已处理。`SurfaceSessionController::attach_from_request()` 已直接持有 attachSurface request 逻辑：解析 `surface/target/layout`、处理 reattach stop、绑定 peer receiver runtime、启动 peer/native surface、保存 waiting-for-artifact 或 running attachment、发送原 `surface-attached` media-state/warning 并返回原 result JSON。`surface_command_pipeline.h/cpp` 已删除，`media-agent/CMakeLists.txt` 移除 `src/surface_command_pipeline.cpp`，`SurfaceSessionController` 不再 include 中间 command pipeline。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 surface 边界。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent unit tests、smoke test 和 runtime binary copy 均通过；`rg -n -F "surface_command_pipeline" media-agent/src media-agent/CMakeLists.txt` 无源码/CMake 残留引用。
+
+### ARCH-SPLIT-P1-258 stale viewer upstream 清理调度仍留在 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-176 已把 viewer 切换上游后的 stale peer id 选择迁入 peer controller，但 `closeStaleViewerUpstreamPeers()` 仍在 legacy override 内部负责延迟 250ms 调度和逐个 close 执行。
+- 影响：viewer upstream 切换后的旧 peer 生命周期清理仍由 legacy 文件编排；后续继续迁 `handleOffer()` 时，stale cleanup 的选择、延迟和 active peer 二次校验仍要跨文件维护。
+- 建议：在 `native-peer-controller.js` 增加 `scheduleStalePeerCleanup(activePeerId, options)`，controller 负责 stale ids 选择和延迟调度；legacy 只注入 `isPeerActive` 与 `closePeer` 外部动作。
+- 修改意见：按建议实施 R5 小切片，不改变 250ms 延迟、不改变 active upstream 二次校验、不改变 `closeNativePeerConnectionImpl(peerId, { clearRetryState: true })` 的实际关闭动作。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `scheduleStalePeerCleanup()`，内部复用 controller peer handle registry 的 `getStalePeerIds()`，在指定延迟后逐个执行注入的 `closePeer`，并通过注入的 `isPeerActive` 保留 active upstream 二次校验；`app-native-overrides.js::closeStaleViewerUpstreamPeers()` 正常路径委托 controller 调度，缺模块 fallback 保留原本 `getStalePeerIds()/setTimeout/closeNativePeerConnectionImpl()` 路径。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+
+### ARCH-SPLIT-P1-270 peer close cleanup 尚未统一到 effects 协议
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-269 后 peer close cleanup 已有统一 helper，但 controller 仍只返回 flags；而 remote ICE 已经采用 controller 返回 `effects`、legacy 消费 effects 的模式。
+- 影响：close cleanup 和 ICE cleanup 两套消费风格不一致；后续迁移 close lifecycle 时仍要把 flags 转换为可执行动作。
+- 建议：让 `preparePeerCloseCleanup()` 同时输出按顺序排列的 `effects`，并让 `applyPeerCloseCleanupEffects()` 优先消费 effects；保留 flags fallback 兼容旧中间态。
+- 修改意见：按建议实施 R5 小切片，不改变 effects 执行顺序、不改变 flags fallback、不改变现有 cleanup 行为。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `buildPeerCloseCleanupEffects()`，`preparePeerCloseCleanup()` 现在返回原 flags 以及按原顺序排列的 close cleanup effects；`app-native-overrides.js::applyPeerCloseCleanupEffects()` 正常路径优先消费 effects，缺 effects 时继续按 flags fallback 执行。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-271 failed host start 清理顺序仍由 legacy 定义
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R6 已把 stop share 前后段清理收口到 `native-session-controller.js`，但 native host start 失败后的 `hostPreviewSurfaceAttached=false -> removeEmbeddedSurfaceTracking(host-start-failed) -> stop host/audio sessions -> reset failed-start UI` 顺序仍由 `app-native-overrides.js::cleanupAfterFailedHostStart()` 内联定义。
+- 影响：host session lifecycle 的失败路径和 stop 路径 owner 不一致；后续继续迁 host start/OBS start 时，失败清理顺序仍要跨 legacy 大文件维护。
+- 建议：在 `native-session-controller.js` 增加 `cleanupFailedHostStart()` facade，由 controller 编排 failed-start 清理顺序；legacy 只注入 host preview 标记、tracking 移除和 UI reset 回调，并保留缺模块 fallback。
+- 修改意见：按建议实施 R6 小切片，不改变 `host-start-failed` reason、不改变 host/audio stop 并发行为、不改变 failed-start UI 文案和按钮状态。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `cleanupFailedHostStart()`，按旧顺序执行 host preview attached reset、host preview tracking 移除、`stopHostAndAudioSessions()` 和 failed-start UI reset callback；`app-native-overrides.js` 初始化 session controller 时注入 `setHostPreviewAttached/removeHostPreviewSurfaceTracking/resetFailedHostStartUi`，`cleanupAfterFailedHostStart()` 正常路径优先委托 controller，缺模块 fallback 保留原实现。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-272 host start 成功后的 session/UI/stats 写入顺序仍内联在 legacy
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R6 已把 host start generation、failed-start cleanup、stop cleanup 收口到 session controller，但 native capture 和 OBS ingest start 成功后仍分别在 `startScreenShareWithSource()` / `startScreenShareWithObsIngest()` 内联写 `nativeHostSessionRunning/localStream/hostPreviewRequested`、启动 stats polling、切换分享按钮、更新 host status 和 encoder detail。
+- 影响：host start 成功路径和 stop/failed cleanup 使用不同 owner 协议；后续把 native/OBS start lifecycle 继续迁入 controller 时，成功状态写入顺序仍需要从 legacy 大函数中剥离。
+- 建议：在 `native-session-controller.js` 增加 `buildHostStartSuccessEffects()`，由 controller 根据 backend/session 输出有序 effects；legacy 只消费 effects 执行具体变量/DOM/stats 回调，并保留缺模块 fallback。
+- 修改意见：按建议实施 R6 小切片，不改变 native capture/OBS 成功后的按钮状态、host status 文案、preview hidden 状态、stats polling 启动时机和 encoder detail 内容。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `buildHostStartSuccessEffects()`，分别为 native capture 和 OBS ingest 生成 session running、local stream reset、preview request/hidden、stats polling、share buttons、host status / minimized waiting UI 和 encoder detail effects；`app-native-overrides.js` 新增 `applyHostStartSuccessEffects()` 集中消费 effects，两个 start 成功路径改为优先使用 controller effects，缺模块时保留等价 fallback effects。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-273 host create-room payload 构造仍重复散落在 start 路径
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R6 已把 host media manifest 构建和 start success effects 收口到 session controller，但 native capture start 和 OBS ingest stream ready 两条路径仍各自内联拼 `create-room` payload，重复写 `type/clientId/publicListing/mediaManifest`。
+- 影响：host 建房 payload 的 owner 仍不统一；后续把建房发送动作迁到 room-client 或 session controller 时，需要先消除两条路径的 payload 重复。
+- 建议：在 `native-session-controller.js` 增加 `buildHostCreateRoomMessage()`，统一 host create-room payload 构造；legacy 只负责 `rememberMediaManifest()`、`waitForWsConnected()` 和 `sendMessage()` 时机，缺模块 fallback 保持原 payload。
+- 修改意见：按建议实施 R6 小切片，不改变 `create-room` JSON shape、不改变 publicListing 来源、不改变 WebSocket 等待和发送时机。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `buildHostCreateRoomMessage()`，通过注入的 quality settings 读取 `publicRoomEnabled`，统一返回 `type/clientId/publicListing/mediaManifest`；`app-native-overrides.js` 新增 `buildNativeHostCreateRoomMessage()` wrapper，native capture 和 OBS ingest 建房发送路径都改为调用该 wrapper，缺模块 fallback 保留原 payload。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-274 host create-room 发送编排仍留在 legacy start 路径
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-273 只统一了 host create-room payload 构造，但 native capture 和 OBS ingest 仍在 legacy 路径里各自串联 `waitForWsConnected(5000)`、`sendMessage()` 和 `__vdsResetShareStartPendingUi()`。
+- 影响：host 建房成功发送的 lifecycle 仍由大 override 编排；后续把 native/OBS start lifecycle 迁入 session controller 时，还要再次拆发送等待和 pending UI 释放顺序。
+- 建议：在 `native-session-controller.js` 增加 `createHostRoom()` facade，通过注入的 `waitForWsConnected/sendHostCreateRoom/resetShareStartPendingUi` 执行等待、发送和 pending UI reset；legacy 只保留 fallback wrapper 和 OBS 失败 UI。
+- 修改意见：按建议实施 R6 小切片，不改变 5 秒 WebSocket 等待、不改变 `create-room` payload、不改变 pending UI reset 时机、不改变 OBS 失败时 `obsRoomCreatePending=false` 和错误提示。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `createHostRoom()`，内部按原顺序等待 WebSocket、调用 `buildHostCreateRoomMessage()` 构造 payload、发送 host create-room message 并释放 share start pending UI；`app-native-overrides.js` 初始化 session controller 时注入 `waitForWsConnected/sendHostCreateRoom/resetShareStartPendingUi`，新增 `createNativeHostRoom()` wrapper，native capture 和 OBS ingest 建房路径都改为调用该 wrapper，缺模块 fallback 保留旧顺序。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-275 OBS host room teardown 顺序仍完整内联在 legacy
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：OBS ingest 断流后 `teardownHostRoomPreservingSession()` 仍在 legacy 文件内串联 close peers、发送 leave-room、清房间状态、reset mediaSessionId、清 viewer playback/reconnect 状态、清 OBS pending/running 标记、重置 host UI 和写 `obs-ingest:room-ended` 日志。
+- 影响：OBS room lifecycle 和 native session lifecycle owner 分裂；后续把 OBS start/end 状态机迁入 session controller 时，断流清房间顺序仍需要跨大文件维护。
+- 建议：在 `native-session-controller.js` 增加 `teardownObsHostRoom()`，通过已注入的 peer close、room snapshot、leave-room 和新增 reset callbacks 编排 OBS room teardown；legacy 只保留 fallback helper 和具体状态/UI 写入。
+- 修改意见：按建议实施 R6 小切片，不改变 close peer options、不改变 leave-room payload、不改变状态 reset 字段、不改变 UI 文案和 `obs-ingest:room-ended` 日志 payload。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `teardownObsHostRoom()`，按原顺序关闭 native peers、发送 leave-room、调用 OBS room state/playback/UI reset callbacks 并记录 `obs-ingest:room-ended`；`app-native-overrides.js` 初始化 session controller 时注入 `resetObsRoomState/resetObsPlaybackState/resetObsRoomUi`，新增 `resetObsRoomStatePreservingSession()`、`resetObsPlaybackStatePreservingSession()`、`resetObsRoomUiWaitingForStream()`，`teardownHostRoomPreservingSession()` 正常路径优先委托 controller，缺模块 fallback 保留原顺序。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-276 OBS host room create 编排仍留在 legacy
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-275 迁出了 OBS room teardown，但 `ensureObsHostRoomCreated()` 仍由 legacy 文件判断 host/native/OBS readiness、检查已有房间或 pending、设置 `obsRoomCreatePending`、写“OBS 节目流已接入，正在创建房间...”文案、构建 manifest、同步 manifest 并调用 create-room。
+- 影响：OBS room create 和 teardown owner 不对称；后续迁 OBS start/end 状态机时，创建房间的 pending/UI/manifest/create-room 顺序仍要从大文件中拆。
+- 建议：在 `native-session-controller.js` 增加 `ensureObsHostRoomCreated()`，由 controller 编排 readiness、pending、UI、manifest 和 createHostRoom 正常路径；legacy 注入具体 state/UI/manifest 回调，只保留 rejected 后的 pending 清理和错误提示 fallback。
+- 修改意见：按建议实施 R6 小切片，不改变 early-return 条件、不改变 `obsRoomCreatePending` 时机、不改变 host status 文案、不改变 manifest 构建来源、不改变 create-room payload/timeout，也不改变失败时错误提示。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `ensureObsHostRoomCreated()`，按原逻辑先检查 `canCreateObsHostRoom()` 和 `hasActiveObsHostRoomOrPending()`，再设置 pending、更新 OBS 建房 UI、通过 `buildObsHostMediaManifest()` 构建 manifest、调用 `rememberMediaManifest()` 并复用 `createHostRoom()` 发送建房；`app-native-overrides.js` 初始化 session controller 时注入 readiness/pending/UI/manifest callbacks，旧 `ensureObsHostRoomCreated()` 正常路径优先委托 controller，catch 中保留原 `obsRoomCreatePending=false` 和 `showError()`。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-269 peer close cleanup flags 的执行串仍内联在 close finally
+
+- 位置：`server/public/app-native-overrides.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-268 后 close cleanup 清单已经由 `native-peer-controller.js::preparePeerCloseCleanup()` 返回 flags，但 `closeNativePeerConnectionImpl()` 的 finally 仍内联十多个 `if (closeCleanupDecision.*)` 执行具体清理回调。
+- 影响：close 入口仍显得臃肿；后续把 close lifecycle 继续迁入 controller 或 native entry 时，还需要先拆出这段执行串。
+- 建议：新增 `applyPeerCloseCleanupEffects(peerId, cleanupDecision)`，把 legacy 具体回调执行集中到一个 helper；`closeNativePeerConnectionImpl()` finally 只调用该 helper。
+- 修改意见：按建议实施 R5 小切片，不改变任何 cleanup flag 名称、执行顺序或具体回调。
+- 处理结果：已处理。`app-native-overrides.js` 新增 `applyPeerCloseCleanupEffects()`，按原顺序执行 handle/map/meta 删除、pending/signal/timer 清理、viewer wait timer/reconnect 清理和 diagnostic refresh；`closeNativePeerConnectionImpl()` finally 已替换为单行 helper 调用。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-268 单 peer close finally 的基础 registry cleanup 仍硬编码在 legacy
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-267 已把 viewer upstream 特例 cleanup decision 迁入 controller，但 `closeNativePeerConnectionImpl()` 的 finally 仍硬编码删除 native handle、peerConnections、peer meta，并清 pending remote candidates、signal state、connect/disconnect timer。
+- 影响：单 peer close lifecycle 的基础 cleanup 清单仍由 legacy 文件定义；后续想在 controller 中加入 draining/stopped 阶段、统计 cleanup 结果或调整清理顺序时，还要改旧大文件。
+- 建议：扩展 `native-peer-controller.js::preparePeerCloseCleanup()`，让它返回基础 registry/pending/timer cleanup flags；legacy 只按 flags 执行现有回调，缺模块 fallback 保持全量清理。
+- 修改意见：按建议实施 R5 小切片，不改变 handle/map/meta 删除顺序，不改变 pending/signal/timer 清理顺序，不改变 viewer upstream 和 retry cleanup 行为。
+- 处理结果：已处理。`preparePeerCloseCleanup()` 现在返回 `deleteNativePeerHandle`、`deletePeerConnection`、`deletePeerMeta`、`clearPendingRemoteCandidates`、`clearPeerSignalState`、`clearPeerConnectTimeout`、`clearPeerDisconnectTimer` 等基础 cleanup flags；`app-native-overrides.js::closeNativePeerConnectionImpl()` finally 改为按 decision flags 执行原回调，缺模块 fallback 继续设置全部基础 cleanup flags。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-267 单 peer close finally 的 viewer upstream 清理决策仍留在 legacy
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-266 后批量关闭 peer 的遍历已迁入 peer controller，但单个 peer close 的 finally cleanup 仍由 legacy 文件判断当前关闭的 peer 是否为 viewer upstream，并据此清 viewer media wait timer、upstream offer wait timer、upstream reconnect peer，以及是否清 retry state。
+- 影响：peer close lifecycle 的 cleanup decision 仍和具体 timer/UI 回调混在一起；后续把 close 入口继续收进 controller 时，容易遗漏 viewer upstream 特例或 `clearRetryState` 透传。
+- 建议：在 `native-peer-controller.js` 增加 `preparePeerCloseCleanup(peerId, options)`，只返回需要执行的 cleanup flags；legacy 继续执行具体 timer/reconnect/diagnostic 回调。
+- 修改意见：按建议实施 R5 小切片，不改变 viewer upstream 判定，不改变 timer 清理顺序，不改变 `clearRetryState` 行为，不改变最后 render P2P diagnostic。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `preparePeerCloseCleanup()`，根据 handle role、sessionRole、upstreamPeerId 和 clearRetryState 返回 `clearViewerMediaWaitTimer`、`clearViewerUpstreamOfferWaitTimer`、`resetViewerUpstreamOfferReconnectPeer`、`clearPeerReconnect` 和 `renderP2pDiagnosticReport` flags；`app-native-overrides.js::closeNativePeerConnectionImpl()` 正常路径消费该 decision 执行原 timer/reconnect/diagnostic 回调，缺模块 fallback 保留原判定。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-266 批量关闭 peer 仍由 legacy 直接扫描 handle registry
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：单个 peer 的 mediaEngine close 已经委托 `native-peer-controller.js::closePeer()`，但 `clearNativePeerConnectionsImpl()` 仍在 legacy 文件里直接调用 `getNativePeerHandleIds()` 扫描 controller handle registry 并循环关闭。
+- 影响：peer registry 的批量遍历 owner 仍不清晰；后续要调整批量关闭顺序、统计 closed peer 或在 controller 内加入 draining state 时，还需要改 legacy 循环。
+- 建议：在 `native-peer-controller.js` 增加 `closeAllPeers(callbacks)`，controller 负责读取当前 handle ids 和循环编排，legacy 只注入单 peer close cleanup 回调。
+- 修改意见：按建议实施 R5 小切片，不改变单 peer 的 `closeNativePeerConnectionImpl()` 清理顺序，不改变 `clearRetryState` 等 options 透传。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `closeAllPeers()`，内部复制当前 peer handle ids 并依次调用注入的 `closePeer` callback；`app-native-overrides.js::clearNativePeerConnectionsImpl()` 正常路径委托该 facade，并把原 `options` 传给单 peer close cleanup，缺模块 fallback 保留原 `getNativePeerHandleIds()` 循环。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-265 remote ICE result 消费仍由 legacy handleIceCandidate 判断 action/reason
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 remote ICE queue/apply/block 执行路径迁入 `native-peer-controller.js::handleRemoteIceCandidate()`，但 `handleIceCandidate()` 正常路径仍直接判断 `result.action/reason/uiState` 来写 stale 日志、blocked relay 日志和 P2P UI 状态。
+- 影响：remote ICE 执行结果的 UI/log 映射仍留在旧大文件；后续迁移 `handleIceCandidate()` 时，controller 和 legacy 之间仍要共享 action/reason 到 UI/log 的隐式协议。
+- 建议：在 `native-peer-controller.js` 增加 `finalizeRemoteIceCandidate()` 和 `buildRemoteIceCandidateEffects()`，controller 把执行结果转换成标准 effects；legacy 只执行 effects，缺模块 fallback 保留原 action/reason 判断。
+- 修改意见：按建议实施 R5 小切片，不改变 stale-attempt 日志、不改变 blocked relay candidate 日志、不改变 `uiState='checking'` 写入。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `finalizeRemoteIceCandidate()` 与 `buildRemoteIceCandidateEffects()`，正常路径先执行 remote ICE queue/apply/block，再返回 `logNativeStep` 和 `setP2pState` effects；`app-native-overrides.js` 新增 `applyRemoteIceCandidateEffects()`，`handleIceCandidate()` 正常路径只调用 finalize facade 并消费 effects，旧 `handleRemoteIceCandidate()` / `prepareRemoteIceCandidate()` fallback 保留。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-264 remote answer apply 后的 queued ICE flush 仍由 legacy handleAnswer 串联
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 remote answer decision 和 remote description apply 迁入 `native-peer-controller.js::handleRemoteAnswer()`，但 `handleAnswer()` 正常路径仍在 legacy 文件里根据 `flushQueuedCandidates` 再调用 `flushQueuedRemoteCandidates()`。
+- 影响：answer 收尾的 apply-then-flush 顺序仍由旧大文件串联；后续迁 `handleAnswer()` 时还要重新搬迁 queued ICE flush 语义，并且容易漏掉 flush result 的 UI/log 消费。
+- 建议：在 `native-peer-controller.js` 增加 `finalizeRemoteAnswer()`，内部调用 `handleRemoteAnswer()` 并在需要时执行 `flushQueuedRemoteCandidates()`；legacy 只负责 ignore 日志和 `applyQueuedRemoteCandidateFlushResult()`。
+- 修改意见：按建议实施 R5 小切片，不改变 answer ignore reason、不改变 remote description apply、不改变 queued ICE flush 顺序和 blocked relay candidate UI/log 消费。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `finalizeRemoteAnswer()`，内部统一执行 remote answer decision/apply 和 queued ICE flush；`app-native-overrides.js::handleAnswer()` 正常路径优先调用该 facade，只保留 `signal:answer:ignored` 日志和 `applyQueuedRemoteCandidateFlushResult()`，旧 `handleRemoteAnswer()`/`prepareRemoteAnswer()` fallback 继续保留。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-263 viewer remote offer surface attach 仍由 legacy handleOffer 直接调用
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 remote offer decision、recreate peer、attempt apply 和 answer 收尾迁入 peer controller，但 viewer 收到 offer 后仍由 `handleOffer()` 直接调用 `attachNativePeerVideoSurface(fromId)`，peer 信令收尾和 surface attach 仍在 legacy 入口串联。
+- 影响：后续迁移 `handleOffer()` 时仍要跨 peer controller 和 surface controller 搬迁 viewer surface attach；如果继续留在 legacy，peer lifecycle 和 surface lifecycle 的协作边界不够清楚。
+- 建议：给 `native-peer-controller.js` 注入 `surfaceController`，增加 `attachViewerRemoteOfferSurface(peerId)` facade，由 peer controller 负责在 remote offer 收尾阶段调用 surface controller；legacy 只保留缺模块 fallback。
+- 修改意见：按建议实施 R5/R4 交界小切片，不改变实际 surface id、target、container、hide legacy video 行为和 attach 时序。
+- 处理结果：已处理。`app-native-overrides.js` 创建 peer controller 时注入 `nativeSurfaceController`；`native-peer-controller.js` 新增并导出 `attachViewerRemoteOfferSurface()`，正常路径调用 `surfaceController.attachPeerVideoSurface(peerId)`，缺 surface controller 时支持 callback/fallback；`handleOffer()` 的 viewer surface attach 改为优先调用该 peer facade，缺模块时仍调用原 `attachNativePeerVideoSurface()`。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5/R4 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-262 remote offer recreate peer 顺序仍由 legacy handleOffer 编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-261 后 recreate peer 的 attempt + remoteDescription apply 已迁入 controller，但 `handleOffer()` 的 recreate 分支仍手写 `shouldCloseExisting -> closeNativePeerConnectionImpl() -> createPeerConnection(..., 'upstream')` 两处重复流程。
+- 影响：remote offer recreate 的 peer lifecycle 顺序仍留在旧文件；后续继续迁 `handleOffer()` 时，还要同时搬迁关闭旧 peer、创建新 upstream peer 和 mediaManifest 传递，容易和 `prepareRemoteOffer()` 的 `shouldCloseExisting` 语义脱节。
+- 建议：在 `native-peer-controller.js` 增加 `recreatePeerForRemoteOffer(peerId, decision, callbacks)`，controller 负责按 decision 编排关闭旧 peer 和创建新 upstream peer；legacy 只注入具体 `closePeer/createPeer` 回调，以保留当前 UI/failfast 副作用。
+- 修改意见：按建议实施 R5 小切片，不改变 `shouldCloseExisting` 判定，不改变 `closeNativePeerConnectionImpl()` 和 `createPeerConnection(peerId, false, 'upstream', { mediaManifest })` 的实际执行动作。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `recreatePeerForRemoteOffer()`，内部根据 `decision.shouldCloseExisting` 调用注入的 `closePeer`，再调用注入的 `createPeer` 创建 upstream handle；`app-native-overrides.js` 新增 `recreateNativePeerForRemoteOffer()` wrapper，正常路径委托 controller 编排，缺模块 fallback 保留原关闭/创建顺序，`handleOffer()` 两个 recreate 分支已改为调用该 wrapper。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-261 recreate remote offer apply 仍由 legacy 串联 attempt 和 remoteDescription
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-260 后 remote offer attempt 写入已有 controller facade，但 recreate peer 分支仍由 `handleOffer()` 先调用 attempt facade，再调用 `setPeerRemoteDescription()`，legacy 仍负责保持 attempt-before-remoteDescription 的信令收尾顺序。
+- 影响：recreate remote offer apply 的顺序语义仍留在旧大文件；后续迁移 `handleOffer()` 时，这段顺序还需要重新搬到 controller，容易遗漏 mediaManifest 或 handle signalingState 更新。
+- 建议：在 `native-peer-controller.js` 增加 `applyRecreatedRemoteOffer(peerId, handle, description, attemptId, mediaManifest, kind)`，内部串联 `applyRemoteOfferAttempt()` 和 `applyRemoteDescription()`；legacy recreate 分支只调用该 facade，缺模块 fallback 保留原两步。
+- 修改意见：按建议实施 R5 小切片，不改变 attempt 写入先于 remoteDescription apply 的顺序，不改变 `mediaManifest` 传入和返回后 answer/surface attach 时序。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `applyRecreatedRemoteOffer()`，内部先写 remote offer attempt，再调用 `applyRemoteDescription()` 并返回 answer/flush 语义；`app-native-overrides.js::handleOffer()` 在 controller 可用时调用该 facade 并标记 remote offer 已由 controller apply，缺模块时保留 `applyRemoteOfferAttempt()`/`ensurePeerMeta()` + `setPeerRemoteDescription()` fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-260 remote offer attempt 写入仍由 legacy handleOffer 直接操作
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 remote offer decision、remote description apply、viewer upstream switch decision 和 answer 收尾迁入 peer controller，但 `handleOffer()` 在 offer 通过决策后仍直接 `ensurePeerMeta(fromId, false, 'upstream')` 并写入 `meta.edgeAttemptId`。
+- 影响：remote offer attempt ownership 仍有一处 legacy 写入口；后续继续迁 `handleOffer()` 时，attempt ordering 相关状态会继续跨 legacy/controller 两边维护。
+- 建议：在 `native-peer-controller.js` 增加 `applyRemoteOfferAttempt(peerId, attemptId, kind)`，由 controller 统一 ensure meta 并写入 remote offer `edgeAttemptId`；legacy 只调用 facade，缺模块 fallback 保留原写法。
+- 修改意见：按建议实施 R5 小切片，不改变无 attemptId 时只 ensure meta、不写 edgeAttemptId 的行为，不改变 `kind='upstream'`。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `applyRemoteOfferAttempt()`，内部复用 `ensurePeerMeta(peerId, false, kind)` 并在存在 `attemptId` 时写入 `edgeAttemptId`；`app-native-overrides.js::handleOffer()` 正常路径改为调用该 facade，缺模块 fallback 保留原 `ensurePeerMeta` 和 `meta.edgeAttemptId` 写入。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-259 viewer upstream 切换决策仍留在 legacy handleOffer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R5 已把 remote offer intake、answer 发送和 stale cleanup 调度迁入 peer controller，但 `handleOffer()` 收到新上游 offer 时仍在 legacy 文件内直接判断是否切换上游，并决定是否重置 `upstreamConnected/viewerReadySent/videoStarted`、清理 viewer timer、写连接文案。
+- 影响：viewer upstream 切换语义仍绑定在旧大文件；后续继续迁 `handleOffer()` 时，需要把纯决策和具体 UI/state 写入一起搬迁，增加行为漂移风险。
+- 建议：在 `native-peer-controller.js` 增加 `prepareViewerUpstreamSwitch()`，只返回是否更新上游、是否切换、是否重置 viewer 状态、是否清理 timer、是否需要 stale cleanup 和连接文案；legacy 只消费决策执行原有状态写入和 UI 回调。
+- 修改意见：按建议实施 R5 小切片，不改变收到 offer 后先清理 upstream offer wait timer 的时机、不改变首次上游赋值、不改变切换上游时的 viewer 状态重置、不改变 stale cleanup 触发条件。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `prepareViewerUpstreamSwitch()`，统一返回 host/缺 peer/首次上游/切换上游四类决策；`app-native-overrides.js::handleOffer()` 正常路径改为消费该决策，仅保留 `upstreamPeerId` 写入、`upstreamConnected/viewerReadySent/videoStarted` 重置、timer 清理和 `setViewerConnectionState()` UI 回调，缺模块 fallback 保持原判断语义。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-session-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-277 OBS media-state 状态分支仍由 legacy 直接编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R6 已把 OBS host room create/teardown 迁入 `native-session-controller.js`，但 `applyNativeMediaStateUpdate()` 收到 `obs-ingest-waiting`、`obs-ingest-connected`、`obs-stream-running`、`obs-ingest-ended` 时仍直接在 legacy 文件内写 host backend/session running/OBS stream active、更新 host status/encoder detail，并触发建房或拆房。
+- 影响：OBS start/end 状态机 owner 仍不完整；后续继续迁 host session lifecycle 时，同一 OBS 状态事件的判定、状态写入和房间生命周期会继续跨 legacy/controller 两边维护。
+- 建议：在 `native-session-controller.js` 增加 OBS media-state effects builder，把四个 OBS 状态转换成标准 effects；legacy 只消费 effects，缺模块时保留旧分支。
+- 修改意见：按建议实施 R6 小切片，不改变 OBS waiting/connected/running/ended 文案，不改变 `obsRoomCreatePending`、`obsIngestStreamActive` 写入语义，不改变 stream-running 触发建房和 ingest-ended 触发拆房的时机。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `buildObsMediaStateEffects()`，统一生成 OBS backend、host running、OBS stream active、pending、encoder detail、host status、ensure room create 和 teardown effects；`app-native-overrides.js::applyNativeMediaStateUpdate()` 在 controller 可用时优先消费 effects，原四个 OBS 分支作为缺模块 fallback 保留。`applyHostStartSuccessEffects()` 已扩展为通用 native session effects consumer，支持 OBS room create/teardown 动作 effect。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-278 host-session-started 状态分支仍由 legacy 直接编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-277 后 OBS media-state 已通过 session controller effects 编排，但 `host-session-started` 仍在 `applyNativeMediaStateUpdate()` 内直接写 `nativeHostSessionRunning`、OBS pending/stream active、codec preference、native effective codec、codec UI lock 和 minimized window UI。
+- 影响：native host session 状态事件和 OBS 状态事件使用两套 owner 协议；后续迁移 host session lifecycle 时，codec/UI 状态写入仍需要从 legacy 分支中拆出来。
+- 建议：在 `native-session-controller.js` 增加 `buildHostSessionStartedEffects()`，把 host-session-started 转换成标准 native session effects；legacy 只消费 effects，缺模块 fallback 保留原分支。
+- 修改意见：按建议实施 R6 小切片，不改变 effective codec 归一化、不改变 codec UI lock、不改变 minimized capture 时触发等待窗口恢复 UI 的语义。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `buildHostSessionStartedEffects()`，统一生成 host running、OBS pending/active reset、effective codec、codec UI lock 和 minimized restore UI effects；`app-native-overrides.js::applyNativeMediaStateUpdate()` 在 controller 可用时优先消费该 effects，原 `host-session-started` 分支保留为缺模块 fallback。`applyHostStartSuccessEffects()` 已扩展支持 `setNativeEffectiveCodec` 和 `lockCodecUiToNativeH264` effects。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-279 host-session-stopped 状态复位仍由 legacy 直接编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-278 后 `host-session-started` 已通过 session controller effects 编排，但 `host-session-stopped` 仍在 `applyNativeMediaStateUpdate()` 内直接复位 `nativeHostSessionRunning`、`hostWaitingWindowRestore`、`obsRoomCreatePending` 和 `obsIngestStreamActive`。
+- 影响：host session lifecycle started/stopped 两端 owner 不对称；后续收紧 stop lifecycle 时，状态复位语义仍有一处留在 legacy 分支。
+- 建议：在 `native-session-controller.js` 增加 `buildHostSessionStoppedEffects()`，把 stopped 状态转换成标准 native session effects；legacy 只消费 effects，缺模块 fallback 保留原分支。
+- 修改意见：按建议实施 R6 小切片，不改变 stopped 事件只做运行态/OBS 标记复位、不触发完整 stop share 清理的语义。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `buildHostSessionStoppedEffects()`，统一生成 host running false、window restore false、OBS room pending false 和 OBS stream active false effects；`app-native-overrides.js::applyNativeMediaStateUpdate()` 在 controller 可用时优先消费该 effects，原 `host-session-stopped` 分支保留为缺模块 fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-280 native host start codec 成功写入仍由 start 函数内联
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R6 已把 host start success UI/stats effects 迁入 session controller，但 native capture start 成功后仍在 `startScreenShareWithSource()` 内联解析 requested/effective codec、写 `nativeHostEffectiveCodec`、写 `qualitySettings.codecPreference` 并锁定 codec UI。
+- 影响：native host start 成功路径仍有一段 session 状态写入留在 legacy 大函数；后续继续迁 start lifecycle 时，codec 状态和 manifest/status 所需 codec 值会继续跨两边维护。
+- 建议：在 `native-session-controller.js` 增加 `buildNativeHostStartCodecEffects()`，controller 负责解析 effective codec 并返回标准 effects；legacy 只消费 effects，并保留 fallback 解析。
+- 修改意见：按建议实施 R6 小切片，不改变 codec 归一化优先级、不改变 `qualitySettings.codecPreference` 写入、不改变 codec UI lock 和 manifest 使用的 effective codec。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `buildNativeHostStartCodecEffects()`，根据 session/requestedCodec 统一解析 effective codec，并返回 `setNativeEffectiveCodec` 与 `lockCodecUiToNativeH264` effects；`startScreenShareWithSource()` 正常路径改为消费该 controller result，fallback 保留原归一化和写入逻辑。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-281 host start begin 状态复位仍由 start 函数内联
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：native capture 和 OBS ingest start 入口一开始仍各自内联写 `currentHostBackend`、`obsRoomCreatePending=false` 和 `obsIngestStreamActive=false`。
+- 影响：host start begin 状态与后续 success/stopped/media-state effects 不一致；后续收紧 start lifecycle 时，入口状态复位仍有两处重复留在 legacy。
+- 建议：在 `native-session-controller.js` 增加 `buildHostStartBeginEffects()`，由 controller 根据 backend 统一生成 start begin 状态 effects；legacy 只消费 effects，缺模块 fallback 保留原写入。
+- 修改意见：按建议实施 R6 小切片，不改变 native/OBS start 入口状态复位时机，不改变 backend 归一化和 OBS pending/active 清零语义。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `buildHostStartBeginEffects()`，统一生成 `setCurrentHostBackend`、`setObsRoomCreatePending(false)` 和 `setObsIngestStreamActive(false)` effects；`startScreenShareWithSource()` 与 `startScreenShareWithObsIngest()` 正常路径改为消费该 controller effects，缺模块 fallback 保留原写入。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-282 host start 返回校验仍由 start 函数内联
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：native capture start 和 OBS ingest start 收到 `startHostSession` 返回后，仍在 legacy start 函数里直接判断 `running`、native capture plan ready/validated、pipeline ready/validated，并拼装错误 reason。
+- 影响：host session lifecycle 的 start result 判定仍留在大函数中；后续迁 start/stop owner 时，native 与 OBS 的返回语义、是否需要主动 stop host session、错误 reason fallback 都会继续跨 legacy/controller 维护。
+- 建议：在 `native-session-controller.js` 增加 `validateHostStartResult()`，根据 backend 返回 `{ ok, reason, shouldStop }`；legacy 只负责执行 stop 和抛错，保持异步清理时序不变。
+- 修改意见：按建议实施 R6 小切片，不改变 native capture/pipeline 校验条件、不改变 OBS 只校验 running 的语义、不改变错误 reason 优先级和主动 stop 时机。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `validateHostStartResult()`，统一校验 native/OBS start result 并返回 reason/shouldStop；`startScreenShareWithSource()` 与 `startScreenShareWithObsIngest()` 正常路径改为调用该 validator，fallback 保留原判定逻辑，legacy 仍负责实际 stop 和 throw。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-283 native capture 建房正常路径仍由 start 函数串联
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：native capture start 成功并完成 preview attach 后，`startScreenShareWithSource()` 仍内联 `buildHostMediaManifest()`、`rememberMediaManifest()` 和 `createNativeHostRoom()` 三步正常建房路径。
+- 影响：native capture host room lifecycle 仍有一段正常路径由 legacy 大函数串联；OBS 建房已由 `ensureObsHostRoomCreated()` 收口，native capture 建房 owner 不对称。
+- 建议：在 `native-session-controller.js` 增加 `createNativeCaptureHostRoom()`，由 controller 根据 session/effectiveCodec 构建 manifest、调用 manifest 记忆 callback 并复用 `createHostRoom()`；legacy 只保留 fallback。
+- 修改意见：按建议实施 R6 小切片，不改变 manifest 字段来源、不改变 `rememberMediaManifest()` 写入时机、不改变 create-room 5 秒 WebSocket 等待和 pending UI reset。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `createNativeCaptureHostRoom()`，统一执行 native capture manifest 构建、`rememberMediaManifest()` callback 和 `createHostRoom()`；`startScreenShareWithSource()` 正常路径改为委托该 facade，缺模块 fallback 保留原三步。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-284 带音频共享启动校验仍由 legacy 入口编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R6 已把 host start/stop、manifest 建房和 OBS 状态 effects 收进 `native-session-controller.js`，但 `startScreenShareWithAudio()` 在画面共享成功后仍直接调用 `startNativeAudioSession()`，并在 legacy 入口内判断 `captureActive/ready`、拼装降级提示。
+- 影响：音频 session start 的正常路径与 host session lifecycle owner 不一致；后续收紧 session-controller 时，带音频共享的成功/降级语义仍会留在旧大文件。
+- 建议：在 `native-session-controller.js` 增加 `validateAudioStartResult()` 和 `startNativeAudioForShare()`，由 controller 负责启动 native audio session、校验结果并返回 warning 文案；legacy 只保留 showError 和 recoverable warning 输出。
+- 修改意见：按建议实施 R6 小切片，不改变先启动画面再启动音频的顺序，不改变音频不可用只提示“仅共享画面”、不打断视频共享的行为，不改变异常时的 recoverable warning key 和用户提示。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `validateAudioStartResult()` 与 `startNativeAudioForShare()`，统一构造 audio request、调用 `startAudioSession()` 并校验 `captureActive/ready`；`app-native-overrides.js::startScreenShareWithAudio()` 正常路径改为调用 controller facade，只消费 `{ ok, warningText }` 展示降级提示，异常 catch 和旧 fallback 保留。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-285 停止共享外层 lifecycle 仍由 legacy 入口定义
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R6 已把 stop share 内部资源清理和最终状态复位收进 `native-session-controller.js`，但 `stopScreenShare()` 外层仍在 legacy 入口直接执行 in-flight guard、取消正在开播、切换停止按钮 UI 和 begin 日志。
+- 影响：stop lifecycle 的前后段 owner 不完整；后续如果继续迁 stop/share session controller，停止入口仍需要跨 legacy/controller 维护同一套并发和 UI 时序。
+- 建议：在 `native-session-controller.js` 增加 `beginStopShare()` / `finishStopShare()`，由 controller 负责 stop in-flight guard、取消 host start、stopping UI begin/end 和 begin 日志；legacy 只保留 fallback wrapper。
+- 修改意见：按建议实施 R6 小切片，不改变重复 stop 直接 return 的行为，不改变 `stopScreenShare:begin` 日志 payload，不改变 finally 中恢复按钮状态的时机。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `beginStopShare()` / `finishStopShare()`，通过注入的 `getStopShareInFlight/setStopShareInFlight/setHostStopUiState` 承接 stop guard、取消 host start、stopping UI 和 begin 日志；`app-native-overrides.js::stopScreenShare()` 改为调用 `beginNativeStopShare()` / `finishNativeStopShare()` wrapper，内部清理和 finalize 逻辑不变，缺模块 fallback 保留原流程。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-286 native session effects consumer 仍留在 legacy 大文件
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R6 已由 `native-session-controller.js` 生成 host start、host-session started/stopped 和 OBS media-state effects，但 `applyHostStartSuccessEffects()` 的 effect 分发 switch 仍完整留在 `app-native-overrides.js`，包括 session state、UI、stats polling、OBS 建房/拆房等动作。
+- 影响：session controller 负责生成 effects，legacy 负责解释 effects，owner 仍然分裂；后续继续迁 start/stop lifecycle 时，新增 effect 类型容易继续沉淀在旧大文件。
+- 建议：在 `native-session-controller.js` 增加 `applyEffects()`，通过注入 callback 消费标准 native session effects；legacy 的 `applyHostStartSuccessEffects()` 正常路径只委托 controller，缺模块时保留原 switch fallback。
+- 修改意见：按建议实施 R6 小切片，不改变任何 effect 类型、字段、执行顺序或 OBS teardown recoverable warning 内容。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `applyEffects()`，统一消费 `setNativeHostSessionRunning`、`setCurrentHostBackend`、`setNativeEffectiveCodec`、`setHostStatus`、`updateHostEncoderDetail`、`ensureObsHostRoomCreated`、`teardownObsHostRoom` 等标准 effects；`app-native-overrides.js` 初始化 session controller 时注入对应 state/UI/stats/OBS 回调，`applyHostStartSuccessEffects()` 正常路径改为委托 controller，原 switch 保留为缺模块 fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-287 native capture source 归一化仍由 legacy start 入口持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R6 已把 host start lifecycle 的多数状态、manifest 和 room create 逻辑迁入 `native-session-controller.js`，但 `parseCaptureSource()` 仍留在 legacy 大文件，负责把 screen/window/exclusive-fullscreen source 转成 native `startHostSession` request，并读取质量设置与 codec preference。
+- 影响：`startScreenShareWithSource()` 仍持有一段纯 session request 构造逻辑；后续把 start 入口变薄时，还需要从 legacy 文件里搬迁 capture source 归一化，容易和 UI/source-selection 边界混在一起。
+- 建议：在 `native-session-controller.js` 增加 `parseCaptureSource()`，通过注入的 quality settings、requested codec 和 capture effective codec callback 生成等价 native host request；legacy 同名函数只保留 fallback。
+- 修改意见：按建议实施 R6 小切片，不改变 screen/window/exclusive-fullscreen 映射字段，不改变 minimized 状态、不改变 hardware encoder/preset/tune/keyframePolicy 字段来源。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `parseCaptureSource()`，统一生成 native capture request；`app-native-overrides.js` 初始化 session controller 时注入 `getRequestedVideoCodec()` 和 `getCaptureEffectiveVideoCodec()`，legacy `parseCaptureSource()` 正常路径优先委托 controller，缺模块 fallback 保留原实现。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-288 native preview 降级重试决策仍由 start 入口持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：native capture start 里仍直接计算 `preferredPreview/allowPreviewForAttempt/previewFallbackNoticeShown`，并在 preview attach 失败后直接判断是否属于可恢复错误、是否重试无预览开播、是否展示“原生预览暂不可用”提示。
+- 影响：preview 降级策略仍绑定在 legacy start 函数；后续把 start 入口变成薄 wrapper 时，预览策略、错误分类和 UI 提示时机还需要再次拆分。
+- 建议：在 `native-session-controller.js` 增加 preview start/retry/fallback-notice 纯决策 facade；legacy 只执行实际 attach、cleanup、日志和 showError。
+- 修改意见：按建议实施 R6 小切片，不改变 preview preference 来源、不改变可恢复错误字符串匹配、不改变只在第一次尝试且 preview attach 失败时降级重试的行为。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `buildNativePreviewStartState()`、`isRecoverableHostPreviewAttachError()`、`shouldRetryNativeStartWithoutPreview()` 和 `shouldShowPreviewFallbackNotice()`；`startScreenShareWithSource()` 正常路径改为消费 controller 决策，缺模块 fallback 保留原布尔判断。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-289 native capture start request 准备仍由 legacy 入口串联
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-287 已把 capture source 归一化迁入 controller，但 `startScreenShareWithSource()` 仍负责把 parsed source 写入 `backend='native'`，并直接输出 `startHostSession:source` 日志。
+- 影响：native capture start request 的准备动作仍散在旧入口；后续把 start 入口变薄时，source parsing、backend 补齐和 session start 日志需要继续跨文件维护。
+- 建议：在 `native-session-controller.js` 增加 `prepareNativeCaptureHostStart()`，串联 source parse、backend 标记和 start source 日志；legacy 只拿到 parsed request 并继续执行外部时序。
+- 修改意见：按建议实施 R6 小切片，不改变日志事件名和 payload，不改变 `parsedSource.backend='native'` 的时机，不改变后续 ensure media engine / wait host UI 顺序。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `prepareNativeCaptureHostStart()`，内部调用 `parseCaptureSource()`、补齐 `backend='native'` 并输出 `startHostSession:source`；`app-native-overrides.js::startScreenShareWithSource()` 正常路径改为调用该 facade，缺模块 fallback 保留原 parse/backend/log 顺序。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6 边界。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/app.js`、`node --check server/public/app-state.js`、`node --check server/public/room-client.js`、`node --check server/public/debug-panel.js`、`node --check server/public/update-ui.js`、`node --check server/public/quality-settings.js`、`node --check server/public/source-selection.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；`git diff --check` 退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-290 host audio dispatch RPC owner 仍由请求分支临时构造
+
+- 位置：`media-agent/src/agent_rpc_router.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：M6 已把 host audio capture/dispatch 迁入 `HostAudioDispatchSession`，但 `agent_rpc_router.cpp` 的 `startAudioSession` 和 `stopAudioSession` 分支仍分别临时构造 `HostAudioDispatchSession`，不像 host/peer/surface/viewer audio controller 那样由 RPC loop 统一持有 owner facade。
+- 影响：RPC 分发层仍保留重复 owner 创建模式；后续继续把 RuntimeState 瘦身为 registry/snapshot 时，audio session 的持有边界会和其它 session controller 不一致。
+- 建议：在 `run_agent_rpc_loop()` 初始化阶段创建一个持久 `HostAudioDispatchSession host_audio_dispatch(runtime_state)`，`startAudioSession` / `stopAudioSession` 只调用该 facade，保持 JSON-RPC wire shape 和内部音频逻辑不变。
+- 修改意见：按建议实施 M6/M7 过渡小切片，不改变 `startAudioSession` / `stopAudioSession` 的 method、request、response、错误码或 host audio start/stop 内部实现。
+- 处理结果：已处理。`agent_rpc_router.cpp` 现在在 RPC loop 初始化阶段与 `HostSessionController`、`PeerSessionController`、`SurfaceSessionController` 和 `ViewerAudioSession` 一起持有 `HostAudioDispatchSession` facade；两个 audio RPC 分支不再各自临时构造 host audio dispatch owner。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已新增 M6/M7 补充记录。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/agent_rpc_router.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-291 host audio sender refresh 仍在 HostAudioDispatchSession 内临时构造 peer controller
+
+- 位置：`media-agent/src/host_audio_dispatch_session.h`、`media-agent/src/host_audio_dispatch_session.cpp`、`media-agent/src/agent_rpc_router.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-290 后 RPC loop 已持久持有 `HostAudioDispatchSession`，但 `HostAudioDispatchSession::start_from_request()` / `stop_from_request()` 内部刷新 host audio sender 时仍每次用完整 `AgentRuntimeState` 临时构造 `PeerSessionController`。
+- 影响：audio session facade 仍知道 peer controller 的构造方式，RPC loop 已有的 peer owner 没有被复用；后续把 audio/peer owner 继续拆成更小 context 或 DLL/API 边界时，这种隐式临时构造会保留不必要耦合。
+- 建议：给 `HostAudioDispatchSession` 增加可选 `PeerSessionController&` 注入；RPC loop 使用同作用域已有 peer controller，非 RPC 调用点继续保留 runtime fallback，避免一次性改动生命周期。
+- 修改意见：按建议实施 M7 小切片，不改变 audio start/stop 请求、返回、事件 payload 或 host audio sender refresh 时机。
+- 处理结果：已处理。`HostAudioDispatchSession` 新增可选 `PeerSessionController&` 构造函数和私有 `refresh_host_audio_senders()`；RPC loop 创建 host audio dispatch facade 时注入已有 `peer_sessions`。未注入的调用点仍通过 `AgentRuntimeState` fallback 构造临时 peer controller，保持兼容行为。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步说明。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/agent_rpc_router.cpp media-agent/src/host_audio_dispatch_session.cpp media-agent/src/host_audio_dispatch_session.h docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-292 host audio transportReady 事件字段仍直接读取完整 runtime
+
+- 位置：`media-agent/src/host_audio_dispatch_session.h`、`media-agent/src/host_audio_dispatch_session.cpp`、`media-agent/src/agent_rpc_router.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-291 后 RPC loop 已向 `HostAudioDispatchSession` 注入 peer controller，但 audio started/stopped 事件里的 `transportReady` 字段仍在 `HostAudioDispatchSession` 内直接读取 `state_->peer_transport_backend.transport_ready`。
+- 影响：audio session facade 仍需要知道完整 runtime 的 peer transport 字段布局；后续把 audio owner 拆成更小 context、DLL API 或独立 worker 时，这个只读快照依赖会继续阻碍边界收窄。
+- 建议：给 `HostAudioDispatchSession` 增加可选 `transportReady` provider。RPC loop 注入 peer transport readiness snapshot 来源；未注入调用点保留 runtime fallback，保持兼容行为。
+- 修改意见：按建议实施 M7 小切片，不改变 `audio-session-started` / `audio-session-stopped` 事件字段名、布尔值语义或其它 payload。
+- 处理结果：已处理。`HostAudioDispatchSession` 新增可选 `std::function<bool()> transport_ready_provider_`、构造函数和私有 `transport_ready()` helper；RPC loop 创建 host audio dispatch facade 时注入 `runtime_state.peer_transport_backend.transport_ready` 的 snapshot provider。audio started/stopped 事件统一通过 helper 输出 `transportReady`，兼容调用点继续 fallback 到 runtime 字段。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步说明。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/agent_rpc_router.cpp media-agent/src/host_audio_dispatch_session.cpp media-agent/src/host_audio_dispatch_session.h docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-293 RPC host audio owner 仍以完整 runtime 作为构造入参
+
+- 位置：`media-agent/src/host_audio_dispatch_session.h`、`media-agent/src/host_audio_dispatch_session.cpp`、`media-agent/src/agent_rpc_router.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-292 后 `HostAudioDispatchSession` 已支持 peer controller 和 transportReady provider 注入，但 RPC loop 创建 host audio owner 时仍传完整 `AgentRuntimeState&`，由 audio facade 自行解析 `current_audio_session()`。
+- 影响：RPC 主路径仍把完整 runtime 作为 audio owner 构造入参；后续把 AudioSessionRegistry 升级为真正 session owner/snapshot 时，audio facade 仍容易依赖 runtime 兼容布局。
+- 建议：新增 `AudioSessionState&` 构造入口，旧 `AgentRuntimeState&` 构造函数保留为兼容层并委托到 session 构造；RPC loop 显式传入 `current_audio_session(runtime_state)`。
+- 修改意见：按建议实施 M7 小切片，不改变 audio start/stop RPC、事件 payload、stats JSON 或旧调用点兼容性。
+- 处理结果：已处理。`HostAudioDispatchSession` 新增 `AudioSessionState&` 构造入口以及 session+peer controller/provider 构造入口；旧 runtime 构造函数改为委托到 `current_audio_session(state)` 兼容层。`agent_rpc_router.cpp` 创建 host audio dispatch facade 时显式传入 `current_audio_session(runtime_state)`，不再以完整 runtime 作为 RPC 主路径构造入参。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步说明。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/agent_rpc_router.cpp media-agent/src/host_audio_dispatch_session.cpp media-agent/src/host_audio_dispatch_session.h docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-294 session-only host audio 构造后 start/stop guard 仍要求完整 runtime
+
+- 位置：`media-agent/src/host_audio_dispatch_session.cpp`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-293 已让 RPC 主路径通过 `AudioSessionState&` 构造 `HostAudioDispatchSession`，但 `start_from_request()` / `stop_from_request()` 的可用性检查仍是 `!state_ || !session_`。RPC 路径故意不再传完整 runtime，会导致 audio start/stop 被错误返回 `AUDIO_SESSION_UNAVAILABLE`。
+- 影响：架构收窄后形成隐藏功能回归：host audio RPC 主路径被旧 runtime guard 拦截，音频启动/停止不可用。
+- 建议：start/stop guard 只检查 `session_`；peer sender refresh 继续走注入的 `PeerSessionController` 或 runtime fallback，`transportReady` 继续走 provider 或 runtime fallback。
+- 修改意见：按建议实施 M7 配套修复，不改变错误码文本、事件 payload 或旧 runtime 构造兼容路径。
+- 处理结果：已处理。`HostAudioDispatchSession::start_from_request()` 和 `stop_from_request()` 的 guard 已改为只要求 `session_` 存在；session-only RPC 路径可正常执行 audio start/stop，未注入依赖仍由各自 fallback 处理。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/agent_rpc_router.cpp media-agent/src/host_audio_dispatch_session.cpp media-agent/src/host_audio_dispatch_session.h docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-295 status/capabilities JSON 仍直接拼写 peer transport runtime 字段
+
+- 位置：`media-agent/src/agent_status_json.cpp`、`media-agent/src/runtime_registry.h`、`media-agent/src/runtime_registry.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`capabilities_json()`、`build_status_json()` 和 `build_agent_ready_json()` 仍直接读取 `state.peer_transport_backend`，status/capabilities 输出层知道 `AgentRuntimeState` 的 peer transport 字段布局。
+- 影响：M7 RuntimeState 瘦身时，peer transport backend 的 owner/snapshot 不能只在 registry facade 内替换；status JSON 输出层还会阻止字段布局隐藏。
+- 建议：在 `runtime_registry` 中增加 peer transport 只读 facade，status/capabilities JSON 通过 facade 读取 backend 和 ready 状态，保持 JSON 输出不变。
+- 修改意见：按建议实施 M7 只读迁移，不改变 `transportReady`、`peerTransport`、message 文案或 capabilities/status/agent-ready JSON 结构。
+- 处理结果：已处理。`runtime_registry.h/cpp` 新增 `peer_transport_backend()` 和 `peer_transport_ready()` facade；`agent_status_json.cpp` 的 capabilities/status/agent-ready JSON 已改为通过 `peer_transport_backend(state)` 读取 peer transport snapshot，不再直接拼写 `state.peer_transport_backend`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步说明。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/agent_status_json.cpp media-agent/src/runtime_registry.cpp media-agent/src/runtime_registry.h docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-296 getStats audioBackend 仍以完整 runtime 构造 host audio facade
+
+- 位置：`media-agent/src/agent_status_json.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-293 后 `HostAudioDispatchSession` 已有 `AudioSessionState&` 构造入口，但 `build_stats_json()` 生成 `audioBackend` 时仍用完整 `AgentRuntimeState&` 构造 host audio facade。
+- 影响：stats 输出层仍让 audio stats 聚合依赖完整 runtime 构造路径；后续 AudioSessionRegistry owner/snapshot 替换时，还需要在 stats 输出层处理兼容 runtime 构造。
+- 建议：`build_stats_json()` 使用 `current_audio_session(state)` 显式构造 `HostAudioDispatchSession`，输出仍调用同一个 `stats_json()`。
+- 修改意见：按建议实施 M7 小切片，不改变 `getStats.audioBackend` JSON 内容或其它 stats 字段。
+- 处理结果：已处理。`agent_status_json.cpp::build_stats_json()` 现在通过 `HostAudioDispatchSession(vds::media_agent::current_audio_session(state))` 聚合 `audioBackend`，不再为了 audio stats 使用完整 runtime 构造 host audio facade。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步说明。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/agent_status_json.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-297 peer transport facade 新增后初始化和 refresh 路径仍直接读写 runtime 字段
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/agent_rpc_router.cpp`、`media-agent/src/peer_refresh_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-295 已新增 `peer_transport_backend()` / `peer_transport_ready()` facade，但初始化写入、RPC host audio `transportReady` provider 和 peer refresh fallback snapshot 仍直接读写 `state.peer_transport_backend`。
+- 影响：peer transport backend 字段布局仍在多个业务文件暴露；后续把 peer transport backend 迁成独立 snapshot/owner 时，这些路径仍需要逐个追踪。
+- 建议：把低风险读写点先迁到 `runtime_registry` facade：初始化赋值用 `peer_transport_backend(state)`，RPC provider 用 `peer_transport_ready(state)`，peer refresh fallback 通过 `peer_transport_backend(runtime_state)` 读取 ready/reason。
+- 修改意见：按建议实施 M7 小切片，不改变初始化顺序、audio event 布尔值、peer transport fallback reason 或任何 JSON 输出。
+- 处理结果：已处理。`initialize_agent_runtime()` 的 backend 初始化写入改为 `peer_transport_backend(state) = get_peer_transport_backend_info()`；`agent_rpc_router.cpp` 的 host audio `transportReady` provider 改为 `peer_transport_ready(runtime_state)`；`peer_refresh_pipeline.cpp` 的无 transport session fallback snapshot 改为通过 `peer_transport_backend(runtime_state)` 读取 ready/reason。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步说明。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/agent_lifecycle.cpp media-agent/src/agent_rpc_router.cpp media-agent/src/peer_refresh_pipeline.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-298 peer create/close 路径仍直接读取 peer transport runtime 字段
+
+- 位置：`media-agent/src/peer_create_request_config.cpp`、`media-agent/src/peer_transport_session_factory.cpp`、`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_close_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-297 后部分 peer transport 访问已迁入 facade，但 create request 初始 snapshot、transport session factory ready gate、controller create ready gate 和 close result ready 字段仍直接读取 `runtime_state.peer_transport_backend`。
+- 影响：peer session owner 仍暴露 runtime 内部 peer transport 字段布局；后续把 peer transport backend 升级为独立 snapshot/owner 时，peer create/close 仍会成为迁移阻塞点。
+- 建议：peer create/close 相关路径统一使用 `peer_transport_backend()` / `peer_transport_ready()` facade 读取 ready/reason。
+- 修改意见：按建议实施 M7 小切片，不改变 createPeer 是否创建 transport、peer transport 初始 reason、closePeer result JSON 或错误语义。
+- 处理结果：已处理。`peer_create_request_config.cpp` 的初始 peer transport snapshot 改为从 `peer_transport_backend(runtime_state)` 读取 ready/reason；`peer_transport_session_factory.cpp` 和 `peer_session_controller.cpp` 的 ready gate 改为 `peer_transport_ready(...)`；`peer_close_pipeline.cpp` 的 close result ready 字段改为 `peer_transport_ready(state)`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步说明。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/peer_create_request_config.cpp media-agent/src/peer_transport_session_factory.cpp media-agent/src/peer_session_controller.cpp media-agent/src/peer_close_pipeline.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-299 surface 事件 payload 仍直接读取 peer transport runtime 字段
+
+- 位置：`media-agent/src/surface_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-298 后 peer create/close 相关路径已迁入 peer transport facade，但 surface attach/update/detach 事件 payload 的 `transportReady` 字段仍直接读取 `runtime_state_.peer_transport_backend.transport_ready`。
+- 影响：surface controller 仍暴露 peer transport backend 的 runtime 字段布局；后续把 transport backend 迁成独立 snapshot/owner 时，surface 事件输出层还需要再次处理。
+- 建议：surface 事件 payload 通过 `peer_transport_ready(runtime_state_)` 输出 `transportReady`，保持 JSON 字段和布尔语义不变。
+- 修改意见：按建议实施 M7 小切片，不改变 surface attach/update/detach 事件名、payload 字段或 surface command result。
+- 处理结果：已处理。`surface_session_controller.cpp` 中 surface attached、surface updated 和 surface detached 事件的 `transportReady` 拼接均改为 `peer_transport_ready(runtime_state_)`；`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步说明。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/surface_session_controller.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-300 host session 事件 payload 仍直接读取 peer transport runtime 字段
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-299 后 surface 事件 payload 已迁入 peer transport facade，但 host session started/stopped 事件 payload 的 `transportReady` 字段仍直接读取 `state.peer_transport_backend.transport_ready`。
+- 影响：host session controller 仍暴露 peer transport backend 的 runtime 字段布局；后续把 peer transport backend 迁成独立 snapshot/owner 时，host session 事件输出还需要再次处理。
+- 建议：host session started/stopped 事件 payload 通过 `peer_transport_ready(state)` 输出 `transportReady`，保持 JSON 字段和布尔语义不变。
+- 修改意见：按建议实施 M7 小切片，不改变 host session started/stopped 事件名、payload 字段、host session result JSON 或 start/stop 生命周期。
+- 处理结果：已处理。`host_session_controller.cpp` 中 host-session-started 和 host-session-stopped 事件的 `transportReady` 拼接均改为 `peer_transport_ready(state)`；`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步说明。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/host_session_controller.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-301 OBS ingest 事件 payload 仍直接读取 peer transport runtime 字段
+
+- 位置：`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-300 后 host session 事件 payload 已迁入 peer transport facade，但 OBS ingest prepare result 以及 waiting/connected/running/ended 事件 payload 的 `transportReady` 字段仍直接读取 `state.peer_transport_backend.transport_ready`。
+- 影响：OBS ingest session 仍暴露 peer transport backend 的 runtime 字段布局；后续把 peer transport backend 迁成独立 snapshot/owner 时，OBS ingest 输出层还需要再次处理。
+- 建议：OBS ingest 输出层统一通过 `peer_transport_ready(state)` 输出 `transportReady`，保持 JSON 字段和布尔语义不变。
+- 修改意见：按建议实施 M7 小切片，不改变 OBS ingest prepare result、media-state 事件名、payload 字段、relay 发布或 ingest worker 生命周期。
+- 处理结果：已处理。`obs_ingest_session.cpp` 中 OBS prepare result 和 obs-ingest-waiting、obs-ingest-connected、obs-stream-running、obs-ingest-ended 事件的 `transportReady` 均改为 `peer_transport_ready(state)`；`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步说明。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/obs_ingest_session.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-302 host audio 兼容 fallback 仍直接读取 peer transport runtime 字段
+
+- 位置：`media-agent/src/host_audio_dispatch_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-301 后 OBS ingest 输出层已迁入 peer transport facade，但 `HostAudioDispatchSession::transport_ready()` 在未注入 provider 的兼容 fallback 中仍直接读取 `state_->peer_transport_backend.transport_ready`。
+- 影响：host audio facade 的兼容路径仍暴露 peer transport backend 的 runtime 字段布局；后续把 transport backend 迁成独立 snapshot/owner 时，audio fallback 仍需要再次处理。
+- 建议：兼容 fallback 保留现有语义，但通过 `peer_transport_ready(*state_)` 读取 ready 状态。
+- 修改意见：按建议实施 M7 小切片，不改变 provider 优先级、audio started/stopped 事件 payload、sender refresh 或 host audio 生命周期。
+- 处理结果：已处理。`HostAudioDispatchSession::transport_ready()` 在没有 `transport_ready_provider_` 时改为 `state_ && peer_transport_ready(*state_)`；`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步说明。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/host_audio_dispatch_session.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-303 capability snapshot 仍直接暴露在 runtime 字段读写中
+
+- 位置：`media-agent/src/runtime_registry.h`、`media-agent/src/runtime_registry.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/agent_status_json.cpp`、`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-302 后 peer transport ready 已基本收口到 facade，但 FFmpeg probe 与 WGC capture backend capability snapshot 仍由初始化、capabilities JSON 和 host session capture/pipeline 路径直接读写 `state.ffmpeg` / `state.wgc_capture_backend`。
+- 影响：`AgentRuntimeState` 仍在业务路径暴露 capability snapshot 字段布局；后续把 capabilities 拆成 registry/snapshot owner 时，初始化、status JSON 和 host session controller 仍需要再次追踪字段访问。
+- 建议：在 `runtime_registry` 增加 `ffmpeg_probe_result()` / `wgc_capture_backend()` facade，业务路径通过 facade 读写 snapshot，保持探测逻辑和 JSON shape 不变。
+- 修改意见：按建议实施 M7 小切片，不改变 FFmpeg/WGC 探测时机、host capture plan/pipeline 选择、capabilities JSON 字段或 host session 生命周期。
+- 处理结果：已处理。`runtime_registry.h/cpp` 新增 FFmpeg/WGC capability snapshot facade；`initialize_agent_runtime()`、`capabilities_json()`、`refresh_default_native_host_plan()`、`start_native_capture_host_session()`、`HostSessionController::revalidate_capture_plan()`、`refresh_capture_runtime()` 和 `ffmpeg_probe()` 已改为通过 facade 访问 snapshot。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步说明。
+- 验证结果：已执行 `powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/runtime_registry.h media-agent/src/runtime_registry.cpp media-agent/src/agent_lifecycle.cpp media-agent/src/agent_status_json.cpp media-agent/src/host_session_controller.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-304 P2P UI state label 默认表仍重复留在 legacy renderer 文件
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/p2p-state-machine.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P2P UI state label 已由 `native/p2p-state-machine.js` 持有并提供 `setStatusElementState()`，但 `app-native-overrides.js` 仍保留一份重复的 `P2P_UI_STATE_LABELS` 默认表用于 fallback。
+- 影响：状态机默认文案存在双 owner；后续调整 P2P UI state 或增加状态时容易出现 controller 与 legacy fallback 文案不一致。
+- 建议：删除 legacy 文件中的重复默认表，fallback 路径直接读取 `VDS.p2pStateMachine.DEFAULT_STATE_LABELS`，保持正常 controller 路径和 UI 文案不变。
+- 修改意见：按建议实施 R7 小切片，不改变 `setP2pStateForPeer()` 调用点、状态名、DOM dataset 或可见文案。
+- 处理结果：已处理。`app-native-overrides.js` 已删除重复 `P2P_UI_STATE_LABELS`，fallback `setP2pStatusElementState()` 现在读取 `window.VDS.p2pStateMachine.DEFAULT_STATE_LABELS`；`docs/RENDERER_SPLIT_MAP.md` 已同步说明。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/p2p-state-machine.js` 和 `npm run check:logging`，均通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-322 native surface controller 内部 surface map 未复用 registry facade
+
+- 位置：`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-316 已把缺 controller fallback 的 surface entry/generation/failure count map 迁到 `createSurfaceRegistry()`，但 `native-surface-controller.js::createController()` 内部仍直接声明 `attachedSurfaces`、`surfaceGenerations` 和 `surfaceFailureCounts` 三张 map，导致正常路径和 fallback 路径的 registry abstraction 不一致。
+- 影响：surface registry owner 的抽象边界不完整；后续如果扩展 surface snapshot、诊断统计、批量 detach 或 recovery 策略，需要分别修改 controller 内部 map 和 fallback registry。
+- 建议：让 `createController()` 内部也创建并使用 `createSurfaceRegistry()`，保留 `getSurfaceCount()` / `getSurfaceEntry()` / `setSurfaceEntry()` / `deleteSurfaceEntry()` / `forEachSurface()` / generation/failure count wrapper 名称不变。
+- 修改意见：按建议实施 R4/R7 内部一致性小切片，不改变 surface entry 结构、不改变 generation 递增语义、不改变 failure count 计数、不改变 attach/update/detach/sync 时序。
+- 处理结果：已处理。`createController()` 现在持有 `surfaceRegistry = createSurfaceRegistry()`；内部 surface count/get/set/delete/forEach/layout invalidation/generation/failure count wrapper 均委托 registry facade。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R4 边界，说明正常 controller 路径和缺 controller fallback 路径共用同一 registry facade。
+- 验证结果：已执行 `node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js` 和 `npm run check:logging`，均通过；已执行 `rg -n "function createController|surfaceRegistry = createSurfaceRegistry|const attachedSurfaces = new Map\\(\\)|const surfaceGenerations = new Map\\(\\)|const surfaceFailureCounts = new Map\\(\\)" server/public/native/native-surface-controller.js`，结果显示三张实际 map 只在 `createSurfaceRegistry()` 本体内声明，`createController()` 只持有 `surfaceRegistry = createSurfaceRegistry()`；已执行 `git diff --check -- server/public/native/native-surface-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-311 latest stats/report 缓存仍由 legacy renderer 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native/native-diagnostics.js` 已承接 P2P/host capture 诊断报告格式化和 stats polling interval，但 latest P2P stats snapshot 与 latest host capture diagnostic report 缓存仍作为 `app-native-overrides.js` 局部变量存在。
+- 影响：诊断模块的输出格式和刷新策略已经独立，但最新 stats/report 的状态 owner 仍留在 legacy 装配层；后续拆诊断面板、复制报告或减少 legacy 文件时还要追踪缓存读写。
+- 建议：把 latest stats/report 缓存迁入 `native-diagnostics.js`，通过 getter/setter facade 给 legacy 使用；缺模块 fallback 保持等价缓存行为。
+- 修改意见：按建议实施 R7 小切片，不改变 `mediaEngine.getStats()` 轮询时机、不改变 P2P 诊断报告内容、不改变 host capture 诊断报告内容、不改变 OBS manifest fallback 使用的 stats 来源。
+- 处理结果：已处理。`native-diagnostics.js` 新增 `setLatestP2pStatsSnapshot()` / `getLatestP2pStatsSnapshot()` 和 `setLatestHostCaptureDiagnosticReport()` / `getLatestHostCaptureDiagnosticReport()`；`app-native-overrides.js` 删除 `latestP2pStatsSnapshot`、`latestHostCaptureDiagnosticReport` 局部变量，所有读取和写入改为通过 diagnostics facade，fallback bridge 内保留等价缓存。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R3/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js` 和 `npm run check:logging`，均通过；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-312 currentHostBackend 仍作为 legacy renderer 裸状态存在
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-session-controller.js` 已承接 host/OBS session lifecycle 和 host media manifest 构建，但 `currentHostBackend` 仍作为 `app-native-overrides.js` 局部变量被多处直接读写。
+- 影响：host backend 属于 session lifecycle 状态，继续留在 legacy 装配层会让 OBS/native start-stop、stats manifest fallback 和诊断输出的状态 owner 分裂；后续拆 OBS pending/streamActive 时还要追踪裸变量写入。
+- 建议：在 `native-session-controller.js` 提供轻量 session state facade，legacy 文件通过 getter/setter 读写 current host backend；缺模块 fallback 保持等价默认值和归一化。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 backend 归一化规则、不改变 OBS/native 判断、不改变 manifest backend 字段、不改变 stats 日志内容。
+- 处理结果：已处理。`native-session-controller.js` 新增 `normalizeHostBackendName()` 和 `createSessionState()`，并导出到 `VDS.nativeSession`；`app-native-overrides.js` 新增 `nativeSessionState` bridge、`getCurrentHostBackend()` 和 `setCurrentHostBackend()`，删除裸 `currentHostBackend` 局部变量，所有读写改为 facade。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js` 和 `npm run check:logging`，均通过；已执行 `rg -n "currentHostBackend\\s*=" server/public/app-native-overrides.js`，无命中，确认 legacy 文件不再裸写该状态；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-session-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-313 hostPreviewRequested 仍作为 legacy renderer 裸状态存在
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`hostPreviewRequested` 属于 native host session/preview lifecycle，但仍作为 `app-native-overrides.js` 局部变量由 failed-start reset、stop reset、host start effects 和 preview attach fallback 直接读写。
+- 影响：R6 session controller 已承接 host start success effects 和 preview request effect，但 preview requested 状态 owner 仍在 legacy 装配层；后续拆 host preview lifecycle 或 surface controller snapshot 时会继续依赖 legacy 局部变量。
+- 建议：扩展 `native-session-controller.js::createSessionState()`，把 `hostPreviewRequested` 与 `currentHostBackend` 一起由 session state facade 持有；legacy 只通过 getter/setter 读写，缺模块 fallback 保持等价默认值。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 preview 默认启用规则、不改变 OBS backend 禁用预览规则、不改变 host preview attach skip 条件、不改变 surface controller snapshot 字段名。
+- 处理结果：已处理。`createSessionState()` 新增 `getHostPreviewRequested()` / `setHostPreviewRequested()`；`app-native-overrides.js` 删除裸 `hostPreviewRequested` 局部变量，failed-start reset、stop reset、host start effect 和 attach fallback 均改为通过 facade 读写。`nativeSurfaceController.getHostPreviewState()` 仍输出同名 snapshot 字段，但来源已改为 `getHostPreviewRequested()`。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js` 和 `npm run check:logging`，均通过；已执行 `rg -n "let hostPreviewRequested|hostPreviewRequested\\s*=\\s*Boolean" server/public/app-native-overrides.js`，无命中，确认 legacy 文件不再持有裸变量或直接布尔写入；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-session-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-314 OBS session flags 仍作为 legacy renderer 裸状态存在
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`obsRoomCreatePending` 和 `obsIngestStreamActive` 属于 OBS host session lifecycle，但仍作为 `app-native-overrides.js` 局部变量由 start/reset、media-state、room-created、error、session-resumed 和 ensure OBS room fallback 直接读写。
+- 影响：R6 session controller 已承接 OBS host room create/teardown 和 OBS media-state effects，但 OBS pending/stream active 状态 owner 仍在 legacy 装配层；后续继续拆 OBS lifecycle 时，异步建房和断流清理状态容易出现双写。
+- 建议：扩展 `native-session-controller.js::createSessionState()`，把 `obsRoomCreatePending` / `obsIngestStreamActive` 与其它 host session flags 一起由 session state facade 持有；legacy 只通过 getter/setter 读写，缺模块 fallback 保持等价默认值。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 OBS 自动建房 early-return 条件、不改变 pending 设置/清理时机、不改变 stream-running 触发建房、不改变 room-created 后 OBS 未 running 时 leave-room 的判断。
+- 处理结果：已处理。`createSessionState()` 新增 `getObsRoomCreatePending()` / `setObsRoomCreatePending()` 和 `getObsIngestStreamActive()` / `setObsIngestStreamActive()`；`app-native-overrides.js` 删除裸 `obsRoomCreatePending` / `obsIngestStreamActive` 局部变量，所有 legacy fallback、media-state、room-created、error 和 session-resumed 读写改为 facade。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js` 和 `npm run check:logging`，均通过；已执行 `rg -n "let obsRoomCreatePending|let obsIngestStreamActive|obsRoomCreatePending\\s*=|obsIngestStreamActive\\s*=" server/public/app-native-overrides.js`，无命中，确认 legacy 文件不再持有或裸写 OBS session flags；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-session-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-315 peer handle fallback registry 仍由 legacy renderer 直接持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：正常路径的 peer handle registry 已由 `native-peer-controller.js` 持有，但缺 controller fallback 时 `app-native-overrides.js` 仍直接声明 `nativePeerHandles = new Map()` 并在 getter/setter/delete/count/entries/ids facade 中操作。
+- 影响：R5 peer handle ownership 仍有一份 map 存在 legacy 大文件里；后续继续把 `app-native-overrides.js` 变薄入口时，还需要迁移这一组 registry 基础能力。
+- 建议：在 `native-peer-controller.js` 导出轻量 `createPeerHandleRegistry()`，legacy fallback 通过该 registry facade 操作；正常 controller 路径保持现状，不改变 peer 创建、关闭或诊断时序。
+- 修改意见：按建议实施 R5/R7 小切片，不改变 peer handle 结构、不改变 handle set/delete 调用点、不改变 count/entries/ids 返回形态、不改变正常 `nativePeerController` 路径。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `createPeerHandleRegistry()`；`app-native-overrides.js` 删除裸 `nativePeerHandles` map，新增 `nativePeerHandleRegistry` bridge，缺 controller fallback 的 get/set/delete/count/entries/ids 均改为通过该 registry facade。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js` 和 `npm run check:logging`，均通过；已执行 `rg -n "nativePeerHandles" server/public/app-native-overrides.js`，无命中，确认 legacy 大文件不再直接持有该 map；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-316 surface fallback registry 仍由 legacy renderer 直接持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：正常路径的 surface registry/generation/failure count 已由 `native-surface-controller.js` 持有，但缺 controller fallback 时 `app-native-overrides.js` 仍直接声明 `attachedEmbeddedSurfaces`、`embeddedSurfaceGenerations` 和 `surfaceSyncFailureCounts` 三个 map。
+- 影响：R4 surface ownership 仍有一份 fallback registry 留在 legacy 大文件；后续把 `app-native-overrides.js` 变薄入口时，还需要继续迁移 surface entry/generation/failure count 基础能力。
+- 建议：在 `native-surface-controller.js` 导出轻量 `createSurfaceRegistry()`，使用与 controller 相同的方法名承接 fallback registry；正常 `nativeSurfaceController` 路径保持现状，不改变 attach/update/detach/sync 时序。
+- 修改意见：按建议实施 R4/R7 小切片，不改变 surface entry 结构、不改变 generation 递增语义、不改变 failure count 计数、不改变正常 controller 路径。
+- 处理结果：已处理。`native-surface-controller.js` 新增并导出 `createSurfaceRegistry()`；`app-native-overrides.js` 删除裸 `attachedEmbeddedSurfaces`、`embeddedSurfaceGenerations` 和 `surfaceSyncFailureCounts` map，新增 `embeddedSurfaceRegistry` bridge，缺 controller fallback 的 surface count/get/set/delete/forEach/layout invalidation/generation/failure count 均改为通过该 registry facade。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R4/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-surface-controller.js` 和 `npm run check:logging`，均通过；已执行 `rg -n "attachedEmbeddedSurfaces|embeddedSurfaceGenerations|surfaceSyncFailureCounts" server/public/app-native-overrides.js`，无命中，确认 legacy 大文件不再直接持有三类 surface fallback map；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-surface-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-317 peer attempt id 生成器仍由 legacy renderer 直接持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：正常 `nativePeerController.createPeerHandle()` 路径已在 `native-peer-controller.js` 内部使用 `peerAttemptSeq` 生成 attempt id，但缺 controller fallback 时 `app-native-overrides.js` 仍持有 `nativePeerAttemptSeq` 并用 `++nativePeerAttemptSeq` 生成 handle attempt id。
+- 影响：R5 peer attempt ownership 仍有一份计数器留在 legacy 大文件；后续继续拆 fallback peer handle 创建时，还需要迁移该计数器。
+- 建议：把 fallback attempt id 生成挂到 `native-peer-controller.js::createPeerHandleRegistry()`，让 peer handle fallback registry 同时拥有 handle map 和 attempt id 递增；正常 controller 路径保持现状。
+- 修改意见：按建议实施 R5/R7 小切片，不改变 attempt id 从 1 递增的语义、不改变 handle 字段、不改变正常 controller createPeerHandle 路径。
+- 处理结果：已处理。`createPeerHandleRegistry()` 新增 `nextAttemptId()`；`app-native-overrides.js` 删除裸 `nativePeerAttemptSeq` 变量，fallback `createNativePeerConnectionImpl()` 改为通过 `nativePeerHandleRegistry.nextAttemptId()` 生成 attempt id。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js` 和 `npm run check:logging`，均通过；已执行 `rg -n "nativePeerAttemptSeq" server/public/app-native-overrides.js`，无命中，确认 legacy 大文件不再直接持有 attempt id 计数器；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-318 signal backlog/waiter fallback map 仍由 legacy renderer 直接持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：正常 `nativePeerController` 路径已在 `native-peer-controller.js` 内部持有 `signalBacklog` / `signalWaiters`，但缺 controller fallback 时 `app-native-overrides.js` 仍直接声明 `nativePeerSignalBacklog` 和 `nativePeerSignalWaiters` 两个 map。
+- 影响：R5 信令队列 ownership 仍有一份裸 map 留在 legacy 大文件；后续继续把 `app-native-overrides.js` 变薄入口时，signal backlog/waiter 的存储边界还会阻塞迁移。
+- 建议：在 `native-peer-controller.js` 导出轻量 `createSignalRegistry()`，只承接 get/set/delete/forEach/keys/size 等 map 存取能力；legacy fallback 的 prune/enqueue/wait/drop 算法保持原样，避免改变 offer/answer/ICE 排队和 timeout 语义。
+- 修改意见：按建议实施 R5/R7 小切片，不改变 backlog per-peer/total limit、不改变 TTL、不改变 waiter limit、不改变 timeout 文案、不改变 sanitize payload 逻辑。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `createSignalRegistry()`；`app-native-overrides.js` 删除裸 `nativePeerSignalBacklog` / `nativePeerSignalWaiters` map，新增 `nativePeerSignalRegistry` bridge，缺 controller fallback 的 prune/enqueue/wait/drop 中所有 backlog/waiter 存取改为通过 registry facade；现有算法、限制值和超时语义保持不变。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js` 和 `npm run check:logging`，均通过；已执行 `rg -n "nativePeerSignalBacklog|nativePeerSignalWaiters" server/public/app-native-overrides.js`，无命中，确认 legacy 大文件不再直接持有 signal backlog/waiter map；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-319 阶段性全量验证与完成度审计缺口
+
+- 位置：`server/public/*.js`、`server/public/native/*.js`、`server/server-core.js`、`vds_web`、`media-agent/src`、`docs/RENDERER_SPLIT_MAP.md`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：R4/R5/R6/R7 与 M7 已连续完成多个小切片，但需要用当前工作区重新验证完整语法、日志、server、web、media-agent 构建/单测/smoke，并重新识别剩余缺口，避免只依赖单切片验证。
+- 影响：如果不做阶段性全量验证，可能遗漏脚本加载顺序、web 协议、server topology、media-agent Release 构建或计划文档过期问题；同时也无法准确判断是否可以接近完成审计。
+- 建议：运行 renderer 全模块 `node --check`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`；同步更新过期的 media-agent 当前结论，并把剩余缺口记录为仍未完成项。
+- 修改意见：按建议执行阶段性验证和文档校准，不改变代码行为；本项只作为完成度审计和证据补强。
+- 处理结果：已处理。已完成 renderer 全模块语法检查、日志策略检查、server core 测试、vds-web TypeScript 检查、vds-web protocol 测试、media-agent Release 构建/单测/smoke；`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 顶部过期结论已更新为当前 registry/facade 收口状态。扫描确认 media-agent 主 registry/snapshot 字段裸访问集中在 `runtime_registry.cpp`；renderer 仍保留 legacy flow glue，但最明显的 session/peer/surface fallback map 已迁出大文件。
+- 验证结果：已执行 renderer 全量语法检查：`node --check server/public/app-state.js`、`room-client.js`、`debug-panel.js`、`update-ui.js`、`quality-settings.js`、`source-selection.js`、`app.js`、`app-native-overrides.js`、`native/native-diagnostics.js`、`native/p2p-state-machine.js`、`native/native-surface-controller.js`、`native/native-peer-controller.js`、`native/native-session-controller.js`、`native/native-entry.js`，均通过；已执行 `npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 media-agent 主 registry/snapshot 字段裸访问扫描，结果仅命中 `media-agent/src/runtime_registry.cpp`；已执行 `git diff --check -- docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md docs/RENDERER_SPLIT_MAP.md server/public/app-native-overrides.js server/public/native/native-peer-controller.js`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-320 native peer controller 内部 handle map 未复用 registry facade
+
+- 位置：`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-315/P1-317 已把缺 controller fallback 的 peer handle map 和 attempt id 生成迁到 `createPeerHandleRegistry()`，但 `native-peer-controller.js::createController()` 内部仍直接声明 `peerHandles = new Map()` 和 `peerAttemptSeq`，导致正常路径和 fallback 路径的 registry abstraction 不一致。
+- 影响：peer handle registry owner 的抽象边界不完整；后续如果继续扩展 registry snapshot、diagnostic 或批量 close 策略，需要分别修改 controller 内部 map 和 fallback registry。
+- 建议：让 `createController()` 内部也创建并使用 `createPeerHandleRegistry()`，保留 `getPeerHandle()` / `setPeerHandle()` / `deletePeerHandle()` / `getPeerHandleIds()` 等公开 facade 名称不变。
+- 修改意见：按建议实施 R5 内部一致性小切片，不改变 handle 字段、不改变 attempt id 从 1 递增语义、不改变 create/close/diagnostic 返回结构。
+- 处理结果：已处理。`createController()` 现在持有 `peerHandleRegistry = createPeerHandleRegistry()`；内部 `getPeerHandle()` / `setPeerHandle()` / `nextPeerAttemptId()` / `deletePeerHandle()` / `getPeerHandleCount()` / `getPeerHandleEntries()` / `getPeerHandleIds()` 均委托 registry facade；`buildPeerDiagnosticEntries()` 改为通过 `getPeerHandleEntries()` 遍历。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js` 和 `npm run check:logging`，均通过；已检查 `createController()` 开头，当前为 `const peerHandleRegistry = createPeerHandleRegistry()`，不再声明第二份 `peerHandles` / `peerAttemptSeq`；`rg -n "function createController|peerHandleRegistry = createPeerHandleRegistry|const peerHandles = new Map\\(\\)|let peerAttemptSeq" server/public/native/native-peer-controller.js` 仅显示 `createPeerHandleRegistry()` 本体持有实际 map/计数器，controller 内部只持有 registry facade；已执行 `git diff --check -- server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-321 native peer controller 内部 signal map 未复用 registry facade
+
+- 位置：`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-318 已把缺 controller fallback 的 signal backlog/waiter map 迁到 `createSignalRegistry()`，但 `native-peer-controller.js::createController()` 内部仍直接声明 `signalBacklog = new Map()` 和 `signalWaiters = new Map()`，导致正常路径和 fallback 路径的 signal registry abstraction 不一致。
+- 影响：signal backlog/waiter 存储边界仍不统一；后续如果继续扩展 signal queue snapshot、debug 统计或 backlog 策略，需要分别修改 controller 内部 map 和 fallback registry。
+- 建议：让 `createController()` 内部也创建并使用 `createSignalRegistry()`，保留 `pruneSignalBacklog()` / `enqueueSignal()` / `waitForSignal()` / `dropQueuedSignals()` 的算法和公开 facade 名称不变。
+- 修改意见：按建议实施 R5 内部一致性小切片，不改变 backlog per-peer/total limit、不改变 TTL、不改变 waiter limit、不改变 timeout 文案、不改变 sanitize payload 逻辑。
+- 处理结果：已处理。`createController()` 现在持有 `signalRegistry = createSignalRegistry()`；内部 `pruneSignalBacklog()` / `clearSignalState()` / `enqueueSignal()` / `waitForSignal()` / `dropQueuedSignals()` 的所有 backlog/waiter 存取均改为通过 registry facade；算法、限制值和超时语义保持不变。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5 边界。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js` 和 `npm run check:logging`，均通过；已执行 `rg -n "function createController|signalRegistry = createSignalRegistry|const signalBacklog = new Map\\(\\)|const signalWaiters = new Map\\(\\)" server/public/native/native-peer-controller.js`，结果仅显示 `createSignalRegistry()` 本体持有实际 maps，`createController()` 内部只持有 `signalRegistry = createSignalRegistry()`；已执行 `git diff --check -- server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-309 host session media-state 分类表仍由 legacy renderer 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：host session / OBS ingest 的 media-state 分类属于 native session lifecycle，但 `app-native-overrides.js` 仍持有 `HOST_SESSION_MEDIA_STATES`，用于 stop 后忽略残留 media-state。
+- 影响：session 事件分类存在双 owner；后续增加或调整 host/OBS media-state 时，legacy 判断可能和 session controller 的 effects builder 不一致。
+- 建议：把 host session media-state 分类表迁入 `native-session-controller.js`，通过 `isHostSessionMediaState()` facade 给 legacy 使用。
+- 修改意见：按建议实施 R7 小切片，不改变被识别的 state 集合、不改变 stop 后忽略残留事件逻辑、不改变 OBS/host session effects。
+- 处理结果：已处理。`native-session-controller.js` 新增私有 `HOST_SESSION_MEDIA_STATES` 和导出的 `isHostSessionMediaState()`；controller 实例也暴露同名方法。`app-native-overrides.js` 已删除本地 `HOST_SESSION_MEDIA_STATES`，stop 后残留 media-state 判断改为优先委托 session controller/static facade，缺模块时保留等价 inline fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步说明。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js` 和 `npm run check:logging`，均通过；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-session-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-310 native stats polling 默认 interval 仍由 legacy renderer 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：host/viewer native stats polling 的默认 interval 属于诊断/统计输出策略，但 `app-native-overrides.js` 仍以 `nativeStatsPollingIntervalMs = 5000` 全局常量持有。
+- 影响：diagnostics 模块已经承接日志节流、P2P/host capture 诊断报告格式化，但 stats polling interval 仍留在 legacy 装配层，后续调整诊断刷新策略时容易遗漏。
+- 建议：把 stats polling 默认 interval 收进 `native-diagnostics.js`，legacy host/viewer polling 通过 diagnostics facade 获取 interval；缺模块时保留 5000ms fallback。
+- 修改意见：按建议实施 R7 小切片，不改变 polling interval=5000ms、不改变 host/viewer stats polling 启停条件、不改变诊断报告内容。
+- 处理结果：已处理。`native-diagnostics.js` 新增 `getStatsPollingIntervalMs()`，默认返回 5000ms；`app-native-overrides.js` 删除 `nativeStatsPollingIntervalMs` 全局常量，新增 `getNativeStatsPollingIntervalMs()` facade，并在 host/viewer stats polling `setInterval()` 中使用该 facade。`docs/RENDERER_SPLIT_MAP.md` 已同步说明。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js` 和 `npm run check:logging`，均通过；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-305 native peer signal backlog 默认配置仍由 legacy renderer 装配层重复持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js` 已内置 signal backlog per-peer/total、waiter per-key 和 TTL 的默认值，但 `app-native-overrides.js` 仍定义同名常量并在创建 controller 时重复传入。
+- 影响：native peer signal backlog 策略存在双 owner；后续调整 backlog/TTL 默认策略时容易遗漏 legacy 装配层，导致 controller 默认值与装配传参不一致。
+- 建议：正常 controller 路径不再从 legacy 文件传入重复 signalMax* 配置，让 `native-peer-controller.js` 持有默认策略；缺 controller fallback 仅在 fallback 函数内部保留等价值。
+- 修改意见：按建议实施 R7 小切片，不改变 backlog 限制数值、TTL、waiter 限制、signal enqueue/wait API 或信令时序。
+- 处理结果：已处理。`app-native-overrides.js` 已删除 `NATIVE_PEER_SIGNAL_MAX_*` / `NATIVE_PEER_SIGNAL_TTL_MS` 常量和 controller 创建时的 `signalMax*`/`signalTtlMs` 传参；fallback `pruneNativePeerSignalBacklog()`、`enqueueNativePeerSignal()` 和 `waitForNativePeerSignal()` 内联保留 32/256/8/30000 的原默认值。`docs/RENDERER_SPLIT_MAP.md` 已同步说明。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js` 和 `npm run check:logging`，均通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-306 NAT/recovery 默认配置仍由 legacy renderer 装配层重复持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js` 已持有 NAT mapping 状态、NAT wait timer 和 disconnected recovery 决策，但 `app-native-overrides.js` 仍全局定义 NAT candidate limit、NAT connect wait 和 disconnected recovery grace 默认值并传给 controller。
+- 影响：NAT/recovery 默认策略存在双 owner；后续调整 controller 默认值时，legacy 装配层常量可能覆盖 controller 默认策略，增加排查 P2P 连接时序问题的成本。
+- 建议：把 NAT candidate limit、NAT mapping connect wait 和 disconnected recovery grace 的默认值收进 `native-peer-controller.js` 正常路径；legacy 文件只在缺 controller fallback 分支内联原等价值。
+- 修改意见：按建议实施 R7 小切片，不改变 NAT candidate limit=4、NAT wait=7000ms、recovery grace=4000ms、openNatMapping RPC timeout=6000ms 或信令发送时序。
+- 处理结果：已处理。`native-peer-controller.js` 的 `getLocalHostUdpCandidates()` 现在在未传 limit 时默认取 4 个候选，`armPeerNatMappingWait()` 未传 timeout 时默认 7000ms，`prepareDisconnectedRecovery()` 继续持有 4000ms 默认 grace；`app-native-overrides.js` 已删除对应全局常量，正常路径不再传 `candidateLimit` / `initialDelayMs`，缺 controller fallback 分支内联保留原默认值。`docs/RENDERER_SPLIT_MAP.md` 已同步说明。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js` 和 `npm run check:logging`，均通过；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-307 surface sync 默认配置仍由 legacy renderer 装配层重复持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-surface-controller.js` 已持有 surface registry、generation、sync failure 计数、tracking loop 和 wheel-driven sync burst，但 `app-native-overrides.js` 仍全局定义或传入 surface sync 最大失败次数、tracking interval 和 wheel burst 默认配置。
+- 影响：surface 同步默认策略存在双 owner；后续调整 controller 默认值时，legacy 装配层传参可能覆盖 controller 策略，增加排查预览/surface 卡顿或重挂载问题的成本。
+- 建议：把 surface sync 最大失败次数、wheel burst 帧数和 tracking interval 默认值收进 `native-surface-controller.js` 正常路径；legacy 文件只在缺 controller fallback 分支内联原等价值。
+- 修改意见：按建议实施 R7 小切片，不改变 max failure=5、wheel burst=8、tracking interval=180ms、surface sync/recover 时序或 attach/update/detach 命令。
+- 处理结果：已处理。`native-surface-controller.js::getTrackingIntervalMs()` 的默认值已从 250ms 对齐为 180ms；`app-native-overrides.js` 已删除 `SURFACE_SYNC_MAX_CONSECUTIVE_FAILURES` 和 `embeddedSurfaceTrackingIntervalMs` 全局常量，不再向 controller 传入 `maxConsecutiveSyncFailures`、`wheelDrivenSyncFrameCount`、`trackingIntervalMs`；缺 controller fallback 分支内联保留 5、8、180ms。`docs/RENDERER_SPLIT_MAP.md` 已同步说明。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-surface-controller.js` 和 `npm run check:logging`，均通过；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-surface-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-308 viewer wait 默认超时仍由 legacy renderer 装配层重复持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/p2p-state-machine.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native/p2p-state-machine.js` 已内置 viewer media wait 7000ms 和 upstream offer wait 6000ms 默认值，但 `app-native-overrides.js` 仍定义同值常量并在创建状态机时重复传入。
+- 影响：P2P viewer wait 策略存在双 owner；后续调整状态机默认超时时，legacy 装配层传参可能覆盖模块默认值。
+- 建议：删除 legacy 装配层重复 wait timeout 常量和传参，让 `native/p2p-state-machine.js` 持有默认策略。
+- 修改意见：按建议实施 R7 小切片，不改变 viewer media wait=7000ms、upstream offer wait=6000ms、timeout 后 UI 文案或 viewer-reconnect-ready 信令。
+- 处理结果：已处理。`app-native-overrides.js` 已删除 `VIEWER_MEDIA_WAIT_TIMEOUT_MS` / `VIEWER_UPSTREAM_OFFER_WAIT_TIMEOUT_MS` 常量和创建 `p2pStateMachine` 时的重复传参；`native/p2p-state-machine.js` 继续持有 7000ms/6000ms 默认值。`docs/RENDERER_SPLIT_MAP.md` 已同步说明。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/p2p-state-machine.js` 和 `npm run check:logging`，均通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-323 native stats polling timer 仍由 legacy renderer 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-310 已把 stats polling 默认 interval 迁到 diagnostics，但 host/viewer polling interval id 仍由 `app-native-overrides.js` 的 `nativeHostStatsIntervalId` / `nativeViewerStatsIntervalId` 持有。
+- 影响：diagnostics 模块已拥有统计刷新策略，但轮询生命周期仍留在 legacy 大文件；后续调整诊断暂停、恢复、节流或统一 teardown 时仍需要回到 renderer glue 修改。
+- 建议：在 `native-diagnostics.js` 中新增 stats polling registry，legacy 只注入 `onStart`、`shouldContinue`、`onTick` 和 `onStop` 回调，保持 poll 函数内容和 UI 更新不变。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 polling interval=5000ms、不改变 initial/periodic tick 顺序、不改变 host/viewer stats 解析、不改变停止后刷新 P2P 诊断报告行为。
+- 处理结果：已处理。`native-diagnostics.js` 新增 `startStatsPolling()` / `stopStatsPolling()` 和内部 `statsPollingTimers` registry；`app-native-overrides.js` 删除 `nativeHostStatsIntervalId` / `nativeViewerStatsIntervalId`，host/viewer stats polling start/stop 均改为通过 diagnostics facade 管理定时器，fallback bridge 在 diagnostics 模块缺失时提供等价 5000ms timer registry。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R3/R7 边界。
+- 验证结果：已执行 `node --check server/public/native/native-diagnostics.js`、`node --check server/public/app-native-overrides.js` 和 `npm run check:logging`，均通过；已执行 `rg -n "nativeViewerStatsIntervalId|nativeHostStatsIntervalId|getNativeStatsPollingIntervalMs\\(|statsPollingTimers|startStatsPolling|stopStatsPolling" server/public/app-native-overrides.js server/public/native/native-diagnostics.js`，确认旧 interval id 和旧 interval helper 无命中，实际 timer registry 位于 `native-diagnostics.js`，legacy 只保留 facade 调用和缺模块 fallback bridge；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-diagnostics.js server/public/native/native-surface-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-324 media-agent 单 session registry 缺少只读 snapshot facade
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/src/runtime_registry.h`、`media-agent/src/runtime_registry.cpp`、`media-agent/src/agent_status_json.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：Host/Audio/OBS 单 session registry 已私有化 `current_` 字段，但只暴露 `current_session()`，只读聚合路径和写入路径使用同一个入口，语义上仍偏兼容 current 容器而不是 owner/snapshot 模型。
+- 影响：M7 的 runtime 瘦身缺少明确的只读 snapshot 边界；后续把单 session registry 升级为多 session registry 时，status/stats 聚合仍容易继续拿到可写 session 引用。
+- 建议：给三类单 session registry 增加只读 `snapshot()` facade，并通过 `runtime_registry` 暴露 `host_session_snapshot()` / `audio_session_snapshot()` / `obs_ingest_session_snapshot()`；先迁移纯只读 JSON 聚合路径，不改变命令写入入口。
+- 修改意见：按建议实施 M7 小切片，不改变 JSON wire shape、不改变 Host/Audio/OBS command 行为、不改变 session 状态字段。
+- 处理结果：已处理。`session_registries.h` 为 Host/Audio/OBS registry 新增只读 `snapshot()`；`runtime_registry.h/cpp` 新增三类 `*_session_snapshot()` facade；`agent_status_json.cpp::build_stats_json()` 的 `audioBackend` 聚合改为直接格式化 `audio_session_snapshot(state)`，不再为了只读 stats 构造可写 `HostAudioDispatchSession`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "snapshot\\(\\) const|host_session_snapshot|audio_session_snapshot|obs_ingest_session_snapshot|HostAudioDispatchSession host_audio_dispatch|audio_session_json\\(vds::media_agent::audio_session_snapshot" media-agent/src/session_registries.h media-agent/src/runtime_registry.h media-agent/src/runtime_registry.cpp media-agent/src/agent_status_json.cpp`，确认 registry snapshot facade 已存在、`getStats.audioBackend` 已走 `audio_session_snapshot()` 且不再构造 `HostAudioDispatchSession host_audio_dispatch`；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/session_registries.h media-agent/src/runtime_registry.h media-agent/src/runtime_registry.cpp media-agent/src/agent_status_json.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md server/public/app-native-overrides.js server/public/native/native-diagnostics.js server/public/native/native-surface-controller.js docs/RENDERER_SPLIT_MAP.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-325 host session JSON 为只读 OBS 字段构造可写 ObsIngestSession
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`host_session_json()` 只是输出 result JSON 里的 `obsIngest` 字段，却构造 `ObsIngestSession obs_ingest(state)` 并调用 `session_json()`，只读路径仍通过可写 session/controller facade 取状态。
+- 影响：M7 的 snapshot owner 边界不完整；后续把 OBS ingest registry 升级为真正 session owner 时，host session JSON 仍会隐式依赖可写 OBS session 构造。
+- 建议：保持 JSON wire shape 不变，把 `obsIngest` 字段改为读取 `obs_ingest_session_snapshot(state)` 并用 `obs_ingest_json()` 格式化；OBS prepare/start/stop 写入路径不变。
+- 修改意见：按建议实施 M7 小切片，不改变 host session result JSON 字段、不改变 OBS ingest 状态锁保护、不改变 OBS command 行为。
+- 处理结果：已处理。`host_session_controller.cpp::host_session_json()` 删除只读 `ObsIngestSession` 构造，改为 `obs_ingest_json(vds::media_agent::obs_ingest_session_snapshot(state))`；`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "host_session_json|ObsIngestSession obs_ingest\\(state\\)|obs_ingest_json\\(vds::media_agent::obs_ingest_session_snapshot\\(state\\)\\)|obs_ingest_session_snapshot" media-agent/src/host_session_controller.cpp media-agent/src/runtime_registry.h media-agent/src/runtime_registry.cpp`，确认 `host_session_json()` 已通过 snapshot facade 输出 `obsIngest`，剩余 `ObsIngestSession obs_ingest(state)` 命中均位于 prepare/start/clear 等写入路径；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/host_session_controller.cpp media-agent/src/session_registries.h media-agent/src/runtime_registry.h media-agent/src/runtime_registry.cpp media-agent/src/agent_status_json.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-326 agent status/stats 为只读 host 字段构造 HostSessionController
+
+- 位置：`media-agent/src/agent_status_json.cpp`、`media-agent/src/host_state_json.h`、`media-agent/src/host_state_json.cpp`、`media-agent/src/host_session_controller.h`、`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`agent_status_json.cpp` 构造 `HostSessionController host_session(state)` 只为输出 status/stats 中的 `hostSessionRunning`、`hostBackend`、`hostPipeline` 和 `hostCapturePlan` 字段，纯只读聚合路径仍依赖可写 host controller。
+- 影响：M7 snapshot owner 边界仍被只读 JSON 聚合穿透；后续升级 HostSessionRegistry owner 时，status/stats 聚合会继续绑定 controller 构造和可写 session 引用。
+- 建议：把 host status/stats 字段 formatter 迁到 `host_state_json.*`，让 `agent_status_json.cpp` 直接读取 `host_session_snapshot(state)`；删除 `HostSessionController` 中仅服务只读 JSON 的 append 方法。
+- 修改意见：按建议实施 M7 小切片，不改变 status/stats JSON 字段、不改变 host command 写入、不改变 host session result JSON。
+- 处理结果：已处理。`host_state_json.h/cpp` 新增 `append_host_session_status_json_fields()` 和 `append_host_session_stats_json_fields()`；`agent_status_json.cpp` 改为直接读取 `vds::media_agent::host_session_snapshot(state)` 输出 host status/stats 字段，不再构造 `HostSessionController`；`HostSessionController::append_status_json_fields()` / `append_stats_json_fields()` 已删除。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "HostSessionController host_session\\(state\\)|append_status_json_fields|append_stats_json_fields|append_host_session_status_json_fields|append_host_session_stats_json_fields|host_session_snapshot\\(state\\)" media-agent/src/agent_status_json.cpp media-agent/src/host_state_json.h media-agent/src/host_state_json.cpp media-agent/src/host_session_controller.h media-agent/src/host_session_controller.cpp`，确认 status/stats 只读聚合已走 `host_session_snapshot()`，`HostSessionController` 不再暴露旧 append 方法；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/agent_status_json.cpp media-agent/src/host_state_json.h media-agent/src/host_state_json.cpp media-agent/src/host_session_controller.h media-agent/src/host_session_controller.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-327 OBS prepare 只读 host guard 构造 HostSessionController
+
+- 位置：`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`ObsIngestSession::prepare_from_request()` 只需要判断 host session 是否已运行且是否非 OBS backend，却构造 `HostSessionController host_session(state)` 调用 `is_running()` / `is_obs_ingest()`。
+- 影响：OBS prepare 的只读 guard 仍穿过可写 host controller；后续 HostSessionRegistry 升级为真正 owner/snapshot 时，这类 guard 会继续扩大 controller 构造面。
+- 建议：改为读取 `host_session_snapshot(state)` 并直接判断 `running/backend`；OBS worker 中需要 `set_video_codec()` 的写回路径暂不迁移。
+- 修改意见：按建议实施 M7 小切片，不改变 `HOST_SESSION_ACTIVE` 条件、不改变 OBS prepare/start/stop 行为、不改变 worker 写回 host codec 的路径。
+- 处理结果：已处理。`ObsIngestSession::prepare_from_request()` 已改为通过 `const HostSessionState& host_session = vds::media_agent::host_session_snapshot(state)` 做 host-active guard，并补充显式 `host_session_state.h` include；`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "prepare_from_request|HostSessionController host_session\\(state\\)|host_session_snapshot\\(state\\)|host_session\\.running|set_video_codec|host_session_state.h" media-agent/src/obs_ingest_session.cpp`，确认 `prepare_from_request()` 已通过 `host_session_snapshot()` 读取 host guard，剩余 `HostSessionController host_session(state)` 位于 worker 写回路径且仍用于 `set_video_codec()`；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/obs_ingest_session.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-328 peer host source binding 为只读 host 状态构造 HostSessionController
+
+- 位置：`media-agent/src/peer_host_source_binding.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：host video binding 和 OBS ingest media binding 只读取 host session 的运行状态、backend、codec、pipeline、capture plan、artifact 和输出参数，却构造 `HostSessionController` 调用只读 getter。
+- 影响：peer host-source 绑定路径仍耦合可写 host controller；后续 HostSessionRegistry 升级为真正 snapshot owner 时，peer binding 侧会继续依赖 controller 构造和方法表。
+- 建议：改为读取 `host_session_snapshot(state)`，直接使用 `HostSessionState` 的只读字段；需要 probe 时显式读取 `ffmpeg_probe_result(state)`，保留 OBS ingest snapshot 获取路径不变。
+- 修改意见：按建议实施 M7 小切片，不改变 media binding 条件、不改变 video/audio track 配置、不改变 sender 启停和 relay subscriber 行为。
+- 处理结果：已处理。`peer_host_source_binding.cpp` 删除 `host_session_controller.h` 依赖，改为包含 `host_session_state.h` 和 `runtime_registry.h`；host video / OBS ingest media binding 均读取 `vds::media_agent::host_session_snapshot(state)`，并通过 `vds::media_agent::ffmpeg_probe_result(state)` 显式传入 `start_peer_video_sender()`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "HostSessionController|host_session_controller|host_session_snapshot\\(state\\)|ffmpeg_probe_result\\(state\\)|host_session\\.pipeline|host_session\\.capture_plan|host_session\\.capture_artifact|ObsIngestSession\\(state\\)\\.snapshot" media-agent/src/peer_host_source_binding.cpp`，确认文件内不再引用 `HostSessionController`，host 状态均通过 `host_session_snapshot(state)` 读取；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/peer_host_source_binding.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-329 OBS ingest snapshot 只读路径仍需构造 ObsIngestSession
+
+- 位置：`media-agent/src/obs_ingest_session.h`、`media-agent/src/obs_ingest_session.cpp`、`media-agent/src/peer_host_source_binding.cpp`、`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：OBS ingest snapshot 的实现绑定在 `ObsIngestSession::snapshot()` 成员方法上，peer host-source OBS binding 和 host controller 只读 snapshot facade 仍需要构造可写 `ObsIngestSession` 才能读取 `ObsIngestSessionSnapshot`。
+- 影响：OBS 只读 snapshot 边界不够清晰；后续将 OBS ingest registry 升级为真正 owner/snapshot 时，只读路径仍会依赖可写 session facade。
+- 建议：抽出 `make_obs_ingest_session_snapshot(const ObsIngestState&)` free helper，保持锁保护和字段不变；`ObsIngestSession::snapshot()` 自身复用 helper，外部只读路径直接读取 `obs_ingest_session_snapshot(state)` 后调用 helper。
+- 修改意见：按建议实施 M7 小切片，不改变 snapshot 字段、不改变 mutex 锁保护、不改变 OBS prepare/start/stop 写入路径。
+- 处理结果：已处理。`obs_ingest_session.h/cpp` 新增 `make_obs_ingest_session_snapshot(const ObsIngestState&)`；`ObsIngestSession::snapshot()` 改为复用该 helper；`peer_host_source_binding.cpp` 和 `HostSessionController::obs_ingest_snapshot()` 改为通过 `make_obs_ingest_session_snapshot(vds::media_agent::obs_ingest_session_snapshot(state))` 读取只读 snapshot。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "make_obs_ingest_session_snapshot|ObsIngestSession\\(state\\)\\.snapshot|ObsIngestSession\\(state_\\)\\.snapshot|obs_ingest_session_snapshot\\(" media-agent/src/obs_ingest_session.h media-agent/src/obs_ingest_session.cpp media-agent/src/peer_host_source_binding.cpp media-agent/src/host_session_controller.cpp`，确认只读路径均已走 `make_obs_ingest_session_snapshot(...)`；已执行 `rg -n "ObsIngestSession\\([^\\n]*\\)\\.snapshot" media-agent/src -g "*.cpp" -g "*.h"`，无命中；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/obs_ingest_session.h media-agent/src/obs_ingest_session.cpp media-agent/src/peer_host_source_binding.cpp media-agent/src/host_session_controller.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-330 surface controller 为只读 host capture 状态构造 HostSessionController
+
+- 位置：`media-agent/src/surface_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`SurfaceSessionController` 在 host capture surface attach、refresh 和 restart 时只读取 host capture plan/process/artifact、running 状态和 ffmpeg probe，却构造 `HostSessionController` 调用只读 getter。
+- 影响：surface owner 仍通过可写 host controller 读取 host snapshot；后续 HostSessionRegistry 升级为真正 owner/snapshot 时，surface controller 会继续和 host command controller 耦合。
+- 建议：改为读取 `host_session_snapshot(runtime_state_)` 和 `ffmpeg_probe_result(runtime_state_)`，保持 surface attach/refresh/restart 条件、result JSON 和事件输出不变。
+- 修改意见：按建议实施 M7 小切片，不改变 surface attach/restart 时序、不改变 waiting-for-artifact 判断、不改变 surface RPC wire shape。
+- 处理结果：已处理。`surface_session_controller.cpp` 删除 `host_session_controller.h` 依赖，改为包含 `host_session_state.h`；host capture surface attach/refresh/restart 均通过 `host_session_snapshot(runtime_state_)` 读取 host 状态，并通过 `ffmpeg_probe_result(runtime_state_)` 显式传入 probe。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "HostSessionController|host_session_controller|host_session_snapshot\\(runtime_state_\\)|ffmpeg_probe_result\\(runtime_state_\\)|host_session\\.capture_plan|host_session\\.capture_process|host_session\\.capture_artifact|host_session\\.running" media-agent/src/surface_session_controller.cpp`，确认文件内不再引用 `HostSessionController`，host capture surface 只读状态均来自 `host_session_snapshot(runtime_state_)`；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/surface_session_controller.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-331 peer create host-downstream 只读 running guard 构造 HostSessionController
+
+- 位置：`media-agent/src/peer_create_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`attach_host_downstream_media_if_running()` 在 create peer pipeline 中只需要判断 host session 是否 running，却构造 `HostSessionController host_session(state)` 调用 `is_running()`。
+- 影响：peer create 路径的只读 guard 仍耦合可写 host controller；后续 HostSessionRegistry 升级为真正 snapshot owner 时，这类简单 guard 会扩大 controller 构造面。
+- 建议：改为读取 `host_session_snapshot(state).running`，保留 `attach_host_video_media_binding()` 的后续行为不变。
+- 修改意见：按建议实施 M7 小切片，不改变 host-downstream media attach 条件、不改变 peer create/initial negotiation 时序。
+- 处理结果：已处理。`peer_create_pipeline.cpp` 删除 `host_session_controller.h` 依赖，改为包含 `host_session_state.h`；`attach_host_downstream_media_if_running()` 通过 `host_session_snapshot(state)` 读取 running guard。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "HostSessionController|host_session_controller|host_session_snapshot\\(state\\)|host_session\\.running" media-agent/src/peer_create_pipeline.cpp`，确认文件内不再引用 `HostSessionController`，host running guard 已走 `host_session_snapshot(state)`；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/peer_create_pipeline.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-332 peer audio readiness guard 为只读状态构造 HostAudioDispatchSession
+
+- 位置：`media-agent/src/audio_session_state.h`、`media-agent/src/host_audio_dispatch_session.cpp`、`media-agent/src/peer_host_source_binding.cpp`、`media-agent/src/peer_refresh_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：peer host-source binding 和 peer refresh 只需要判断 audio capture 是否 ready，却构造 `HostAudioDispatchSession` 调用 `capture_ready()`。
+- 影响：只读 audio guard 仍绑定可写 audio dispatch facade；后续 AudioSessionRegistry 升级为真正 owner/snapshot 时，peer 路径会继续扩大 dispatch session 构造面。
+- 建议：把 `capture_active && ready` 提炼为 `audio_session_capture_ready(const AudioSessionState&)`，只读 guard 改为读取 `audio_session_snapshot()`；需要 register/unregister transport session 或实际 audio command 时再构造 `HostAudioDispatchSession`。
+- 修改意见：按建议实施 M7 小切片，不改变 audio capture ready 条件、不改变 audio track 配置、不改变 transport session 注册/注销时机。
+- 处理结果：已处理。`audio_session_state.h` 新增 `audio_session_capture_ready()`；`HostAudioDispatchSession::capture_ready()` 复用该 helper；`peer_host_source_binding.cpp` 和 `peer_refresh_pipeline.cpp` 的只读 audio ready guard 改为 `audio_session_capture_ready(audio_session_snapshot(...))`，并仅在 register transport session 时构造 `HostAudioDispatchSession`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "HostAudioDispatchSession [A-Za-z_]+\\([^\\n]*\\)|\\.capture_ready\\(|audio_session_capture_ready|audio_session_snapshot\\(" media-agent/src/audio_session_state.h media-agent/src/host_audio_dispatch_session.cpp media-agent/src/peer_host_source_binding.cpp media-agent/src/peer_refresh_pipeline.cpp`，确认 peer host-source/refresh 的只读 audio readiness guard 已走 `audio_session_snapshot()`，`HostAudioDispatchSession` 构造仅保留在 transport session register/unregister 或真实 audio command 路径；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/audio_session_state.h media-agent/src/host_audio_dispatch_session.cpp media-agent/src/peer_host_source_binding.cpp media-agent/src/peer_refresh_pipeline.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-333 peer refresh 为 host capture plan 软刷新构造 HostSessionController
+
+- 位置：`media-agent/src/peer_refresh_pipeline.cpp`、`media-agent/src/host_session_runtime.h`、`media-agent/src/host_session_runtime.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`refresh_all_host_video_senders()` 属于 peer refresh 批处理，但为了判断 host running 和重校验 capture plan 构造 `HostSessionController host_session(runtime_state)`。
+- 影响：peer refresh 仍临时持有完整 host command controller；后续 HostSessionRegistry 升级为真正 owner/snapshot 时，peer 侧软刷新会继续绕过明确的 host capture-plan 边界。
+- 建议：host running guard 改为读取 `host_session_snapshot(runtime_state)`；需要写回 capture plan 的重校验提炼为窄 facade，例如 `revalidate_current_host_capture_plan(AgentRuntimeState&)`，只暴露这一条明确 command。
+- 修改意见：按建议实施 M7 小切片，不改变 soft refresh 触发条件、不改变 capture plan 校验逻辑、不改变后续 `attach_host_video_media_binding(..., soft_refresh=true)` 行为。
+- 处理结果：已处理。新增 `host_session_runtime.h/cpp`，提供 `revalidate_current_host_capture_plan()`，内部通过 `current_host_session(runtime_state)` 写回当前 host capture plan 并复用原 `validate_host_capture_plan(ffmpeg_probe_result(...))`；`peer_refresh_pipeline.cpp` 删除 `host_session_controller.h` 依赖，host running guard 改为 `host_session_snapshot(runtime_state).running`，软刷新重校验改为调用窄 facade。`media-agent/CMakeLists.txt` 已加入新实现文件，`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "HostSessionController|host_session_controller|revalidate_current_host_capture_plan|host_session_snapshot\\(runtime_state\\)\\.running" media-agent/src/peer_refresh_pipeline.cpp media-agent/src/host_session_runtime.h media-agent/src/host_session_runtime.cpp`，确认 peer refresh 不再引用 `HostSessionController`，running guard 已走 snapshot，capture plan 重校验已走窄 facade；media-agent verify 和 `git diff --check` 已并入 P1-334 统一执行。
+
+### ARCH-SPLIT-P1-334 OBS worker 为 host codec 写回构造 HostSessionController
+
+- 位置：`media-agent/src/obs_ingest_session.cpp`、`media-agent/src/host_session_runtime.h`、`media-agent/src/host_session_runtime.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`ObsIngestSession::run_worker()` 在 worker 启动时构造 `HostSessionController host_session(state)`，仅用于 media-state payload 读取 backend/target 和在视频包到达后 `set_video_codec()` 写回 host codec。
+- 影响：OBS worker 仍持有完整 host command controller；后续 HostSessionRegistry 升级为真正 owner/snapshot 时，OBS ingest worker 会继续通过大 controller 读取只读状态和执行单字段写回。
+- 建议：media-state payload 改为接收 `host_session_snapshot(state)`；host codec 写回收口为窄 facade，例如 `set_current_host_video_codec(AgentRuntimeState&, const std::string&)`，只暴露这一条明确 command。
+- 修改意见：按建议实施 M7 小切片，不改变 OBS worker 循环、不改变 media-state payload 字段、不改变 video codec 检测时机、不改变 relay publish 行为。
+- 处理结果：已处理。`obs_ingest_session.cpp` 删除 `host_session_controller.h` 依赖；`obs_ingest_media_state_payload()` 改为接收 `const HostSessionState&` 并直接读取 backend/captureTargetId；worker 的 `obs-ingest-waiting`、`obs-ingest-connected`、`obs-stream-running`、`obs-ingest-ended` 事件均传入 `host_session_snapshot(state)`；视频包到达后的 host codec 写回改为 `set_current_host_video_codec(state, video_codec)`。`host_session_runtime.h/cpp` 同时承载 P1-333 的 capture-plan 重校验 facade 和本项 codec 写回 facade。
+- 验证结果：已执行 `rg -n "HostSessionController|host_session_controller|set_video_codec|set_current_host_video_codec|obs_ingest_media_state_payload|host_session_snapshot\\(state\\)" media-agent/src/obs_ingest_session.cpp media-agent/src/host_session_runtime.h media-agent/src/host_session_runtime.cpp`，确认 OBS worker 不再引用 `HostSessionController` / `host_session_controller.h`，payload 已走 `host_session_snapshot(state)`，codec 写回已走 `set_current_host_video_codec()`；已执行 `rg -n "HostSessionController [A-Za-z_]+\\(|HostSessionController\\(" media-agent/src -g "*.cpp" -g "*.h"`，确认剩余 host controller 构造仅在 `agent_rpc_router.cpp` 和 `agent_lifecycle.cpp` 的 command/lifecycle owner 路径；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/peer_refresh_pipeline.cpp media-agent/src/obs_ingest_session.cpp media-agent/src/host_session_runtime.h media-agent/src/host_session_runtime.cpp media-agent/src/host_capture_plan_runtime.h media-agent/src/host_capture_plan_runtime.cpp media-agent/CMakeLists.txt docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-335 agent lifecycle 为 host refresh/init/shutdown 构造 HostSessionController
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/host_session_controller.cpp`、`media-agent/src/host_session_runtime.h`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`refresh_host_capture_runtime()`、`initialize_agent_runtime()` 和 `shutdown_agent_runtime()` 属于 agent lifecycle 编排，但为了刷新 host capture runtime、初始化默认 capture runtime、停止 OBS ingest 和停止 capture process 构造 `HostSessionController`。
+- 影响：lifecycle 层仍临时持有完整 host command controller；后续 HostSessionRegistry 升级为真正 owner/snapshot 时，agent lifecycle 的基础启动/关闭路径会继续绕过明确 host runtime command 边界。
+- 建议：把 lifecycle 用到的 host 操作收口到 `host_session_runtime.*` 的窄 facade，并让 `HostSessionController` 自身委托同一套 facade，避免两套实现分叉。
+- 修改意见：按建议实施 M7 小切片，不改变 host capture runtime refresh 行为、不改变窗口恢复检查、不改变 artifact probe/manifest persist、不改变 shutdown stop 顺序。
+- 处理结果：已处理。`host_session_runtime.h` 新增 `initialize_current_default_capture_runtime()`、`refresh_current_host_capture_runtime()`、`stop_current_host_capture_process()`、`stop_current_obs_ingest_session()`；`host_session_controller.cpp` 把原初始化、refresh、stop OBS、stop capture process 实现迁入这些 facade，并让 controller public 方法委托 facade；`agent_lifecycle.cpp` 删除 lifecycle 内 `HostSessionController` 构造，改为直接调用窄 facade。
+- 验证结果：已执行 `rg -n "HostSessionController [A-Za-z_]+\\(|HostSessionController\\(" media-agent/src -g "*.cpp" -g "*.h"`，确认剩余 `HostSessionController` 实例化仅在 `agent_rpc_router.cpp` 的 RPC command owner 入口，`agent_lifecycle.cpp` 已无构造；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/agent_lifecycle.cpp media-agent/src/host_session_controller.cpp media-agent/src/host_session_runtime.h media-agent/src/host_session_runtime.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-336 HostSessionController 仍暴露已迁移的 getter/lifecycle API
+
+- 位置：`media-agent/src/host_session_controller.h`、`media-agent/src/host_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-333 到 P1-335 已把 peer refresh、OBS worker 和 agent lifecycle 的 host 只读/窄写路径迁到 snapshot/runtime facade，但 `HostSessionController` 仍公开 `session_json()`、`initialize_default_capture_runtime()`、`refresh_capture_runtime()`、`stop_capture_process()`、`stop_obs_ingest_session()`、大量 getter 和 `set_video_codec()` 等 legacy 方法。
+- 影响：controller API 面仍暗示外部可以继续通过 host command controller 读取快照或做单字段写入；后续迁移时容易重新引入对大 controller 的依赖。
+- 建议：扫描确认无调用方后，删除已迁移的 public 方法和实现，让 `HostSessionController` 只保留 host RPC command owner 的 `start_from_request()` / `stop()`。
+- 修改意见：按建议实施 M7 API 瘦身，不改变 start/stop RPC wire shape，不改变 host session 内部 helper。
+- 处理结果：已处理。`host_session_controller.h` 删除未使用的只读 getter、lifecycle wrapper、codec setter 和相关前置声明；`host_session_controller.cpp` 删除对应实现。`HostSessionController` public API 现在只剩构造、`start_from_request()` 和 `stop()`，host 只读/窄写路径统一走 snapshot/runtime facade。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "HostSessionController::" media-agent/src/host_session_controller.cpp`，确认 controller 实现只剩构造、`start_from_request()` 和 `stop()`；已执行 `rg -n "HostSessionController [A-Za-z_]+\\(|HostSessionController\\(" media-agent/src -g "*.cpp" -g "*.h"`，确认实例化仍仅在 `agent_rpc_router.cpp` RPC command owner 入口；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/host_session_controller.h media-agent/src/host_session_controller.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-337 host session result JSON formatter 留在 HostSessionController 实现内
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`media-agent/src/host_state_json.h`、`media-agent/src/host_state_json.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`host_session_json(AgentRuntimeState&, const HostSessionState&)` 仍定义在 `host_session_controller.cpp`，但它只是 start/stop command result 的 JSON formatter，并不属于 host command controller 编排职责。
+- 影响：controller 文件仍承载只读 JSON 格式化职责，且 formatter 为了拼 `obsIngest` 字段接收完整 `AgentRuntimeState&`，后续 snapshot owner 边界仍容易回流到 controller 文件。
+- 建议：把 formatter 迁到 `host_state_json.*`，签名改为显式接收 `HostSessionState` 和 `ObsIngestState` snapshot；controller 只负责在 command result 处传入当前 snapshot。
+- 修改意见：按建议实施 M7 小切片，不改变 host session result JSON 字段、不改变 OBS ingest JSON 格式、不改变 start/stop command wire shape。
+- 处理结果：已处理。`host_state_json.h/cpp` 新增 `host_session_json(const HostSessionState&, const ObsIngestState&)`，复用既有 `host_pipeline_json()`、`host_capture_plan_json()` 和 `obs_ingest_json()`；`host_session_controller.cpp` 删除本地 formatter，三处 command result 改为传入 `host_session_json(session, obs_ingest_session_snapshot(state))`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "host_session_json\\(" media-agent/src/host_session_controller.cpp media-agent/src/host_state_json.h media-agent/src/host_state_json.cpp`，确认 formatter 只定义在 `host_state_json.*`，controller 仅在 command result 处调用并传入 OBS snapshot；已执行 `rg -n "host_session_json\\(AgentRuntimeState|std::string host_session_json" media-agent/src -g "*.cpp" -g "*.h"`，确认旧 runtime 依赖签名已删除；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/host_session_controller.cpp media-agent/src/host_state_json.h media-agent/src/host_state_json.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-338 host runtime facade 实现仍驻留在 HostSessionController 文件内
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`media-agent/src/host_session_runtime.h`、`media-agent/src/host_session_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-335 后虽然 lifecycle 已经调用 `host_session_runtime.*` facade，但 `initialize_current_default_capture_runtime()`、`refresh_current_host_capture_runtime()`、`stop_current_host_capture_process()`、`stop_current_obs_ingest_session()` 的实现仍留在 `host_session_controller.cpp`。
+- 影响：host command controller 文件仍承载 runtime owner 逻辑，窗口恢复检测、artifact probe、manifest persist 和 shutdown stop 逻辑继续混在 start/stop command 编排文件里。
+- 建议：把这些 facade 实现和相关 Windows handle availability helper 迁到 `host_session_runtime.cpp`；controller 文件只保留 start/stop command orchestration 和内部 command helper。
+- 修改意见：按建议实施 M7 小切片，不改变窗口恢复检测、不改变 capture artifact probe/manifest persist、不改变 OBS stop/capture stop 顺序。
+- 处理结果：已处理。`host_session_runtime.cpp` 接管 `refresh_default_native_host_plan()`、`initialize_current_default_capture_runtime()`、`refresh_current_host_capture_runtime()`、`stop_current_host_capture_process()`、`stop_current_obs_ingest_session()`、`set_current_host_video_codec()` 及其 Windows 窗口恢复 helper；`host_session_controller.cpp` 删除重复 runtime facade 实现，并在 drain/start/reset 路径调用 `host_session_runtime` facade。迁移后还清理了 `drain_running_host_session()` 未使用的 `HostSessionState&` 参数。
+- 验证结果：已执行 `rg -n "WindowCaptureAvailability|parse_runtime_window_handle|query_window_capture_availability|try_resolve_restored_window_handle|initialize_current_default_capture_runtime|refresh_current_host_capture_runtime|stop_current_host_capture_process|stop_current_obs_ingest_session|set_current_host_video_codec|refresh_default_native_host_plan\\(" media-agent/src/host_session_controller.cpp media-agent/src/host_session_runtime.cpp`，确认 runtime facade 实现只在 `host_session_runtime.cpp`，controller 仅调用 facade；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/host_session_controller.cpp media-agent/src/host_session_runtime.h media-agent/src/host_session_runtime.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-339 host start apply/reset helper 仍留在 HostSessionController 文件内
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`media-agent/src/host_session_runtime.h`、`media-agent/src/host_session_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`apply_host_session_start_request()` 和 `reset_host_session_to_default_native()` 是 HostSessionState 的 request apply / default reset 逻辑，但仍放在 `host_session_controller.cpp`，让 command controller 文件继续承载字段级状态写入。
+- 影响：后续升级 HostSessionRegistry owner 时，request normalization、OBS/native 默认值和 capture process reset 容易继续和 RPC command 编排耦合。
+- 建议：把 apply/reset helper 迁到 `host_session_runtime.*`，controller 仅调用窄 helper，不直接承载字段级 apply/reset 实现。
+- 修改意见：按建议实施 M7 小切片，不改变 start/stop RPC wire shape、不改变 request 字段归一化、不改变 stop 后默认 native 状态。
+- 处理结果：已处理。`apply_host_session_start_request()` 和 `reset_host_session_to_default_native()` 已迁入 `host_session_runtime.h/cpp`；`host_session_controller.cpp` 的 start/stop 路径只调用 `vds::media_agent::apply_host_session_start_request(...)` 和 `vds::media_agent::reset_host_session_to_default_native(...)`。迁移后补齐 `host_session_runtime.cpp` 的显式 include，避免依赖 controller 文件传递包含。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "apply_host_session_start_request|reset_host_session_to_default_native|extract_bool_value|extract_int_value|extract_string_value|normalize_video_codec|normalize_video_encoder_preference|normalize_host_encoder|normalize_host_keyframe|normalize_host_output_dimension|build_host_capture_process_state" media-agent/src/host_session_controller.cpp media-agent/src/host_session_runtime.cpp media-agent/src/host_session_runtime.h`，确认 apply/reset 和字段归一化实现只在 `host_session_runtime.cpp`，controller 仅保留调用；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过。
+
+### ARCH-SPLIT-P1-340 host start backend helper 仍驻留在 HostSessionController 文件内
+
+- 位置：`media-agent/src/host_session_controller.h`、`media-agent/src/host_session_controller.cpp`、`media-agent/src/host_session_command.h`、`media-agent/src/host_session_start_pipeline.h`、`media-agent/src/host_session_start_pipeline.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`start_obs_ingest_host_session()` 和 `start_native_capture_host_session()` 仍在 `host_session_controller.cpp` 内实现，包含 OBS prepare/start worker、native capture plan/process 启动、surface refresh、downstream media attach、media-state/warning event 输出等 backend 细节。
+- 影响：HostSessionController 虽已瘦身 public API，但实现文件仍混合 RPC command 分派和 backend 启动 pipeline；后续拆 HostSession/ObsIngest/CaptureSession owner 时，启动细节会继续堆回 command controller。
+- 建议：引入 host start pipeline 文件承载 OBS/native backend 启动 helper，并把 callbacks/result 类型拆成独立 `host_session_command.h`，让 pipeline 不依赖 controller class。
+- 修改意见：按建议实施 M7 小切片，不改变 restart drain 顺序、不改变 OBS prepare/start worker 行为、不改变 native capture process 启动顺序、不改变 emitted JSON 字段。
+- 处理结果：已处理。新增 `host_session_command.h` 承载 `HostSessionControllerCallbacks` 与 `HostSessionCommandResult`；新增 `host_session_start_pipeline.h/cpp` 承载 `is_obs_ingest_backend_state()`、`start_obs_ingest_host_session()`、`start_native_capture_host_session()`；`host_session_controller.cpp` 删除 backend start helper 实现，只保留 begin、restart drain、apply request、backend 分派和 stop command 编排。`media-agent/CMakeLists.txt` 已加入新实现文件，`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "start_obs_ingest_host_session|start_native_capture_host_session|is_obs_ingest_backend_state|host_session_start_pipeline|host_session_command|HostSessionCommandResult|HostSessionControllerCallbacks" media-agent/src/host_session_controller.cpp media-agent/src/host_session_controller.h media-agent/src/host_session_command.h media-agent/src/host_session_start_pipeline.h media-agent/src/host_session_start_pipeline.cpp media-agent/CMakeLists.txt`，确认 backend start helper 已迁入 start pipeline，controller 仅调用；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过。
+
+### ARCH-SPLIT-P1-341 host stop/drain helper 仍驻留在 HostSessionController 文件内
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`media-agent/src/host_session_stop_pipeline.h`、`media-agent/src/host_session_stop_pipeline.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`drain_running_host_session()`、`detach_host_downstream_peer_sessions()` 和 `stop_host_session()` 仍在 `host_session_controller.cpp` 内实现，导致 controller 文件继续混合 surface stop、OBS stop、peer detach、capture process stop 和 stopped event 输出。
+- 影响：即使 start backend helper 已迁出，stop/drain 生命周期仍会把 OBS/Capture/Peer 的 legacy runtime 操作留在 command controller 文件中，后续拆真正 session owner 时边界不清。
+- 建议：新增 host stop pipeline 文件承载 drain/stop helper；controller 的 `stop()` 只委托该 pipeline，start restart 时也调用同一个 drain helper，避免重复实现。
+- 修改意见：按建议实施 M7 小切片，不改变 start restart drain 顺序、不改变 stop share 清理顺序、不改变 stopped event JSON 字段。
+- 处理结果：已处理。新增 `host_session_stop_pipeline.h/cpp`，迁入 `drain_running_host_session()`、`stop_host_session()` 和 downstream detach helper；`host_session_controller.cpp` 删除 stop/drain 实现，只在 start restart 时调用 `vds::media_agent::drain_running_host_session(...)`，`HostSessionController::stop()` 只委托 `vds::media_agent::stop_host_session(...)`。`media-agent/CMakeLists.txt` 已加入新实现文件，`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "drain_running_host_session|stop_host_session|detach_host_downstream_peer_sessions|ObsIngestSession\\(state\\)\\.stop|stop_current_host_capture_process|host-session-stopped|host_session_stop_pipeline" media-agent/src/host_session_controller.cpp media-agent/src/host_session_stop_pipeline.h media-agent/src/host_session_stop_pipeline.cpp media-agent/CMakeLists.txt`，确认 stop/drain helper 已迁入 stop pipeline，controller 仅调用；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过。
+
+### ARCH-SPLIT-P1-342 host start/stop pipeline 直接构造 ObsIngestSession
+
+- 位置：`media-agent/src/host_session_start_pipeline.cpp`、`media-agent/src/host_session_stop_pipeline.cpp`、`media-agent/src/host_session_runtime.h`、`media-agent/src/host_session_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：host start/stop pipeline 已从 controller 文件拆出，但仍直接 include/构造 `ObsIngestSession` 来执行 prepare、clear prepared、start worker 和 stop。
+- 影响：pipeline 文件仍知道 OBS session 具体实现，后续把 OBS ingest 升级为独立 session owner 时，start/stop pipeline 会继续绕过明确的 host runtime command 边界。
+- 建议：在 `host_session_runtime.*` 中补齐 OBS ingest 窄 facade：prepare、clear prepared、start worker、stop；start/stop pipeline 只调用这些 command，不直接构造 `ObsIngestSession`。
+- 修改意见：按建议实施 M7 小切片，不改变 OBS prepare 参数、不改变失败时 clear prepared 行为、不改变 native start 前清理 OBS prepared、不改变 restart/stop 时 OBS stop 顺序。
+- 处理结果：已处理。`host_session_runtime.h/cpp` 新增 `prepare_current_obs_ingest_session()`、`clear_current_obs_ingest_prepared()`、`start_current_obs_ingest_worker()`，并复用已有 `stop_current_obs_ingest_session()`；`host_session_start_pipeline.cpp` 和 `host_session_stop_pipeline.cpp` 删除 `obs_ingest_session.h` 依赖，不再直接构造 `ObsIngestSession`，OBS ingest 操作统一通过 host runtime facade。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "ObsIngestSession\\(|obs_ingest_session\\.h|prepare_current_obs_ingest_session|clear_current_obs_ingest_prepared|start_current_obs_ingest_worker|stop_current_obs_ingest_session" media-agent/src/host_session_start_pipeline.cpp media-agent/src/host_session_stop_pipeline.cpp media-agent/src/host_session_runtime.h media-agent/src/host_session_runtime.cpp`，确认 pipeline 不再直接 include/构造 `ObsIngestSession`，OBS 操作收口到 runtime facade；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过，输出仅有既有 FFmpeg/MSVC 警告。
+
+### ARCH-SPLIT-P1-343 native start pipeline 直接启动 host capture process
+
+- 位置：`media-agent/src/host_session_start_pipeline.cpp`、`media-agent/src/host_session_runtime.h`、`media-agent/src/host_session_runtime.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`start_native_capture_host_session()` 已拆到 start pipeline，但仍直接调用 `start_host_capture_process(ffmpeg_probe_result(state), session.pipeline, session.capture_plan, session.capture_process)` 并写回 `session.capture_process`。
+- 影响：native start pipeline 仍知道 capture process 的低层启动参数和 FFmpeg probe 来源；后续抽 HostCaptureSession owner 时，该 pipeline 会继续绕过明确的 capture process command 边界。
+- 建议：在 `host_session_runtime.*` 中新增 `start_current_host_capture_process()`，由 runtime facade 读取当前 host session、FFmpeg probe、pipeline、capture plan 并写回 capture process；start pipeline 只触发该 command。
+- 修改意见：按建议实施 M7 小切片，不改变 capture process 启动参数、不改变 start breadcrumb 顺序、不改变 media-state JSON 和 warning 输出。
+- 处理结果：已处理。`host_session_runtime.h/cpp` 新增 `start_current_host_capture_process(AgentRuntimeState&)`；`host_session_start_pipeline.cpp` 删除 `ffmpeg_probe.h` 依赖，native start 路径改为调用 `start_current_host_capture_process(state)`，capture process 启动和写回收口到 host runtime facade。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "start_host_capture_process|start_current_host_capture_process|ffmpeg_probe_result|ffmpeg_probe\\.h" media-agent/src/host_session_start_pipeline.cpp media-agent/src/host_session_runtime.h media-agent/src/host_session_runtime.cpp`，确认 start pipeline 不再直接调用 `start_host_capture_process()` 或包含 FFmpeg probe；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过，输出仅有既有 FFmpeg/MSVC 警告。
+
+### ARCH-SPLIT-P1-344 host start/stop pipeline 直接构造 PeerSessionController
+
+- 位置：`media-agent/src/host_session_start_pipeline.cpp`、`media-agent/src/host_session_stop_pipeline.cpp`、`media-agent/src/peer_host_binding_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：host start/stop pipeline 为 host-downstream media attach/detach 直接构造 `PeerSessionController`；同时 `peer_host_binding_pipeline.cpp` 为了 callback/result 类型 include `host_session_controller.h`。
+- 影响：host pipeline 仍依赖完整 peer controller class，peer host binding helper 也依赖 host controller class 头；后续继续瘦身 controller API 时容易重新引入跨 owner 头依赖。
+- 建议：host start/stop pipeline 改为调用已有 `peer_host_binding_pipeline.*` 窄入口；`peer_host_binding_pipeline.cpp` 只 include `host_session_command.h` 获取 callback 类型，不再依赖 `HostSessionController` class。
+- 修改意见：按建议实施 M7 小切片，不改变 host-downstream attach/detach 遍历逻辑、不改变 local description refresh、不改变 peer-state event 输出。
+- 处理结果：已处理。`host_session_start_pipeline.cpp` 改为调用 `attach_host_downstream_media_bindings(state, callbacks)`；`host_session_stop_pipeline.cpp` 改为调用 `detach_host_downstream_media_bindings(state, callbacks)`；两个文件删除 `peer_session_controller.h` 依赖。`peer_host_binding_pipeline.cpp` 改为 include `host_session_command.h`，不再 include `host_session_controller.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "PeerSessionController|peer_session_controller\\.h|attach_host_downstream_media_bindings|detach_host_downstream_media_bindings|host_session_controller\\.h|host_session_command\\.h" media-agent/src/host_session_start_pipeline.cpp media-agent/src/host_session_stop_pipeline.cpp media-agent/src/peer_host_binding_pipeline.cpp`，确认 host start/stop pipeline 不再直接构造 `PeerSessionController`，peer host binding helper 不再 include controller class 头；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过。
+
+### ARCH-SPLIT-P1-345 PeerSessionController 仍暴露 host-downstream 批量绑定过时 wrapper
+
+- 位置：`media-agent/src/peer_session_controller.h`、`media-agent/src/peer_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-344 后 host start/stop pipeline 已直接调用 `peer_host_binding_pipeline.*` 窄入口，但 `PeerSessionController` 仍公开 `attach_host_downstream_media_bindings()` / `detach_host_downstream_media_bindings()` wrapper，且实现文件仍 include `peer_host_binding_pipeline.h`。
+- 影响：过时 API 面会误导后续调用方重新通过完整 peer controller 做 host-downstream 批量绑定，扩大 controller 责任并保留不必要头依赖。
+- 建议：确认无调用方后删除这两个 public wrapper 和实现，让 host-downstream 批量绑定只保留 `peer_host_binding_pipeline.*` 入口。
+- 修改意见：按建议实施 M7 API 瘦身，不改变 create/close/signaling/media-source/stats/refresh/lifecycle 方法。
+- 处理结果：已处理。`peer_session_controller.h` 删除 `HostSessionControllerCallbacks` 前置声明和两个 host-downstream 批量绑定方法；`peer_session_controller.cpp` 删除对应实现和 `peer_host_binding_pipeline.h` include。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "attach_host_downstream_media_bindings\\(|detach_host_downstream_media_bindings\\(|HostSessionControllerCallbacks|peer_host_binding_pipeline\\.h" media-agent/src/peer_session_controller.h media-agent/src/peer_session_controller.cpp media-agent/src -g "*.cpp" -g "*.h"`，确认 `PeerSessionController` 不再暴露/实现这两个 wrapper，实际 host-downstream 批量绑定调用只保留在 host start/stop pipeline 到 `peer_host_binding_pipeline.*`；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过，输出仅有既有 FFmpeg/MSVC 警告。
+
+### ARCH-SPLIT-P1-346 peer host binding pipeline 自行遍历全部 peer 并过滤 role
+
+- 位置：`media-agent/src/runtime_registry.h`、`media-agent/src/runtime_registry.cpp`、`media-agent/src/peer_host_binding_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`peer_host_binding_pipeline.cpp` 通过 `for_each_mutable_peer()` 拿到全部 peer 后在业务层手写 `peer.role != "host-downstream"` 过滤。
+- 影响：host-downstream peer 集合的选择规则散落在业务 pipeline 中；后续把 PeerSessionRegistry 升级为真正 owner/snapshot API 时，这类 role 过滤仍会继续穿透 peer 全量遍历。
+- 建议：在 `runtime_registry` 增加按 role 遍历的 mutable facade，让业务 pipeline 只声明需要处理的 role，不再自行筛选全集。
+- 修改意见：按建议实施 M7 小切片，不改变 host-downstream attach/detach 行为、不改变 peer 遍历顺序、不改变 callback、renegotiation 或 peer-state event 输出。
+- 处理结果：已处理。`runtime_registry.h/cpp` 新增 `for_each_mutable_peer_with_role(AgentRuntimeState&, const std::string&, callback)`；`peer_host_binding_pipeline.cpp` 的 attach/detach 批处理改为调用 `for_each_mutable_peer_with_role(state, "host-downstream", ...)`，不再在 pipeline 内手写 role 过滤。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "for_each_mutable_peer_with_role|for_each_mutable_peer\\(|peer\\.role != \\"host-downstream\\"|peer\\.role == role" media-agent/src/runtime_registry.h media-agent/src/runtime_registry.cpp media-agent/src/peer_host_binding_pipeline.cpp`，确认 role 过滤已收口到 runtime registry facade；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过，输出仅有既有 FFmpeg/MSVC 警告。
+
+### ARCH-SPLIT-P1-347 peer refresh pipeline 自行过滤 host-downstream peer
+
+- 位置：`media-agent/src/peer_refresh_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`refresh_all_host_video_senders()` 和 `refresh_all_host_audio_senders()` 仍通过 `for_each_mutable_peer()` 遍历全部 peer，并在业务层手写 `peer.role != "host-downstream"` 过滤。
+- 影响：host-downstream 集合选择逻辑虽然已在 P1-346 为 host binding pipeline 收口，但 peer refresh 仍保留同类全集遍历和 role 过滤，后续迁 PeerSessionRegistry owner 时会继续穿透 registry 细节。
+- 建议：复用 `runtime_registry::for_each_mutable_peer_with_role()`，让 peer refresh pipeline 只接收 host-downstream peer，并保留 transport session、soft refresh、audio readiness 等原有业务 guard。
+- 修改意见：按建议实施 M7 小切片，不改变 host video sender soft refresh 条件、不改变 capture plan revalidate、不改变 host audio sender refresh 或 renegotiation 行为。
+- 处理结果：已处理。`peer_refresh_pipeline.cpp` 中 host video/audio sender refresh 的两个循环已改为 `for_each_mutable_peer_with_role(runtime_state, "host-downstream", ...)`；业务层只保留 `transport_session`、soft refresh 和 audio track 相关 guard，不再手写 host-downstream role 过滤。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "for_each_mutable_peer_with_role|for_each_mutable_peer\\(|peer\\.role != \\"host-downstream\\"" media-agent/src/peer_refresh_pipeline.cpp media-agent/src/peer_host_binding_pipeline.cpp media-agent/src/runtime_registry.h media-agent/src/runtime_registry.cpp`，确认 peer refresh 的 host-downstream 过滤已走 registry facade；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过。
+
+### ARCH-SPLIT-P1-348 role-filtered peer 遍历仍由 runtime_registry 实现
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/src/runtime_registry.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-346/P1-347 已让业务 pipeline 通过 `runtime_registry::for_each_mutable_peer_with_role()` 访问 host-downstream peer，但 role 过滤实现仍在 `runtime_registry.cpp` 中通过 `for_each_mutable_peer()` 包一层 lambda 完成。
+- 影响：`runtime_registry` 仍承担一部分 PeerSessionRegistry 的集合选择规则；后续把 `PeerSessionRegistry` 升级为真正 owner/snapshot API 时，role-filtered 遍历还没有完全归属 registry。
+- 建议：把 role-filtered 遍历实现下沉到 `PeerSessionRegistry::for_each_mutable_with_role()`，`runtime_registry` 只保留兼容转发 facade。
+- 修改意见：按建议实施 M7 小切片，不改变 host-downstream 遍历顺序、不改变 callback 调用时机、不改变任何业务 pipeline 行为。
+- 处理结果：已处理。`session_registries.h` 中 `PeerSessionRegistry` 新增 `for_each_mutable_with_role(role, callback)`；`runtime_registry.cpp::for_each_mutable_peer_with_role()` 改为直接委托 `runtime_state.peer_sessions.for_each_mutable_with_role(role, callback)`，不再自行实现 role 过滤。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "for_each_mutable_with_role|for_each_mutable_peer_with_role|peer\\.role == role|for_each_mutable\\(runtime_state" media-agent/src/session_registries.h media-agent/src/runtime_registry.cpp media-agent/src/runtime_registry.h media-agent/src/peer_host_binding_pipeline.cpp media-agent/src/peer_refresh_pipeline.cpp`，确认 role-filtered 遍历实现位于 `PeerSessionRegistry`，runtime facade 只转发；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过，输出仅有既有 FFmpeg/MSVC 警告。
+
+### ARCH-SPLIT-P1-349 agent status/stats 为只读 peer 聚合构造 PeerSessionController
+
+- 位置：`media-agent/src/agent_status_json.cpp`、`media-agent/src/peer_session_controller.h`、`media-agent/src/peer_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`build_status_json()` 和 `build_stats_json()` 只需要 peer count / peers stats JSON，却构造 `PeerSessionController` 调用 `count()` / `stats_json()`；controller 也因此继续暴露只读聚合 API。
+- 影响：`PeerSessionController` 的职责混合 command owner 与只读 snapshot aggregator；后续收紧 controller API 时，status/stats 聚合会继续误用可写 controller。
+- 建议：`agent_status_json.cpp` 直接使用 `peer_snapshot_aggregator.*` 的 `peer_session_count()` / `peer_session_stats_json()`；删除 `PeerSessionController` 上对应只读 API。
+- 修改意见：按建议实施 M7 API 瘦身，不改变 `getStatus.peerCount` 或 `getStats.peers[]` JSON 输出。
+- 处理结果：已处理。`agent_status_json.cpp` 删除 `peer_session_controller.h` 依赖，改为 include `peer_snapshot_aggregator.h` 并直接调用 `peer_session_count(state)` / `peer_session_stats_json(state)`；`peer_session_controller.h/cpp` 删除 `count()` / `stats_json()` 声明和实现，也删除不再需要的 `<cstddef>` 与 `peer_snapshot_aggregator.h` include。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "PeerSessionController peer_sessions|peer_sessions\\.count|peer_sessions\\.stats_json|PeerSessionController::count|PeerSessionController::stats_json|peer_snapshot_aggregator|peer_session_count\\(|peer_session_stats_json\\(" media-agent/src/agent_status_json.cpp media-agent/src/peer_session_controller.h media-agent/src/peer_session_controller.cpp media-agent/src -g "*.cpp" -g "*.h"`，确认 status/stats 不再构造 `PeerSessionController` 读取 peer 聚合，controller 只读 API 已删除；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过，输出仅有既有 FFmpeg/MSVC 警告。
+
+### ARCH-SPLIT-P1-350 agent status/stats 为只读 surface 聚合构造 SurfaceSessionController
+
+- 位置：`media-agent/src/agent_status_json.cpp`、`media-agent/src/surface_session_controller.h`、`media-agent/src/surface_session_controller.cpp`、`media-agent/src/surface_snapshot_aggregator.h`、`media-agent/src/surface_snapshot_aggregator.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`build_status_json()` 和 `build_stats_json()` 只需要 surface count / surfaces stats JSON，却构造 `SurfaceSessionController` 调用 `count()` / `stats_json()`；controller 也因此继续暴露只读聚合 API。
+- 影响：`SurfaceSessionController` 的职责混合 command owner、lifecycle command 和只读 snapshot aggregator；后续收紧 controller API 时，status/stats 聚合会继续误用可写 controller。
+- 建议：新增 `surface_snapshot_aggregator.*`，让 `agent_status_json.cpp` 直接使用 `surface_session_count()` / `surface_session_stats_json()`；删除 `SurfaceSessionController` 上对应只读 API。
+- 修改意见：按建议实施 M7 API 瘦身，不改变 `getStatus.surfaceCount` 或 `getStats.surfaces[]` JSON 输出。
+- 处理结果：已处理。新增 `surface_snapshot_aggregator.h/cpp` 并加入 `media-agent/CMakeLists.txt`；`agent_status_json.cpp` 删除 `surface_session_controller.h` 依赖，改为 include `surface_snapshot_aggregator.h` 并直接调用 `surface_session_count(state)` / `surface_session_stats_json(state)`；`surface_session_controller.h/cpp` 删除 `count()` / `stats_json()` 声明和实现，也删除不再需要的 `<cstddef>` 与 `<sstream>` include。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "SurfaceSessionController surface_sessions|surface_sessions\\.count|surface_sessions\\.stats_json|SurfaceSessionController::count|SurfaceSessionController::stats_json|surface_snapshot_aggregator|surface_session_count\\(|surface_session_stats_json\\(" media-agent/src/agent_status_json.cpp media-agent/src/surface_session_controller.h media-agent/src/surface_session_controller.cpp media-agent/src -g "*.cpp" -g "*.h"`，确认 status/stats 不再构造 `SurfaceSessionController` 读取 surface 聚合，controller 只读 API 已删除；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过。
+
+### ARCH-SPLIT-P1-351 host audio dispatch 调用点仍传入完整 runtime
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/peer_host_source_binding.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`HostAudioDispatchSession` 已支持直接绑定 `AudioSessionState&`，但 lifecycle 的 audio status refresh 和 peer host audio sender 注册仍使用 `HostAudioDispatchSession(state)` 构造，导致不需要完整 runtime 的路径继续暴露 runtime 依赖。
+- 影响：audio owner 虽然已有 session 构造入口，但普通调用点仍容易沿用完整 runtime 构造；后续把 `AudioSessionRegistry` 升级为真正 session owner 时，需要额外追踪这些无必要 runtime 入参。
+- 建议：lifecycle audio status refresh 改为显式传入 `current_audio_session(state)`；peer host source binding 中仅用于 transport session register/unregister 的路径改为默认 host audio dispatch facade，避免为了全局 transport registry 注册传完整 runtime。
+- 修改意见：按建议实施 M7 小切片，不改变 WASAPI callback、capture active flag、transport session registry 或 host audio sender refresh 行为。
+- 处理结果：已处理。`refresh_agent_runtime_state()` 和 `initialize_agent_runtime()` 的 audio status refresh 已改为 `HostAudioDispatchSession(current_audio_session(state))`；WASAPI callback 挂接改为默认 facade；`configure_host_audio_sender()` 内 register transport session 的两个路径已改为默认 `HostAudioDispatchSession`，不再传入完整 runtime。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "HostAudioDispatchSession\\(state\\)|HostAudioDispatchSession host_audio_dispatch\\(state\\)|HostAudioDispatchSession\\(vds::media_agent::current_audio_session|HostAudioDispatchSession host_audio_dispatch\\;|current_audio_session\\(state\\)" media-agent/src -g "*.cpp"`，确认新增调用点不再使用完整 runtime 构造 host audio dispatch，剩余 `HostAudioDispatchSession(state)` 只保留在 facade 自身兼容构造函数中；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/agent_lifecycle.cpp media-agent/src/peer_host_source_binding.cpp docs/CODE_AUDIT_FINDINGS.md docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-352 HostAudioDispatchSession 仍保留完整 runtime 兼容构造 API
+
+- 位置：`media-agent/src/host_audio_dispatch_session.h`、`media-agent/src/host_audio_dispatch_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-351 后外部调用点已不再使用 `HostAudioDispatchSession(state)`，但 facade 头文件和实现仍保留完整 `AgentRuntimeState&` 构造函数、`state_` 成员、`peer_transport_ready(*state_)` fallback，以及未使用的 `AgentRuntimeState` 前置声明。
+- 影响：audio session owner 的公共 API 仍暗示可以从完整 runtime 自行解析 session 和 transport readiness；后续把 `AudioSessionRegistry` 升级为真实 owner 时，这些兼容入口会继续给新调用方留下绕过显式依赖注入的路径。
+- 建议：删除完整 runtime 构造函数和 `state_` 成员；transport readiness 只能通过构造时注入 provider，未注入时返回 false；保留默认构造仅用于全局 capture callback/transport registry 操作。
+- 修改意见：按建议实施 M7 API 瘦身，不改变 RPC loop 的 injected provider 路径，不改变 WASAPI callback、capture active、transport session registry、PCM dispatch 或 audio stats 行为。
+- 处理结果：已处理。`HostAudioDispatchSession` 公共头删除 `AgentRuntimeState&` 构造重载和 `AgentRuntimeState` 前置声明；实现文件删除 `agent_runtime.h` / `runtime_registry.h` 依赖、完整 runtime 构造实现和 `state_` fallback。`transport_ready()` 现在只使用注入的 provider，未注入时返回 false；`refresh_host_audio_senders()` 只在注入 `PeerSessionController` 时刷新 peer sender。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "HostAudioDispatchSession\\(AgentRuntimeState|HostAudioDispatchSession\\(.*state|AgentRuntimeState|agent_runtime\\.h|runtime_registry\\.h|state_|peer_transport_ready|current_audio_session" media-agent/src/host_audio_dispatch_session.h media-agent/src/host_audio_dispatch_session.cpp`，确认 host audio dispatch facade 不再依赖完整 runtime/registry；已执行 `rg -n "HostAudioDispatchSession\\(state\\)|HostAudioDispatchSession host_audio_dispatch\\(state\\)|HostAudioDispatchSession\\(vds::media_agent::current_audio_session|HostAudioDispatchSession\\(current_audio_session" media-agent/src -g "*.cpp" -g "*.h"`，确认全项目没有旧 runtime 构造调用方；首次 `verify-media-agent` 暴露缺少 `audio_session_state.h` 窄头，补充后再次执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/host_audio_dispatch_session.h media-agent/src/host_audio_dispatch_session.cpp media-agent/src/agent_lifecycle.cpp media-agent/src/peer_host_source_binding.cpp docs/CODE_AUDIT_FINDINGS.md docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-353 diagnostics fallback 仍持有第二套 stats polling timer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-diagnostics.js` 已是 host/viewer stats polling 的唯一正常 owner，但 `app-native-overrides.js::createNativeDiagnosticsBridge()` 在缺模块 fallback 中仍维护 `fallbackStatsPollingTimers`、`setInterval()` 周期 tick 和 stop 回调状态。
+- 影响：R7 薄入口仍保留第二套 diagnostics polling owner；如果加载顺序异常或模块缺失，legacy 文件会继续执行一套和正常 diagnostics 模块并行的 timer 逻辑，后续清理入口时还需要额外证明这套 fallback 没有业务依赖。
+- 建议：缺 `native-diagnostics.js` 时只保留同形状 no-op bridge：`startStatsPolling()` 调用 `onStart` 后返回 disabled 结果，`stopStatsPolling()` 调用传入 `onStop`，不再创建 timer、不再持有 map、不再周期调用 `onTick`。正常路径保持 `native-diagnostics.js` 托管。
+- 修改意见：按建议实施 R7 小切片，不改变正常脚本顺序和正常 diagnostics 行为，不改变 P2P/host capture 报告 builder 正常路径。
+- 处理结果：已处理。`app-native-overrides.js` 的 diagnostics fallback 删除 `fallbackStatsPollingTimers`、`setInterval()` 和周期 tick；新增极小 `invokeOptional()` helper，fallback `startStatsPolling()` 只触发 `onStart` 并返回 `{ disabled: true }`，fallback `stopStatsPolling()` 只触发显式 `onStop`。`docs/RENDERER_SPLIT_MAP.md` 已同步 R3/R7 当前边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`，均通过；已执行 `rg -n "fallbackStatsPollingTimers|setInterval\\(\\(\\) => tick|startStatsPolling|stopStatsPolling|disabled: true|invokeOptional" server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认当前源码 fallback 已无 `fallbackStatsPollingTimers` 或周期 tick，唯一真实 timer registry 位于 `native-diagnostics.js`；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-354 diagnostics fallback 仍持有 latest stats/report 缓存
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-353 已把 diagnostics fallback 的 polling timer 收成 no-op，但 `createNativeDiagnosticsBridge()` fallback 仍持有 `fallbackLatestP2pStatsSnapshot` 和 `fallbackLatestHostCaptureDiagnosticReport` 两份缓存。
+- 影响：正常路径的 latest P2P stats 和 host capture report 已由 `native-diagnostics.js` 持有，legacy fallback 再保存一份缓存会继续保留第二个 diagnostics snapshot owner，阻碍 `app-native-overrides.js` 变成纯装配入口。
+- 建议：缺模块 fallback 只保留同形状方法，不持有缓存；`setLatestP2pStatsSnapshot()` 返回传入 stats 或 null，`getLatestP2pStatsSnapshot()` 返回 null；host capture report setter 返回格式化文本，getter 返回静态等待文案。
+- 修改意见：按建议实施 R7 小切片，不改变正常 diagnostics 模块行为，不改变 report builder 正常路径。
+- 处理结果：已处理。`app-native-overrides.js` 的 diagnostics fallback 删除 `fallbackLatestP2pStatsSnapshot` 和 `fallbackLatestHostCaptureDiagnosticReport`；fallback latest stats/report API 变为无状态同形状 facade。`docs/RENDERER_SPLIT_MAP.md` 已同步 R3/R7 当前边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`，均通过；已执行 `rg -n "fallbackLatestP2pStatsSnapshot|fallbackLatestHostCaptureDiagnosticReport|setLatestP2pStatsSnapshot|getLatestP2pStatsSnapshot|setLatestHostCaptureDiagnosticReport|getLatestHostCaptureDiagnosticReport" server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认当前源码 fallback 不再持有 latest stats/report 缓存，真实缓存只在 `native-diagnostics.js`；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-355 session state bridge 正常路径重复传入默认状态
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-session-controller.js::createSessionState()` 已内置 `currentHostBackend='native'`、`hostPreviewRequested=true`、`obsRoomCreatePending=false`、`obsIngestStreamActive=false` 默认值，但 `app-native-overrides.js::createNativeSessionStateBridge()` 正常路径仍传入同一组重复默认对象。
+- 影响：legacy 装配层继续承担一份 session state 默认策略；后续调整默认值时需要同时检查 controller 和 legacy bridge，和 R7 “entry 只装配，不持有业务默认策略”的目标不一致。
+- 建议：正常路径直接调用 `VDS.nativeSession.createSessionState()`，默认策略由 session controller 持有；仅缺模块 fallback 保留等价本地状态，避免加载异常时崩溃。
+- 修改意见：按建议实施 R6/R7 小切片，不改变默认值、不改变 getter/setter 行为、不改变 host/OBS lifecycle 状态读写语义。
+- 处理结果：已处理。`app-native-overrides.js` 正常路径改为直接 `window.VDS.nativeSession.createSessionState()`；重复默认对象已删除，缺模块 fallback 仍保留等价本地默认状态。`docs/RENDERER_SPLIT_MAP.md` 已同步 R6 当前边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js`，均通过；已执行 `rg -n "createSessionState\\(\\{|createSessionState\\(\\)|currentHostBackend: 'native'|hostPreviewRequested: true|obsRoomCreatePending: false|obsIngestStreamActive: false" server/public/app-native-overrides.js server/public/native/native-session-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认正常路径只剩 `createSessionState()` 无参调用，重复默认对象只剩历史文档文字；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-356 diagnostics no-op fallback 仍返回 5000ms polling interval
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-353/P1-354 已把 diagnostics fallback 收成无 timer、无 cache 的 no-op bridge，但 fallback `getStatsPollingIntervalMs()` 仍返回 5000ms，和 `startStatsPolling()` 的 disabled 结果不一致。
+- 影响：缺模块路径仍暴露一份看似有效的 stats polling 默认策略；后续读代码时容易误判 legacy fallback 仍管理 5 秒 polling，削弱 `native-diagnostics.js` 作为唯一 polling owner 的边界。
+- 建议：fallback `getStatsPollingIntervalMs()` 返回 0，明确表达 disabled；正常路径的 5000ms 默认值继续只存在于 `native-diagnostics.js`。
+- 修改意见：按建议实施 R7 小切片，不改变正常 diagnostics 行为，不改变 host/viewer polling 正常路径。
+- 处理结果：已处理。`app-native-overrides.js` 的 diagnostics fallback `getStatsPollingIntervalMs()` 已改为返回 0；`docs/RENDERER_SPLIT_MAP.md` 已同步说明 fallback 为 disabled。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`，均通过；已执行 `rg -n "getStatsPollingIntervalMs: \\(\\) =>|getStatsPollingIntervalMs\\(\\)|intervalMs: 0|disabled: true|statsPollingIntervalMs|5000" server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认 fallback interval 已是 0，正常 diagnostics 模块仍持有 5000ms 默认值；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-357 ViewerAudioSession 仍保留无用途 runtime 构造入口
+
+- 位置：`media-agent/src/viewer_audio_session.h`、`media-agent/src/viewer_audio_session.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/agent_rpc_router.cpp`、`media-agent/src/peer_close_pipeline.cpp`、`media-agent/src/peer_transport_callback_factory.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-217 已删除 `ViewerAudioSession::state_` 成员，但构造函数仍要求 `AgentRuntimeState&` 参数并在实现中 `(void)state`。调用点因此继续为了 viewer audio facade 传完整 runtime。
+- 影响：viewer audio owner 的公共 API 仍暗示需要完整 runtime；后续把 audio/session registry 继续物理拆分时，会保留一条无意义的大 runtime 依赖边。
+- 建议：删除 `AgentRuntimeState` 前置声明和 `ViewerAudioSession(AgentRuntimeState&)` 构造函数，改为默认构造；所有调用点同步改为 `ViewerAudioSession viewer_audio;`，并移除 peer transport callback 中不再使用的 runtime capture。
+- 修改意见：按建议实施 M6/M7 小切片，不改变 viewer audio RPC、remote audio relay/playback、viewer-upstream close 或 agent shutdown 行为。
+- 处理结果：已处理。`ViewerAudioSession` 现在默认构造，不再暴露 `AgentRuntimeState&` 构造入口；`viewer_audio_session.cpp` 删除空构造实现；RPC loop、agent shutdown、close viewer-upstream peer 和 peer transport audio callbacks 均改为默认构造；`peer_transport_callback_factory.cpp` 删除不再使用的 runtime capture。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M6/M7 边界。
+- 验证结果：已执行 `rg -n "ViewerAudioSession\\(AgentRuntimeState|ViewerAudioSession\\([^\\)]*state|ViewerAudioSession::ViewerAudioSession|struct AgentRuntimeState|runtime_state = context\\.runtime_state" media-agent/src/viewer_audio_session.h media-agent/src/viewer_audio_session.cpp media-agent/src/agent_lifecycle.cpp media-agent/src/agent_rpc_router.cpp media-agent/src/peer_close_pipeline.cpp media-agent/src/peer_transport_callback_factory.cpp`，无命中，确认 viewer audio facade 不再暴露 runtime 构造或无用 runtime capture；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/viewer_audio_session.h media-agent/src/viewer_audio_session.cpp media-agent/src/agent_lifecycle.cpp media-agent/src/agent_rpc_router.cpp media-agent/src/peer_close_pipeline.cpp media-agent/src/peer_transport_callback_factory.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-358 surface registry fallback 仍持有第二套 Map owner
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-surface-controller.js` 已是正常路径的 surface registry owner，但 `app-native-overrides.js::createEmbeddedSurfaceRegistryBridge()` 在缺模块 fallback 中仍维护 `fallbackAttachedSurfaces`、`fallbackSurfaceGenerations` 和 `fallbackSurfaceFailureCounts` 三份 Map。
+- 影响：R7 薄入口仍保留第二套 surface entry/generation/failure owner；加载异常路径会继续执行一份 legacy registry 逻辑，后续删除 legacy wrapper 时需要额外证明这套状态没有业务依赖。
+- 建议：缺 `native-surface-controller.js` 时只保留同形状 disabled facade：surface count 为 0、entry 为 null、generation/failure count 为 0，不再保存 Map。正常路径保持 `native-surface-controller.js` 托管。
+- 修改意见：按建议实施 R7 小切片，不改变正常 surface attach/update/detach、host preview、peer viewer surface 或窗口跟随行为。
+- 处理结果：已处理。`app-native-overrides.js` 的 surface registry fallback 删除 `fallbackAttachedSurfaces`、`fallbackSurfaceGenerations` 和 `fallbackSurfaceFailureCounts`；fallback registry API 变为无状态 disabled facade。`docs/RENDERER_SPLIT_MAP.md` 已同步正常路径唯一 surface registry owner 和缺模块 fallback disabled 语义。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-surface-controller.js`，均通过；已执行 `rg -n "fallbackAttachedSurfaces|fallbackSurfaceGenerations|fallbackSurfaceFailureCounts|createEmbeddedSurfaceRegistryBridge|getSurfaceCount: \\(\\) => 0|getSurfaceEntry: \\(\\) => null|incrementSurfaceFailureCount: \\(\\) => 0|disabled facade|唯一 surface registry owner" server/public/app-native-overrides.js server/public/native/native-surface-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认源码已无 fallback surface Map，剩余命中为审计/拆分文档说明和 disabled facade API；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-359 surface sync fallback 仍保留第二套 RAF/timer loop
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-358 已把缺 `native-surface-controller.js` 时的 surface registry fallback 收成 disabled facade，但 `app-native-overrides.js` 仍保留 `embeddedSurfaceSyncRafId`、`embeddedSurfaceTrackingRafId`、wheel-driven sync 和 window-bounds final sync timer 等 legacy fallback loop 状态。
+- 影响：R7 薄入口仍暴露第二套 surface sync/tracking timer owner；虽然 registry count 已为 0，大部分路径会提前返回，但代码读起来仍像 legacy 文件能独立管理 surface sync，增加后续删除入口的证明成本。
+- 建议：保留同名 wrapper，但缺 `native-surface-controller.js` 时直接 no-op；正常路径继续委托 `nativeSurfaceController.scheduleSync()`、`scheduleWheelDrivenSync()`、`forceResync()`、`forceResyncBurst()`、`scheduleWindowBoundsSync()` 和 tracking loop API。
+- 修改意见：按建议实施 R7 小切片，不改变正常 surface controller 路径，不改变窗口 bounds 缓存写入，不改变 host preview 或 viewer surface 行为。
+- 处理结果：已处理。`app-native-overrides.js` 删除 legacy surface fallback 的 RAF/timer 状态变量和 fallback loop 实现；`syncAllEmbeddedSurfaces()`、`scheduleEmbeddedSurfaceSync()`、`scheduleWheelDrivenSurfaceSync()`、`forceEmbeddedSurfaceResync()`、`forceEmbeddedSurfaceResyncBurst()`、`scheduleWindowBoundsSurfaceSync()`、`start/stopEmbeddedSurfaceTrackingLoop()` 在正常路径继续委托 `native-surface-controller.js`，缺 controller 时直接 no-op；`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-surface-controller.js`，均通过；已执行 `rg -n "embeddedSurfaceSyncRafId|embeddedSurfaceSyncInFlight|embeddedSurfaceSyncPending|embeddedSurfaceTrackingRafId|wheelDrivenSyncRafId|wheelDrivenSyncFramesRemaining|windowBoundsSurfaceSyncRafId|windowBoundsSurfaceSyncFinalTimerId|runWheelDrivenSurfaceSyncBurst|setTimeout\\(forceEmbeddedSurfaceResync|requestAnimationFrame\\(runPass|requestAnimationFrame\\(async \\(\\) =>" server/public/app-native-overrides.js`，无命中，确认 legacy 文件不再持有 surface fallback timer/RAF 状态；已执行包含 `native-surface-controller.js` 和文档的同模式搜索，剩余源码命中均在正常 surface controller owner 内；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-360 prepareObsIngest RPC 仍通过静态 session 方法直接传 runtime
+
+- 位置：`media-agent/src/agent_rpc_router.cpp`、`media-agent/src/obs_ingest_session.h`、`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`ObsIngestSession` 已作为 OBS ingest facade 接管 prepare/start/stop/snapshot，但 `prepareObsIngest` RPC 仍调用 `ObsIngestSession::prepare_from_request(runtime_state, line)` 静态方法；该方法内部又重新构造 `ObsIngestSession obs_ingest(state)`。
+- 影响：RPC router 虽然已持有 Host/Peer/Surface/Audio facade，但 OBS prepare 仍暴露一个静态函数直接接收完整 runtime 的入口，也保留一次无必要的 facade 重构造，削弱 OBS session ownership 表达。
+- 建议：在 `run_agent_rpc_loop()` 中创建 `ObsIngestSession obs_ingest(runtime_state)`，把 `prepare_from_request()` 改为实例方法并复用 `state_` / `session_`。JSON-RPC wire shape 和结果 JSON 保持不变。
+- 修改意见：按建议实施 M7 API 瘦身，不改变 OBS ingest port prepare、host-active guard、transportReady 输出或 obsIngest JSON。
+- 处理结果：已处理。`agent_rpc_router.cpp` 现在持有 `ObsIngestSession obs_ingest(runtime_state)`，`prepareObsIngest` 调用 `obs_ingest.prepare_from_request(line)`；`obs_ingest_session.h/cpp` 删除静态 `prepare_from_request(AgentRuntimeState&, ...)` 入口，实例方法直接复用 `state_` / `session_`，不再重新构造 session facade。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M7 边界。
+- 验证结果：已执行 `rg -n "ObsIngestSession::prepare_from_request\\(|prepare_from_request\\(runtime_state|static ObsIngestCommandResult prepare_from_request|ObsIngestSession obs_ingest\\(runtime_state\\)|obs_ingest\\.prepare_from_request\\(line\\)" media-agent/src/agent_rpc_router.cpp media-agent/src/obs_ingest_session.h media-agent/src/obs_ingest_session.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，确认源码已无静态 runtime 入口或 `prepare_from_request(runtime_state, ...)` 调用，新入口为 router 中的 `ObsIngestSession obs_ingest(runtime_state)` 与 `obs_ingest.prepare_from_request(line)`；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过，仅保留既有 FFmpeg 头文件/`av_init_packet` 警告；已执行 `git diff --check -- media-agent/src/agent_rpc_router.cpp media-agent/src/obs_ingest_session.h media-agent/src/obs_ingest_session.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-361 closePeer request 仍通过临时 pipeline free-function 暴露 runtime
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_close_pipeline.h`、`media-agent/src/peer_close_pipeline.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`PeerSessionController` 已是 peer map 和 closePeer command owner，但 `close_from_request()` 仍只转调 `close_peer_session_from_request(runtime_state_, request_json)`；该 helper 通过 `peer_close_pipeline.h` 继续公开完整 `AgentRuntimeState&` request 入口。
+- 影响：M2/M7 的 peer ownership 还有一个历史中间层，后续搜索 `from_request(AgentRuntimeState&)` 会继续看到 closePeer 可绕过 controller 调用，削弱“PeerSessionController 是 request owner”的边界。
+- 建议：把 closePeer request body 收回 `PeerSessionController::close_from_request()` 本体，删除 `peer_close_pipeline.h/cpp` 并从 CMake 移除；行为、breadcrumb、surface detach、media binding close、transport/receiver cleanup、viewer-upstream relay/audio cleanup 和 result JSON 保持不变。
+- 修改意见：按建议实施 M2/M7 小切片，不改变 closePeer JSON-RPC wire shape 和 close cleanup 顺序。
+- 处理结果：已处理。`PeerSessionController::close_from_request()` 现在直接解析 peerId、查找/删除 peer、调用 `SurfaceSessionController::detach_peer_surfaces()`、关闭 media binding/receiver/transport、清理 viewer-upstream relay bootstrap 与 viewer audio、发送 closed peer-state，并返回原 `build_peer_closed_result_json(peer_transport_ready(...))`；`peer_close_pipeline.h/cpp` 已删除，`media-agent/CMakeLists.txt` 已移除 `src/peer_close_pipeline.cpp`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M2/M7 边界。
+- 验证结果：已执行 `rg -n "peer_close_pipeline|close_peer_session_from_request|from_request\\(AgentRuntimeState&|\\b[A-Za-z0-9_]+_from_request\\(runtime_state" media-agent/CMakeLists.txt media-agent/src docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md -g "*.cpp" -g "*.h" -g "*.md"`，确认源码/CMake 已无 `peer_close_pipeline.*` 和 `close_peer_session_from_request`，剩余 runtime request helper 命中为 signaling pipeline 边界或历史文档；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/peer_session_controller.cpp media-agent/CMakeLists.txt media-agent/src/peer_close_pipeline.cpp media-agent/src/peer_close_pipeline.h docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-362 peer signaling request 仍通过临时 pipeline free-function 暴露 runtime
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`media-agent/src/peer_signaling_pipeline.h`、`media-agent/src/peer_signaling_pipeline.cpp`、`media-agent/CMakeLists.txt`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`PeerSessionController` 已是 peer request owner，但 `set_remote_description_from_request()` 和 `add_remote_ice_candidate_from_request()` 仍只转调 `set_peer_remote_description_from_request(runtime_state_, request_json)` / `add_peer_remote_ice_candidate_from_request(runtime_state_, request_json)`；这两个 helper 通过 `peer_signaling_pipeline.h` 继续公开完整 `AgentRuntimeState&` request 入口。
+- 影响：M2/M7 的 peer signaling ownership 仍有一个历史中间层，新增代码仍可绕过 controller 调用 signaling request helper；完成审计时也会继续看到 `from_request(AgentRuntimeState&)` 残留。
+- 建议：把 setRemoteDescription/addRemoteIceCandidate request body 收回 `PeerSessionController` 本体，删除 `peer_signaling_pipeline.h/cpp` 并从 CMake 移除；行为、manifest apply、transport write、snapshot refresh、fallback peer-state event 和 OK/error result JSON 保持不变。
+- 修改意见：按建议实施 M2/M7 小切片，不改变 setRemoteDescription/addRemoteIceCandidate JSON-RPC wire shape。
+- 处理结果：已处理。`PeerSessionController::set_remote_description_from_request()` 现在直接解析 peerId/type/sdp、查找 peer、应用 media manifest、写入 remote description、刷新 transport snapshot、在无 transport 时发送 fallback peer-state，并返回原 OK/error result；`add_remote_ice_candidate_from_request()` 现在直接解析 peerId/candidate/sdpMid、写入 remote ICE candidate、刷新 snapshot 和 fallback peer-state；`peer_signaling_pipeline.h/cpp` 已删除，`media-agent/CMakeLists.txt` 已移除 `src/peer_signaling_pipeline.cpp`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 M2/M7 边界。
+- 验证结果：已执行 `rg -n "peer_signaling_pipeline|set_peer_remote_description_from_request|add_peer_remote_ice_candidate_from_request|from_request\\(AgentRuntimeState&|\\b[A-Za-z0-9_]+_from_request\\(runtime_state" media-agent/CMakeLists.txt media-agent/src docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md -g "*.cpp" -g "*.h" -g "*.md"`，确认源码/CMake 已无 `peer_signaling_pipeline.*`、`set_peer_remote_description_from_request` 或 `add_peer_remote_ice_candidate_from_request` helper，剩余命中为历史审计文档；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- media-agent/src/peer_session_controller.cpp media-agent/CMakeLists.txt media-agent/src/peer_signaling_pipeline.cpp media-agent/src/peer_signaling_pipeline.h docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-363 media-agent request runtime 暴露最终扫描结论未记录
+
+- 位置：`media-agent/src`、`media-agent/CMakeLists.txt`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-360 到 P1-362 已清掉 OBS prepare 静态 runtime 入口、closePeer pipeline 和 peer signaling pipeline，但缺少一条最终扫描结论，后续审计容易重复追问是否仍存在公开 `from_request(AgentRuntimeState&)` request helper。
+- 影响：没有记录最终扫描证据时，media-agent M2/M7 的“核心 request 由 controller/session facade 持有”只能从多个零散条目推断，完成审计成本更高。
+- 建议：用全源码搜索确认 request runtime helper 已无源码/CMake 残留；同时记录 renderer peer fallback Map 暂不收窄的原因，避免把仍可能支撑缺 `native-peer-controller.js` 降级路径的状态误删。
+- 修改意见：按建议实施文档收尾，不改运行代码。
+- 处理结果：已处理。最终扫描确认 media-agent 源码/CMake 中已无公开 `from_request(AgentRuntimeState&)` 或 `_from_request(runtime_state...)` request helper；剩余 `AgentRuntimeState& state_` / `runtime_state_` 为 Host/Peer/Surface/OBS controller/session facade 自身持有 runtime 的正常 owner 边界。renderer 侧仍存在 native peer signal/handle fallback Map，但它属于缺 `native-peer-controller.js` 时的真实降级路径，本轮不做 no-op 收窄。
+- 验证结果：已执行 `rg -n "from_request\\(AgentRuntimeState&|\\b[A-Za-z0-9_]+_from_request\\(runtime_state|peer_close_pipeline|peer_signaling_pipeline|prepare_from_request\\(runtime_state" media-agent/CMakeLists.txt media-agent/src -g "*.cpp" -g "*.h" -g "CMakeLists.txt"`，无命中，确认 media-agent 源码/CMake 中 request runtime helper 已清零；已执行 `rg -n "fallbackSignalBacklog|fallbackSignalWaiters|fallbackPeerHandles|createNativePeerSignalRegistryBridge|createNativePeerHandleRegistryBridge|nativePeerController" server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/CODE_AUDIT_FINDINGS.md`，确认 renderer 剩余 fallback owner 集中在 native peer 缺模块路径；已执行 `git diff --check -- docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-364 connect failfast 默认值仍由 legacy 正常路径传入 controller
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js::armPeerConnectFailfast()` 已拥有 15000ms 默认 timeout，但 `app-native-overrides.js::armPeerConnectFailfast()` 正常路径仍先读取 `P2P_CONNECT_FAILFAST_MS`，再把 timeout 显式传给 controller。
+- 影响：R5/R7 边界里 connect failfast 的默认策略仍有两份 owner；后续调整默认值时需要同时检查 `app.js` 常量、legacy wrapper 和 controller 默认值。
+- 建议：正常 controller 路径调用 `nativePeerController.armPeerConnectFailfast(peerId, undefined, onConnectFailfast)`，让 controller 使用自己的默认值；缺 controller fallback 继续读取旧 `P2P_CONNECT_FAILFAST_MS` 或 15000ms，保证降级路径语义不变。
+- 修改意见：按建议实施 R5/R7 小切片，不改变超时回调、NAT fallback、失败 UI 或缺 controller fallback。
+- 处理结果：已处理。`app-native-overrides.js` 正常路径不再读取并传入 `P2P_CONNECT_FAILFAST_MS`，而是把 timeout 留空交给 `native-peer-controller.js` 默认值；仅缺 controller fallback 继续计算 `timeoutMs` 并走旧 timer。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`，均通过；已执行 `rg -n "armPeerConnectFailfast\\(peerId, timeoutMs|armPeerConnectFailfast\\(peerId, undefined|const timeoutMs = typeof P2P_CONNECT_FAILFAST_MS|P2P_CONNECT_FAILFAST_MS|connect failfast 15000ms 默认值" server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认正常路径调用已改为传 `undefined`，`P2P_CONNECT_FAILFAST_MS` 只剩缺 controller fallback 和历史文档命中；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-365 disconnected recovery 重试延迟仍由 legacy 正常路径传入 controller
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js::prepareDisconnectedRecovery()` 已持有 `[750,1500]` 重试延迟默认值，但 `app-native-overrides.js::scheduleDisconnectedPeerRecovery()` 正常路径仍把 `P2P_RECONNECT_DELAYS_MS` 作为 `reconnectDelaysMs` 传给 controller。
+- 影响：disconnected recovery 的默认策略仍有两份 owner；调整默认值时需要同时检查 legacy wrapper 和 controller。
+- 建议：正常 controller 路径直接调用 `prepareDisconnectedRecovery(peerId, handle)`，让 controller 使用默认值；缺 controller fallback 继续读取旧 `P2P_RECONNECT_DELAYS_MS || [750,1500]`。
+- 修改意见：按建议实施 R5/R7 小切片，不改变 disconnected recovery callback、attempt 校验、host force offer、viewer reconnect-ready 或缺 controller fallback。
+- 处理结果：已处理。`app-native-overrides.js` 正常路径不再向 `prepareDisconnectedRecovery()` 传入 `reconnectDelaysMs`；缺 controller fallback 仍内联旧 `[4000].concat(P2P_RECONNECT_DELAYS_MS || [750,1500])`。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`，均通过；已执行 `rg -n "prepareDisconnectedRecovery\\(peerId, handle, \\{|prepareDisconnectedRecovery\\(peerId, handle\\)|reconnectDelaysMs: P2P_RECONNECT_DELAYS_MS|P2P_RECONNECT_DELAYS_MS|disconnected recovery 的" server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认 disconnected recovery 正常路径已不再传 `reconnectDelaysMs`，剩余 `P2P_RECONNECT_DELAYS_MS` 源码命中为缺 controller fallback 与 relay offer retry 另一路径；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-366 relay offer retry 重试延迟仍由 legacy 正常路径计算
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：relay connect-to-next 失败后，`scheduleRelayOfferRetry()` 正常路径仍直接读取 `P2P_RECONNECT_DELAYS_MS` 计算 `[750,1500]` 延迟，再传给 `nativePeerController.schedulePeerReconnect()`；但该 controller 已是 peer reconnect timer owner。
+- 影响：relay offer retry 的默认延迟策略仍有两份 owner，和 disconnected recovery 的默认策略收口不一致。
+- 建议：让 `native-peer-controller.js::schedulePeerReconnect()` 在未传 `delayMs` 时按 attempt 使用 `[750,1500]` 默认值；`scheduleRelayOfferRetry()` 正常路径传 `undefined`，缺 controller fallback 在 `scheduleNativePeerReconnect()` 内联旧默认值。
+- 修改意见：按建议实施 R5/R7 小切片，不改变最大重试次数 2、不改变 relay retry 回调、不改变缺 controller fallback。
+- 处理结果：已处理。`native-peer-controller.js::schedulePeerReconnect()` 现在按 attempt 持有 `[750,1500]` 默认延迟；`scheduleRelayOfferRetry()` 不再直接读取 `P2P_RECONNECT_DELAYS_MS`，而是调用 `scheduleNativePeerReconnect(nextViewerId, nextAttempt, undefined, ...)`；缺 controller fallback 的 `scheduleNativePeerReconnect()` 仍按旧 `P2P_RECONNECT_DELAYS_MS || [750,1500]` 计算延迟。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`，均通过；已执行 `rg -n "scheduleNativePeerReconnect\\(nextViewerId, nextAttempt, undefined|scheduleNativePeerReconnect\\(nextViewerId, nextAttempt, retryDelayMs|const retryDelays = Array\\.isArray\\(P2P_RECONNECT_DELAYS_MS\\)|P2P_RECONNECT_DELAYS_MS|retryDelays = \\[750, 1500\\]|relay offer retry 的" server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认 relay offer retry 正常路径传 `undefined`，`P2P_RECONNECT_DELAYS_MS` 源码命中只剩缺 controller fallback/disconnected recovery fallback，正常默认值在 `native-peer-controller.js`；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-367 native P2P 默认常量仍从 app.js 暴露
+
+- 位置：`server/public/app.js`、`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-364 到 P1-366 已把 connect failfast、disconnected recovery 和 relay retry 的正常默认策略迁入 `native-peer-controller.js`，但 `app.js` 顶层仍保留 `P2P_CONNECT_FAILFAST_MS` / `P2P_RECONNECT_DELAYS_MS` 常量，缺 controller fallback 也继续引用这些 legacy 常量。
+- 影响：`app.js` 仍像 native P2P 策略 owner；R7 薄入口完成审计时还要解释为什么 renderer 主入口导出 peer 重连默认值，调整默认策略也容易误改旧入口。
+- 建议：删除 `app.js` 中的 native P2P 默认常量；`app-native-overrides.js` 缺 controller fallback 内联当前默认值；正常路径继续完全交给 `native-peer-controller.js`。
+- 修改意见：按建议实施 R7 小切片，不改变 15000ms failfast、不改变 `[750,1500]` 重试延迟、不改变缺 controller fallback 行为。
+- 处理结果：已处理。`app.js` 已删除 `P2P_CONNECT_FAILFAST_MS` 和 `P2P_RECONNECT_DELAYS_MS`；`app-native-overrides.js` 的 connect failfast fallback 内联 15000ms，disconnected recovery/relay reconnect fallback 内联 `[750,1500]`；`docs/RENDERER_SPLIT_MAP.md` 已同步为 `app.js` 不再暴露 native P2P failfast/reconnect 常量。
+- 验证结果：已执行 `node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`，均通过；已执行 `rg -n "P2P_CONNECT_FAILFAST_MS|P2P_RECONNECT_DELAYS_MS" server/public/app.js server/public/app-native-overrides.js server/public/native docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md -g "*.js" -g "*.md"`，确认源码和当前拆分文档已无命中，剩余命中仅为历史审计记录。
+
+### ARCH-SPLIT-P1-368 app-native-overrides 仍能绕过 native-entry 自行安装
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-entry.js`、`server/public/index.html`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`index.html` 已固定在 `app-native-overrides.js` 之前加载 `native/native-entry.js`，但 `app-native-overrides.js` 底部仍保留缺 native-entry 时直接调用 `installNativeAuthorityOverrides()` 并手动注册 `legacyGlobalBindings` 的 standalone fallback。
+- 影响：R7 的入口 ownership 仍不唯一；加载顺序异常或 native-entry 缺失时，旧大文件会重新成为 install guard 和全局 hook 注册 owner，削弱“native-entry 只做装配、app-native-overrides 只提供 installer”的边界。
+- 建议：删除 standalone fallback，只允许 `VDS.nativeEntry.installLegacyOverrides(installNativeAuthorityOverrides)` 托管安装；加载顺序异常时 fail-fast，不再静默绕过 entry。
+- 修改意见：按建议实施 R7 小切片，不改变正常脚本顺序、不改变 installer 返回 hook map、不改变 native-entry 注册全局的行为。
+- 处理结果：已处理。`app-native-overrides.js` 底部已删除 `legacyGlobalBindings = installNativeAuthorityOverrides()` 和手动 `window[name]` 注册 fallback；当前只有存在 `VDS.nativeEntry.installLegacyOverrides` 时才调用 installer。`docs/RENDERER_SPLIT_MAP.md` 已同步 native-entry 为唯一托管安装入口。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`，均通过；已执行 `rg -n "installNativeAuthorityOverrides\\(|installLegacyOverrides\\(installNativeAuthorityOverrides\\)|legacyGlobalBindings = installNativeAuthorityOverrides|Object\\.keys\\(legacyGlobalBindings\\)|standalone auto-install|缺 native-entry" server/public/app-native-overrides.js server/public/native/native-entry.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认源码中只剩 native-entry 托管调用路径，standalone fallback 仅剩历史审计/拆分文档描述；已执行 `npm run check:logging`，通过。
+
+### ARCH-SPLIT-P1-369 native peer registry 缺模块 fallback 仍持有第二套 Map
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js` 已是 peer handle registry 和 signal backlog/waiter registry owner，但 `app-native-overrides.js::createNativePeerSignalRegistryBridge()` / `createNativePeerHandleRegistryBridge()` 在缺模块时仍创建 `fallbackSignalBacklog`、`fallbackSignalWaiters`、`fallbackPeerHandles` 和 `fallbackPeerAttemptSeq`。同时 controller 的 `getSignalPeerId` option 一度指向 legacy wrapper，controller 内部调用时可能绕回自身。
+- 影响：R5/R7 peer registry ownership 不完整；加载顺序异常时 legacy 文件会重新持有 peer handle/backlog 状态，signal peerId 解析也存在不必要的递归风险。
+- 建议：固定脚本顺序下缺 `native-peer-controller.js` 应 fail-fast；删除 registry fallback Map；给 controller 注入纯 signal peerId parser，legacy wrapper 再委托 controller。
+- 修改意见：按建议实施 R7 小切片，不改变正常 controller 路径、不改变 peer handle/backlog API shape、不改变 signal payload 字段。
+- 处理结果：已处理。`createNativePeerSignalRegistryBridge()` 和 `createNativePeerHandleRegistryBridge()` 已删除 fallback Map，缺 registry 时分别抛出 `native-peer-signal-registry-unavailable` / `native-peer-handle-registry-unavailable`；新增 `parseNativeSignalPeerId()`，`nativePeerController` 初始化注入纯 parser，`getNativeSignalPeerId()` 仅作为 legacy wrapper 委托 controller 或 fallback 到纯 parser。`docs/RENDERER_SPLIT_MAP.md` 已同步 peer registry 缺模块 fail-fast 语义。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`，均通过；已执行 `rg -n "fallbackSignalBacklog|fallbackSignalWaiters|fallbackPeerHandles|fallbackPeerAttemptSeq|getSignalPeerId: \\(params\\) => getNativeSignalPeerId|parseNativeSignalPeerId|native-peer-signal-registry-unavailable|native-peer-handle-registry-unavailable|缺 native-peer-controller registry" server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认源码已无 fallback peer registry Map、controller 注入纯 parser，fail-fast 错误和文档记录存在；已执行 `npm run check:logging`，通过。
+
+### ARCH-SPLIT-P1-370 nativePeerController 本体仍允许缺模块继续走 legacy 分支
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-369 已删除 peer signal/handle registry fallback Map，但 `nativePeerController` 本体仍按三元表达式创建，缺 `VDS.nativePeer.createController` 时会得到 `null`。后续大量 `if (nativePeerController) ... else ...` 分支仍被视为可达 legacy peer 编排路径。
+- 影响：R7 完成审计时仍无法证明 peer owner 唯一；加载顺序异常时会绕过 controller，落到旧 offer/answer/ICE/recovery 分支，和 fail-fast 目标不一致。
+- 建议：新增 `createNativePeerControllerBridge()`，正常路径返回 `VDS.nativePeer.createController(options)`；缺模块直接抛 `native-peer-controller-unavailable`，让旧分支只作为历史兼容代码而非可达降级入口。
+- 修改意见：按建议实施 R7 小切片，不改变正常 controller 初始化参数、不改变 native peer controller API。
+- 处理结果：已处理。`nativePeerController` 初始化改为调用 `createNativePeerControllerBridge()`；缺 `native-peer-controller.js` 时抛出 `native-peer-controller-unavailable`，不再继续构造可空 controller 并进入后续 legacy fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步缺 controller fail-fast 语义。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`，均通过；已执行 `rg -n "const nativePeerController = window\\.VDS|const nativePeerController = createNativePeerControllerBridge|function createNativePeerControllerBridge|native-peer-controller-unavailable|: null;" server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认 `nativePeerController` 已由 bridge 创建且缺模块直接抛错，源码不再有旧三元创建 controller 的命中；已执行 `npm run check:logging`，通过。
+
+### ARCH-SPLIT-P1-371 native session controller/state 缺模块 fallback 仍持有第二套 session 状态
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-session-controller.js::createSessionState()` 已是 current host backend、host preview requested、OBS room pending、OBS stream active 的状态 owner，但 `app-native-overrides.js::createNativeSessionStateBridge()` 在缺模块时仍维护 fallbackCurrentHostBackend/fallbackHostPreviewRequested/fallbackObsRoomCreatePending/fallbackObsIngestStreamActive；`nativeSessionController` 本体也仍允许缺模块时为 `null`。
+- 影响：R6/R7 session ownership 仍不唯一；加载顺序异常时 legacy 文件会重新持有 host/OBS session 状态，后续 start/stop wrapper 也继续被视为可达降级路径。
+- 建议：固定脚本顺序下缺 `native-session-controller.js` 应 fail-fast；删除 session state fallback 变量；新增 controller/state bridge，缺模块时直接抛错。
+- 修改意见：按建议实施 R7 小切片，不改变正常 session controller/state API，不改变 host/OBS start-stop 正常路径。
+- 处理结果：已处理。`nativeSessionController` 初始化改为 `createNativeSessionControllerBridge()`，缺 controller 抛 `native-session-controller-unavailable`；`createNativeSessionStateBridge()` 删除四个 fallback 状态变量，缺 state factory 抛 `native-session-state-unavailable`。`docs/RENDERER_SPLIT_MAP.md` 已同步 session controller/state fail-fast 语义。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js`，均通过；已执行 `rg -n "fallbackCurrentHostBackend|fallbackHostPreviewRequested|fallbackObsRoomCreatePending|fallbackObsIngestStreamActive|const nativeSessionController = window\\.VDS|const nativeSessionController = createNativeSessionControllerBridge|function createNativeSessionControllerBridge|native-session-controller-unavailable|native-session-state-unavailable" server/public/app-native-overrides.js server/public/native/native-session-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认源码已无 session state fallback 变量，session controller/state 缺模块改为 fail-fast；已执行 `npm run check:logging`，通过。
+
+### ARCH-SPLIT-P1-372 native surface controller/registry 缺模块 fallback 仍保留 disabled facade
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-surface-controller.js` 已是 surface registry 和 surface controller 的唯一正常 owner，但 `app-native-overrides.js` 仍在缺模块时返回 disabled surface registry facade，并把 `nativeSurfaceController` 构造成可空值。
+- 影响：R4/R7 surface ownership 仍保留降级入口；加载顺序异常时 legacy 文件不会明确失败，而是静默进入无 surface 状态，增加预览/嵌入问题定位成本。
+- 建议：固定脚本顺序下缺 `native-surface-controller.js` 应 fail-fast；surface registry 缺失抛 `native-surface-registry-unavailable`，controller 缺失抛 `native-surface-controller-unavailable`。
+- 修改意见：按建议实施 R7 小切片，不改变正常 surface controller 初始化参数，不改变 attach/update/detach 正常路径。
+- 处理结果：已处理。`nativeSurfaceController` 初始化改为 `createNativeSurfaceControllerBridge()`；`createEmbeddedSurfaceRegistryBridge()` 删除 disabled facade，缺 registry 抛 `native-surface-registry-unavailable`，缺 controller 抛 `native-surface-controller-unavailable`。`docs/RENDERER_SPLIT_MAP.md` 已同步 surface fail-fast 语义。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-surface-controller.js`，均通过；已执行 `rg -n "const nativeSurfaceController = window\\.VDS|const nativeSurfaceController = createNativeSurfaceControllerBridge|function createNativeSurfaceControllerBridge|native-surface-controller-unavailable|native-surface-registry-unavailable|getSurfaceCount: \\(\\) => 0|getSurfaceEntry: \\(\\) => null|disabled facade" server/public/app-native-overrides.js server/public/native/native-surface-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认源码已由 bridge 创建 surface controller/registry 且缺模块 fail-fast，disabled facade 只剩历史审计记录；已执行 `npm run check:logging`，通过。
+
+### ARCH-SPLIT-P1-373 embeddedSurfaceRegistry bridge 已不可达但仍保留 facade 变量
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-372 已让 `nativeSurfaceController` 和 surface registry 缺模块 fail-fast，但 `app-native-overrides.js` 仍创建 `embeddedSurfaceRegistry = createEmbeddedSurfaceRegistryBridge()`，surface helper 在 `nativeSurfaceController` 不存在时才委托该 facade。
+- 影响：R4/R7 surface ownership 仍保留一个不可达但可见的 registry facade，审计时仍会看到 legacy 文件像是能持有 surface entry/generation/failure count。
+- 建议：删除 `embeddedSurfaceRegistry` 变量和 `createEmbeddedSurfaceRegistryBridge()`；surface count/get/set/delete/forEach/generation/failure helper 直接委托 `nativeSurfaceController`。
+- 修改意见：按建议实施 R7 小切片，不改变正常 surface controller 行为。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `embeddedSurfaceRegistry` 创建和 `createEmbeddedSurfaceRegistryBridge()`；`get/set/delete/forEachEmbeddedSurface*`、generation 和 failure count helper 均直接委托 `nativeSurfaceController`。`docs/RENDERER_SPLIT_MAP.md` 已同步 surface registry 只由 `native-surface-controller.js` 持有。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-surface-controller.js`，均通过；已执行 `rg -n "embeddedSurfaceRegistry|createEmbeddedSurfaceRegistryBridge|native-surface-registry-unavailable" server/public/app-native-overrides.js`，无命中，确认 legacy surface registry bridge 已从源码删除；已执行 `rg -n "getEmbeddedSurfaceCount|getEmbeddedSurfaceEntry|setEmbeddedSurfaceEntry|deleteEmbeddedSurfaceEntry|forEachEmbeddedSurface|invalidateEmbeddedSurfaceRegistryLayouts|getEmbeddedSurfaceGeneration|setEmbeddedSurfaceGeneration|incrementEmbeddedSurfaceGeneration|clearEmbeddedSurfaceFailureCount|incrementEmbeddedSurfaceFailureCount" server/public/app-native-overrides.js`，确认剩余 wrapper 均直接委托 `nativeSurfaceController`；已执行 `npm run check:logging`，通过。
+
+### ARCH-SPLIT-P1-374 diagnostics 缺模块 no-op bridge 仍让 Electron native 路径静默降级
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-diagnostics.js` 已是 diagnostics/stats polling/cache owner，但 `app-native-overrides.js::createNativeDiagnosticsBridge()` 仍在缺模块时返回 no-op bridge；且该 bridge 在 `!window.isElectron || !mediaEngine` 早返回之前创建。
+- 影响：Electron native 路径加载顺序异常时会静默关闭 diagnostics，而不是暴露模块缺失；Web 路径又不能直接 fail-fast，否则会破坏普通网页加载。
+- 建议：先把非 Electron / 无 mediaEngine 的早返回提前到 diagnostics 创建之前；然后删除 no-op bridge，Electron native 路径缺 diagnostics 时抛 `native-diagnostics-unavailable`。
+- 修改意见：按建议实施 R3/R7 小切片，不改变正常 diagnostics API，不改变 Web 非 Electron 返回行为。
+- 处理结果：已处理。`app-native-overrides.js` 现在先在非 Electron/无 mediaEngine 时返回 `null`，再创建 `nativeDiagnostics`；`createNativeDiagnosticsBridge()` 删除 no-op bridge，缺 `VDS.nativeDiagnostics.create` 时抛 `native-diagnostics-unavailable`。`docs/RENDERER_SPLIT_MAP.md` 已同步 diagnostics fail-fast 语义。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`，均通过；已执行 `rg -n "native-diagnostics-unavailable|logNativeDebug: \\(\\) =>|getStatsPollingIntervalMs: \\(\\) => 0|disabled: true|invokeOptional|const nativeDiagnostics = createNativeDiagnosticsBridge|if \\(!window\\.isElectron \\|\\| !mediaEngine\\)" server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认源码中非 Electron 早返回位于 diagnostics 创建前、Electron native 缺 diagnostics 会 fail-fast，no-op bridge 只剩历史审计记录；已执行 `npm run check:logging`，通过。
+
+### ARCH-SPLIT-P1-375 surface/peer 基础 helper 仍保留不可达 legacy 本地实现
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-370 到 P1-374 已让 surface/peer/diagnostics/session controller 在 Electron native 路径 fail-fast，但 `app-native-overrides.js` 里一批基础 helper 仍按 `if (native*Controller && typeof ...)` 判断后保留本地算法或本地 timer/map owner。典型包括 surface warning/recover/describe、peer handle 判定、SDP/candidate helper、signal backlog prune/sanitize、stale peer error 分类和 reconnect timer helper。
+- 影响：这些 fallback 在当前固定脚本顺序下不可达，但仍让 R7 审计看到 legacy 文件像是能够独立管理 surface 恢复、peer signal queue 和 peer reconnect timer；后续调整 controller 默认值或排查连接问题时容易误读 owner。
+- 建议：保留同名 legacy wrapper 以兼容调用点，但正常路径直接委托 controller；删除不可达本地实现和本地 `peerReconnectState` 引用，不改变 controller API、不改变实际调用点。
+- 修改意见：按建议实施 R7 小切片，不改变 surface attach/update/recover 正常行为，不改变 peer signal/reconnect 正常行为，不改变非 Electron/Web 早返回。
+- 处理结果：已处理。`app-native-overrides.js` 的 surface recoverable warning、clear warning、tracking remove、recover/reattach 和 element describe wrapper 已改为直接调用 `nativeSurfaceController`；native peer handle、session description、candidate key/text、pure P2P candidate filter、remote description compare、signal peer id/state、signal backlog prune、signal payload sanitize、stale peer error 和 reconnect timer wrapper 已改为直接调用 `nativePeerController`，删除了对应本地 fallback 算法与 `peerReconnectState` 访问。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R4/R5/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-surface-controller.js`、`node --check server/public/native/native-peer-controller.js`，均通过；已执行 `rg -n "peerReconnectState|nativePeerSignalRegistry\\.forEachBacklog|nativeSurfaceController && typeof nativeSurfaceController\\.(logRecoverableSurfaceSyncWarning|clearRecoverableSurfaceSyncWarning|removeSurfaceTracking|recoverSurface)|nativePeerController && typeof nativePeerController\\.(normalizeSessionDescription|buildRemoteCandidateKey|getIceCandidateText|isAllowedPureP2pCandidate|isSameSessionDescription|clearPeerConnectTimeout|schedulePeerReconnect)" server/public/app-native-overrides.js`，无命中，确认这些 helper 的 legacy fallback 已删除；已执行 `npm run check:logging`，通过。
+
+### ARCH-SPLIT-P1-376 session lifecycle/manifest wrapper 仍保留不可达本地构造
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-session-controller.js` 已承接 mediaSessionId、host start generation、host media manifest 和 host create-room facade，但 `app-native-overrides.js` 仍在同名 wrapper 中保留本地 mediaSessionId 生成、host start generation 修改、manifest 构造、stats/OBS manifest dimension resolver 和 create-room 发送 fallback。
+- 影响：R6/R7 session ownership 看起来仍不唯一；后续修改 manifest 字段、keyframe policy、OBS/native 尺寸来源或 create-room payload 时容易误以为需要同时维护 legacy 文件和 session controller。
+- 建议：保留兼容 wrapper 名称，但直接委托 `nativeSessionController`；删除不可达本地 manifest/create-room 构造和只服务旧 fallback 的 dimension resolver。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 session controller API、不改变 manifest 字段、不改变 create-room payload 和发送时序。
+- 处理结果：已处理。`ensureHostMediaSessionId` 无调用后删除；`resetHostMediaSessionId`、`begin/finish/cancel/isNativeHostStartCurrent`、`buildHostMediaManifest*` 和 `createNativeHostRoom` 均直接委托 `nativeSessionController`；`buildNativeHostCreateRoomMessage`、`resolveObsManifestVideoDimension`、`resolveManifestVideoDimension` 等旧 fallback helper 已删除。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js`，均通过；已执行 `rg -n "ensureHostMediaSessionId|buildNativeHostCreateRoomMessage|resolveObsManifestVideoDimension|resolveManifestVideoDimension|nativeSessionController && typeof nativeSessionController\\.(ensureMediaSessionId|resetMediaSessionId|beginHostStart|finishHostStart|cancelHostStart|isHostStartCurrent|buildHostMediaManifest|buildHostMediaManifestFromStats|buildHostMediaManifestFromObsIngest|buildHostCreateRoomMessage|createHostRoom)" server/public/app-native-overrides.js`，无命中，确认 session 这组 legacy fallback 已删除；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-377 peer attempt/signal queue wrapper 仍保留不可达本地实现
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js` 已承接 peer attempt、signal backlog/waiter queue 和 media-offer 等待，但 `app-native-overrides.js` 仍在同名 wrapper 中保留 attemptId 解析、meta attempt fallback、signal backlog/waiter 操作、offer SDP 文本提取和 timeout loop。
+- 影响：R5/R7 peer ownership 看起来仍不唯一；后续排查 offer timeout、旧 signal 污染、attemptId 过期或 waiter limit 时容易误以为 legacy 文件还持有一套 queue/timer 逻辑。
+- 建议：保留兼容 wrapper 名称，但直接委托 `nativePeerController`；删除不可达本地 queue/waiter/offer 判断实现和只服务旧 fallback 的 `extractNativeSignalSdpText()`。
+- 修改意见：按建议实施 R5/R7 小切片，不改变 signal queue API、不改变 offer timeout 默认值、不改变上层调用点。
+- 处理结果：已处理。`getSignalAttemptId`、`getCurrentPeerAttemptId`、`getCurrentPeerEdgeAttemptId`、`isCurrentPeerAttempt`、`appendPeerAttempt`、`clear/enqueue/wait/dropQueuedNativePeerSignals`、`isMediaOfferSignal` 和 `waitForNativeMediaOffer` 已直接委托 `nativePeerController`；`extractNativeSignalSdpText()` 已删除。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`，均通过；已执行 `rg -n "extractNativeSignalSdpText|nativePeerSignalRegistry\\.(deleteBacklog|waiterKeys|getWaiters|setWaiters|hasWaiters|setBacklog|getBacklog|deleteWaiters)|nativePeerController && typeof nativePeerController\\.(getSignalAttemptId|getCurrentPeerAttemptId|getCurrentPeerEdgeAttemptId|isCurrentPeerAttempt|appendPeerAttempt|isMediaOfferSignal|waitForMediaOffer)" server/public/app-native-overrides.js`，无命中，确认 peer signal/attempt 这组 legacy fallback 已删除；已执行 `npm run check:logging`，通过。
+
+### ARCH-SPLIT-P1-378 surface layout/sync/attach wrapper 仍保留不可达本地实现
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-surface-controller.js` 已承接 surface layout/key、updateSurface、syncAll、scheduleSync、attach/detach、host preview 和 peer surface lifecycle，但 `app-native-overrides.js` 仍保留一套 layout 计算、layout key 构造、updateSurface RPC、attach/detach RPC 和 host/peer surface attach fallback。
+- 影响：R4/R7 surface ownership 看起来仍不唯一；后续排查窗口移动卡住、预览丢失、surface stale result 或 layout drift 时容易误读 legacy 文件仍是 surface 算法 owner。
+- 建议：保留仍有调用点的兼容 wrapper，但直接委托 `nativeSurfaceController`；删除不可达本地 layout/update/attach/detach 实现，并删除无调用点的空 wrapper。
+- 修改意见：按建议实施 R4/R7 小切片，不改变 surface controller API、不改变 host preview/peer surface 调用点、不改变窗口 bounds 缓存写入。
+- 处理结果：已处理。`syncAllEmbeddedSurfaces`、`scheduleEmbeddedSurfaceSync`、`scheduleWheelDrivenSurfaceSync`、`forceEmbeddedSurfaceResync*`、`scheduleWindowBoundsSurfaceSync`、`start/stopEmbeddedSurfaceTrackingLoop`、`attach/detachNativeHostPreviewSurface` 和 `attach/detachNativePeerVideoSurface` 均直接委托 `nativeSurfaceController`；无调用点的 `buildSurfaceLayout`、`getSurfaceLayoutKey`、`syncEmbeddedSurface`、`attachEmbeddedSurface`、`detachEmbeddedSurface` 已删除。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R4/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-surface-controller.js`，均通过；已执行 `rg -n "\\b(buildSurfaceLayout|getSurfaceLayoutKey|syncEmbeddedSurface|attachEmbeddedSurface|detachEmbeddedSurface)\\b|if \\(nativeSurfaceController\\)|nativeSurfaceController && typeof|mediaEngine\\.(attachSurface|detachSurface|updateSurface)" server/public/app-native-overrides.js`，无命中，确认 surface layout/sync/attach/detach 的 legacy fallback 已删除；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-379 peer handle/signal registry bridge 仍留在 legacy 文件
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js` 已 fail-fast 创建且内部持有 peer handle registry、attempt sequence 和 signal backlog/waiter registry，但 `app-native-overrides.js` 仍创建 `nativePeerHandleRegistry` / `nativePeerSignalRegistry` bridge，并在 peer handle wrapper 和 create-peer fallback 中保留第二套 registry 入口。
+- 影响：R5/R7 peer ownership 看起来仍不唯一；后续追踪 peer attempt、handle 生命周期或 signal queue 污染时，legacy 文件仍像是可以持有一套 registry，增加审计和排障成本。
+- 建议：删除 `nativePeerHandleRegistry` / `nativePeerSignalRegistry` 创建和 bridge；peer meta、handle get/set/delete/count/ids、create peer handle 和 attempt 初始化直接委托 `nativePeerController`。
+- 修改意见：按建议实施 R5/R7 小切片，不改变 `native-peer-controller.js` API、不改变 createPeer 正常参数、不改变上层调用点。
+- 处理结果：已处理。`app-native-overrides.js` 已删除 `nativePeerHandleRegistry` / `nativePeerSignalRegistry` 创建、`createNativePeerHandleRegistryBridge()` 和 `createNativePeerSignalRegistryBridge()`；`ensurePeerMeta`、peer handle get/set/delete/count/entries/ids 和 `createNativePeerConnectionImpl()` 的 handle 创建/attempt 初始化均直接委托 `nativePeerController`。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`，均通过；已执行 `rg -n "nativePeerHandleRegistry|nativePeerSignalRegistry|createNativePeerHandleRegistryBridge|createNativePeerSignalRegistryBridge|native-peer-handle-registry-unavailable|native-peer-signal-registry-unavailable" server/public/app-native-overrides.js`，无命中，确认 peer registry bridge 已从 legacy 源码删除；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-380 P2P state machine 仍允许缺模块静默降级
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/p2p-state-machine.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native/p2p-state-machine.js` 已承接 P2P UI label、状态写入、失败分类、viewer media wait 和 upstream offer wait timer，但 `app-native-overrides.js` 仍把 `p2pStateMachine` 构造成可空值，并在同名 wrapper 中保留状态文案、失败分类和 timer 的 legacy fallback。
+- 影响：R3/R7 P2P state ownership 看起来仍不唯一；加载顺序异常时不会 fail-fast，而是静默落回 legacy 状态/timer 逻辑，后续排查等待上游、媒体等待和重连触发时容易误判真实 owner。
+- 建议：固定脚本顺序下缺 `native/p2p-state-machine.js` 应直接失败；新增 bridge 创建函数，并让状态/timer wrapper 直接委托 state machine。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 P2P 文案、不改变 7000ms/6000ms 默认等待时间、不改变 viewer-reconnect-ready 信令 payload。
+- 处理结果：已处理。`app-native-overrides.js` 新增 `createP2pStateMachineBridge()`，缺模块抛 `p2p-state-machine-unavailable`；`setP2pStatusElementState`、`setP2pStateForPeer`、`classifyP2pFailure`、viewer media/upstream offer wait timer wrapper 均直接委托 `p2pStateMachine`，删除了 legacy 文案表、失败分类和 timer fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R3/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/p2p-state-machine.js`，均通过；已执行 `rg -n "p2pStateMachine && typeof|DEFAULT_STATE_LABELS|p2p-state-machine-unavailable|createP2pStateMachineBridge" server/public/app-native-overrides.js server/public/native/p2p-state-machine.js`，确认 `DEFAULT_STATE_LABELS` 只在 `p2p-state-machine.js` 模块内部，legacy 文件只剩 fail-fast bridge；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-381 nativeSessionState getter/setter 仍保留本地默认 fallback
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`createNativeSessionStateBridge()` 已在缺 `native-session-controller.js` 或缺 factory 时 fail-fast，但 `getCurrentHostBackend`、`setCurrentHostBackend`、`get/setHostPreviewRequested`、`get/setObsRoomCreatePending`、`get/setObsIngestStreamActive` 仍保留 `'native'`、`true`、`false` 等本地默认 fallback。
+- 影响：R6/R7 session state ownership 看起来仍不唯一；后续调整默认 backend、host preview 或 OBS pending/active 状态时容易误以为 legacy 文件还持有一套默认策略。
+- 建议：保留兼容 wrapper 名称，但直接委托 `nativeSessionState`；删除不可达的本地默认 fallback。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 `createSessionState()` 默认值、不改变 getter/setter 调用点。
+- 处理结果：已处理。`app-native-overrides.js` 的 current backend、host preview requested、OBS room pending 和 OBS ingest stream active getter/setter 已直接调用 `nativeSessionState`；本地 `'native'`/`true`/`false` fallback 已删除。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js`，均通过；已执行 `rg -n "nativeSessionState && typeof|\\? nativeSessionState\\.|: normalizeHostBackendName\\(|: Boolean\\(|: 'native'|: true;|: false;" server/public/app-native-overrides.js`，确认 `nativeSessionState && typeof` / direct default fallback 已无命中；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-382 host/audio stop-start wrapper 仍保留不可达本地编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-session-controller.js` 已承接 host/audio session RPC wrapper、audio start validation、stop resources cleanup、stop finalization、begin/finish stop share、failed-start cleanup 和 standard effects 分发，但 `app-native-overrides.js` 仍保留 mediaEngine 直连 fallback、Promise.all stop fallback、stop resource cleanup 本地编排、stop state reset 本地编排和一整套 legacy effects switch。
+- 影响：R6/R7 host session ownership 看起来仍不唯一；后续修改 stop share、failed host start、OBS room teardown 或 effects 语义时容易误改 legacy 分支，增加停止共享/再次共享问题回归风险。
+- 建议：保留兼容 wrapper 名称，但直接委托 `nativeSessionController`；删除不可达的 mediaEngine 直连 fallback、Promise.all stop fallback 和 legacy effects switch。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 session controller API、不改变 stop/start 调用点、不改变 effects 类型。
+- 处理结果：已处理。`isRecoverableHostPreviewAttachError`、`start/stopNativeHostSession`、`start/stopNativeAudioSession`、`startNativeAudioForShare`、`stopNativeHostAndAudioSessions`、`cleanupNativeStopResources`、`finalizeNativeStopState`、`begin/finishNativeStopShare`、`cleanupAfterFailedHostStart` 和 `applyHostStartSuccessEffects` 已直接委托 `nativeSessionController`；legacy mediaEngine fallback、Promise.all stop fallback、stop reset fallback 和 effects switch 已删除。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js`，均通过；已执行 `rg -n "nativeSessionController && typeof nativeSessionController\\.(isRecoverableHostPreviewAttachError|startNativeAudioForShare|validateAudioStartResult|stopHostAndAudioSessions|cleanupStopResources|finalizeStopState|beginStopShare|finishStopShare|cleanupFailedHostStart|applyEffects)|mediaEngine\\.(startHostSession|stopHostSession|startAudioSession|stopAudioSession)|stopNativeHostAndAudioSessions\\(\\).*Promise\\.all|case 'setNativeHostSessionRunning'|case 'teardownObsHostRoom'" server/public/app-native-overrides.js`，无命中，确认这批 session legacy fallback 已删除；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-383 native/OBS host start 主流程仍保留不可达本地 fallback
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-session-controller.js` 已承接 native/OBS host start 的 begin effects、source prepare、preview policy、start result validation、codec effects、success effects、preview fallback notice、native capture create-room 和 OBS success effects，但 `app-native-overrides.js::startScreenShareWithSource()` / `startScreenShareWithObsIngest()` 仍在每个调用点保留 `nativeSessionController && typeof ...` 分支和等价本地实现。
+- 影响：R6/R7 session ownership 仍可被误读为双 owner；后续修改 host start 校验、codec/manifest/OBS UI effects 或预览 fallback 语义时，容易漏改 legacy 分支或在审计中误判真实执行路径。
+- 建议：保留 host start 的外层顺序、surface attach、retry loop 和错误展示在 legacy 入口，所有纯决策、effects 和 create-room facade 直接调用 `native-session-controller.js`；缺模块由已有 bridge fail-fast。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 native/OBS start 正常调用顺序，不改变 preview retry 行为，不改变 manifest/create-room payload。
+- 处理结果：已处理。`startScreenShareWithSource()` 的 start begin、source prepare、preview start state、host start validation、codec effects、host success effects、preview fallback notice、native capture room create 和 retry decision 已直接委托 `nativeSessionController`；`startScreenShareWithObsIngest()` 的 start begin、OBS start validation 和 OBS success effects 也已直接委托。对应本地 fallback 逻辑已删除，`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R6/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js`，均通过；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-384 peer diagnostics/candidate/close/offer facade 仍保留不可达本地 fallback
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js` 已承接 peer diagnostics entries、candidate 记忆、pending remote candidate queue、edge state、peer close cleanup、close-all、offer/answer message 生成与发送、local ICE signal payload 和 clear-all pending hook，但 `app-native-overrides.js` 仍保留本地 candidate 统计、pending queue、mediaEngine 直连 close、offer/answer payload builder 和 sendMessage fallback。
+- 影响：R5/R7 peer ownership 仍可被误读为双 owner；旧 `pendingRemoteCandidates` 引用已经没有声明，只因 fallback 不可达才未触发，后续若误改加载/bridge 逻辑会变成隐藏 ReferenceError。
+- 建议：保留 legacy wrapper 调用点，正常路径直接委托 `native-peer-controller.js`；删除本地 diagnostics/candidate/queue/close/offer/answer/ICE signal payload fallback。
+- 修改意见：按建议实施 R5/R7 小切片，不改变网络连接时序，不改变 offer/answer/ICE payload shape，不处理 NAT/recovery 和远端 offer/answer/ice 主流程。
+- 处理结果：已处理。`buildP2pDiagnosticReport()` 的 peer entries、local candidate 记忆、remote candidate apply/flush/queue/clear、edge state、peer close cleanup、close-all、offer/answer create-and-send、local ICE signal forwarding 和 `__vdsClearNativePendingRemoteCandidates` 均改为直接调用 `nativePeerController`；删除了 `getCandidateTypeCountsFromMeta()`、`pickPeerStats()`、本地 `rememberLocalIceCandidate()`、旧 pending queue fallback、本地 close fallback、本地 offer/answer payload builder 和 sendMessage fallback。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`，均通过；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-385 peer NAT/recovery/remote-signal 主路径仍保留可选 controller fallback
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-384 后 `native-peer-controller.js` 已是 Electron native 路径必需模块，但 `app-native-overrides.js` 在 NAT mapping、P2P failfast、peer recovery、disconnected recovery、peer-state event、remote offer/answer/ice 和 stale cleanup 主路径仍保留 `nativePeerController && typeof ...` 可选分支，以及等价本地状态/timer/信令决策。
+- 影响：R5/R7 peer ownership 仍不彻底；连接主路径看起来仍有两套 attempt、candidate queue、NAT/recovery timer 和 remote signal decision 实现，后续排查重连、stale offer、ICE candidate 或上游切换时容易误判真实 owner。
+- 建议：在已有 fail-fast bridge 保障下，remote peer 主路径直接调用 `native-peer-controller.js`；legacy 入口只保留 UI/timer 清理、viewer stats、surface attach callback 和 sendMessage 等外部副作用。
+- 修改意见：按建议实施 R5/R7 小切片，不改变信令 payload，不改变 viewer upstream switch 顺序，不改变 NAT mapped candidate 发送和 recovery close/offer 副作用。
+- 处理结果：已处理。`attemptLastChanceNatMapping()`、`finalizeP2pFailureWithNatMapping()`、`armPeerConnectFailfast()`、`requestPeerRecovery()`、`scheduleDisconnectedPeerRecovery()`、`handleNativePeerStateEvent()`、`handleOffer()`、`handleAnswer()`、`handleIceCandidate()` 和 `closeStaleViewerUpstreamPeers()` 已直接委托 `nativePeerController` 的对应 facade；删除了 NAT meta 本地写入、connect/disconnect timer fallback、peer-state 本地 switch、remote offer/answer/ice 本地 decision tree、stale cleanup 本地 timer，以及随之无调用的 remote/candidate helper。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R5/R7 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`，均通过；已执行 `rg -n "nativePeerController && typeof nativePeerController\\.|if \\(nativePeerController\\)|function isCurrentPeerAttempt|function buildRemoteCandidateKey|function getIceCandidateText|function isAllowedPureP2pCandidate|function isSameRemoteDescription|function setPeerRemoteDescription|function addPeerRemoteIceCandidate|function queueNativeRemoteCandidate" server/public/app-native-overrides.js`，无命中；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-386 diagnostics report/cache wrapper 仍保留可选模块语义
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-diagnostics.js` 已是 diagnostics/report/cache owner，但 `app-native-overrides.js` 的 P2P/host diagnostic report 与 latest stats/report cache wrapper 仍需要审计确认是否还存在可选模块或本地缓存语义。
+- 影响：如果 diagnostics wrapper 保留可选路径，R3/R7 会看起来仍有两套 diagnostics/cache owner；后续排查日志密度、诊断面板或 copy report 时容易误判真实状态来源。
+- 建议：在已有 `createNativeDiagnosticsBridge()` fail-fast 保障下，diagnostics report/cache wrapper 直接调用 `nativeDiagnostics`，文档同步为 direct delegation。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 report 字段、不改变 stats polling、不改变 Web 非 Electron 早返回。
+- 处理结果：已处理。`buildP2pDiagnosticReport()`、`buildHostCaptureDiagnosticReportFromStats()`、`rememberLatestP2pStatsSnapshot()`、`getLatestP2pStatsSnapshot()`、`rememberLatestHostCaptureDiagnosticReport()` 和 `getLatestHostCaptureDiagnosticReport()` 均直接委托 `nativeDiagnostics`；`docs/RENDERER_SPLIT_MAP.md` 已同步 diagnostics wrapper 直接委托和 fail-fast 语义，并清理 R5/R6/R7 段落中过期的缺模块 fallback 描述。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`，均通过；已执行 `rg -n "native(Surface|Peer|Session)Controller && typeof|if \\(native(Surface|Peer|Session)Controller\\)|p2pStateMachine && typeof|if \\(p2pStateMachine\\)|nativeDiagnostics && typeof|if \\(nativeDiagnostics\\)" server/public/app-native-overrides.js`，确认只剩 diagnostics/p2p bridge factory 检查；已执行 `npm run check:logging`，通过；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-387 native stats summary/log fields 仍由 legacy renderer 构造
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-diagnostics.js` 已是 stats polling timer、diagnostic report/cache 和日志节流 owner，但 `pollNativeHostStats()` / `pollNativeViewerStats()` 仍在 legacy 文件中拆解 stats 的 peer/surface/frame 数据，并手写 host/viewer/relay periodic stats log fields。
+- 影响：R3/R7 diagnostics 边界仍不完整；后续优化诊断信息密度、日志字段或 stats 输出时需要同时读 legacy UI 状态机和 diagnostics 模块，容易把诊断字段 owner 误判为 renderer 编排层。
+- 建议：把 host/viewer/relay stats summary 与 periodic log fields 构造迁入 `native-diagnostics.js`；legacy polling 只保留 `mediaEngine.getStats()`、FPS DOM、OBS/minimized UI、诊断渲染、viewer-ready 和连接状态副作用。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 stats polling 启停条件、不改变日志 label/rate limit key、不改变 UI 状态副作用、不改变 viewer-ready 发送逻辑。
+- 处理结果：已处理。`native-diagnostics.js` 新增 `buildHostStatsSummary()` 和 `buildViewerStatsSummary()`，统一生成 host peer/surface/frame 摘要、viewer peer/surface/frame 摘要以及 host/viewer/relay periodic log fields；`app-native-overrides.js` 的 `pollNativeHostStats()` / `pollNativeViewerStats()` 改为消费 summary，保留原有 UI、诊断渲染和 viewer-ready 副作用。`docs/RENDERER_SPLIT_MAP.md` 已同步 diagnostics stats summary owner。
+- 验证结果：已执行 `node --check server/public/native/native-diagnostics.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `rg -n "buildHostStatsSummary|buildViewerStatsSummary|const peers = Array\\.isArray\\(stats && stats\\.peers\\)|const surfaces = Array\\.isArray\\(stats(?: &&)?\\.surfaces\\)|relayPeers|relayRuntime = relayPeer|avgCopyUs=|receiverConfigured=|native-host-stats|native-peer-stats|native-relay-stats" server/public/app-native-overrides.js server/public/native/native-diagnostics.js`，确认 stats 摘要和字段构造只剩 diagnostics owner，legacy 只保留 summary 调用和日志 label；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，退出码为 0，仅输出既有 LF/CRLF 转换提示。
+
+### ARCH-SPLIT-P1-388 host/viewer FPS 采样状态仍由 legacy renderer 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-387 后 diagnostics 已承接 host/viewer/relay stats summary 和 periodic log fields，但 FPS 计算所需的 host/source/preview/send 采样帧计数、viewer received/rendered 采样帧计数和采样时间仍作为 `app-native-overrides.js` 顶层变量存在。
+- 影响：diagnostics 已是 stats/report/cache/polling owner，但 FPS 采样状态仍留在 legacy renderer；后续优化诊断刷新、FPS 计算或复制诊断时仍可能误判 renderer 是统计状态 owner。
+- 建议：把 FPS 采样状态和计算迁入 `native-diagnostics.js`，暴露 reset/update facade；legacy renderer 只保留 DOM 写入 wrapper。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 FPS 文案、不改变 `0 fps` 初始展示、不改变 host capture diagnostic report 的 fpsSnapshot 字段。
+- 处理结果：已处理。`native-diagnostics.js` 新增 `resetHostFpsSample()`、`updateHostFpsSample()`、`resetViewerFpsSample()` 和 `updateViewerFpsSample()`，内部持有 host/viewer FPS 采样状态；`app-native-overrides.js` 删除 `hostSourceFramesSample`、`hostPreviewFramesSample`、`hostSendFramesSample`、`hostFramesSampleAtMs`、`viewerReceivedFramesSample`、`viewerRenderedFramesSample`、`viewerFramesSampleAtMs` 顶层变量，`reset/update*FpsIndicator()` 只调用 diagnostics facade 并写 DOM。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 R3/R7 边界。
+- 验证结果：已执行 `node --check server/public/native/native-diagnostics.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `rg -n "hostSourceFramesSample|hostPreviewFramesSample|hostSendFramesSample|hostFramesSampleAtMs|viewerReceivedFramesSample|viewerRenderedFramesSample|viewerFramesSampleAtMs|resetHostFpsSample|updateHostFpsSample|resetViewerFpsSample|updateViewerFpsSample" server/public/app-native-overrides.js server/public/native/native-diagnostics.js`，确认旧采样变量只剩 diagnostics facade 调用和 diagnostics 内部 API。
+
+### ARCH-SPLIT-P1-389 viewer 音量控件状态仍由 legacy renderer 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-viewer-controls.js`、`server/public/index.html`、`knip.json`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：viewer fullscreen 音量控件的 UI 状态、延迟 `setViewerVolume`、静音切换、取回音量和拖动状态仍全部留在 `app-native-overrides.js`，包括 `viewerVolumeApplyTimerId`、`viewerVolumeApplySeq`、`viewerVolumeApplyPreviousVolume`、`lastNonZeroViewerVolume` 和 `viewerFullscreenVolumeDragging`。
+- 影响：R7 legacy 文件仍混合媒体调用、UI 控件状态和 fullscreen popover 编排；后续调整音量交互或排查 viewer 音频 UI 时容易继续扩大 `app-native-overrides.js`。
+- 建议：新增 viewer controls 模块，承接音量 UI、延迟应用、静音切换、音量刷新和拖动状态；legacy 保留 fullscreen underbar/popover 显隐、事件绑定和显示控件外层编排。
+- 修改意见：按建议实施 R7 小切片，不改变 `mediaEngine.getViewerVolume()` / `setViewerVolume()` 调用时机，不改变 80ms 延迟应用，不改变 fullscreen controls 显隐。
+- 处理结果：已处理。新增 `server/public/native/native-viewer-controls.js`，通过 `VDS.nativeViewerControls.createController()` 暴露 `applyVolumeUi()`、`setVolumeValue()`、`toggleMute()`、`refreshVolumeUi()`、`setVolumeDragging()` 和 `isVolumeDragging()`；`app-native-overrides.js` 删除 viewer 音量延迟应用、静音和拖动状态的本地变量，改为通过 `nativeViewerControls` 调用。`server/public/index.html` 和 `knip.json` 已加入新模块，`docs/RENDERER_SPLIT_MAP.md` 已同步 R7 viewer 控件边界。
+- 验证结果：已执行 `node --check server/public/native/native-viewer-controls.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测和 smoke 均通过；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-viewer-controls.js server/public/index.html knip.json docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-390 viewer fullscreen 控件状态仍由 legacy renderer 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-viewer-fullscreen-controls.js`、`server/public/index.html`、`knip.json`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：viewer fullscreen underbar、音量 popover hide timer、controls hide timer、光标轮询、`fullscreenTransitionPromise` 和 Esc/exit/toggle 状态仍留在 `app-native-overrides.js`，legacy 文件继续持有 viewer fullscreen 控件生命周期。
+- 影响：R7 legacy 文件仍混合 fullscreen 控件状态、surface resync 触发和媒体编排；后续排查 fullscreen 鼠标唤出、音量 popover 隐藏或 Esc 退出时需要继续阅读大文件。
+- 建议：新增 viewer fullscreen controls 模块，承接 underbar/popup 显隐、鼠标轮询、fullscreen toggle/exit/Esc 状态；legacy 只保留事件绑定和 wrapper 委托。
+- 修改意见：按建议实施 R7 小切片，不改变 fullscreen class 名、不改变 hide 延迟、不改变 cursor polling 120ms 节奏、不改变 surface resync 调用时机。
+- 处理结果：已处理。新增 `server/public/native/native-viewer-fullscreen-controls.js`，通过 `VDS.nativeViewerFullscreenControls.createController()` 持有 fullscreen controls hide timer、volume popover hide timer、cursor poll timer、last cursor point 和 fullscreen transition promise；`app-native-overrides.js` 删除这些本地状态，`isViewerFullscreenMode()`、`shouldReserveViewerFullscreenUnderbarSpace()`、`set/scheduleViewerFullscreenVolumePopover*()`、`syncViewerFullscreenUnderbarState()`、`schedule/showViewerFullscreenControls()`、`updateFullscreenUi()`、fullscreen button、Esc 和 exit 流程均改为委托新模块。`server/public/index.html`、`knip.json` 和 `docs/RENDERER_SPLIT_MAP.md` 已同步新模块。
+- 验证结果：已执行 `node --check server/public/native/native-viewer-fullscreen-controls.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "viewerFullscreenControlsHideTimerId|viewerFullscreenCursorPollTimerId|viewerFullscreenVolumePopoverHideTimerId|fullscreenTransitionPromise|lastViewerCursorPoint|startViewerFullscreenCursorPolling|stopViewerFullscreenCursorPolling|isCursorInsideCurrentWindow|nativeViewerFullscreenControls|native-viewer-fullscreen-controls" server/public/app-native-overrides.js server/public/native/native-viewer-fullscreen-controls.js server/public/index.html knip.json docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认旧 fullscreen 控件状态只剩新模块和历史审计记录；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-viewer-fullscreen-controls.js server/public/index.html knip.json docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-391 viewer fullscreen 事件绑定仍留在 legacy 初始化
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-viewer-fullscreen-controls.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-390 后 fullscreen 控件状态已迁入 `native-viewer-fullscreen-controls.js`，但 `initializeNativeUi()` 仍手写 fullscreen 按钮、viewer 音量输入、fullscreen 音量拖动、popover hover/focus、mute、exit、remote container hover、underbar hover、`onFullscreenChange` 和 Escape 的 listener 绑定。
+- 影响：legacy 初始化仍承担 viewer fullscreen 控件 lifecycle，模块 owner 和事件 owner 分离；后续调整 fullscreen 控件交互仍需要同时改 legacy 大文件和新模块。
+- 建议：将 viewer/fullscreen/volume listener 注册迁入 `native-viewer-fullscreen-controls.js`，legacy 只注入 `onVolumeInput`、`onToggleMute` 和错误日志回调。
+- 修改意见：按建议实施 R7 小切片，不改变事件类型、不改变 hide 延迟、不改变 mute/exit/Escape 错误日志内容、不改变 surface resync 调用路径。
+- 处理结果：已处理。`native-viewer-fullscreen-controls.js` 新增 `bindViewerEvents()`，集中绑定 fullscreen buttons、viewer/main 音量 input、fullscreen volume pointer/change/blur、popover hover/focus、mute、exit、remote container hover/touch、underbar hover/focus、`electronApi.onFullscreenChange` 和 Escape keydown；`app-native-overrides.js` 的 `initializeNativeUi()` 删除这组 listener 手写逻辑，改为一次 `nativeViewerFullscreenControls.bindViewerEvents({ ... })` 注入音量输入、静音和错误日志回调。`docs/RENDERER_SPLIT_MAP.md` 已同步事件绑定 owner。
+- 验证结果：已执行 `node --check server/public/native/native-viewer-fullscreen-controls.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "addEventListener\\('(click|input|pointerdown|pointerup|change|blur|mouseenter|mouseleave|focusin|focusout|mousemove|touchstart)'|onFullscreenChange|handleFullscreenButtonClick|handleFullscreenEscapeKey|bindViewerEvents" server/public/app-native-overrides.js server/public/native/native-viewer-fullscreen-controls.js`，确认 viewer/fullscreen listener 仅剩新模块和 legacy stop-share 绑定；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-viewer-fullscreen-controls.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-392 surface layout 事件绑定仍留在 legacy 初始化
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-surface-controller.js` 已承接 surface sync 调度、window bounds sync、滚轮 burst 和强制 resync，但 `initializeNativeUi()` 仍手写 `onWindowBoundsChange`、`onMaximizedChange`、`ResizeObserver`、window resize/scroll/wheel 和 `visualViewport` resize/scroll 绑定。
+- 影响：surface layout 事件 owner 和 surface sync owner 分离；后续排查窗口移动、resize、滚轮导致的 surface 卡顿或布局错位时仍需要同时读 legacy 初始化和 surface controller。
+- 建议：将 surface layout listener 注册迁入 `native-surface-controller.js`，legacy 只注入 `electronApi`、host/remote element、window bounds getter/setter 和 resync 需要的回调。
+- 修改意见：按建议实施 R4/R7 小切片，不改变监听事件、不改变 ResizeObserver 目标、不改变 wheel listener capture/passive 参数、不改变 window bounds 更新和 resync 时机。
+- 处理结果：已处理。`native-surface-controller.js` 新增 `bindLayoutEvents()`，集中绑定 `electronApi.onWindowBoundsChange`、`electronApi.onMaximizedChange`、host/remote `ResizeObserver`、window resize/scroll/wheel 和 `visualViewport` resize/scroll；`app-native-overrides.js` 删除对应手写绑定和无调用的 sync wrapper，初始化阶段改为一次 `nativeSurfaceController.bindLayoutEvents()`，并向 controller 注入 `electronApi` 与 `setCurrentWindowBounds()` 保持原 bounds 更新语义。`docs/RENDERER_SPLIT_MAP.md` 已同步 surface layout 事件 owner。
+- 验证结果：已执行 `node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "ResizeObserver|visualViewport|window\\.addEventListener\\('(resize|scroll|wheel)'|onWindowBoundsChange|onMaximizedChange|bindLayoutEvents|scheduleEmbeddedSurfaceSync|scheduleWheelDrivenSurfaceSync|forceEmbeddedSurfaceResyncBurst|scheduleWindowBoundsSurfaceSync" server/public/app-native-overrides.js server/public/native/native-surface-controller.js`，确认 surface layout listener 和 sync wrapper 已由 controller 持有，legacy 只剩 `bindLayoutEvents()` 调用；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-surface-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-393 legacy 文件残留无调用 controller wrapper
+
+- 位置：`server/public/app-native-overrides.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：多轮 controller 拆分后，`app-native-overrides.js` 仍保留一批只有定义、没有调用的纯委托 wrapper，包括 surface registry/recovery、host start cancel/create room、native audio start/stop、peer signal queue/media-offer、peer handle/set/entries、peer media source 和 answer creation wrapper。
+- 影响：这些函数不参与运行路径，但会让 legacy 文件看起来仍拥有 surface/peer/session 的写入口，削弱 R4/R5/R6/R7 ownership 边界的可读性。
+- 建议：静态扫描 legacy 内部函数引用次数，删除确认无调用且不在 legacy global binding 暴露面的纯委托 wrapper。
+- 修改意见：按建议实施清理，不删除仍有调用点的 wrapper，不改变任何信令 payload、mediaEngine RPC 或 DOM 副作用。
+- 处理结果：已处理。删除无调用的 surface registry wrapper、`recoverEmbeddedSurface()`、`cancelNativeHostStart()`、`createNativeHostRoom()`、`startNativeAudioSession()`、`stopNativeAudioSession()`、`stopNativeHostAndAudioSessions()`、peer signal queue/media-offer wrapper、`syncViewerFullscreenUnderbarState()`、`attachNativePeerVideoSurface()`、`setNativePeerHandle()`、`getNativePeerHandleEntries()`、`ensureNativePeerConnectionReady()`、`attachNativePeerMediaSources()` 和 `createAndSendPeerAnswer()`；`docs/RENDERER_SPLIT_MAP.md` 已同步 legacy 假入口清理结果。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、函数引用计数扫描、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行残留名称搜索，确认被删除 wrapper 无命中；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-394 mediaEngine event summary 仍由 legacy diagnostics 逻辑构造
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-diagnostics.js` 已持有 native 日志 gate、rate limit、payload 摘要和诊断报告，但 `logNativeMediaEngineEventSummary()` 仍在 `app-native-overrides.js` 中判断高频事件、nativeEvents 开关、rate limit 和 suppressed payload。
+- 影响：mediaEngine event 日志策略仍分散在 legacy 和 diagnostics 两处；后续调整日志密度或排查刷屏时容易遗漏 legacy 内的事件摘要逻辑。
+- 建议：将 mediaEngine event summary logging 迁入 `native-diagnostics.js`，legacy event handler 只保留事件分发和业务副作用。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 event 名称、不改变 highFrequency/nativeEvents 开关、不改变 rate key、不改变 console 输出格式。
+- 处理结果：已处理。`native-diagnostics.js` 新增 `logMediaEngineEventSummary()`，复用 diagnostics 内部 `getNativeDebugCategoryFromEvent()`、`shouldShowDebugLogsFor()`、`shouldEmitNativeDebugLog()` 和 `appendSuppressedDebugCount()`；`app-native-overrides.js` 删除 `logNativeMediaEngineEventSummary()` 本地实现，`handleNativeMediaEngineEvent()` 改为直接调用 `nativeDiagnostics.logMediaEngineEventSummary(event)`，并删除已无调用的 `appendSuppressedDebugCount()`、`getNativeDebugCategoryFromEvent()` 和 `summarizeNativeLogValue()` legacy wrapper。`docs/RENDERER_SPLIT_MAP.md` 已同步 diagnostics event summary owner。
+- 验证结果：已执行 `node --check server/public/native/native-diagnostics.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "logNativeMediaEngineEventSummary|logMediaEngineEventSummary|appendSuppressedDebugCount|getNativeDebugCategoryFromEvent|summarizeNativeLogValue" server/public/app-native-overrides.js server/public/native/native-diagnostics.js`，确认 event summary 和相关 helper 只剩 diagnostics owner，legacy 只调用 `nativeDiagnostics.logMediaEngineEventSummary(event)`；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-395 stop-share 按钮绑定仍留在 legacy 初始化
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-session-controller.js` 已承接 stop share lifecycle，但 `initializeNativeUi()` 仍直接给 `btnStopShare` 绑定 capture-phase click listener，包含 host session running 判断、`preventDefault()`、`stopImmediatePropagation()`、`stopScreenShare()` 调用和错误展示。
+- 影响：host stop 控件 lifecycle 和 session lifecycle owner 分离；继续扩大 legacy 初始化职责，也让 stop-share 入口看起来仍由 renderer 大文件直接管理。
+- 建议：将 host stop-share 控件绑定迁入 `native-session-controller.js`，legacy 只注入按钮元素、running 判断、stop 回调和错误回调。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 capture 参数、不改变 `nativeHostSessionRunning` 判断、不改变 `preventDefault/stopImmediatePropagation`，不改变错误日志和 `showError` 文案。
+- 处理结果：已处理。`native-session-controller.js` 新增 `bindHostControlEvents()`，内部集中绑定 stop-share 按钮 click listener；`app-native-overrides.js` 的 `initializeNativeUi()` 删除手写 listener，改为调用 `nativeSessionController.bindHostControlEvents({ stopShareButton, isHostSessionRunning, onStopShare, onStopShareError })`。`docs/RENDERER_SPLIT_MAP.md` 已同步 host stop 控件绑定 owner。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "btnStopShare\\.addEventListener|bindHostControlEvents|stopShareButton|stopImmediatePropagation|stopScreenShare failed" server/public/app-native-overrides.js server/public/native/native-session-controller.js`，确认 stop-share listener 由 session controller 持有，legacy 只剩 bind 调用和错误回调；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-session-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-396 初始 window bounds 获取仍留在 legacy 初始化
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-392 后 surface layout 事件绑定已迁入 `native-surface-controller.js`，但 `initializeNativeUi()` 仍在绑定前手写 `electronApi.getWindowBounds()` 初始读取和失败写 `null`。
+- 影响：窗口 bounds 初始化和后续 bounds change 事件 owner 分离；surface layout controller 仍不能完整掌握自身初始布局输入。
+- 建议：将初始 window bounds 获取也迁入 `native-surface-controller.js::bindLayoutEvents()`，legacy 只注入 bounds 写回回调。
+- 修改意见：按建议实施 R4/R7 小切片，保持初始化时 await 获取 bounds 的顺序，保持失败时写 `null`，不改变后续 `refreshCurrentWindowBounds()` 回调。
+- 处理结果：已处理。`native-surface-controller.js::bindLayoutEvents()` 改为 async，先 await `electronApi.getWindowBounds()` 并通过 `setCurrentWindowBounds()` 写回成功值或失败 `null`，再绑定 window bounds/maximize/resize/scroll/wheel 等 layout 事件；`app-native-overrides.js` 删除初始化中的手写 getWindowBounds block，改为 `await nativeSurfaceController.bindLayoutEvents()`。`docs/RENDERER_SPLIT_MAP.md` 已同步初始 bounds owner。
+- 验证结果：已执行 `node --check server/public/native/native-surface-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "getWindowBounds|setCurrentWindowBounds|bindLayoutEvents|currentWindowBounds = null|currentWindowBounds = await|await nativeSurfaceController\\.bindLayoutEvents" server/public/app-native-overrides.js server/public/native/native-surface-controller.js`，确认初始化 bounds 读取由 surface controller 执行，legacy 保留 `refreshCurrentWindowBounds()` 回调和 bounds setter 注入；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-surface-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-397 mediaEngine event/status 绑定仍留在 legacy 初始化
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-394 后 mediaEngine event summary 已迁入 diagnostics，但 `initializeNativeUi()` 仍直接绑定 `mediaEngine.onEvent(handleNativeMediaEngineEvent)` 和 `mediaEngine.onStatus(...)`，status 日志也留在 legacy 初始化。
+- 影响：diagnostics 已是 native event/status 日志 owner，但 listener binding owner 仍在 legacy；初始化文件继续承担诊断通道装配。
+- 建议：将 mediaEngine event/status listener 绑定迁入 `native-diagnostics.js`，legacy 只注入业务事件分发回调。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 `handleNativeMediaEngineEvent()` 分发逻辑，不改变 status 日志内容，不改变 mediaEngine start 顺序。
+- 处理结果：已处理。`native-diagnostics.js` 新增 `bindMediaEngineEvents(mediaEngine, { onEvent })`，内部绑定 `mediaEngine.onEvent()` 和 `mediaEngine.onStatus()`，并保留原 `Native media engine status updated:` debug 输出；`app-native-overrides.js` 的 `initializeNativeUi()` 删除手写 onEvent/onStatus 绑定，改为调用 `nativeDiagnostics.bindMediaEngineEvents(mediaEngine, { onEvent: handleNativeMediaEngineEvent })`。`docs/RENDERER_SPLIT_MAP.md` 已同步 diagnostics event/status binding owner。
+- 验证结果：已执行 `node --check server/public/native/native-diagnostics.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "mediaEngine\\.onEvent|mediaEngine\\.onStatus|bindMediaEngineEvents|Native media engine status updated" server/public/app-native-overrides.js server/public/native/native-diagnostics.js`，确认 onEvent/onStatus 绑定和 status 日志由 diagnostics 持有，legacy 只剩 `bindMediaEngineEvents()` 调用；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-398 mediaEngine start lifecycle 仍由 legacy renderer 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-media-engine-controller.js`、`server/public/index.html`、`knip.json`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-397 后 mediaEngine 事件/status 绑定已迁入 diagnostics，但 `mediaEngineStarted`、`mediaEngineStartPromise` 和 `ensureMediaEngineStarted()` 的启动去重、started 状态、capabilities 日志触发仍由 legacy renderer 持有。
+- 影响：native engine 启动生命周期和事件绑定 owner 分离；后续排查 agent 缺失、启动失败、重复 start 或 capabilities 日志时仍需要回到 `app-native-overrides.js`。
+- 建议：新增 native media engine controller，承接 start in-flight 去重、started 状态和 capabilities 日志触发；legacy 只保留兼容 wrapper 调用 controller。
+- 修改意见：按建议实施 R7 小切片，不改变 `mediaEngine.start()` 成功条件，不改变 `available/running` fail-fast 检查，不改变 capabilities 日志内容。
+- 处理结果：已处理。新增 `server/public/native/native-media-engine-controller.js`，通过 `VDS.nativeMediaEngine.createController()` 持有 `started` 和 `startPromise`；`app-native-overrides.js` 删除 `mediaEngineStarted` / `mediaEngineStartPromise` 顶层状态，`ensureMediaEngineStarted()` 改为委托 `nativeMediaEngineController.ensureStarted()`。`server/public/index.html`、`knip.json` 和 `docs/RENDERER_SPLIT_MAP.md` 已同步新模块。
+- 验证结果：已执行 `node --check server/public/native/native-media-engine-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "mediaEngineStarted|mediaEngineStartPromise|nativeMediaEngineController|native-media-engine-controller|mediaEngine\\.start\\(|getCapabilities" server/public/app-native-overrides.js server/public/native/native-media-engine-controller.js server/public/index.html knip.json docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认旧启动状态变量已移除，legacy 只保留 controller 实例和 `ensureMediaEngineStarted()` 兼容 wrapper；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-media-engine-controller.js server/public/index.html knip.json docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-399 mediaEngine warning 事件日志仍由 legacy handler 处理
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`scripts/check-logging-policy.ps1`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-394/P1-397 后 mediaEngine event summary 和 event/status listener 已迁入 diagnostics，但 `warning` 事件的 `agent-warning:*` rate-limit key、`[media-engine warning]` 输出和 suppressed 计数仍直接写在 `handleNativeMediaEngineEvent()` 里。
+- 影响：diagnostics 已是 native 日志节流 owner，但 warning 事件仍由 legacy handler 手写，后续优化日志密度或排查 agent warning 刷屏时仍需读 legacy 分发函数。
+- 建议：将 warning 事件日志节流迁入 `native-diagnostics.js`，legacy event handler 只保留业务事件分发，并对未命中的诊断事件做模块委托。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 warning key、不改变 5000ms 节流、不改变 `[media-engine warning]` 输出格式。
+- 处理结果：已处理。`native-diagnostics.js` 新增 `logMediaEngineWarningEvent()` 并导出，内部持有 `agent-warning:${scope}:${message}` rate-limit、suppressed 计数和 warning 输出；`app-native-overrides.js::handleNativeMediaEngineEvent()` 删除本地 warning 节流实现，改为 `nativeDiagnostics.logMediaEngineWarningEvent(event)`。`scripts/check-logging-policy.ps1` 已同步允许 `native-diagnostics.js::logMediaEngineEventSummary()` 作为受控日志 wrapper。`docs/RENDERER_SPLIT_MAP.md` 已同步 diagnostics warning event logging owner。
+- 验证结果：已执行 `node --check server/public/native/native-diagnostics.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "agent-warning|logMediaEngineWarningEvent|media-engine warning|shouldEmitNativeDebugLog\\(warningKey|event\\.event === 'warning'" server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认 warning 节流和输出只剩 diagnostics owner，legacy 只保留委托；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-diagnostics.js scripts/check-logging-policy.ps1 docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-400 mediaEngine 诊断预处理仍从 legacy event handler 进入
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-397/P1-399 后 event/status 绑定、event summary 和 warning event logging 都已在 diagnostics 模块内实现，但 `handleNativeMediaEngineEvent()` 仍先调用 diagnostics summary，末尾再调用 diagnostics warning，导致 legacy 业务 handler 仍承担诊断预处理入口。
+- 影响：R3/R7 边界仍不够干净；后续读 native event 分发时，会把诊断日志副作用和 signal/peer/media/audio 业务副作用混在同一个 legacy handler 里。
+- 建议：让 `native-diagnostics.js::bindMediaEngineEvents()` 在 listener callback 内先处理 summary 和 warning；warning 事件由 diagnostics 消费，不再转交 legacy 业务分发。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 event summary 字段、不改变 warning 日志节流，不改变 signal/peer-state/media-state/audio-data 的业务分发路径。
+- 处理结果：已处理。`native-diagnostics.js::bindMediaEngineEvents()` 现在包装 `mediaEngine.onEvent()` callback，先执行 `logMediaEngineEventSummary(event)`，再由 `logMediaEngineWarningEvent(event)` 消费 warning 事件，非 warning 事件才转交 `callbacks.onEvent`；`app-native-overrides.js::handleNativeMediaEngineEvent()` 删除 diagnostics summary/warning 调用，只保留 signal、peer-state、media-state、audio-data 四类业务分发。
+- 验证结果：已执行 `node --check server/public/native/native-diagnostics.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "handleNativeMediaEngineEvent|logMediaEngineEventSummary\\(|logMediaEngineWarningEvent\\(|bindMediaEngineEvents\\(|event 诊断预处理" server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认 diagnostics 预处理只在 `native-diagnostics.js` listener binding 内执行，legacy handler 只保留业务分发；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-401 media-state update 判断树仍留在 legacy handler
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-session-controller.js` 已承接 host-session-started/stopped 与 OBS media-state effects，但 `app-native-overrides.js::applyNativeMediaStateUpdate()` 仍直接判断 stop 后残留 media-state、backend 更新、surface-detached tracking 清理、OBS 状态和 host-session 状态。
+- 影响：session controller 和 legacy handler 同时拥有 media-state update 决策；后续调整 host/OBS lifecycle 或停止共享后的残留事件过滤时，需要跨两个文件确认顺序。
+- 建议：把 media-state update 决策统一迁入 `native-session-controller.js`，输出 effects；legacy 只把当前 host/session 上下文传入并调用统一 effects 消费入口。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 ignored-after-stop 条件、不改变 backend/surface/OBS/host-session effects 顺序。
+- 处理结果：已处理。`native-session-controller.js` 新增 `buildMediaStateUpdateEffects(params, context)`，集中处理 stop 后残留 media-state 过滤、backend 更新、surface-detached tracking 清理、OBS media-state effects 和 host-session-started/stopped effects；`applyEffects()` 新增 `logNativeStep` 与 `removeEmbeddedSurfaceTracking` effect 消费。`app-native-overrides.js::applyNativeMediaStateUpdate()` 改为只调用 `nativeSessionController.buildMediaStateUpdateEffects()` 并通过 `applyHostStartSuccessEffects()` 消费 effects。`docs/RENDERER_SPLIT_MAP.md` 已同步 media-state update effects owner。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "buildMediaStateUpdateEffects|buildObsMediaStateEffects\\(|buildHostSessionStartedEffects\\(|buildHostSessionStoppedEffects\\(|isHostSessionMediaState\\(|media-state:ignored-after-stop|removeEmbeddedSurfaceTracking" server/public/app-native-overrides.js server/public/native/native-session-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认 media-state update 判断树由 session controller 持有，legacy 只保留 effects 调用和 surface tracking callback 注入；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-session-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-402 mediaEngine signal 事件的 peer signal 编排仍拆在 legacy handler
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js` 已持有 signal peer id、local description 状态更新、signal backlog 和 local ICE candidate payload 构造，但 `handleNativeMediaEngineEvent()` 的 `signal` 分支仍在 legacy 中手写 peerId 解析、`updateSignalState()`、`enqueueSignal()` 和 `forwardNativeMediaSignal()` 串联。
+- 影响：peer controller 和 legacy handler 共同拥有 mediaEngine signal 事件编排；后续调整 signal backlog、offer/answer waiter 或 local candidate payload 时容易漏掉 legacy 分支。
+- 建议：在 `native-peer-controller.js` 增加 signal event facade，统一执行 peer id 解析、signal state update、backlog 入队和 candidate signal decision；legacy 只保留外部副作用。
+- 修改意见：按建议实施 R5/R7 小切片，不改变 signal payload、不改变 block relay candidate 行为、不改变最终 `sendMessage` 时机。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `handleLocalSignalEvent(params, { roomId })`，内部执行 `getSignalPeerId()`、`updateSignalState()`、`enqueueSignal()` 和 `prepareLocalIceCandidateSignal()`；`app-native-overrides.js` 删除 `getNativeSignalPeerId()`、`updateNativePeerSignalState()`、`enqueueNativePeerSignal()` wrapper，`signal` 分支改为调用 `forwardNativeMediaSignal()`，该函数通过 `handleLocalSignalEvent()` 获取 candidate decision 后继续保留 block 日志、本地 candidate 统计和最终 send。`docs/RENDERER_SPLIT_MAP.md` 已同步 signal event facade owner。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "getNativeSignalPeerId|updateNativePeerSignalState|enqueueNativePeerSignal|forwardNativeMediaSignal|handleLocalSignalEvent|prepareLocalIceCandidateSignal\\(" server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认旧 signal wrapper 已删除，signal event 编排由 peer controller facade 持有，legacy 只保留 `forwardNativeMediaSignal()` 外部副作用；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-403 mediaEngine audio-data no-op 分支仍留在 legacy handler
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：native 音频已由 media-agent/native path 管理，但 `handleNativeMediaEngineEvent()` 仍把 `audio-data` 传给 `deliverNativeProcessAudioPacket()`；该函数只是 no-op 注释，实际语义是不要恢复 renderer audio authority。
+- 影响：legacy event handler 看起来仍有 audio-data 业务分支，增加读者对 renderer 音频路径是否仍接管的误判。
+- 建议：在 diagnostics listener binding 内消费 `audio-data` 事件，保留 event summary/high-frequency gate，不再转交 legacy 业务 handler。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 audio-data 日志 gate，不恢复 renderer audio playback，不改变 native audio path。
+- 处理结果：已处理。`native-diagnostics.js::bindMediaEngineEvents()` 在 summary/warning 预处理后直接消费 `audio-data` 事件；`app-native-overrides.js` 删除 `deliverNativeProcessAudioPacket()` no-op 函数和 `audio-data` 分支。`docs/RENDERER_SPLIT_MAP.md` 已同步 diagnostics audio-data no-op owner。
+- 验证结果：已执行 `node --check server/public/native/native-diagnostics.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "deliverNativeProcessAudioPacket|event\\.event === 'audio-data'|audio-data no-op|audio-data" server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认 legacy 已无 audio-data/no-op 分支，audio-data 消费只剩 diagnostics listener 和历史审计记录；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-diagnostics.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-404 peer-state 外部动作仍以 ad hoc 字段由 legacy 消费
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js::applyPeerStateEvent()` 已持有 peer-state 状态写入和 timer 清理，但 `app-native-overrides.js::handleNativePeerStateEvent()` 仍直接读取 `uiState`、`armViewerMediaWait`、`scheduleDisconnectedRecovery`、`clearViewerMediaWait`、`finalizeFailure/failureFinalization` 等 ad hoc 字段执行外部动作。
+- 影响：peer-state 的内部状态 owner 和外部动作编排仍耦合在 legacy handler；后续增加或调整 peer-state side effects 时容易继续扩张 legacy 分支。
+- 建议：让 `applyPeerStateEvent()` 返回标准 effects 数组；legacy 只保留一个 `applyPeerStateEffects()` 消费器，按 effect type 调用现有外部动作。
+- 修改意见：按建议实施 R5/R7 小切片，先保留旧返回字段一轮兼容，不改变 connected/connecting/disconnected/failed/closed 行为顺序。
+- 处理结果：已处理。`native-peer-controller.js::applyPeerStateEvent()` 为 connected、connecting、disconnected 和 failed 状态增加 `effects` 数组，覆盖 `setP2pState`、`armViewerMediaWaitTimer`、`scheduleDisconnectedRecovery`、`clearViewerMediaWaitTimer` 和 `finalizeP2pFailure`；`app-native-overrides.js` 新增 `applyPeerStateEffects()`，`handleNativePeerStateEvent()` 删除 ad hoc 字段读取，改为只消费 `result.effects`。`docs/RENDERER_SPLIT_MAP.md` 已同步 peer-state effects owner。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "applyPeerStateEffects|result\\.uiState|result\\.armViewerMediaWait|result\\.scheduleDisconnectedRecovery|result\\.clearViewerMediaWait|result\\.finalizeFailure|type: 'finalizeP2pFailure'|type: 'armViewerMediaWaitTimer'|type: 'scheduleDisconnectedRecovery'" server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认 legacy handler 不再读 ad hoc peer-state fields，外部动作通过 effects 消费；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-405 peer-state effects consumer 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-404 后 peer-state 外部动作已经标准化为 effects，但 `applyPeerStateEffects()` consumer 仍定义在 `app-native-overrides.js`，legacy 继续按 effect type 调用 P2P UI、viewer media wait、断线恢复和 failure finalize。
+- 影响：peer-state effects 的产出和消费分离在 peer controller 与 legacy 两处；后续新增 peer-state effect 时仍需要扩 legacy handler。
+- 建议：把 `applyPeerStateEffects()` 移入 `native-peer-controller.js`，通过 controller 创建参数注入外部动作回调，保持 controller 不直接操作 DOM。
+- 修改意见：按建议实施 R5/R7 小切片，不改变 effect 类型、不改变回调顺序、不改变 failure finalize 异步 fire-and-forget 语义。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `applyPeerStateEffects(effects)`，通过注入的 `setP2pStateForPeer`、`armViewerMediaWaitTimer`、`scheduleDisconnectedPeerRecovery`、`clearViewerMediaWaitTimer` 和 `finalizeP2pFailureWithNatMapping` 回调消费 peer-state effects；`app-native-overrides.js` 删除本地 `applyPeerStateEffects()`，创建 peer controller 时注入对应回调，`handleNativePeerStateEvent()` 改为调用 `nativePeerController.applyPeerStateEffects(result.effects)`。`docs/RENDERER_SPLIT_MAP.md` 已同步 peer-state effects consumer owner。
+- 验证结果：已执行 `node --check server/public/native/native-peer-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function applyPeerStateEffects|nativePeerController\\.applyPeerStateEffects|setP2pStateForPeer:|armViewerMediaWaitTimer:|scheduleDisconnectedPeerRecovery:|clearViewerMediaWaitTimer:|finalizeP2pFailureWithNatMapping:" server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认 peer-state effects consumer 已迁入 peer controller，legacy 只保留回调注入和 controller 调用；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-406 mediaEngine event 业务路由仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-media-engine-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-400/P1-403 后 diagnostics 已处理 event 诊断预处理和 audio-data 消费，但 `app-native-overrides.js::handleNativeMediaEngineEvent()` 仍按 `signal`、`peer-state`、`media-state` 做业务事件路由。
+- 影响：legacy 文件仍承担 mediaEngine event router 职责；后续继续拆 signal/peer/session 业务时，事件入口仍锚在 legacy handler。
+- 建议：把 mediaEngine event 业务路由迁入 `native-media-engine-controller.js`，通过 `eventHandlers` 注入 signal/peer-state/media-state 回调；legacy 只提供具体 controller 回调。
+- 修改意见：按建议实施 R7 小切片，不改变 diagnostics 预处理，不改变 signal/peer-state/media-state 回调时机，不处理 unknown event。
+- 处理结果：已处理。`native-media-engine-controller.js` 新增 `eventHandlers` 与 `handleEvent(event)`，统一按 `signal`、`peer-state`、`media-state` 分发到注入回调；`app-native-overrides.js` 删除 `handleNativeMediaEngineEvent()`，创建 mediaEngine controller 时注入 `onSignal/onPeerState/onMediaState`，`nativeDiagnostics.bindMediaEngineEvents()` 的 `onEvent` 改为委托 `nativeMediaEngineController.handleEvent(event)`。`docs/RENDERER_SPLIT_MAP.md` 已同步 mediaEngine event router owner。
+- 验证结果：已执行 `node --check server/public/native/native-media-engine-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "handleNativeMediaEngineEvent|handleEvent\\(|eventHandlers|bindMediaEngineEvents\\(|nativeMediaEngineController\\.handleEvent" server/public/app-native-overrides.js server/public/native/native-media-engine-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，确认 legacy `handleNativeMediaEngineEvent()` 已删除，event router 由 media engine controller 持有；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-media-engine-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-407 legacy 模块工厂 bridge 仍散落在 app-native-overrides
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-entry.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：R7 后 `native-entry.js` 已负责 install guard 和 legacy hook 注册，但 `app-native-overrides.js` 仍保留 `createNativeDiagnosticsBridge`、`createNativePeerControllerBridge`、`createNativeSessionControllerBridge` 等重复工厂查找函数。
+- 影响：legacy 文件仍承担模块装配细节；每新增 native 模块都容易在 legacy 中继续复制 `window.VDS.*` 查找和 fail-fast 错误码。
+- 建议：把必需模块 factory 查找统一收口到 `native-entry.js`，legacy 只直接声明需要哪个 namespace/factory/errorCode。
+- 修改意见：按建议实施 R7 小切片，不改变脚本顺序、不改变错误码、不改变各 controller 创建参数。
+- 处理结果：已处理。`native-entry.js` 新增 `createRequired(namespaceName, factoryName, errorCode, ...args)` 并导出；`app-native-overrides.js` 删除 9 个 `createNative*Bridge` / `createP2pStateMachineBridge` helper，controller/session/diagnostics/state machine/viewer controls 的创建调用直接委托 `nativeEntry.createRequired()`；Electron native 路径缺 `native-entry` 时显式抛出 `native-entry-unavailable`。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 owner。
+- 验证结果：已执行 `node --check server/public/native/native-entry.js`、`node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "createNativeDiagnosticsBridge|createNativeMediaEngineControllerBridge|createNativeSurfaceControllerBridge|createP2pStateMachineBridge|createNativePeerControllerBridge|createNativeSessionControllerBridge|createNativeSessionStateBridge|createNativeViewerControlsBridge|createNativeViewerFullscreenControlsBridge" server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md`，确认源码和当前拆分映射中旧 bridge 名称已无命中；已执行 `rg -n "createRequired|native-entry-unavailable|native-diagnostics-unavailable|native-peer-controller-unavailable|native-session-controller-unavailable|native-viewer-controls-unavailable" server/public/app-native-overrides.js server/public/native/native-entry.js docs/RENDERER_SPLIT_MAP.md`，确认模块创建统一通过 `nativeEntry.createRequired()`；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-entry.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-408 viewer 控件 direct wrapper 仍留在 legacy 初始化附近
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-viewer-controls.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-389/P1-391 后 viewer volume/fullscreen 控件状态和事件绑定已迁入 controller，但 legacy 文件仍保留 `applyViewerVolumeUi()`、`setViewerVolumeValue()`、`toggleViewerMute()`、`refreshViewerVolumeUi()` 等只做 direct delegation 的 wrapper；同时还有少量未使用的 diagnostics/surface wrapper。
+- 影响：`initializeNativeUi()` 附近仍像是 legacy 拥有 viewer 音量生命周期，后续排查 viewer 控件时需要判断哪些函数是真业务、哪些只是转发。
+- 建议：删除无调用的 diagnostics/surface wrapper，并让 viewer 控件调用点直接使用 `nativeViewerControls`。
+- 修改意见：按建议实施 R7 小切片，不改变音量刷新、拖动 input、静音后显示 fullscreen controls、错误日志回调或 controller API。
+- 处理结果：已处理。`app-native-overrides.js` 删除未使用的 `isDebugModeEnabled`、`isVerboseMediaLoggingEnabled`、`logNativeWarningLine`、`logRecoverableSurfaceSyncWarning`、`clearRecoverableSurfaceSyncWarning`、`describeSurfaceElement` wrapper；删除 viewer 控件 direct wrapper，并把 delayed refresh、初始化音量、音量 input 和 mute 回调改为直接调用 `nativeViewerControls.refreshVolumeUi/applyVolumeUi/setVolumeValue/toggleMute`。`docs/RENDERER_SPLIT_MAP.md` 已同步 viewer controls 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-viewer-controls.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function applyViewerVolumeUi|function setViewerVolumeValue|function toggleViewerMute|refreshViewerVolumeUi|isDebugModeEnabled|isVerboseMediaLoggingEnabled|logNativeWarningLine|logRecoverableSurfaceSyncWarning|clearRecoverableSurfaceSyncWarning|describeSurfaceElement" server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md`，确认源码和当前拆分映射中旧 wrapper 名称已无命中；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-entry.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-409 viewer 音量 input 事件语义仍由 legacy 注入
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-viewer-controls.js`、`server/public/native/native-viewer-fullscreen-controls.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-408 后 viewer 音量 direct wrapper 已删除，但 `app-native-overrides.js::initializeNativeUi()` 仍定义并注入 `handleViewerVolumeInput()`，由 legacy 解析 input value、调用 `nativeViewerControls.setVolumeValue()` 并显示 fullscreen controls。
+- 影响：viewer volume/fullscreen controller 已拥有控件状态和事件绑定，但音量 input 的交互语义仍锚在 legacy 初始化函数，后续调整音量输入行为仍需要改 legacy 文件。
+- 建议：把标准音量 input 处理迁入 `native-viewer-controls.js`，`native-viewer-fullscreen-controls.js` 在缺外部 callback 时默认使用 viewer controls 处理并显示 controls；legacy 不再注入 `onVolumeInput`。
+- 修改意见：按建议实施 R7 小切片，不改变 input 监听位置、不改变 80ms 延迟应用、不改变输入后展示 fullscreen controls。
+- 处理结果：已处理。`native-viewer-controls.js` 新增 `handleVolumeInput(event)`，统一从 input event 读取 `target.value` 并调用 `setVolumeValue()`；`native-viewer-fullscreen-controls.js::bindViewerEvents()` 默认使用 `viewerControls.handleVolumeInput()` 并在输入后调用 `showControls()`；`app-native-overrides.js` 删除 `handleViewerVolumeInput()`，初始化时不再向 `bindViewerEvents()` 注入 `onVolumeInput`。`docs/RENDERER_SPLIT_MAP.md` 已同步 viewer controls 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-viewer-controls.js`、`node --check server/public/native/native-viewer-fullscreen-controls.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "handleViewerVolumeInput|onVolumeInput:|handleVolumeInput|bindViewerEvents" server/public/app-native-overrides.js server/public/native/native-viewer-controls.js server/public/native/native-viewer-fullscreen-controls.js docs/RENDERER_SPLIT_MAP.md`，确认 legacy 已无 `handleViewerVolumeInput` / `onVolumeInput` 注入，音量 input 处理由 viewer controls 承接；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-viewer-controls.js server/public/native/native-viewer-fullscreen-controls.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-410 viewer fullscreen direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-viewer-fullscreen-controls.js`
+- 问题：P1-409 后 viewer 音量 input 事件语义已迁入 viewer controls，但 `app-native-overrides.js` 仍保留 `showViewerFullscreenControls()` 和 `shouldReserveViewerFullscreenUnderbarSpace()` 两个只转发到 fullscreen controller 的 wrapper。
+- 影响：legacy 文件继续暴露 fullscreen controls helper 名称，后续阅读初始化流程时仍需要区分真实 UI 逻辑和 direct delegation。
+- 建议：删除这两个 direct wrapper，调用点直接使用 `nativeViewerFullscreenControls.showControls()` 和 `shouldReserveUnderbarSpace()`。
+- 修改意见：按建议实施 R7 小切片，不改变 fullscreen controls 显示时机，不改变 surface layout 预留 underbar 空间判断。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `showViewerFullscreenControls()` 和 `shouldReserveViewerFullscreenUnderbarSpace()`；surface controller 注入改为直接调用 `nativeViewerFullscreenControls.shouldReserveUnderbarSpace()`，mute 成功后直接调用 `nativeViewerFullscreenControls.showControls()`。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function showViewerFullscreenControls|function shouldReserveViewerFullscreenUnderbarSpace|showViewerFullscreenControls\\(|shouldReserveViewerFullscreenUnderbarSpace\\(" server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md`，确认源码和当前拆分映射中两个 direct wrapper 已无命中；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-viewer-controls.js server/public/native/native-viewer-fullscreen-controls.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-411 viewer mute 事件语义仍由 legacy 注入
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-viewer-fullscreen-controls.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-410 后 fullscreen direct wrapper 已删除，但 `initializeNativeUi()` 仍向 `bindViewerEvents()` 注入 `onToggleMute`，由 legacy 调用 `nativeViewerControls.toggleMute()` 并显示 controls。
+- 影响：viewer fullscreen controls 已拥有 mute button listener，但 mute 的默认动作还由 legacy 决定，viewer 控件交互 owner 仍不完整。
+- 建议：让 `native-viewer-fullscreen-controls.js` 在缺外部 `onToggleMute` 时默认调用 `viewerControls.toggleMute()` 并显示 controls；legacy 只保留 mute 失败日志回调。
+- 修改意见：按建议实施 R7 小切片，不改变 mute button listener、不改变 toggleMute 调用、不改变 mute 后显示 fullscreen controls。
+- 处理结果：已处理。`native-viewer-fullscreen-controls.js::bindViewerEvents()` 新增默认 `onToggleMute`，通过 `viewerControls.toggleMute()` 执行静音切换并调用 `showControls()`；`app-native-overrides.js` 删除 `onToggleMute` 注入，只保留 `onMuteToggleError` 日志回调。`docs/RENDERER_SPLIT_MAP.md` 已同步 viewer controls 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-viewer-fullscreen-controls.js`、`node --check server/public/native/native-viewer-controls.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "onToggleMute:|viewerControls\\.toggleMute|onMuteToggleError|bindViewerEvents" server/public/app-native-overrides.js server/public/native/native-viewer-fullscreen-controls.js docs/RENDERER_SPLIT_MAP.md`，确认 legacy 已无 `onToggleMute` 注入，mute 默认动作由 fullscreen controls 调用 viewer controls 承接；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-viewer-controls.js server/public/native/native-viewer-fullscreen-controls.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-412 session/surface direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`server/public/native/native-surface-controller.js`
+- 问题：`native-session-controller.js` / `native-surface-controller.js` 已承接 host session、manifest、preview surface 和 peer surface 操作，但 `app-native-overrides.js` 仍保留一批只做 direct delegation 或单点调用的 wrapper，例如 `resetHostMediaSessionId()`、`buildHostMediaManifest()`、`getManifestMediaSessionId()`、`parseCaptureSource()`、`attachNativeHostPreviewSurface()`、`detachNativeHostPreviewSurface()` 和 `detachNativePeerVideoSurface()`。
+- 影响：legacy 文件继续暴露 session/surface helper 名称，后续阅读 host start/stop 和 close peer 流程时，需要判断这些函数是否还有本地语义。
+- 建议：删除无调用或单点 direct wrapper，调用点直接使用对应 controller 方法；manifest ack 的 mediaSessionId 提取在调用处保持原逻辑内联。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 host preview attach/detach 时机、不改变 peer surface detach 时机、不改变 stop/share reset 和 manifest ack 判断。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `resetHostMediaSessionId()`、`buildHostMediaManifest()`、`getManifestMediaSessionId()`、`isRecoverableHostPreviewAttachError()`、`parseCaptureSource()`、`attachNativeHostPreviewSurface()`、`detachNativeHostPreviewSurface()` 和 `detachNativePeerVideoSurface()`；对应调用点直接使用 `nativeSessionController.resetMediaSessionId()`、`nativeSurfaceController.attachHostPreviewSurface()`、`nativeSurfaceController.detachHostPreviewSurface()`、`nativeSurfaceController.detachPeerVideoSurface()`，manifest ack 的 `mediaSessionId` 提取已在 `room-created` 分支内联。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "resetHostMediaSessionId|buildHostMediaManifest\\(|getManifestMediaSessionId|isRecoverableHostPreviewAttachError|parseCaptureSource\\(|attachNativeHostPreviewSurface|detachNativeHostPreviewSurface|detachNativePeerVideoSurface" server/public/app-native-overrides.js`，确认 legacy 源码中这些 direct wrapper 已无命中；已执行 `git diff --check -- server/public/app-native-overrides.js docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-413 surface 批量生命周期路径缺少统一 phase 维护
+
+- 位置：`media-agent/src/surface_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`SurfaceAttachmentState` 已接入 `SessionPhase` / `phase_reason`，attach/update/detach request 路径也会维护生命周期，但 `SurfaceSessionController::refresh_host_capture_surfaces()`、`stop_all()`、`restart_host_capture_surfaces()` 和 `detach_peer_surfaces()` 这些批量 lifecycle 路径仍只调用 start/stop helper，没有统一写入 draining/starting/running/stopped/failed phase。
+- 影响：surface session owner 已接管批量操作，但 stats/diagnostics 观察这些路径时 phase 可能停留在旧值，削弱 M3/M7 的“所有 session 生命周期可观察”目标。
+- 建议：在 `SurfaceSessionController` 内增加私有 phase helper，让批量 stop/restart/detach 路径和 request 路径一样维护 lifecycle snapshot。
+- 修改意见：按建议实施 M3/M7 小切片，不改变 attach/update/detach JSON-RPC shape，不改变 surface start/stop 顺序，不改变 warning/event 输出。
+- 处理结果：已处理。`surface_session_controller.cpp` 新增私有 `mark_surface_draining()`、`mark_surface_started()`、`mark_surface_stopped()` helper；host capture surface auto refresh/restart 会标记 `Starting` 并根据 start result 落到 `Running`、`Running(surface-waiting-for-artifact)` 或 `Failed`；`stop_all()` 和 `detach_peer_surfaces()` 会标记 `Draining` 后在 stop helper 返回后标记 `Stopped`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步当前 surface lifecycle 覆盖范围。
+- 验证结果：已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；其中 `verify-media-agent` 完成 Release 构建、复制 runtime/media-agent、media-agent 单测和 smoke。已执行 `rg -n "ARCH-SPLIT-P1-413|mark_surface_draining|mark_surface_started|mark_surface_stopped|surface-auto-restart-starting|host-capture-surface-restart-starting" media-agent/src/surface_session_controller.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，确认 phase helper 和文档记录已落地；已执行 `git diff --check -- media-agent/src/surface_session_controller.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-414 OBS ingest owner 仍以完整 runtime 构造为主路径
+
+- 位置：`media-agent/src/obs_ingest_session.*`、`media-agent/src/host_session_runtime.cpp`、`media-agent/src/agent_rpc_router.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`ObsIngestSession` 已接管 prepare/start/stop worker 和 stream metadata，但主 RPC loop 与 host runtime facade 仍通过 `ObsIngestSession(runtime_state)` 构造，OBS worker 也通过完整 runtime 获取 host snapshot、transport ready 和 host codec 写入口。
+- 影响：OBS ingest session owner 的状态边界已收窄，但依赖边界仍偏大；后续拆成 Host/OBS session owner、DLL 或独立进程时，OBS ingest worker 仍难以看清真正需要的跨 session 服务。
+- 建议：新增 OBS ingest runtime access 窄接口，主路径显式绑定 `ObsIngestState&` 和所需 callback；保留完整 runtime 构造只作为兼容委托层。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 JSON-RPC method/request/response，不改变 OBS UDP 监听、Annex-B/AAC 处理、RelayHub publish 或 media-state event 时机。
+- 处理结果：已处理。`ObsIngestSessionRuntimeAccess` 新增并显式注入 `host_session_snapshot`、`peer_transport_ready` 和 `set_host_video_codec`；`ObsIngestSession` 新增 `ObsIngestState& + access` 构造，原 `AgentRuntimeState&` 构造仅作为兼容委托；RPC loop 的 `prepareObsIngest` owner 和 `host_session_runtime.*` 的 prepare/clear/start/stop facade 均改为绑定 `current_obs_ingest_session(runtime_state)` + `make_obs_ingest_runtime_access(runtime_state)`。OBS worker 线程现在携带 `ObsIngestState*` 和 access copy，payload/host codec 更新通过显式 callback 完成。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步 OBS ingest owner 当前边界。
+- 验证结果：已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；其中 `verify-media-agent` 完成 Release 构建、复制 runtime/media-agent、media-agent 单测和 smoke，构建仅输出 FFmpeg 头文件/`av_init_packet` 既有 warning。已执行 `rg -n "ObsIngestSessionRuntimeAccess|make_obs_ingest_runtime_access|ObsIngestSession\\(runtime_state\\)|AgentRuntimeState& state_|run_worker\\(ObsIngestState\\*" media-agent/src/obs_ingest_session.h media-agent/src/obs_ingest_session.cpp media-agent/src/host_session_runtime.cpp media-agent/src/agent_rpc_router.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，确认主路径已显式绑定 OBS session/runtime access，旧完整 runtime 构造只剩兼容委托层；已执行 `git diff --check -- media-agent/src/obs_ingest_session.h media-agent/src/obs_ingest_session.cpp media-agent/src/host_session_runtime.cpp media-agent/src/agent_rpc_router.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-415 OBS ingest 完整 runtime 兼容构造仍可被新代码误用
+
+- 位置：`media-agent/src/obs_ingest_session.h`、`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-414 后主路径已经显式绑定 `ObsIngestState& + ObsIngestSessionRuntimeAccess`，但 `ObsIngestSession(AgentRuntimeState&)` 兼容构造仍保留在公共头，后续新代码可能重新传入完整 runtime。
+- 影响：OBS ingest owner 的依赖边界虽然已收窄，但公共 API 仍允许绕过窄接口，削弱后续多 session、多 DLL 或多进程边界演进。
+- 建议：确认源码无旧构造调用后删除 `ObsIngestSession(AgentRuntimeState&)`，强制调用方显式选择 session 和 runtime access。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 RPC loop、host runtime facade、OBS worker 行为或 JSON-RPC shape。
+- 处理结果：已处理。`ObsIngestSession(AgentRuntimeState&)` 已从公共头和实现文件删除；OBS ingest owner 只能通过 `ObsIngestSession(ObsIngestState&, ObsIngestSessionRuntimeAccess)` 构造，`make_obs_ingest_runtime_access(runtime_state)` 继续作为外部绑定工具。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步删除兼容构造后的边界。
+- 验证结果：已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；其中 `verify-media-agent` 完成 Release 构建、复制 runtime/media-agent、media-agent 单测和 smoke，构建仅输出 FFmpeg 头文件/`av_init_packet` 既有 warning。已执行 `rg -n "\\bstate_\\b|run_worker\\(AgentRuntimeState|ObsIngestSession\\(runtime_state\\)|ObsIngestSession obs_ingest\\(runtime_state\\)" media-agent/src/obs_ingest_session.h media-agent/src/obs_ingest_session.cpp media-agent/src/host_session_runtime.cpp media-agent/src/agent_rpc_router.cpp`，确认源码中已无 OBS ingest 完整 runtime 构造、`state_` 成员或 worker runtime 指针；已执行 `git diff --check -- media-agent/src/obs_ingest_session.h media-agent/src/obs_ingest_session.cpp media-agent/src/host_session_runtime.cpp media-agent/src/agent_rpc_router.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-416 native session state direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-session-controller.js::createSessionState()` 已持有 current backend、host preview requested、OBS room pending 和 OBS stream active，但 `app-native-overrides.js` 仍保留 8 个只转发到 `nativeSessionState` 的 getter/setter wrapper。
+- 影响：legacy 文件继续暴露 session state 假 owner 函数名，阅读 host start/stop、OBS room create 和 stats polling 时需要判断这些函数是否有本地语义。
+- 建议：删除这些 direct wrapper，调用点直接使用 `nativeSessionState.get*/set*`，保留 `isObsIngestHostBackend()` 和 `shouldShowNativeHostPreviewForBackend()` 这两个仍有业务归一化/策略语义的 helper。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 native session state 值、不改变 host preview policy、不改变 OBS room pending/active 时序。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `getCurrentHostBackend()`、`setCurrentHostBackend()`、`getHostPreviewRequested()`、`setHostPreviewRequested()`、`getObsRoomCreatePending()`、`setObsRoomCreatePending()`、`getObsIngestStreamActive()` 和 `setObsIngestStreamActive()`；调用点改为直接读写 `nativeSessionState`，两个策略 helper 的默认 backend 也直接读取 `nativeSessionState.getCurrentHostBackend()`。`docs/RENDERER_SPLIT_MAP.md` 已同步 session state wrapper 删除后的边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function getCurrentHostBackend|function setCurrentHostBackend|function getHostPreviewRequested|function setHostPreviewRequested|function getObsRoomCreatePending|function setObsRoomCreatePending|function getObsIngestStreamActive|function setObsIngestStreamActive" server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md`，确认 legacy 源码和拆分映射中 8 个 direct wrapper 已无命中；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-417 native session controller direct wrapper 仍留在 host start/stop 流程
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-416 后 session state direct wrapper 已删除，但 host start/stop 附近仍保留 `beginNativeHostStart()`、`finishNativeHostStart()`、`isNativeHostStartCurrent()`、manifest build、host session start/stop、stop cleanup/finalize/finish 和 effects apply 等一批只转发到 `nativeSessionController` 的 wrapper。
+- 影响：legacy 文件继续暴露 session controller 假 owner 函数名，host start/stop 主流程需要额外跳转才能判断真实 owner，R6/R7 边界不够直观。
+- 建议：删除纯 direct wrapper，调用点直接使用 `nativeSessionController`；保留仍需要本地参数组装或 UI 语义的 helper，例如 `startNativeAudioForShare()` 和 `beginNativeStopShare()`。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 host start generation、不改变 stop cleanup 顺序、不改变 manifest 内容、不改变 start success effects 顺序。
+- 处理结果：已处理。`app-native-overrides.js` 删除 host start generation/current、manifest build、host session start/stop、stop cleanup/finalize/finish、failed-start cleanup 和 effects apply 的 direct wrapper；调用点改为直接调用 `nativeSessionController`。保留 `startNativeAudioForShare()` 的音频 PID 参数组装和 `beginNativeStopShare()` 的 peer/room/session snapshot 组装。`docs/RENDERER_SPLIT_MAP.md` 已同步当前 session controller wrapper 删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function beginNativeHostStart|function finishNativeHostStart|function isNativeHostStartCurrent|function buildHostMediaManifestFromStats|function buildHostMediaManifestFromObsIngest|function startNativeHostSession|function stopNativeHostSession|function cleanupNativeStopResources|function cleanupAfterFailedHostStart|function applyHostStartSuccessEffects|function finalizeNativeStopState|function finishNativeStopShare" server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md`，无命中，确认这些 direct wrapper 已从 legacy 源码和拆分映射移除；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-418 native peer utility direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js` 已持有 peer handle registry、signal attempt、description normalize、stale error 判断、signal state 和 candidate/offer utility，但 `app-native-overrides.js` 仍保留一批只转发到 `nativePeerController` 的工具 wrapper。
+- 影响：legacy 文件继续暴露 peer utility 假 owner 函数名，offer/answer/ICE 和 close cleanup 流程需要额外跳转，R5/R7 边界不够清楚。
+- 建议：删除纯 direct wrapper，调用点直接使用 `nativePeerController`；保留仍有本地 UI/状态副作用的 peer helper。
+- 修改意见：按建议实施 R5/R7 小切片，不改变 peer 创建/关闭顺序、不改变 signal payload、不改变 offer/answer/ICE RPC 时序。
+- 处理结果：已处理。`app-native-overrides.js` 删除 peer handle 查询/删除/count/ids、native peer handle 判断、signal attempt、session description normalize、stale native peer error、signal state clear、media offer 判定等 direct wrapper；controller 创建时也不再注入 legacy `getSignalPeerId`，改用 `native-peer-controller.js` 自身默认解析。调用点直接使用 `nativePeerController`。`docs/RENDERER_SPLIT_MAP.md` 已同步 peer utility wrapper 删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function isNativePeerHandle|function normalizeNativeSessionDescription|function parseNativeSignalPeerId|function isStaleNativePeerError|function getSignalAttemptId|function getCurrentPeerAttemptId|function getCurrentPeerEdgeAttemptId|function appendPeerAttempt|function clearNativePeerSignalState|function isMediaOfferSignal|function ensurePeerMeta|function getNativePeerHandle|function deleteNativePeerHandle|function getNativePeerHandleCount|function getNativePeerHandleIds|getSignalPeerId: \\(params\\) =>" server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md`，无命中，确认这些 peer utility direct wrapper 和 legacy signal peer-id 注入已移除；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-419 P2P/reconnect timer direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/p2p-state-machine.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-418 后 peer utility direct wrapper 已删除，但 `app-native-overrides.js` 中仍残留部分 viewer wait timer 和 relay reconnect timer 的旧 wrapper 调用，例如 `clearViewerMediaWaitTimer()`、`armViewerUpstreamOfferWaitTimer()`、`clearViewerUpstreamOfferWaitTimer()` 和 `clearNativePeerReconnect()`。
+- 影响：P2P wait timer 与 reconnect timer 的 owner 已分别迁到 `p2p-state-machine.js` / `native-peer-controller.js`，但 legacy 调用点继续走旧函数名，会让后续阅读连接时序时误判 owner 边界。
+- 建议：删除剩余裸调用点，调用处直接使用 `p2pStateMachine.*` 和 `nativePeerController.*`，不改变等待超时、重连次数或信令 payload。
+- 修改意见：按建议实施 R3/R5/R7 小切片，不改变 viewer join/resume、host disconnected、chain reconnect 或 relay retry 的时序。
+- 处理结果：已处理。`app-native-overrides.js` 中 viewer join/resume、host disconnected、chain reconnect 等路径的 wait timer 调用已改为直接使用 `p2pStateMachine.clearViewerMediaWaitTimer()`、`p2pStateMachine.clearViewerUpstreamOfferWaitTimer()` 和 `p2pStateMachine.armViewerUpstreamOfferWaitTimer()`；relay offer retry exhaustion 改为直接调用 `nativePeerController.clearPeerReconnect()`。`docs/RENDERER_SPLIT_MAP.md` 已同步 P2P timer 和 relay reconnect timer 的当前 owner 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check server/public/native/p2p-state-machine.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function clearViewerMediaWaitTimer|function clearViewerUpstreamOfferWaitTimer|function resetViewerUpstreamOfferReconnectPeer|function armViewerUpstreamOfferWaitTimer|function armViewerMediaWaitTimer|function classifyP2pFailure|function clearNativePeerConnectTimeout|function clearNativePeerDisconnectTimer|function getNativePeerReconnectState|function clearNativePeerReconnect|function scheduleNativePeerReconnect|function clearAllNativePeerReconnects|\\bclearNativePeerReconnect\\(|\\bclearViewerMediaWaitTimer\\(|\\barmViewerUpstreamOfferWaitTimer\\(" server/public/app-native-overrides.js`，确认只剩 `p2pStateMachine.*` 的直接调用和 controller 注入字段，无旧 wrapper 函数定义或 reconnect 裸调用；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-420 diagnostics low-frequency direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-diagnostics.js` 已持有 debug gate、rate limit、debug log 和 stats line 输出，但 `app-native-overrides.js` 仍保留 `shouldShowDebugLogsFor()`、`shouldEmitNativeDebugLog()`、`logNativeDebug()`、`logNativeStatsLine()` 这类低频纯转发 wrapper。
+- 影响：diagnostics owner 已经明确，但 legacy 文件继续暴露这些假 owner 函数名；阅读 stats polling 和 start/stop 日志时仍需要跳一层才能判断真实日志策略。
+- 建议：删除低频纯转发 wrapper，调用点直接使用 `nativeDiagnostics.*`；暂不批量迁移高频 `logNativeStep()` / `logRecoverableNativeWarning()`，避免本轮修改面过大。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 debug category、rate limit key、suppressed 计数、日志 label 或 payload。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `shouldShowDebugLogsFor()`、`shouldEmitNativeDebugLog()`、`logNativeDebug()` 和 `logNativeStatsLine()`；surface tracking、host/viewer periodic stats、host native/OBS start result、message received 和 stop share error 日志调用点已改为直接调用 `nativeDiagnostics.shouldShowDebugLogsFor()`、`shouldEmitNativeDebugLog()`、`logNativeDebug()` 和 `logNativeStatsLine()`。`docs/RENDERER_SPLIT_MAP.md` 已同步 diagnostics 低频 wrapper 删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function shouldShowDebugLogsFor|function shouldEmitNativeDebugLog|function logNativeDebug|function logNativeStatsLine|\\bshouldShowDebugLogsFor\\(|\\bshouldEmitNativeDebugLog\\(|\\blogNativeDebug\\(|\\blogNativeStatsLine\\(" server/public/app-native-overrides.js`，确认旧函数定义已删除，剩余命中均为 `nativeDiagnostics.*` 显式调用；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-421 diagnostics snapshot direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-diagnostics.js` 已是 latest P2P stats snapshot 与 latest host capture diagnostic report 的唯一正常 owner，但 `app-native-overrides.js` 仍保留 `rememberLatestP2pStatsSnapshot()`、`getLatestP2pStatsSnapshot()`、`rememberLatestHostCaptureDiagnosticReport()`、`getLatestHostCaptureDiagnosticReport()` 四个 direct wrapper。
+- 影响：diagnostics 缓存 owner 仍被 legacy 函数名遮蔽，manifest 构建、host capture 报告和 stats polling 读起来像在使用 legacy 本地缓存。
+- 建议：删除四个 direct wrapper，调用点直接使用 `nativeDiagnostics` 的 getter/setter。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 snapshot 内容、不改变 host/viewer stats polling 时机、不改变 diagnostic report 文案。
+- 处理结果：已处理。`app-native-overrides.js` 删除四个 diagnostics snapshot direct wrapper；host manifest 构建、P2P report build、host capture report render、host stats polling 和 viewer stats polling 均直接调用 `nativeDiagnostics.getLatestP2pStatsSnapshot()`、`setLatestP2pStatsSnapshot()`、`getLatestHostCaptureDiagnosticReport()`、`setLatestHostCaptureDiagnosticReport()`。`docs/RENDERER_SPLIT_MAP.md` 已同步 latest diagnostics snapshot/cache wrapper 删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function rememberLatestP2pStatsSnapshot|function getLatestP2pStatsSnapshot|function rememberLatestHostCaptureDiagnosticReport|function getLatestHostCaptureDiagnosticReport" server/public/app-native-overrides.js`，无命中，确认四个 wrapper 定义已删除；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-422 P2P UI state direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/p2p-state-machine.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`p2p-state-machine.js` 已持有 P2P UI state/status DOM 写入和 peer meta `p2pUiState` 写入，但 `app-native-overrides.js` 仍保留 `setP2pStatusElementState()` / `setP2pStateForPeer()` 两个 direct wrapper。
+- 影响：P2P 状态 owner 仍被 legacy 函数名遮蔽，peer failure/recovery、remote ICE effects、viewer connected UI 和 host waiting-viewer UI 读起来像由 legacy 写 UI state。
+- 建议：删除两个 direct wrapper，调用点和 peer controller 注入回调直接使用 `p2pStateMachine`。
+- 修改意见：按建议实施 R3/R5/R7 小切片，不改变 P2P state label、不改变 DOM class、不改变 peer meta 写入、不改变连接状态机时序。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `setP2pStatusElementState()` 和 `setP2pStateForPeer()`；native peer controller 注入、NAT/failfast/recovery、remote ICE effects、viewer connected UI 和 host waiting-viewer UI 已直接调用 `p2pStateMachine.setP2pStateForPeer()` / `setStatusElementState()`。`docs/RENDERER_SPLIT_MAP.md` 已同步 P2P UI state wrapper 删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/p2p-state-machine.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function setP2pStatusElementState|function setP2pStateForPeer|\\bsetP2pStatusElementState\\(|\\bsetP2pStateForPeer\\(" server/public/app-native-overrides.js`，确认旧 wrapper 函数定义已删除，剩余命中均为 `p2pStateMachine.*` 显式调用或 controller 注入字段；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-423 diagnostics step log direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：P1-420 后低频 diagnostics wrapper 已删除，但 `app-native-overrides.js` 仍保留 `getNativeDebugCategoryFromScope()` 和 `logNativeStep()` 两个 direct wrapper，surface、NAT/failfast/recovery、offer/answer/ICE、room lifecycle 和初始化日志仍通过 legacy 函数名输出。
+- 影响：step log 的分类、节流和 payload 摘要 owner 已在 `native-diagnostics.js`，但 legacy 函数名继续让日志路径看起来由大文件持有。
+- 建议：删除两个 direct wrapper，controller 注入和调用点直接使用 `nativeDiagnostics.logNativeStep()`。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 scope、payload、category 参数，不改变日志分类默认值和输出格式。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `getNativeDebugCategoryFromScope()` 和 `logNativeStep()`；native surface/peer/session controller 注入，以及 viewer upstream timeout、surface tracking、NAT mapping、P2P failure、remote ICE effects、peer recovery、offer/answer/ICE、room created、viewer joined、initializeNativeUi 等日志调用点已直接使用 `nativeDiagnostics.logNativeStep()`。`docs/RENDERER_SPLIT_MAP.md` 已同步 step log wrapper 删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function getNativeDebugCategoryFromScope|function logNativeStep|\\blogNativeStep\\(" server/public/app-native-overrides.js`，确认旧 wrapper 函数定义已删除，剩余命中均为 `nativeDiagnostics.logNativeStep()` 显式调用或 controller 注入字段；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-424 diagnostics recoverable warning direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-diagnostics.js` 已持有 recoverable warning 的节流、分类和 fallback label 输出，但 `app-native-overrides.js` 仍保留 `logRecoverableNativeWarning()` direct wrapper。
+- 影响：warning 日志 owner 被 legacy 函数名遮蔽；peer recovery、stats polling、audio start、relay retry 和 fullscreen/mute 错误日志路径仍像由大文件持有。
+- 建议：删除 wrapper，controller 注入和调用点直接使用 `nativeDiagnostics.logRecoverableNativeWarning()`。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 warning key、category、channel、fallback label 或节流语义。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `logRecoverableNativeWarning()`；viewer controls、surface sync error、session controller 注入、peer disconnected recovery、host/viewer stats polling、audio start、relay retry、viewer mute/fullscreen/escape 错误日志调用点已直接使用 `nativeDiagnostics.logRecoverableNativeWarning()`。`docs/RENDERER_SPLIT_MAP.md` 已同步 recoverable warning wrapper 删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function logRecoverableNativeWarning|\\blogRecoverableNativeWarning\\(" server/public/app-native-overrides.js`，确认旧 wrapper 函数定义已删除，剩余命中均为 `nativeDiagnostics.logRecoverableNativeWarning()` 显式调用或 controller 注入字段；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-425 surface direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-surface-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-surface-controller.js` 已持有 surface tracking 和 force resync，但 `app-native-overrides.js` 仍保留 `removeEmbeddedSurfaceTracking()` 和 `forceEmbeddedSurfaceResync()` direct wrapper。
+- 影响：surface lifecycle owner 已经迁入 controller，但 viewer fullscreen resync 与 session cleanup 注入仍通过 legacy 函数名，降低 R4/R7 边界清晰度。
+- 建议：删除两个 direct wrapper，调用点直接使用 `nativeSurfaceController.forceResync()` / `removeSurfaceTracking()`；保留 `surfaceId` 空值保护和默认 reason。
+- 修改意见：按建议实施 R4/R7 小切片，不改变 resync 时机、不改变 surface tracking remove reason、不改变 host preview attached 回调。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `removeEmbeddedSurfaceTracking()` 和 `forceEmbeddedSurfaceResync()`；viewer fullscreen controller 注入直接调用 `nativeSurfaceController.forceResync()`，native session controller 的 host preview / generic surface tracking cleanup 注入直接调用 `nativeSurfaceController.removeSurfaceTracking()`，并保留空 `surfaceId` 保护和 `surface-sync-failed` 默认 reason。`docs/RENDERER_SPLIT_MAP.md` 已同步 surface wrapper 删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-surface-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function (removeEmbeddedSurfaceTracking|forceEmbeddedSurfaceResync)|\\bremoveEmbeddedSurfaceTracking\\(|\\bforceEmbeddedSurfaceResync\\(" server/public/app-native-overrides.js`，无命中，确认两个 direct wrapper 定义和裸调用均已删除；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-426 mediaEngine/pending candidate direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-media-engine-controller.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-media-engine-controller.js` 已持有 mediaEngine start lifecycle，`native-peer-controller.js` 已持有 pending remote candidate queue，但 `app-native-overrides.js` 仍保留 `ensureMediaEngineStarted()` 和 `clearNativePendingRemoteCandidates()` direct wrapper。
+- 影响：native start 和 pending candidate cleanup 的 owner 被 legacy 函数名遮蔽，host start/retry/native UI init 与 peer close cleanup 仍需要额外跳转。
+- 建议：删除两个 direct wrapper，调用点直接使用 `nativeMediaEngineController.ensureStarted()` 和 `nativePeerController.clearPendingRemoteCandidates()`。
+- 修改意见：按建议实施 R5/R7 小切片，不改变 mediaEngine start 时机、不改变 pending candidate clear 时机、不改变 close cleanup effects 顺序。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `ensureMediaEngineStarted()` 和 `clearNativePendingRemoteCandidates()`；native/OBS host start、preview retry、native UI 初始化直接调用 `nativeMediaEngineController.ensureStarted()`，peer close cleanup effects 和 fallback cleanup 直接调用 `nativePeerController.clearPendingRemoteCandidates()`。`docs/RENDERER_SPLIT_MAP.md` 已同步 mediaEngine start 和 pending candidate cleanup wrapper 删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-media-engine-controller.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function (ensureMediaEngineStarted|clearNativePendingRemoteCandidates)|\\bensureMediaEngineStarted\\(|\\bclearNativePendingRemoteCandidates\\(" server/public/app-native-overrides.js`，无命中，确认两个 direct wrapper 定义和裸调用均已删除；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-427 unused peer edge direct wrapper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-peer-controller.js` 已持有 `getPeerEdgeState(peerId)`，而 `app-native-overrides.js` 中残留的同名 direct wrapper 已无调用。
+- 影响：即便不可达，该函数名仍让 legacy 文件看起来拥有 peer edge snapshot 入口，削弱 R5/R7 ownership 边界。
+- 建议：删除无调用 wrapper，保留 controller 内 edge snapshot owner。
+- 修改意见：按建议实施 R5/R7 小切片，不改变 peer recovery、attempt 或 diagnostic 行为。
+- 处理结果：已处理。`app-native-overrides.js` 删除无调用的 `getPeerEdgeState()` direct wrapper；源码中 peer edge snapshot owner 只保留在 `native-peer-controller.js`。`docs/RENDERER_SPLIT_MAP.md` 已同步删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function getPeerEdgeState|\\bgetPeerEdgeState\\(" server/public/app-native-overrides.js`，无命中，确认 legacy wrapper 定义和裸调用均已删除；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-428 diagnostics report helper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-diagnostics.js`、`server/public/native/native-media-engine-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-diagnostics.js` 已持有 media capabilities debug logging 和 host capture report builder/cache，但 `app-native-overrides.js` 仍保留 `logNativeMediaCapabilities()`、`buildHostCaptureDiagnosticReportFromStats()` 和 `buildHostCaptureDiagnosticReport()` helper。
+- 影响：diagnostics owner 已明确后，这些 helper 仍让 capabilities logging、host capture report build 和 legacy report hook 看起来由大文件持有。
+- 建议：删除这些 helper，调用点直接使用 `nativeDiagnostics`；legacy global hook 直接返回 latest host capture diagnostic report。
+- 修改意见：按建议实施 R3/R7 小切片，不改变 capabilities 日志内容、不改变 host backend 参数、不改变 diagnostic report 缓存和 hook 返回值。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `logNativeMediaCapabilities()`、`buildHostCaptureDiagnosticReportFromStats()` 和 `buildHostCaptureDiagnosticReport()`；mediaEngine controller `logCapabilities` 注入直接调用 `nativeDiagnostics.logNativeDebug()`，host stats polling 直接调用 `nativeDiagnostics.buildHostCaptureDiagnosticReportFromStats()` 并传入 current backend，`__vdsBuildHostCaptureDiagnosticReport` hook 直接返回 `nativeDiagnostics.getLatestHostCaptureDiagnosticReport()`。`docs/RENDERER_SPLIT_MAP.md` 已同步 diagnostics report helper 删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-diagnostics.js`、`node --check server/public/native/native-media-engine-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function (logNativeMediaCapabilities|buildHostCaptureDiagnosticReportFromStats|buildHostCaptureDiagnosticReport)|\\b(logNativeMediaCapabilities|buildHostCaptureDiagnosticReportFromStats|buildHostCaptureDiagnosticReport)\\b" server/public/app-native-overrides.js`，确认旧 helper 函数定义已删除，剩余命中仅为 `nativeDiagnostics.buildHostCaptureDiagnosticReportFromStats()` 方法调用；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-429 single-use P2P timeout helper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`withP2pTimeout()` 只服务 NAT mapping 一处调用，作为通用 helper 留在 legacy 文件中会扩大阅读面。
+- 影响：虽然不是跨模块 owner 问题，但它让 NAT mapping 失败路径需要额外跳转，削弱当前 R7 收尾阶段的可读性。
+- 建议：删除单点 helper，把 `Promise.race` timeout 逻辑内联到 NAT mapping 调用处。
+- 修改意见：按建议实施 R7 小切片，不改变 6000ms 超时、不改变 `nat-mapping-timeout` 错误文案、不改变 `openNatMapping` request payload。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `withP2pTimeout()`，`attemptLastChanceNatMapping()` 内联 `Promise.race([mediaEngine.openNatMapping(...), timeout])`，保留 `peerId`、`candidates`、`lifetimeSeconds: 180`、6000ms timeout 和 `nat-mapping-timeout` 文案。`docs/RENDERER_SPLIT_MAP.md` 已同步删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function withP2pTimeout|\\bwithP2pTimeout\\(" server/public/app-native-overrides.js`，无命中，确认 helper 定义和调用均已删除；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-430 codec UI refresh helper 仍留在 legacy renderer
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：session controller 已通过 effects 描述 codec UI lock，但 `app-native-overrides.js` 仍保留 `lockCodecUiToNativeH264()` helper，只是调用 `window.__vdsRefreshQualitySettingsUi()`。
+- 影响：codec UI refresh 的实际动作很小，却被 legacy helper 命名成 native H264 lock，增加 host start/session effects 阅读跳转。
+- 建议：删除 helper，在 session effects 注入、native host start 和 native UI 初始化处直接调用 `window.__vdsRefreshQualitySettingsUi()`。
+- 修改意见：按建议实施 R6/R7 小切片，不改变刷新函数名、不改变调用时机、不改变 codec preference 写入。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `lockCodecUiToNativeH264()`；session effects 注入、native host start 和 native UI 初始化均直接检查并调用 `window.__vdsRefreshQualitySettingsUi()`。`docs/RENDERER_SPLIT_MAP.md` 已同步删除范围。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "function lockCodecUiToNativeH264|\\blockCodecUiToNativeH264\\(" server/public/app-native-overrides.js`，无命中，确认 helper 定义和调用均已删除；已执行 `git diff --check -- server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-431 codec normalization 仍在 renderer 重复实现
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`native-session-controller.js` 内部已有 `normalizeVideoCodec()`，但 `app-native-overrides.js` 仍保留重复的 `normalizeNativeVideoCodec()`，用于 `setNativeEffectiveCodec` effect。
+- 影响：codec 归一化规则存在 renderer/session controller 两份实现，后续新增 codec 或调整 fallback 时容易出现不一致。
+- 建议：由 session controller 暴露 `normalizeVideoCodec()`，renderer 删除重复实现并直接调用 controller API。
+- 修改意见：按建议实施 R6/R7 小切片，不改变 h265/hevc -> h265、h264 -> h264 和 fallback 语义。
+- 处理结果：已处理。`native-session-controller.js` 导出 `normalizeVideoCodec()`；`app-native-overrides.js` 删除 `normalizeNativeVideoCodec()`，`setNativeEffectiveCodec` effect 直接调用 `nativeSessionController.normalizeVideoCodec(codec, qualitySettings.codecPreference || 'h264')`。`docs/RENDERER_SPLIT_MAP.md` 已同步 codec normalization owner。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`，均通过；已执行 `rg -n "normalizeNativeVideoCodec|function normalizeVideoCodec|normalizeVideoCodec," server/public/app-native-overrides.js server/public/native/native-session-controller.js`，确认 renderer 重复实现已删除，`normalizeVideoCodec` 只在 session controller 定义/导出；已执行 `git diff --check -- server/public/app-native-overrides.js server/public/native/native-session-controller.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-432 peer create request 配置阶段仍暴露完整 runtime
+
+- 位置：`media-agent/src/peer_create_request_config.h`、`media-agent/src/peer_create_request_config.cpp`、`media-agent/src/peer_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`configure_peer_create_request()` 只需要读取 peer transport backend 的 `transport_ready` 和 `reason` snapshot，却接收完整 `AgentRuntimeState&`，使 create request 解析/配置阶段继续暴露完整 runtime 依赖。
+- 影响：PeerSessionController 已经是 createPeer owner，但下游配置 helper 仍可访问完整 runtime，后续维护者容易在 request parsing 阶段重新读写不属于该阶段的全局状态。
+- 建议：把 `configure_peer_create_request()` 的入参收窄为 `const PeerTransportBackendInfo&`，由 `PeerSessionController::create_from_request()` 在 owner 边界读取一次 `peer_transport_backend(runtime_state_)` 后注入。
+- 修改意见：按建议实施 M7 小切片，不改变 createPeer request 字段解析、不改变 `transport_ready/reason` 初始赋值、不改变 transport session 创建或 host downstream media attach 顺序。
+- 处理结果：已处理。`configure_peer_create_request()` 不再 include `agent_runtime.h` 或 `runtime_registry.h`，函数签名改为接收 `PeerTransportBackendInfo` snapshot；`PeerSessionController::create_from_request()` 负责从 `runtime_registry` facade 读取 backend snapshot 并传入配置阶段。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步 peer create request 配置阶段的窄依赖边界。
+- 验证结果：已执行 `rg -n "configure_peer_create_request\\(|AgentRuntimeState|runtime_registry" media-agent/src/peer_create_request_config.h media-agent/src/peer_create_request_config.cpp media-agent/src/peer_session_controller.cpp`，确认 `peer_create_request_config.*` 中已无完整 runtime/registry 依赖；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认本切片未新增大字段裸访问；已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；已执行 `git diff --check -- media-agent/src/peer_create_request_config.h media-agent/src/peer_create_request_config.cpp media-agent/src/peer_session_controller.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-433 peer transport factory/callback 仍暴露完整 runtime
+
+- 位置：`media-agent/src/peer_transport_callback_factory.h`、`media-agent/src/peer_transport_callback_factory.cpp`、`media-agent/src/peer_transport_session_factory.h`、`media-agent/src/peer_transport_session_factory.cpp`、`media-agent/src/peer_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`PeerTransportCallbackContext` 仍保留未使用的 `AgentRuntimeState*`，`create_transport_for_peer_session()` 也只为了 `peer_transport_ready()` ready gate 接收完整 `AgentRuntimeState&`。
+- 影响：peer transport callback/factory 层看起来仍可访问完整 runtime，后续维护者可能在 transport 创建或 callback 构造阶段重新引入跨 session 读写，削弱 PeerSessionController 的 owner 边界。
+- 建议：删除 callback context 中未使用的 runtime 指针；把 `create_transport_for_peer_session()` 入参收窄为 `transport_ready` snapshot bool，由 `PeerSessionController::create_from_request()` 在 owner 入口读取并注入。
+- 修改意见：按建议实施 M7 小切片，不改变 PeerTransportCallbacks 的事件 payload、不改变 transport session 创建参数、不改变 media manifest apply、不改变 createPeer 成功/失败状态写回。
+- 处理结果：已处理。`PeerTransportCallbackContext` 删除 `AgentRuntimeState* runtime_state`，`peer_transport_callback_factory.cpp` 不再 include `agent_runtime.h`；`create_transport_for_peer_session()` 改为接收 `bool transport_ready`，`peer_transport_session_factory.*` 不再前置声明完整 runtime、include `agent_runtime.h` 或 include `runtime_registry.h`；`PeerSessionController::create_from_request()` 在 owner 边界读取一次 `peer_transport_ready(runtime_state_)` 后传入 factory。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该收窄边界。
+- 验证结果：已执行 `rg -n "AgentRuntimeState|agent_runtime|runtime_registry|runtime_state" media-agent/src/peer_transport_callback_factory.h media-agent/src/peer_transport_callback_factory.cpp media-agent/src/peer_transport_session_factory.h media-agent/src/peer_transport_session_factory.cpp`，无命中，确认 callback/factory 文件已无完整 runtime/registry 依赖；已执行 `rg -n "create_transport_for_peer_session\\(|PeerTransportCallbackContext|peer_transport_ready" media-agent/src/peer_transport_callback_factory.h media-agent/src/peer_transport_callback_factory.cpp media-agent/src/peer_transport_session_factory.h media-agent/src/peer_transport_session_factory.cpp media-agent/src/peer_session_controller.cpp`，确认 factory 调用只接收 `transport_ready` snapshot；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；已执行 `git diff --check -- media-agent/src/peer_create_request_config.h media-agent/src/peer_create_request_config.cpp media-agent/src/peer_transport_callback_factory.h media-agent/src/peer_transport_callback_factory.cpp media-agent/src/peer_transport_session_factory.h media-agent/src/peer_transport_session_factory.cpp media-agent/src/peer_session_controller.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-434 host audio sender 配置仍为 capture ready 检查暴露完整 runtime
+
+- 位置：`media-agent/src/peer_host_source_binding.h`、`media-agent/src/peer_host_source_binding.cpp`、`media-agent/src/peer_refresh_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`configure_host_audio_sender()` 只需要判断 `audio_session_capture_ready(audio_session_snapshot(state))`，却接收完整 `AgentRuntimeState&`。
+- 影响：host audio sender 配置路径看起来仍能访问全局 runtime，削弱 AudioSession owner 和 Peer host binding helper 之间的快照边界；后续维护者可能在音频 sender 配置中重新引入跨 session 读写。
+- 建议：将 `configure_host_audio_sender()` 入参收窄为 `const AudioSessionState&`，由调用方在 host video attach 或 host audio refresh owner 边界读取 `audio_session_snapshot()` 后注入。
+- 修改意见：按建议实施 M6/M7 小切片，不改变 audio ready 判断、不改变 Opus sender 配置、不改变 encoded datachannel 下注册 host audio transport session 的行为。
+- 处理结果：已处理。`configure_host_audio_sender()` 改为接收 `AudioSessionState` snapshot；`attach_host_video_media_binding()` 在完成视频 sender 后读取一次 `audio_session_snapshot(state)` 并在 ready 时注入；`refresh_all_host_audio_senders()` 在遍历 host-downstream peer 前读取一次 audio session snapshot 并复用。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步 host audio sender 配置的窄依赖边界。
+- 验证结果：已执行 `rg -n "configure_host_audio_sender" media-agent/src`，确认调用点只剩 snapshot 版本；已执行 `rg -n "configure_host_audio_sender\\((runtime_state|state)|bool configure_host_audio_sender\\(AgentRuntimeState" media-agent/src`，无命中，确认旧 runtime 签名和 runtime 调用已删除；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；已执行 `git diff --check -- media-agent/src/peer_host_source_binding.h media-agent/src/peer_host_source_binding.cpp media-agent/src/peer_refresh_pipeline.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-435 OBS ingest media binding 内部 helper 仍自行读取完整 runtime
+
+- 位置：`media-agent/src/peer_host_source_binding.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`attach_obs_ingest_media_binding()` 是 `peer_host_source_binding.cpp` 内部 helper，但仍接收 `AgentRuntimeState&` 并自行读取 `host_session_snapshot(state)` 与 `obs_ingest_session_snapshot(state)`。
+- 影响：外层 `attach_host_video_media_binding()` 已经读取 host snapshot 后判断 OBS backend，内部 helper 再拿完整 runtime 会让 OBS binding 子流程继续隐藏 registry 读取点，削弱 Host/OBS session snapshot owner 边界。
+- 建议：把内部 helper 入参收窄为 `const HostSessionState&` 和 `const ObsIngestSessionSnapshot&`，由外层兼容入口读取 snapshot 后传入，保持对外函数签名和行为不变。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 OBS prepared/running gate、不改变 relay subscriber 注册、不改变 AAC audio sender 配置、不改变 encoded datachannel 路径。
+- 处理结果：已处理。`attach_obs_ingest_media_binding()` 改为接收 `HostSessionState` 与 `ObsIngestSessionSnapshot`，内部不再接收完整 runtime 或读取 host/OBS registry；`attach_host_video_media_binding()` 在 OBS backend 分支读取 `obs_ingest_session_snapshot(state)` 并通过 `make_obs_ingest_session_snapshot()` 注入。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步内部 helper 的窄 snapshot 边界。
+- 验证结果：已执行 `rg -n "attach_obs_ingest_media_binding\\(AgentRuntimeState|host_session_snapshot\\(state\\)|obs_ingest_session_snapshot\\(state\\)" media-agent/src/peer_host_source_binding.cpp`，确认旧 helper runtime 签名已删除，host/OBS snapshot 读取只留在外层兼容入口；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；已执行 `git diff --check -- media-agent/src/peer_host_source_binding.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-436 native host video binding 子流程仍直接读取 ffmpeg/audio runtime facade
+
+- 位置：`media-agent/src/peer_host_source_binding.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-435 后 OBS binding helper 已接收 snapshot，但非 OBS 的 native host video binding 大段逻辑仍直接留在 `attach_host_video_media_binding()` 中，并在 sender 启动和 audio sender 配置时读取 `ffmpeg_probe_result(state)` 与 `audio_session_snapshot(state)`。
+- 影响：`attach_host_video_media_binding()` 同时承担兼容入口、host/OBS 分支、native sender 配置、ffmpeg probe 注入和 audio snapshot 注入，后续拆 HostSession/PeerSession owner 时边界仍不够清晰。
+- 建议：把非 OBS native host video binding 逻辑拆到内部 helper，显式接收 `HostSessionState`、`FfmpegProbeResult` 和 `AudioSessionState`；外层兼容入口只负责读取 snapshots、判断 OBS/native 分支并转发。
+- 修改意见：按建议实施 M4/M6/M7 小切片，不改变 host session ready gate、不改变 transport video sender 配置、不改变 `start_peer_video_sender()` 参数、不改变 host audio sender ready 判断。
+- 处理结果：已处理。新增内部 `attach_native_host_video_media_binding()`，显式接收 `HostSessionState`、`FfmpegProbeResult`、`AudioSessionState`、peer/error/forceRestart；原 native host sender 配置、reconfigure、start sender、audio sender 注入和 media binding 状态写回均迁入该 helper。`attach_host_video_media_binding()` 只保留 host snapshot 读取、OBS/native 分支和 snapshot 注入。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步 native host video binding helper 的 snapshot 边界。
+- 验证结果：已执行 `rg -n "attach_native_host_video_media_binding|ffmpeg_probe_result|audio_session_snapshot|start_peer_video_sender" media-agent/src/peer_host_source_binding.cpp`，确认 `start_peer_video_sender()` 使用 helper 入参 `ffmpeg`，`ffmpeg/audio` runtime facade 读取只留在外层兼容入口；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；已执行 `git diff --check -- media-agent/src/peer_host_source_binding.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-437 host video binding 缺少显式 snapshot context 入口
+
+- 位置：`media-agent/src/peer_host_source_binding.h`、`media-agent/src/peer_host_source_binding.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-436 后 native/OBS 子流程已经使用显式 snapshots，但公开的 `attach_host_video_media_binding()` 仍只有 `AgentRuntimeState&` 入口，导致调用方无法逐步迁移到明确的 Host/FFmpeg/Audio/OBS snapshot contract。
+- 影响：即便内部 helper 已收窄，模块公共边界仍以完整 runtime 为主，后续拆 HostSession/PeerSession owner 或迁移多 session registry 时缺少可直接复用的窄入口。
+- 建议：新增 `HostVideoBindingContext`，包含 `HostSessionState`、`FfmpegProbeResult`、`AudioSessionState`、`ObsIngestSessionSnapshot` 引用；提供 snapshot context overload，旧 `AgentRuntimeState&` overload 只负责组装 context 并转发。
+- 修改意见：按建议实施 M4/M6/M7 小切片，不改变任何现有调用点、不改变默认 `force_restart`、不改变 OBS/native 分支和 sender 配置行为。
+- 处理结果：已处理。`peer_host_source_binding.h` 新增 `HostVideoBindingContext` 和 `attach_host_video_media_binding(const HostVideoBindingContext&, ...)`；`peer_host_source_binding.cpp` 中 context overload 成为真实分支入口，旧 `AgentRuntimeState&` overload 退化为兼容包装器，负责读取 host/ffmpeg/audio/OBS snapshots 后构造 context 并转发。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步 context 入口。
+- 验证结果：已执行 `rg -n "HostVideoBindingContext|attach_host_video_media_binding\\(" media-agent/src/peer_host_source_binding.h media-agent/src/peer_host_source_binding.cpp`，确认 context overload 和兼容 overload 均存在；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；已执行 `git diff --check -- media-agent/src/peer_host_source_binding.h media-agent/src/peer_host_source_binding.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-438 host video soft refresh 仍通过完整 runtime wrapper 进入 binding
+
+- 位置：`media-agent/src/peer_refresh_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`HostVideoBindingContext` 已存在，但 `refresh_all_host_video_senders()` 的 soft refresh 路径仍调用 `attach_host_video_media_binding(runtime_state, ...)`，继续通过完整 runtime wrapper 进入 host video binding。
+- 影响：soft refresh 本身已经在 peer refresh owner 边界重校验 capture plan，仍走 runtime wrapper 会隐藏 host/ffmpeg/audio/OBS snapshot 依赖，削弱 context 入口的实际使用面。
+- 建议：在 soft refresh 路径完成 `revalidate_current_host_capture_plan()` 后显式组装 `HostVideoBindingContext`，并调用 context overload。
+- 修改意见：按建议实施 M4/M6/M7 小切片，不改变 capture plan revalidate 时机、不改变 soft refresh failure reason、不改变 sender restart 行为。
+- 处理结果：已处理。`peer_refresh_pipeline.cpp::refresh_all_host_video_senders()` 在 capture plan revalidate 通过后读取 host/ffmpeg/audio/OBS snapshots，构造 `HostVideoBindingContext`，并调用 `attach_host_video_media_binding(binding_context, peer, &refresh_error, true)`；该路径不再通过完整 runtime wrapper 进入 host video binding。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步 soft refresh context 迁移。
+- 验证结果：已执行 `rg -n "attach_host_video_media_binding\\(runtime_state|HostVideoBindingContext|make_obs_ingest_session_snapshot|obs_ingest_session_snapshot" media-agent/src/peer_refresh_pipeline.cpp media-agent/src/peer_host_source_binding.cpp`，确认 soft refresh 路径已使用 `HostVideoBindingContext`，且 runtime wrapper 调用已无命中；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；已执行 `git diff --check -- media-agent/src/peer_refresh_pipeline.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-439 attachPeerMediaSource host path 仍通过完整 runtime wrapper 进入 host binding
+
+- 位置：`media-agent/src/peer_media_source_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-438 已迁移 soft refresh，但 `attach_peer_media_source_command()` 的 host source 路径仍调用 `attach_host_video_media_binding(runtime_state, ...)`。
+- 影响：显式 attachPeerMediaSource 命令仍把 host binding 的 host/ffmpeg/audio/OBS snapshot 依赖隐藏在 runtime wrapper 内，PeerSessionController 下游命令边界不够清楚。
+- 建议：在非 relay source 分支显式组装 `HostVideoBindingContext` 并调用 context overload；relay source 分支继续走 relay binding。
+- 修改意见：按建议实施 M4/M6/M7 小切片，不改变 source 参数校验、不改变 relay attach 行为、不改变 attachment negotiation 判断。
+- 处理结果：已处理。`peer_media_source_pipeline.cpp::attach_peer_media_source_command()` 将 attach 分支拆为 relay/source 两条路径；host source 路径读取 host/ffmpeg/audio/OBS snapshots，构造 `HostVideoBindingContext` 并调用 context overload。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步 attachPeerMediaSource host path 的 context 迁移。
+- 验证结果：已执行 `rg -n "attach_host_video_media_binding\\(runtime_state|HostVideoBindingContext|make_obs_ingest_session_snapshot|obs_ingest_session_snapshot" media-agent/src/peer_media_source_pipeline.cpp media-agent/src/peer_refresh_pipeline.cpp media-agent/src/peer_host_source_binding.cpp`，确认 attachPeerMediaSource host path 和 soft refresh 路径均使用 `HostVideoBindingContext`，且 runtime wrapper 调用已无命中；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；已执行 `git diff --check -- media-agent/src/peer_media_source_pipeline.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-440 createPeer host-downstream 自动 attach 仍通过完整 runtime wrapper 进入 host binding
+
+- 位置：`media-agent/src/peer_create_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：soft refresh 与 attachPeerMediaSource host path 已迁到 `HostVideoBindingContext`，但 `attach_host_downstream_media_if_running()` 在 createPeer 时仍调用 `attach_host_video_media_binding(state, ...)`。
+- 影响：createPeer 初始化 host-downstream media binding 仍隐藏 host/ffmpeg/audio/OBS snapshot 依赖，PeerSessionController 的 create pipeline 边界不够明确。
+- 建议：在 host running guard 通过后显式组装 `HostVideoBindingContext`，调用 context overload。
+- 修改意见：按建议实施 M4/M6/M7 小切片，不改变 host-downstream guard、不改变 createPeer negotiation 判断、不改变 attach failure reason。
+- 处理结果：已处理。`peer_create_pipeline.cpp::attach_host_downstream_media_if_running()` 在确认 peer 是 host-downstream 且 host running 后，读取 host/ffmpeg/audio/OBS snapshots 并构造 `HostVideoBindingContext`，随后调用 context overload；该路径不再通过完整 runtime wrapper 进入 host video binding。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步 createPeer host-downstream attach context 迁移。
+- 验证结果：已执行 `rg -n "attach_host_video_media_binding\\((state|runtime_state)|HostVideoBindingContext|make_obs_ingest_session_snapshot|obs_ingest_session_snapshot" media-agent/src/peer_create_pipeline.cpp media-agent/src/peer_media_source_pipeline.cpp media-agent/src/peer_refresh_pipeline.cpp media-agent/src/agent_lifecycle.cpp media-agent/src/peer_host_source_binding.cpp`，确认 create、attach media source、soft refresh 均已使用 context，剩余 runtime wrapper 调用仅为 lifecycle callback 兼容路径；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；已执行 `git diff --check -- media-agent/src/peer_create_pipeline.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-441 lifecycle host attach callback 仍通过完整 runtime wrapper 进入 host binding
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：create、attachPeerMediaSource、soft refresh 路径已迁到 `HostVideoBindingContext`，但 `make_start_host_session_callbacks()` 生成的 `attach_host_video_media_binding` callback 仍调用 `attach_host_video_media_binding(state, ...)`。
+- 影响：HostSessionController start callbacks 仍通过完整 runtime wrapper 进入 host video binding，内部 owner 边界尚未完全使用 context contract。
+- 建议：在 callback 内显式组装 `HostVideoBindingContext` 并调用 context overload；完整 runtime overload 仅保留为外部兼容入口。
+- 修改意见：按建议实施 M4/M6/M7 小切片，不改变 callback 签名、不改变 HostSessionController 调用方式、不改变 start host 后批量 attach 行为。
+- 处理结果：已处理。`agent_lifecycle.cpp::make_start_host_session_callbacks()` 的 host video attach callback 现在读取 host/ffmpeg/audio/OBS snapshots，构造 `HostVideoBindingContext` 后调用 context overload；源码中已无 `attach_host_video_media_binding(state, ...)` 或 `attach_host_video_media_binding(runtime_state, ...)` 调用。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步 lifecycle callback context 迁移。
+- 验证结果：已执行 `rg -n "attach_host_video_media_binding\\((state|runtime_state)|HostVideoBindingContext|make_obs_ingest_session_snapshot|obs_ingest_session_snapshot" media-agent/src/agent_lifecycle.cpp media-agent/src/peer_create_pipeline.cpp media-agent/src/peer_media_source_pipeline.cpp media-agent/src/peer_refresh_pipeline.cpp media-agent/src/peer_host_source_binding.cpp`，确认 lifecycle/create/attach media source/soft refresh 均使用 context；已执行 `rg -n "attach_host_video_media_binding\\((state|runtime_state)" media-agent/src`，无命中，确认完整 runtime overload 已无内部调用；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `npm run test:media-agent`、`npm run smoke:media-agent`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过；已执行 `git diff --check -- media-agent/src/agent_lifecycle.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-442 peer host source binding 仍保留未使用的完整 runtime overload
+
+- 位置：`media-agent/src/peer_host_source_binding.h`、`media-agent/src/peer_host_source_binding.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：P1-441 后源码内部已无 `attach_host_video_media_binding(state/runtime_state, ...)` 调用，但 `peer_host_source_binding` 仍暴露完整 `AgentRuntimeState&` overload，并为此 include `agent_runtime.h` / `runtime_registry.h`。
+- 影响：模块公共面仍允许新代码绕过 `HostVideoBindingContext`，并让 host source binding 文件继续依赖完整 runtime 头，削弱已建立的 snapshot contract。
+- 建议：删除未使用的完整 runtime overload；`peer_host_source_binding` 只保留 context 入口，移除 `AgentRuntimeState` 前置声明和完整 runtime/registry include。
+- 修改意见：按建议实施 M4/M6/M7 小切片，不改变任何已迁移调用点，不改变 host video binding 行为。
+- 处理结果：已处理。`peer_host_source_binding.h` 删除 `AgentRuntimeState` 前置声明和完整 runtime overload 声明；`peer_host_source_binding.cpp` 删除完整 runtime overload 实现，并移除 `agent_runtime.h` / `runtime_registry.h` include。该模块现在只通过 `HostVideoBindingContext` 进入 host video binding。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步删除结果。
+- 验证结果：已执行 `rg -n "AgentRuntimeState|agent_runtime|runtime_registry|attach_host_video_media_binding\\(AgentRuntimeState|attach_host_video_media_binding\\((state|runtime_state)" media-agent/src/peer_host_source_binding.h media-agent/src/peer_host_source_binding.cpp`，无命中，确认 peer host source binding 已无完整 runtime 入口/依赖；已执行 `rg -n "attach_host_video_media_binding\\((state|runtime_state)|attach_host_video_media_binding\\(AgentRuntimeState" media-agent/src`，无命中，确认全源码无旧 overload 调用；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；首次 verify 暴露 `PeerState` 不再由 `agent_runtime.h` 间接提供，已补充显式 `peer_session_state.h` include；随后执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 media-agent build、unit tests 和 smoke；已执行 `git diff --check -- media-agent/src/peer_host_source_binding.h media-agent/src/peer_host_source_binding.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-443 peer media detach helper 残留 stale runtime include
+
+- 位置：`media-agent/src/peer_media_detach_binding.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`peer_media_detach_binding.cpp` 的函数签名已经只接收 `PeerState&`，但实现文件仍 include `agent_runtime.h`，只是为了间接拿到 `PeerState` 完整定义。
+- 影响：detach helper 的真实边界是 peer media binding cleanup，却继续依赖完整 runtime 头，容易让后续维护者误以为该 helper 可以访问或修改全局 runtime。
+- 建议：删除 stale `agent_runtime.h` include，改为显式 include `peer_session_state.h`。
+- 修改意见：按建议实施 M7 小切片，不改变 detach/prepare close 行为、不改变 relay/audio/video sender cleanup 顺序。
+- 处理结果：已处理。`peer_media_detach_binding.cpp` 移除 `agent_runtime.h` include，新增 `peer_session_state.h` include；该 helper 仍只暴露 `PeerState&` 入参，不依赖完整 runtime。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步 stale include 清理。
+- 验证结果：已执行 `rg -n "AgentRuntimeState|agent_runtime|runtime_registry" media-agent/src/peer_media_detach_binding.cpp media-agent/src/peer_media_detach_binding.h`，无命中，确认 detach helper 已无完整 runtime 依赖；已执行 `rg -n "#include \"agent_runtime\\.h\"|#include \"runtime_registry\\.h\"|AgentRuntimeState&" media-agent/src -g "peer_*binding*.*" -g "peer_*pipeline.*"`，确认 peer media detach binding 不再出现在 runtime 依赖列表，剩余命中为仍需 runtime registry 的 create/relay/refresh/source/lifecycle pipeline；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 media-agent build、unit tests 和 smoke；已执行 `git diff --check -- media-agent/src/peer_media_detach_binding.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-444 relay source binding 仍为 upstream peer lookup 暴露完整 runtime
+
+- 位置：`media-agent/src/peer_relay_source_binding.h`、`media-agent/src/peer_relay_source_binding.cpp`、`media-agent/src/peer_media_source_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`attach_relay_video_media_binding()` 只需要经过校验后的 upstream peer 与 upstream peer id，却接收完整 `AgentRuntimeState&` 并在 helper 内自行解析 source、查找 peer registry。
+- 影响：relay binding helper 表面上仍能访问完整 peer registry，削弱 RelayHub/PeerSessionController 之间的显式边界；后续拆 DLL/多进程时，这类隐藏 registry lookup 会增加 IPC 边界识别成本。
+- 建议：把 source 解析、self-reference guard 和 upstream peer lookup 移到 `peer_media_source_pipeline.cpp`，`peer_relay_source_binding` 只接收 `RelayVideoBindingContext`。
+- 修改意见：按建议实施 M5/M7 小切片，不改变 relay readiness gate、不改变 codec 检查、不改变 encoded DataChannel 分支、不改变 subscriber 注册和 negotiation 条件。
+- 处理结果：已处理。`peer_relay_source_binding.h/cpp` 新增并使用 `RelayVideoBindingContext`，实现文件删除 `agent_runtime.h` / `runtime_registry.h` include 和 `find_peer()` 依赖；`peer_media_source_pipeline.cpp` 在 owner/pipeline 边界完成 source 解析、自引用校验、upstream peer 查找，再调用 relay binding context 入口。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n "AgentRuntimeState|agent_runtime|runtime_registry|find_peer" media-agent/src/peer_relay_source_binding.h media-agent/src/peer_relay_source_binding.cpp`，无命中，确认 relay binding helper 已无完整 runtime/registry lookup 依赖；已执行 `rg -n "attach_relay_video_media_binding\\(" media-agent/src`，确认调用点只剩 `RelayVideoBindingContext` 入口；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 Release build、unit tests 和 smoke。
+
+### ARCH-SPLIT-P1-445 createPeer host-downstream 自动 attach 仍在 helper 内组装完整 host context
+
+- 位置：`media-agent/src/peer_create_pipeline.h`、`media-agent/src/peer_create_pipeline.cpp`、`media-agent/src/peer_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`attach_host_downstream_media_if_running()` 已经是 createPeer host-downstream 自动 attach 的窄 helper，但仍接收完整 `AgentRuntimeState&`，并在 helper 内读取 host/ffmpeg/audio/OBS snapshots 后再构造 `HostVideoBindingContext`。
+- 影响：create pipeline helper 同时承担 host running guard 和跨 session snapshot 组装，削弱 `PeerSessionController::create_from_request()` 作为 createPeer owner 边界的清晰度。
+- 建议：由 `PeerSessionController::create_from_request()` 在 owner 边界组装 `HostVideoBindingContext`，`attach_host_downstream_media_if_running()` 只接收 context 和 peer。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 host-downstream guard、不改变 attach failure 状态写回、不改变 initial negotiation 和 registry store 顺序。
+- 处理结果：已处理。`attach_host_downstream_media_if_running()` 签名改为 `const HostVideoBindingContext&`；host/ffmpeg/audio/OBS snapshot 组装上移到 `PeerSessionController::create_from_request()`；`peer_create_pipeline.cpp` 删除 OBS snapshot 组装逻辑，只保留 host-downstream guard、host binding 调用和失败状态写回。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n "attach_host_downstream_media_if_running\\(" media-agent/src`，确认函数签名与唯一调用点均使用 `HostVideoBindingContext`；已执行 `rg -n "obs_ingest_session_snapshot|ffmpeg_probe_result|audio_session_snapshot|host_session_snapshot" media-agent/src/peer_create_pipeline.cpp media-agent/src/peer_session_controller.cpp`，确认 snapshot 读取只剩 `PeerSessionController::create_from_request()` owner 边界；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 Release build、unit tests 和 smoke。
+
+### ARCH-SPLIT-P1-446 peer lifecycle shutdown helper 残留 stale runtime include
+
+- 位置：`media-agent/src/peer_lifecycle_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`peer_lifecycle_pipeline.cpp` 的 shutdown close-all helper 已经只通过 `runtime_registry` facade 遍历 peer，但仍 include `agent_runtime.h`，只是为了间接获得 `PeerState` 完整定义。
+- 影响：peer lifecycle pipeline 表面上仍依赖完整 runtime 头，容易让后续维护误以为该 helper 可以直接访问 `AgentRuntimeState` 内部结构，而不是只通过 registry facade 工作。
+- 建议：删除 stale `agent_runtime.h` include，改为显式 include `peer_session_state.h`，保持 `runtime_registry.h` 作为唯一 registry 访问入口。
+- 修改意见：按建议实施 M7 小切片，不改变 shutdown 顺序、不改变 receiver handle close 和 transport session close 行为。
+- 处理结果：已处理。`peer_lifecycle_pipeline.cpp` 移除 `agent_runtime.h` include，新增 `peer_session_state.h` include；两个 shutdown helper 仍通过 `for_each_mutable_peer()` 遍历 peer，并保持原 receiver/transport close 行为。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n "AgentRuntimeState|agent_runtime|runtime_registry|PeerState" media-agent/src/peer_lifecycle_pipeline.cpp media-agent/src/peer_lifecycle_pipeline.h`，确认实现文件不再 include `agent_runtime.h`，仅保留 header 的 `AgentRuntimeState` 前置声明和 `runtime_registry.h` facade 访问；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 Release build、unit tests 和 smoke。
+
+### ARCH-SPLIT-P1-447 snapshot aggregator 残留 stale runtime include
+
+- 位置：`media-agent/src/peer_snapshot_aggregator.cpp`、`media-agent/src/surface_snapshot_aggregator.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：peer/surface snapshot aggregator 已经只负责 count/stats 只读聚合，并通过 `runtime_registry` facade 读取 registry，但实现文件仍 include `agent_runtime.h`，只是为了间接获得 `PeerState` / `SurfaceAttachmentState` 完整类型。
+- 影响：只读 snapshot 聚合层继续依赖完整 runtime 头，会模糊 aggregator 与 runtime registry 的边界，后续迁移 snapshot API 时容易重新读取 runtime 内部结构。
+- 建议：删除 stale `agent_runtime.h` include，peer aggregator 显式 include `peer_session_state.h`，surface aggregator 显式 include `surface_attachment_state.h`，保留 `runtime_registry.h` 作为唯一 registry 访问入口。
+- 修改意见：按建议实施 M7 小切片，不改变 count/stats JSON 字段、不改变 registry 遍历顺序。
+- 处理结果：已处理。`peer_snapshot_aggregator.cpp` 移除 `agent_runtime.h`，新增 `peer_session_state.h`；`surface_snapshot_aggregator.cpp` 移除 `agent_runtime.h`，新增 `surface_attachment_state.h`；两者继续通过 `runtime_registry` facade 读取 count/stats。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n '#include "agent_runtime\\.h"|AgentRuntimeState|PeerState|SurfaceAttachmentState' media-agent/src/peer_snapshot_aggregator.cpp media-agent/src/surface_snapshot_aggregator.cpp media-agent/src/peer_snapshot_aggregator.h media-agent/src/surface_snapshot_aggregator.h`，确认 `.cpp` 已无 `agent_runtime.h` include，header 仅保留 `AgentRuntimeState` 前置声明作为函数签名；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 Release build、unit tests 和 smoke；已执行 `git diff --check -- media-agent/src/peer_snapshot_aggregator.cpp media-agent/src/surface_snapshot_aggregator.cpp docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md docs/CODE_AUDIT_FINDINGS.md`，仅有 LF/CRLF 工作区提示，无空白错误。
+
+### ARCH-SPLIT-P1-448 host-downstream binding pipeline 残留 stale runtime include
+
+- 位置：`media-agent/src/peer_host_binding_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`peer_host_binding_pipeline.cpp` 已经通过 `for_each_mutable_peer_with_role()` 访问 host-downstream peer，但仍 include `agent_runtime.h`，只是为了间接获得 `PeerState` 完整定义。
+- 影响：host-downstream 批量绑定 pipeline 表面上仍依赖完整 runtime 头，削弱 role-filtered registry facade 的边界表达。
+- 建议：删除 stale `agent_runtime.h` include，改为显式 include `peer_session_state.h`，保留 `runtime_registry.h` 作为唯一 registry 遍历入口。
+- 修改意见：按建议实施 M7 小切片，不改变 host start/stop 调用时序、不改变 attach/detach callback 行为、不改变 local description negotiation 触发条件。
+- 处理结果：已处理。`peer_host_binding_pipeline.cpp` 移除 `agent_runtime.h` include，新增 `peer_session_state.h` include；批量 attach/detach 仍通过 `for_each_mutable_peer_with_role(state, "host-downstream", ...)` 遍历 peer，行为保持不变。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n '#include "agent_runtime\\.h"|AgentRuntimeState|PeerState|for_each_mutable_peer_with_role' media-agent/src/peer_host_binding_pipeline.cpp media-agent/src/peer_host_binding_pipeline.h`，确认实现文件已无 `agent_runtime.h` include，header 仅保留 `AgentRuntimeState` 前置声明作为函数签名；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 Release build、unit tests 和 smoke。
+
+### ARCH-SPLIT-P1-449 surface controller 残留 stale runtime include
+
+- 位置：`media-agent/src/surface_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`SurfaceSessionController` 已经通过 `runtime_registry` facade 访问 peer/surface/host snapshot，但实现文件仍 include `agent_runtime.h`，只是为了间接获得 `PeerState` / `SurfaceAttachmentState` 完整类型。
+- 影响：surface controller 实现看起来仍依赖完整 runtime 头和字段布局，削弱 SurfaceSessionController 作为 surface owner、runtime_registry 作为 registry 访问入口的边界表达。
+- 建议：删除 stale `agent_runtime.h` include，显式 include `peer_session_state.h`、`surface_attachment_state.h`，保留 `runtime_registry.h` 作为 registry/snapshot facade 入口。
+- 修改意见：按建议实施 M7 小切片，不改变 attach/update/detach RPC、不改变 host capture surface refresh/restart/stop 行为、不改变 peer surface detach 行为。
+- 处理结果：已处理。`surface_session_controller.cpp` 移除 `agent_runtime.h` include，新增 `peer_session_state.h` 与 `surface_attachment_state.h` include；controller 仍持有 `AgentRuntimeState&` 并通过 `runtime_registry` facade 操作 registry/snapshot。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n '#include "agent_runtime\\.h"|AgentRuntimeState|PeerState|SurfaceAttachmentState|runtime_state_\\.' media-agent/src/surface_session_controller.cpp media-agent/src/surface_session_controller.h`，确认实现文件已无 `agent_runtime.h` include，header 仅保留 `AgentRuntimeState` 前置声明/成员签名，运行时访问均经 `runtime_registry` facade；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 Release build、unit tests 和 smoke。
+
+### ARCH-SPLIT-P1-450 media source pipeline 残留 stale runtime include
+
+- 位置：`media-agent/src/peer_media_source_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`peer_media_source_pipeline.cpp` 已经通过 `runtime_registry` facade 查找 peer、读取 host/audio/OBS snapshots，但仍 include `agent_runtime.h`，只是为了间接获得 `PeerState` 完整类型。
+- 影响：attach/detach media source command owner 表面上仍依赖完整 runtime 头，削弱 pipeline 与 registry facade 之间的边界表达。
+- 建议：删除 stale `agent_runtime.h` include，改为显式 include `peer_session_state.h`，保留 `runtime_registry.h` 作为 peer/snapshot 访问入口。
+- 修改意见：按建议实施 M7 小切片，不改变 attach/detach request parse、不改变 host/relay source 分支、不改变 renegotiation 条件和 result JSON。
+- 处理结果：已处理。`peer_media_source_pipeline.cpp` 移除 `agent_runtime.h` include，新增 `peer_session_state.h` include；attach/detach media source command 仍通过 `runtime_registry` facade 查找 peer 和读取 snapshots，行为保持不变。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n '#include "agent_runtime\\.h"|AgentRuntimeState|PeerState|HostVideoBindingContext|RelayVideoBindingContext' media-agent/src/peer_media_source_pipeline.cpp media-agent/src/peer_media_source_pipeline.h`，确认实现文件已无 `agent_runtime.h` include，header 仅保留 `AgentRuntimeState` 前置声明作为函数签名；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 Release build、unit tests 和 smoke。
+
+### ARCH-SPLIT-P1-451 peer create/refresh pipeline 残留 stale runtime include
+
+- 位置：`media-agent/src/peer_create_pipeline.cpp`、`media-agent/src/peer_refresh_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：peer create/refresh pipeline 已经通过 `runtime_registry` facade 存储 peer、刷新 transport、读取 host/audio/OBS snapshots，但实现文件仍 include `agent_runtime.h`，主要用于间接获得 `PeerState` 等完整类型。
+- 影响：create/refresh pipeline 看起来仍依赖完整 runtime 头和字段布局，削弱 PeerSessionController pipeline 与 registry facade 之间的边界表达。
+- 建议：删除 stale `agent_runtime.h` include，显式 include `peer_session_state.h` 和实际需要的 state/facade 头，保持 `runtime_registry.h` 作为 registry/snapshot 访问入口。
+- 修改意见：按建议实施 M7 小切片，不改变 createPeer finalize、initial negotiation、transport refresh、host video soft refresh、host audio refresh 的执行顺序或行为。
+- 处理结果：已处理。`peer_create_pipeline.cpp` 与 `peer_refresh_pipeline.cpp` 移除 `agent_runtime.h` include，新增/保留显式 state 头依赖；两者仍通过 `runtime_registry` facade 访问 peer registry、transport backend 和 host/audio/OBS snapshots。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n '#include "agent_runtime\\.h"|AgentRuntimeState|PeerState|HostCapturePlan|AudioSessionState|HostVideoBindingContext' media-agent/src/peer_create_pipeline.cpp media-agent/src/peer_refresh_pipeline.cpp media-agent/src/peer_create_pipeline.h media-agent/src/peer_refresh_pipeline.h`，确认实现文件已无 `agent_runtime.h` include，header 仅保留 `AgentRuntimeState` 前置声明作为函数签名；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 Release build、unit tests 和 smoke。
+
+### ARCH-SPLIT-P1-452 PeerSessionController 残留 stale runtime include
+
+- 位置：`media-agent/src/peer_session_controller.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`PeerSessionController` 已经通过 `runtime_registry` facade 和各 pipeline/controller 执行 create/close/signaling/media-source 命令，但实现文件仍 include `agent_runtime.h`，主要用于间接获得 `PeerState` 完整类型。
+- 影响：PeerSessionController 作为 command owner 表面上仍依赖完整 runtime 头和字段布局，削弱 controller -> registry facade 的边界表达。
+- 建议：删除 stale `agent_runtime.h` include，显式 include `peer_session_state.h`，保持 `runtime_registry.h` 作为 registry/snapshot 访问入口。
+- 修改意见：按建议实施 M7 小切片，不改变 create/close/setRemoteDescription/addRemoteIceCandidate/attach/detach media source 的执行顺序和 JSON 行为。
+- 处理结果：已处理。`peer_session_controller.cpp` 移除 `agent_runtime.h` include，新增 `peer_session_state.h` include；controller 仍持有 `AgentRuntimeState&`，并继续通过 `runtime_registry` facade 与下游 pipeline/controller 协作。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n '#include "agent_runtime\\.h"|AgentRuntimeState|PeerState|runtime_state_\\.' media-agent/src/peer_session_controller.cpp media-agent/src/peer_session_controller.h`，确认实现文件已无 `agent_runtime.h` include，header 仅保留 `AgentRuntimeState` 前置声明/成员签名，运行时访问均经 `runtime_registry` facade 或下游 controller/pipeline；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 Release build、unit tests 和 smoke。
+
+### ARCH-SPLIT-P1-453 host controller/start-stop pipeline 残留 stale runtime include
+
+- 位置：`media-agent/src/host_session_controller.cpp`、`media-agent/src/host_session_start_pipeline.cpp`、`media-agent/src/host_session_stop_pipeline.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：host controller 与 start/stop pipeline 已经通过 `host_session_runtime` / `runtime_registry` facade 操作 host/OBS/peer transport 状态，但实现文件仍 include `agent_runtime.h`。
+- 影响：host command owner 与 start/stop pipeline 表面上仍依赖完整 runtime 头和字段布局，削弱 HostSession owner 与 runtime facade 的边界表达。
+- 建议：删除 stale `agent_runtime.h` include，显式 include `host_session_state.h` 和实际使用的 runtime/facade 头；保持 `AgentRuntimeState&` 函数签名和 start/stop 时序不变。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 host start/stop/restart drain、OBS prepare/start、native capture start、downstream attach/detach 或 media-state JSON 行为。
+- 处理结果：已处理。`host_session_controller.cpp`、`host_session_start_pipeline.cpp`、`host_session_stop_pipeline.cpp` 移除 `agent_runtime.h` include；controller 显式 include `host_session_state.h`，start/stop pipeline 保持已有 host/OBS/runtime facade 头。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n '#include "agent_runtime\\.h"|AgentRuntimeState|current_host_session|peer_transport_ready|obs_ingest_session_snapshot' media-agent/src/host_session_controller.cpp media-agent/src/host_session_start_pipeline.cpp media-agent/src/host_session_stop_pipeline.cpp media-agent/src/host_session_controller.h media-agent/src/host_session_start_pipeline.h media-agent/src/host_session_stop_pipeline.h`，确认实现文件已无 `agent_runtime.h` include，header 仅保留 `AgentRuntimeState` 前置声明/成员签名，runtime 访问均经 runtime/registry facade；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 Release build、unit tests 和 smoke。
+
+### ARCH-SPLIT-P1-454 status JSON 聚合层残留 stale runtime include
+
+- 位置：`media-agent/src/agent_status_json.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：`agent_status_json.cpp` 的 capabilities/status/ready/stats JSON 已通过 `runtime_registry` facade、host/audio/peer/surface snapshot formatter 读取状态，但仍 include `agent_runtime.h`。
+- 影响：只读 JSON 聚合层表面上仍依赖完整 runtime 头和字段布局，削弱 status formatter 与 runtime facade/snapshot aggregator 的边界表达。
+- 建议：删除 stale `agent_runtime.h` include，保留 `runtime_registry.h`、snapshot aggregator 和具体 JSON formatter 头；`VDS_MEDIA_AGENT_NAME/VERSION` 继续使用 CMake 编译宏，不需要 runtime 头。
+- 修改意见：按建议实施 M7 小切片，不改变 capabilities/status/agent-ready/getStats JSON 字段和输出顺序。
+- 处理结果：已处理。`agent_status_json.cpp` 移除 `agent_runtime.h` include；status JSON 聚合层继续通过 `runtime_registry` facade、`host_state_json`、`audio_state_json`、peer/surface snapshot aggregator 读取状态。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n '#include "agent_runtime\\.h"|AgentRuntimeState|peer_transport_backend|host_session_snapshot|audio_session_snapshot|surface_session_stats_json|peer_session_stats_json' media-agent/src/agent_status_json.cpp media-agent/src/agent_status_json.h`，确认实现文件已无 `agent_runtime.h` include，header 仅保留 `AgentRuntimeState` 前置声明作为函数签名，状态读取均经 registry/snapshot facade；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:logging`，均通过，verify 内已覆盖 Release build、unit tests 和 smoke。
+
+### ARCH-SPLIT-P1-455 lifecycle/RPC 入口残留 stale runtime include
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/agent_rpc_router.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：lifecycle 与 RPC loop 已经主要通过 `runtime_registry`、Host/Peer/Surface/Audio/OBS controller facade 编排，但实现文件仍 include `agent_runtime.h`，只是为了间接获得 registry/capability 字段完整类型。
+- 影响：入口编排层表面上仍依赖完整 runtime 头和字段布局，容易让后续维护把 lifecycle/RPC 分发重新写成直接读写 `AgentRuntimeState` 内部字段，而不是通过 owner/facade。
+- 建议：删除 stale `agent_runtime.h` include，保留 `AgentRuntimeState&` 作为函数签名与 facade 入参；所需具体完整类型改为显式 include 对应 state 头。
+- 修改意见：按建议实施 M7 小切片，不改变 JSON-RPC method、不改变 request/response shape、不改变 lifecycle refresh/shutdown/start/stop 顺序。
+- 处理结果：已处理。`agent_lifecycle.cpp` 与 `agent_rpc_router.cpp` 移除 `agent_runtime.h` include；`agent_lifecycle.cpp` 为 `ffmpeg_probe_result(state) = probe_ffmpeg(...)` 的赋值需求显式 include `ffmpeg_probe_state.h`。两个入口仍通过 `runtime_registry` facade 和 session/controller owner 工作，行为保持不变。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n '#include "agent_runtime\\.h"|AgentRuntimeState|PeerState|FfmpegProbeResult|runtime_state|state' media-agent/src/agent_lifecycle.cpp media-agent/src/agent_rpc_router.cpp`，确认两个实现文件已无 `agent_runtime.h` include，runtime 访问保持为 facade 入参/调用；已执行 `rg -n "\\b(state|state_|runtime_state|runtime_state_)\\.(peer_transport_backend|ffmpeg|wgc_capture_backend|host_sessions|audio_sessions|obs_ingest_sessions|peer_sessions|surface_sessions)" media-agent/src -g "!runtime_registry.cpp"`，无命中，确认未新增大字段裸访问；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过，覆盖 Release build、unit tests 和 smoke。
+
+### ARCH-SPLIT-P1-456 OBS/Relay 兼容实现残留 stale runtime include
+
+- 位置：`media-agent/src/obs_ingest_session.cpp`、`media-agent/src/relay_dispatch.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：OBS ingest facade 和 RelayDispatch backend 已经分别通过 `ObsIngestSessionRuntimeAccess`、`RelayHub`/transport API 工作，但实现文件仍 include `agent_runtime.h`，主要为了间接获得 `ObsIngestState` 或 `PeerTransportSession` 相关完整定义。
+- 影响：OBS/relay 两条媒体路径表面上仍依赖完整 runtime 头，削弱 OBS session owner、RelayHub/RelayDispatch backend 与 runtime registry 之间的边界表达。
+- 建议：删除 stale `agent_runtime.h` include；OBS 显式 include `obs_ingest_session_state.h`，RelayDispatch 显式 include `peer_transport.h`，保持所有 host/transport 写回继续通过现有 facade。
+- 修改意见：按建议实施 M5/M7 小切片，不改变 OBS prepare/start/stop、音视频发布、relay subscriber/bootstrap/dispatch queue 或 encoded DataChannel 转发行文。
+- 处理结果：已处理。`obs_ingest_session.cpp` 移除 `agent_runtime.h` include，并显式 include `obs_ingest_session_state.h`；`relay_dispatch.cpp` 移除 `agent_runtime.h` include，并显式 include `peer_transport.h`。OBS host snapshot/transport ready/codec 写回仍通过 `ObsIngestSessionRuntimeAccess` 与 runtime/host facade 注入，RelayDispatch 继续只管理私有 subscriber/bootstrap/dispatch runtime。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `rg -n '#include "agent_runtime\\.h"|ObsIngestState|PeerTransportSession|runtime_registry|state\\.|runtime_state\\.' media-agent/src/obs_ingest_session.cpp media-agent/src/relay_dispatch.cpp`，确认两个实现文件已无 `agent_runtime.h` include，OBS 仅保留 facade 入参与显式 session state，Relay 仅保留私有 dispatch state 和 transport API；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过，覆盖 Release build、unit tests 和 smoke。
+
+### ARCH-SPLIT-P1-457 native legacy globals 残留已迁移函数引用
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`app-native-overrides.js` 的 `legacyGlobalBindings` 仍用对象简写导出 `isNativePeerHandle`，但该本地函数已迁入 `native-peer-controller.js`，legacy 文件内不再定义同名函数。
+- 影响：native-entry 注册 legacy globals 时会求值 bindings 对象；如果引用未定义变量，会在 native override 安装阶段抛 `ReferenceError`，阻断后续 native 初始化。
+- 建议：保留兼容全局名，但改成显式委托 `nativePeerController.isNativePeerHandle(handle)`，不要恢复本地 duplicate helper。
+- 修改意见：按建议实施 R7 小切片，不改变外部 `window.isNativePeerHandle` 兼容 API，不改变 peer handle 判定逻辑。
+- 处理结果：已处理。`legacyGlobalBindings.isNativePeerHandle` 已改为箭头函数委托 `nativePeerController.isNativePeerHandle(handle)`；`app-native-overrides.js` 不再引用不存在的本地 `isNativePeerHandle` 标识符。`docs/RENDERER_SPLIT_MAP.md` 已同步该 legacy globals 边界。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-entry.js`、`node --check server/public/native/native-peer-controller.js`，均通过；已执行 `rg -n "\\bisNativePeerHandle\\b" server/public/app-native-overrides.js server/public/native/native-peer-controller.js`，确认 legacy 导出显式委托 controller，唯一实现仍位于 `native-peer-controller.js`。
+
+### ARCH-SPLIT-P1-458 createPeerConnection legacy wrapper 丢失 options 参数
+
+- 位置：`server/public/app.js`、`server/public/app-native-overrides.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：`app.js::createPeerConnection()` legacy wrapper 只接收并转发 `peerId/isInitiator/kind` 三个参数，但 native override 的同名入口已经需要第四个 `options`，其中包含 `mediaManifest`、`encodedMediaDataChannel` 等 peer 创建配置。
+- 影响：通过 app.js 兼容入口进入 native peer 创建时会丢失 manifest/DataChannel 配置，可能导致 host-viewer 或 relay-viewer peer 创建后的媒体绑定、encoded DataChannel 选择与后续 offer 行为不一致。
+- 建议：保持 legacy wrapper 名称不变，补齐 `options = {}` 参数并原样传给 native authority override。
+- 修改意见：按建议实施 R5/R7 小切片，不改变 native override 内部 peer 创建逻辑，不改变非 native fallback 的默认参数行为。
+- 处理结果：已处理。`app.js::createPeerConnection(peerId, isInitiator, kind = 'direct', options = {})` 现在将第四个参数传入 `requireNativeAuthorityOverride('createPeerConnection', ...)` 返回的实现；native override 能收到原始 `mediaManifest` / `encodedMediaDataChannel` 配置。`docs/RENDERER_SPLIT_MAP.md` 已同步该兼容入口边界。
+- 验证结果：已执行 `node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`，均通过；已执行 `rg -n "function createPeerConnection|createPeerConnection\\(" server/public/app.js server/public/app-native-overrides.js docs/RENDERER_SPLIT_MAP.md docs/CODE_AUDIT_FINDINGS.md` 和 `rg -n "createPeerConnection\\([^\\n]*peerId, isInitiator, kind\\)|requireNativeAuthorityOverride\\('createPeerConnection'" server/public/app.js`，确认 app.js wrapper 已接收并转发 `options`；已执行 app.js native override wrapper 参数透传脚本，确认 `closePeerConnection/clearAllPeerConnections/setViewerConnectionState/startScreenShare*/handleMessage/createPeerConnection/createOffer*/handleOffer/handleAnswer/handleIceCandidate` 的形参与转发实参一致。
+
+### ARCH-SPLIT-P1-459 renderer native bridge 缺少自动防回归检查
+
+- 位置：`scripts/check-renderer-bridge.js`、`package.json`、`scripts/release-check.js`、`server/public/app.js`、`server/public/app-native-overrides.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：renderer 拆分进入 R7 后，`app.js` native authority wrapper 和 `app-native-overrides.js` legacy globals 仍承担兼容桥接职责，但此前没有自动检查防止 wrapper 丢参或 legacy binding 简写引用已迁走的本地符号。
+- 影响：继续拆分时容易再次出现 `createPeerConnection` 漏转 `options`、`isNativePeerHandle` 未定义这类错误；这类问题语法检查不一定覆盖，且会在 native 接管路径运行时才暴露。
+- 建议：新增轻量静态检查，验证 `requireNativeAuthorityOverride()` wrapper 的 fallback 形参都被转发，验证 `legacyGlobalBindings` 简写导出都能在 legacy 文件中解析；并接入 npm/release check。
+- 修改意见：按建议实施 R7 工具化小切片，不改变 runtime 行为，只增加发布前防回归门禁。
+- 处理结果：已处理。新增 `scripts/check-renderer-bridge.js`；新增 `npm run check:renderer-bridge`；`scripts/release-check.js` 已把脚本纳入语法检查列表和 release check 执行链。`docs/RENDERER_SPLIT_MAP.md` 已同步该验证边界。
+- 验证结果：已执行 `npm run check:renderer-bridge`，通过并输出 `Renderer bridge check passed.`；已执行 `node --check scripts/check-renderer-bridge.js`、`node --check scripts/release-check.js`、`node --check server/public/app.js`、`node --check server/public/app-native-overrides.js`，均通过；已执行 `npm run check:logging` 和 `npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-460 renderer 拆分模块缺少批量语法门禁
+
+- 位置：`scripts/check-renderer-syntax.js`、`package.json`、`scripts/release-check.js`、`server/public/*.js`、`server/public/native/*.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：renderer 已拆出 `app-state.js`、`room-client.js`、`debug-panel.js`、`quality-settings.js`、`source-selection.js`、`update-ui.js` 和多个 `native/*.js`，但 release-check 原本只手写检查 `app.js` / `app-native-overrides.js`，新增模块可能绕过语法门禁。
+- 影响：继续拆分时，新 renderer 模块的语法错误可能不会在发布前被发现，只在浏览器加载到对应脚本时失败。
+- 建议：新增递归检查 `server/public` 源码 JS 的脚本，排除 `vds_web` 打包产物，并接入 npm/release check。
+- 修改意见：按建议实施 R7 工具化小切片，不改变运行时代码，只扩大 renderer 拆分模块的验证覆盖。
+- 处理结果：已处理。新增 `scripts/check-renderer-syntax.js`；新增 `npm run check:renderer-syntax`；`scripts/release-check.js` 已把脚本加入语法检查列表并在 release check 中执行。脚本递归检查 `server/public` 下源码 JS，跳过 `vds_web` 构建产物。`docs/RENDERER_SPLIT_MAP.md` 已同步该验证边界。
+- 验证结果：已执行 `npm run check:renderer-syntax`，通过并输出 `Renderer syntax check passed (17 files).`；已执行 `node --check scripts/check-renderer-syntax.js`、`node --check scripts/release-check.js`，均通过；已执行 `npm run check:renderer-bridge` 和 `npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-461 renderer 入口脚本顺序缺少自动门禁
+
+- 位置：`server/public/index.html`、`scripts/check-renderer-entry.js`、`package.json`、`scripts/release-check.js`、`docs/RENDERER_SPLIT_MAP.md`
+- 问题：renderer 已拆成多个传统 `<script>` 文件，但入口顺序仍靠人工维护；当前顺序和原拆分计划目标顺序存在漂移，且没有自动检查确认脚本顺序和文件存在性。
+- 影响：后续继续拆分时，脚本顺序错误或漏引文件会导致 `window.VDS.*` 模块缺失、native-entry fail-fast 或 app.js 初始化异常，而普通语法检查无法发现加载顺序问题。
+- 建议：把 `index.html` 入口顺序对齐拆分计划，并新增入口顺序检查脚本，校验 17 个脚本的顺序和文件存在性，接入 npm/release check。
+- 修改意见：按建议实施 R7 工具化小切片，不改变脚本内容，只收齐入口顺序和发布前门禁。
+- 处理结果：已处理。`index.html` 顺序已调整为 `app-state -> debug-panel -> quality-settings -> source-selection -> room-client -> update-ui -> app.js -> native modules -> native-entry -> app-native-overrides`；新增 `scripts/check-renderer-entry.js`；新增 `npm run check:renderer-entry`；`scripts/release-check.js` 已把脚本加入语法检查列表并在 release check 中执行。`docs/RENDERER_SPLIT_MAP.md` 已同步当前入口顺序和验证边界。
+- 验证结果：已执行 `npm run check:renderer-entry`，通过并输出 `Renderer entry check passed (17 scripts).`；已执行 `npm run check:renderer-syntax` 和 `npm run check:renderer-bridge`，均通过；已执行 `node --check scripts/check-renderer-entry.js`、`node --check scripts/release-check.js`，均通过。
+
+### ARCH-SPLIT-P1-462 media-agent runtime 边界缺少自动门禁
+
+- 位置：`scripts/check-media-agent-boundary.js`、`package.json`、`scripts/release-check.js`、`media-agent/src/agent_runtime.h`、`media-agent/src/runtime_registry.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：media-agent runtime ownership 已收口到 `agent_runtime.h` 只由 `main.cpp` / `runtime_registry.cpp` include、业务代码不再裸访问 runtime 大字段，但该规则此前依赖人工 `rg` 检查。
+- 影响：继续拆 session/controller 时，维护者可能无意重新 include `agent_runtime.h` 或绕过 `runtime_registry.cpp` 直接访问 `peer_sessions` / `host_sessions` / capability 字段，破坏已经建立的 owner/facade 边界。
+- 建议：新增 media-agent boundary 静态检查，限制完整 runtime 头 include 位置，并限制业务文件直接访问关键 runtime 字段；接入 npm/release check。
+- 修改意见：按建议实施 M7 工具化小切片，不改变 media-agent runtime 行为，只增加架构边界防回归门禁。
+- 处理结果：已处理。新增 `scripts/check-media-agent-boundary.js`；新增 `npm run check:media-agent-boundary`；`scripts/release-check.js` 已把脚本加入语法检查列表并在 release check 中执行。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该边界。
+- 验证结果：已执行 `npm run check:media-agent-boundary`，通过并输出 `Media agent boundary check passed.`；已执行 `node --check scripts/check-media-agent-boundary.js`、`node --check scripts/release-check.js`，均通过；已执行 `npm run check:renderer-entry` 和 `npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-463 renderer/media-agent 架构门禁缺少统一快速入口
+
+- 位置：`package.json`、`scripts/release-check.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`
+- 问题：renderer 入口顺序、renderer 语法、renderer native bridge 和 media-agent runtime boundary 已经分别有门禁，但 package 中缺少一个统一快速入口；release-check 也逐个调用这些脚本，后续新增架构门禁时容易漏接发布链路。
+- 影响：日常推进拆分时需要记住多条命令，终审或发布检查新增门禁时容易产生覆盖漂移。
+- 建议：新增 `check:architecture` 组合入口，串联当前 renderer/media-agent 架构边界检查，并让 release-check 调用该组合入口。
+- 修改意见：按建议实施工具化小切片，不改变运行时代码，只收束拆分健康检查入口。
+- 处理结果：已处理。`package.json` 新增 `check:architecture`，串联 `check:renderer-entry`、`check:renderer-syntax`、`check:renderer-bridge`、`check:media-agent-boundary`；`scripts/release-check.js` 已改为调用 `npm run check:architecture`。`docs/RENDERER_SPLIT_MAP.md` 与 `docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已同步该快速总入口。
+- 验证结果：已执行 `npm run check:architecture`，通过并依次输出 renderer entry/syntax/bridge 和 media-agent boundary checks passed；已执行 `node --check scripts/release-check.js` 和 `npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-464 架构拆分缺少逐阶段完成度审计
+
+- 位置：`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/RENDERER_SPLIT_MAP.md`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：Renderer 与 media-agent 拆分已经推进到多模块、多 controller、多门禁状态，但此前缺少一份按 R0-R7、M0-M7 逐项核对的完成度审计；容易把“已创建文件/已通过局部门禁”误判为“整体完成”。
+- 影响：后续继续拆分时无法快速判断剩余关键缺口，尤其是 `app-native-overrides.js` legacy glue、`app.js` 房间生命周期、Host/OBS/RelayHub/RuntimeState 兼容层和人工 E2E 验收。
+- 建议：新增完成度审计文档，逐项列出要求、当前证据、状态、剩余动作和未完成 E2E 场景；同时在 renderer/media-agent 架构文档中建立入口。
+- 修改意见：按建议实施文档与审计小切片，不改变运行时代码，不调整信令协议或 JSON-RPC wire shape。
+- 处理结果：已处理。新增 `docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`，按 Renderer R0-R7、media-agent M0-M7、显式约束和 E2E 场景列出证据与缺口；当前审计结论为 Renderer 约 72%、media-agent 约 82%、自动门禁约 85%，整体仍为 Partial，不标记完成。`docs/RENDERER_SPLIT_MAP.md` 与 `docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 已补充完成度审计入口。
+- 验证结果：已执行 `npm run check:architecture`、`npm run check:logging`、`npm run test:server`、`npm run check:vds-web`、`npm run test:vds-web`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；已执行 `rg -n '#include "agent_runtime\\.h"' media-agent/src`，确认完整 runtime 头仅由 `main.cpp` / `runtime_registry.cpp` include；已执行关键 runtime 字段裸访问扫描，业务源码无命中。
+
+### ARCH-SPLIT-P1-465 native host 建房/退房发送仍绕过 room-client facade
+
+- 位置：`server/public/room-client.js`、`server/public/app-native-overrides.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`
+- 问题：R2 已经让 `room-client.js` 承接 WebSocket、pending queue、viewer join/leave facade，但 native host create-room 发送 callback 和 stop-share leave-room callback 仍在 `app-native-overrides.js` 里直接调用 `sendMessage()`。
+- 影响：房间控制消息 owner 继续分散，后续拆 `app.js` 主消息分发和 native session lifecycle 时仍要跨 legacy 文件追踪 create/leave 发送路径。
+- 建议：先把 create-room/leave-room 的发送 facade 收进 `room-client`，不移动 manifest 构造、不改变协议、不改变 create-room ACK 处理。
+- 修改意见：按建议实施 R2 小切片，保持 `native-session-controller.js` 继续负责 host manifest/create-room payload 构造，`room-client` 只负责标准化并发送房间控制消息。
+- 处理结果：已处理。`room-client.js` 新增 `buildCreateRoomMessage()` / `createRoom()`；`app-native-overrides.js` 的 `sendHostCreateRoom` 改为 `window.VDS.roomClient.createRoom(message)`，`sendLeaveRoom` 改为 `window.VDS.roomClient.leaveRoom(snapshot)`；`docs/RENDERER_SPLIT_MAP.md` 和完成度审计已同步 R2 进度，Renderer 粗略完成度从约 72% 调整为约 73%。
+- 验证结果：已执行 `node --check server/public/room-client.js`、`node --check server/public/app-native-overrides.js`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-466 room-client 缺少可逐项迁移的消息分发骨架
+
+- 位置：`server/public/room-client.js`、`scripts/check-room-client-dispatcher.js`、`package.json`、`scripts/release-check.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`
+- 问题：`room-client.js` 虽已承接 WebSocket 与房间控制消息发送 facade，但 `ws.onmessage` 仍直接调用 legacy adapter 的 `handleMessage`，导致后续只能继续在 `app-native-overrides.js` 的大 switch 内迁移，缺少按消息类型逐项搬迁的稳定入口。
+- 影响：R2/R7 后续拆 `room-created`、`room-joined`、`session-resumed` 等处理时，没有统一注册/回退机制，容易一次性改动大 switch 或引入双处理风险。
+- 建议：在 `room-client` 内新增按 `type` 注册的 dispatcher；默认无 handler 时 fallback 到 legacy `handleMessage`，先建立迁移骨架，不改变任何现有消息行为。
+- 修改意见：按建议实施 R2 小切片，不移动具体消息 handler，不改变 WebSocket payload、不改变 native override switch 行为。
+- 处理结果：已处理。`room-client.js` 新增 `registerMessageHandler()`、`unregisterMessageHandler()`、`getRegisteredMessageTypes()` 和 `dispatchMessage()`；WebSocket `onmessage` 改为先调用 `dispatchMessage(data)`，没有注册 handler 时继续 fallback 到 legacy adapter。新增 `scripts/check-room-client-dispatcher.js`，并接入 `npm run check:room-client-dispatcher`、`npm run check:architecture` 和 `scripts/release-check.js`。完成度审计中 Renderer 粗略完成度更新为约 74%，自动门禁约 87%。
+- 验证结果：已执行 `node --check scripts/check-room-client-dispatcher.js`、`node --check scripts/release-check.js`、`node --check server/public/room-client.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`，均通过。
+
+### ARCH-SPLIT-P1-467 首个低风险消息仍停留在 native override 大 switch
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：虽然 `room-client` 已有按类型 dispatcher，但没有任何真实消息迁入该路径，`viewer-count-updated` 仍作为低风险人数更新逻辑停留在 `app-native-overrides.js` 的大 switch 中。
+- 影响：dispatcher 骨架缺少实战验证，后续迁移更复杂的 `room-created` / `room-joined` 时仍不清楚真实切分路径是否可靠。
+- 建议：先迁移 `viewer-count-updated`，该消息只更新 viewer count DOM 和 app state，不涉及 peer、surface、manifest 或重连时序；同时给门禁增加检查，防止该 case 回流到 legacy switch。
+- 修改意见：按建议实施 R2 小切片，不改变消息 payload，不改变人数归一化逻辑，不触碰其它 message case。
+- 处理结果：已处理。`app-native-overrides.js` 新增 `handleViewerCountUpdatedMessage(data)` 并通过 `roomClient.registerMessageHandler('viewer-count-updated', handleViewerCountUpdatedMessage)` 注册；legacy `handleMessage` switch 已删除 `viewer-count-updated` case。`check-room-client-dispatcher.js` 已新增检查，要求该 handler 存在、必须注册到 dispatcher、且 legacy switch 不得再包含该 case。完成度审计中 Renderer 粗略完成度更新为约 75%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`，均通过。
+
+### ARCH-SPLIT-P1-474 offer 仍停留在 native override 大 switch
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`offer` 仍在 native override 大 switch 中处理，虽然内部已大量委托 `handleOffer(data)` 和 native peer controller，但消息入口仍与房间生命周期分支混在一起。
+- 影响：R2 的信令分发边界不完整；后续拆 `room-created` / `room-joined` / `session-resumed` 时，核心 offer 入口仍会牵连 legacy switch，增加双处理或回流风险。
+- 建议：先把 `offer` 整体迁入 room-client dispatcher handler，但不改 `handleOffer()`、stale native peer error 判断或 peer controller 内部时序。
+- 修改意见：按建议实施 R2 小切片，不改变消息 payload、不改变 offer 处理语义、不改变 stale native peer error 降级日志。
+- 处理结果：已处理。`app-native-overrides.js` 新增 async `handleOfferMessage(data)` 并注册 `roomClient.registerMessageHandler('offer', handleOfferMessage)`；legacy `handleMessage` switch 已删除 `offer` case。`check-room-client-dispatcher.js` 已新增检查，要求 handler 存在、必须注册到 dispatcher、且 legacy switch 不得再包含该 case。完成度审计中 Renderer 粗略完成度更新为约 82%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-479 unknown message fallback 仍依赖 legacy handleMessage adapter
+
+- 位置：`server/public/room-client.js`、`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：十三个 native message case 迁入 dispatcher 后，`room-client.dispatchMessage()` 的无 handler 路径仍调用 legacy adapter 的 `handleMessage(data)`，而 `app-native-overrides.js` 中只剩一个空 `switch (data.type)`。
+- 影响：R2 的消息分发 owner 仍不够明确；未知消息 fallback 看起来仍由 native override 持有，后续 R7 薄入口时容易误以为 legacy `handleMessage` 仍是必要分发点。
+- 建议：把 unknown-message fallback 收进 `room-client`，保留可选 adapter hook 供旧代码观测未知消息，但正常路径不再调用 legacy `handleMessage`。
+- 修改意见：按建议实施 R2 收口小切片，不改变已注册消息处理语义，不改变 WebSocket onmessage 入口，只改无 handler 消息的 fallback owner。
+- 处理结果：已处理。`room-client.js` 新增 `handleUnhandledMessage(data)`，未注册消息会优先调用可选 `onUnhandledMessage` hook，未接管时按 connection 日志记录；`dispatchMessage()` 不再调用 `callAdapter('handleMessage', [data])`。`app-native-overrides.js` 的 `handleMessage()` 已收薄为兼容 hook，不再包含 `switch (data.type)`。`check-room-client-dispatcher.js` 已新增检查，禁止 dispatcher 回退 legacy `handleMessage`，并禁止 native override 重新持有 `switch (data.type)`。完成度审计中 Renderer 粗略完成度更新为约 87%。
+- 验证结果：已执行 `node --check server/public/room-client.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-480 RelayHub 公开头仍暴露 legacy relay backend API
+
+- 位置：`media-agent/src/relay_hub.h`、`media-agent/src/relay_dispatch.h`、`media-agent/src/relay_subscriber_state.h`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`RelayHub` 已作为 M5 facade 存在，但 `relay_hub.h` 为了暴露 `RelaySubscriberState` 仍 include `relay_dispatch.h`，导致所有 RelayHub 调用方都能看到 `register_relay_subscriber()` / `fanout_relay_*()` 等 legacy backend API。
+- 影响：RelayHub 作为 owner 边界不够干净，新增调用点容易绕过 hub 直接调用 relay_dispatch backend，削弱后续把 subscriber/bootstrap/queue 迁入 RelayHub 私有实现的可控性。
+- 建议：把 subscriber snapshot 类型拆到独立头，`relay_hub.h` 只 include snapshot 类型，不再 include legacy backend header；legacy `relay_dispatch.h` 只供 backend 实现和 `relay_hub.cpp` 使用。
+- 修改意见：按建议实施 M5 边界小切片，不改变 relay 行为、不改变 publish/register/query 语义，只减少 legacy backend API 的公开传播面。
+- 处理结果：已处理。新增 `media-agent/src/relay_subscriber_state.h` 承载 `RelaySubscriberState`；`relay_dispatch.h` 改为 include 该 snapshot 头并继续声明 backend API；`relay_hub.h` 改为 include `relay_subscriber_state.h`，不再 include `relay_dispatch.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 与完成度审计已同步，media-agent 粗略完成度更新为约 83%。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`npm run check:architecture`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；verify 过程中仅出现 FFmpeg 头文件/`av_init_packet` 既有编译警告。
+
+### ARCH-SPLIT-P1-481 relay backend include 边界缺少自动门禁
+
+- 位置：`scripts/check-media-agent-boundary.js`、`media-agent/src/relay_dispatch.h`、`media-agent/src/relay_hub.h`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`relay_hub.h` 不再暴露 `relay_dispatch.h` 后，仍缺少自动门禁防止新业务文件重新直接 include `relay_dispatch.h` 并绕过 RelayHub facade。
+- 影响：M5 的 RelayHub owner 边界容易回退；新增 relay lifecycle/publish/query 调用点可能再次依赖 legacy backend API，增加后续把 subscriber/bootstrap/queue 内聚到 RelayHub 的迁移面。
+- 建议：扩展 `check-media-agent-boundary.js`，只允许 `relay_dispatch.cpp` 和 `relay_hub.cpp` include `relay_dispatch.h`，其它源码必须通过 `relay_hub.h`。
+- 修改意见：按建议实施 M5/M7 门禁小切片，不改变运行时代码，只把刚建立的 RelayHub/relay backend include 边界固化为自动检查。
+- 处理结果：已处理。`check-media-agent-boundary.js` 新增 `allowedRelayDispatchIncludes` 白名单，并在源码扫描中禁止非白名单文件 include `relay_dispatch.h`。`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md` 与完成度审计已同步该门禁，`check:media-agent-boundary` 现在同时覆盖 M5/M7 边界。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`npm run check:architecture`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过。
+
+### ARCH-SPLIT-P1-483 relay backend API 仍处于全局符号层级
+
+- 位置：`media-agent/src/relay_dispatch.h`、`media-agent/src/relay_dispatch.cpp`、`media-agent/src/relay_hub.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：legacy relay backend 函数虽然已被 include/call 门禁限制，但仍声明在全局命名空间，与 `RelayHub` facade 处在同一符号层级。
+- 影响：owner 边界表达不够清晰；后续把 `relay_dispatch` 内部实现迁入 RelayHub 私有 backend 时，还需要先区分哪些符号是临时 backend API、哪些是业务 facade。
+- 建议：把 legacy relay backend 函数收进明确的 backend namespace，`RelayHub` 作为唯一委托方使用 namespace alias 调用，业务侧继续只看 `relay_hub.h`。
+- 修改意见：按建议实施 M5 小切片，不改变 relay subscriber/bootstrap/queue 行为、不改变 EncodedFrameBus publish 行为，只改变 backend API 的符号边界。
+- 处理结果：已处理。`relay_dispatch.h/cpp` 中的 `register_relay_subscriber()`、`fanout_relay_*()`、`query_relay_subscriber_state()` 等 backend 函数已收进 `vds::media_agent::relay_backend` namespace；`relay_hub.cpp` 新增 `relay_backend` namespace alias 并通过该 alias 委托 backend。`relay_dispatch.cpp` 内部 helper 对 subscriber 查询的两处调用已改为显式限定 namespace。ownership 文档和完成度审计已同步。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`npm run check:architecture`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过。
+
+### ARCH-SPLIT-P1-484 relay backend 静态状态入口仍命名为 dispatch 全局状态
+
+- 位置：`media-agent/src/relay_dispatch.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：M5 已建立 RelayHub facade 和 backend namespace，但 `relay_dispatch.cpp` 内部静态状态仍命名为 `RelayDispatchState` / `relay_dispatch_state()`，语义上仍像 dispatch 全局单例。
+- 影响：后续把 subscriber/bootstrap/queue 状态迁入 RelayHub 私有 backend 时，状态入口语义不清，容易继续把它视作独立全局 dispatch runtime。
+- 建议：先把内部静态状态入口改为 backend 语义，作为后续把状态成员化到 RelayHub private backend 的前置收口。
+- 修改意见：按建议实施 M5 小切片，不改变状态结构、不改变锁/队列/worker 行为，只调整内部类型和 accessor 命名。
+- 处理结果：已处理。`relay_dispatch.cpp` 内部 `RelayDispatchState` 已重命名为 `RelayBackendState`，`relay_dispatch_state()` 已重命名为 `relay_backend_state()`，所有内部访问点已同步；ownership 文档和完成度审计已记录该 backend state facade。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`npm run check:architecture`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过。
+
+### ARCH-SPLIT-P1-482 relay backend API 直接调用缺少自动门禁
+
+- 位置：`scripts/check-media-agent-boundary.js`、`media-agent/src/relay_hub.cpp`、`media-agent/src/relay_dispatch.*`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`relay_dispatch.h` include 边界已有门禁，但仍缺少对 legacy relay backend 函数直接调用的扫描；新文件即使不 include backend 头，也可能通过手写声明或间接声明绕过 `RelayHub`。
+- 影响：M5 RelayHub owner 边界仍可能回退，新增 publish/lifecycle/query 调用点可能直接依赖 `register_relay_subscriber()`、`fanout_relay_*()` 或 `query_relay_subscriber_state()` 等 backend API。
+- 建议：扩展 `check-media-agent-boundary.js`，把 legacy relay backend 函数调用纳入扫描，仅允许 `relay_dispatch.h` / `relay_dispatch.cpp` / `relay_hub.cpp` 使用。
+- 修改意见：按建议实施 M5/M7 门禁小切片，不改变运行时代码，只固化 RelayHub 是唯一业务入口的边界。
+- 处理结果：已处理。`check-media-agent-boundary.js` 新增 `relayDispatchApiFunctions` 和 `allowedRelayDispatchApiUsers`，会扫描 `register_relay_subscriber()`、`unregister_relay_subscriber()`、`clear_relay_upstream_bootstrap_state()`、`shutdown_relay_dispatch_runtime()`、`query_relay_subscriber_state()`、`relay_subscriber_runtime_json()`、`fanout_relay_video_units()`、`fanout_relay_audio_frame()` 的直接使用；非白名单源码命中会失败并提示使用 `RelayHub`。ownership 文档和完成度审计已同步。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`npm run check:architecture`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过。
+
+### ARCH-SPLIT-P1-478 session-resumed 仍停留在 native override 大 switch
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`session-resumed` 是 native override legacy switch 中最后一个消息分支，同时处理 host 恢复和 viewer 恢复两条路径。
+- 影响：只要该 case 留在大 switch，R2 的 dispatcher 迁移就仍不完整；后续 R7 薄入口仍会被一个高复杂度生命周期分支卡住。
+- 建议：先把 `session-resumed` 整体迁入 room-client dispatcher handler，但不改 host/viewer 恢复路径、不改 OBS 状态恢复、不改 viewer peer 清理和 upstream offer wait timer。
+- 修改意见：按建议实施 R2 生命周期小切片，不改变消息 payload、不改变 host/viewer 恢复语义、不改变 UI 文案和恢复顺序。
+- 处理结果：已处理。`app-native-overrides.js` 新增 async `handleSessionResumedMessage(data)` 并注册 `roomClient.registerMessageHandler('session-resumed', handleSessionResumedMessage)`；legacy `handleMessage` switch 已删除 `session-resumed` case，仅保留 default fallback。`check-room-client-dispatcher.js` 已新增检查，要求 handler 存在、必须注册到 dispatcher、且 legacy switch 不得再包含该 case。完成度审计中 Renderer 粗略完成度更新为约 86%，R2 标为 Mostly Complete。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-477 room-created 仍停留在 native override 大 switch
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`room-created` 仍在 native override 大 switch 中处理，包含 OBS pending 释放、host media session ACK 校验、stale ACK 退房、OBS 等待退房、host room/app state、复制房间号、host P2P 状态和 stats polling。
+- 影响：host 建房 ACK 入口仍混在 legacy switch 内，R2 的房间生命周期分发边界不完整，后续 thin entry/R7 还要跨大分支迁移 host UI 和 session 状态。
+- 建议：先把 `room-created` 整体迁入 room-client dispatcher handler，但不改 ACK 校验、不改 stale room leave、不改 OBS 等待策略、不改 host UI 和 stats polling 顺序。
+- 修改意见：按建议实施 R2 生命周期小切片，不改变消息 payload、不改变 host 建房成功/失败分支、不改变 room create ACK 处理语义。
+- 处理结果：已处理。`app-native-overrides.js` 新增 async `handleRoomCreatedMessage(data)` 并注册 `roomClient.registerMessageHandler('room-created', handleRoomCreatedMessage)`；legacy `handleMessage` switch 已删除 `room-created` case。`check-room-client-dispatcher.js` 已新增检查，要求 handler 存在、必须注册到 dispatcher、且 legacy switch 不得再包含该 case。完成度审计中 Renderer 粗略完成度更新为约 85%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-476 room-joined 仍停留在 native override 大 switch
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`room-joined` 仍在 native override 大 switch 中处理，包含 viewer 入房后的 relay retry 清理、manifest 记忆、旧 peer 清理、viewer room/app state 写入、upstream offer wait timer 和 viewer UI 切换。
+- 影响：viewer 入房生命周期入口仍和 host 建房/session resume 分支混在同一个 legacy switch 内，R2 的 room-client 消息分发边界不完整。
+- 建议：先把 `room-joined` 整体迁入 room-client dispatcher handler，但不改 join ack payload、不改旧 peer 清理时序、不改 upstream offer wait timer 或 viewer UI 文案。
+- 修改意见：按建议实施 R2 生命周期小切片，不改变消息 payload、不改变 viewer 入房状态初始化顺序、不改变 P2P 等待状态。
+- 处理结果：已处理。`app-native-overrides.js` 新增 async `handleRoomJoinedMessage(data)` 并注册 `roomClient.registerMessageHandler('room-joined', handleRoomJoinedMessage)`；legacy `handleMessage` switch 已删除 `room-joined` case。`check-room-client-dispatcher.js` 已新增检查，要求 handler 存在、必须注册到 dispatcher、且 legacy switch 不得再包含该 case。完成度审计中 Renderer 粗略完成度更新为约 84%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-475 chain-reconnect 仍停留在 native override 大 switch
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`chain-reconnect` 仍在 native override 大 switch 中处理，包含 relay retry 清理、manifest 记忆、链位/上游更新、viewer 状态重置和 `viewer-reconnect-ready` 发送。
+- 影响：链路重分配入口继续混在 legacy switch 内，后续拆房间生命周期时仍要同时处理拓扑恢复逻辑，增加切分范围。
+- 建议：先把 `chain-reconnect` 整体迁入 room-client dispatcher handler，但不改拓扑重分配、viewer 状态清理或 reconnect-ready 发送顺序。
+- 修改意见：按建议实施 R2 小切片，不改变消息 payload、不改变已有上游切换判定、不改变 viewer 状态重置和重连通知逻辑。
+- 处理结果：已处理。`app-native-overrides.js` 新增 async `handleChainReconnectMessage(data)` 并注册 `roomClient.registerMessageHandler('chain-reconnect', handleChainReconnectMessage)`；legacy `handleMessage` switch 已删除 `chain-reconnect` case。`check-room-client-dispatcher.js` 已新增检查，要求 handler 存在、必须注册到 dispatcher、且 legacy switch 不得再包含该 case。完成度审计中 Renderer 粗略完成度更新为约 83%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-471 viewer-joined 仍停留在 native override 大 switch
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`viewer-joined` 仍在 native override 大 switch 中处理，包含 manifest 记忆、host session 校验、人数更新、`createOffer()` 和 stale peer error 日志处理，是 R2 dispatcher 迁移中第一个进入 offer 创建路径的分支。
+- 影响：如果继续留在大 switch，后续拆 `room-created` / `room-joined` 时仍要在同一个大分支中混合房间生命周期和 peer offer 编排。
+- 建议：先把 `viewer-joined` 整体迁入 room-client dispatcher handler，但不改 `createOffer()`、stale error 判断或 peer controller 逻辑。
+- 修改意见：按建议实施 R2 小切片，不改变消息 payload、不改变 reconnect 判断、不改变 offer 参数和 stale peer error 处理。
+- 处理结果：已处理。`app-native-overrides.js` 新增 async `handleViewerJoinedMessage(data)` 并注册 `roomClient.registerMessageHandler('viewer-joined', handleViewerJoinedMessage)`；legacy `handleMessage` switch 已删除 `viewer-joined` case。`check-room-client-dispatcher.js` 已新增检查，要求 handler 存在、必须注册到 dispatcher、且 legacy switch 不得再包含该 case。完成度审计中 Renderer 粗略完成度更新为约 79%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-473 answer/ice-candidate 仍停留在 native override 大 switch
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`answer` 与 `ice-candidate` 仍在 native override 大 switch 中处理，虽然两者只是直接委托既有 `handleAnswer(data)` / `handleIceCandidate(data)`。
+- 影响：信令核心中的低复杂度分支仍混在 legacy switch 内，后续迁移 `offer` 和房间生命周期分支时剩余边界不够清晰。
+- 建议：先把 `answer` / `ice-candidate` 整体迁入 room-client dispatcher handler，但不改现有信令处理函数。
+- 修改意见：按建议实施 R2 小切片，不改变消息 payload、不改变 answer/ICE 处理语义。
+- 处理结果：已处理。`app-native-overrides.js` 新增 async `handleAnswerMessage(data)` / `handleIceCandidateMessage(data)` 并注册 `roomClient.registerMessageHandler('answer', handleAnswerMessage)` 与 `roomClient.registerMessageHandler('ice-candidate', handleIceCandidateMessage)`；legacy `handleMessage` switch 已删除 `answer` / `ice-candidate` case。`check-room-client-dispatcher.js` 已新增检查，要求 handler 存在、必须注册到 dispatcher、且 legacy switch 不得再包含这两个 case。完成度审计中 Renderer 粗略完成度更新为约 81%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-472 connect-to-next 仍停留在 native override 大 switch
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`connect-to-next` 仍在 native override 大 switch 中处理，包含 relay 下游 offer 创建、失败 recoverable warning、关闭目标 peer 和 relay retry 安排。
+- 影响：relay offer 创建路径继续混在主消息大 switch 内，后续拆房间生命周期和信令核心分支时仍会被 relay 失败恢复逻辑牵连。
+- 建议：先把 `connect-to-next` 整体迁入 room-client dispatcher handler，但不改 `createOfferToNextViewer()`、peer close 或 relay retry 策略。
+- 修改意见：按建议实施 R2 小切片，不改变消息 payload、不改变 recoverable warning 内容、不改变 relay retry 调用。
+- 处理结果：已处理。`app-native-overrides.js` 新增 async `handleConnectToNextMessage(data)` 并注册 `roomClient.registerMessageHandler('connect-to-next', handleConnectToNextMessage)`；legacy `handleMessage` switch 已删除 `connect-to-next` case。`check-room-client-dispatcher.js` 已新增检查，要求 handler 存在、必须注册到 dispatcher、且 legacy switch 不得再包含该 case。完成度审计中 Renderer 粗略完成度更新为约 80%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-470 error 消息仍停留在 native override 大 switch
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`error` 消息仍在 native override 大 switch 中处理，逻辑只包含 OBS 建房 pending 释放、viewer join error hook 和 `showError()` fallback，适合作为 dispatcher 的第四个低风险迁移点。
+- 影响：viewer join 错误类消息仍未通过 dispatcher 验证，后续拆 `room-joined` / `room-created` 时仍需要跨 legacy switch 追踪错误处理。
+- 建议：迁移 `error` 到 room-client dispatcher，保持原执行顺序：先 `setObsRoomCreatePending(false)`，再调用 `window.__vdsHandleViewerJoinError(data)`，未处理时 `showError(data.message)`；同时扩展门禁防止该 case 回流。
+- 修改意见：按建议实施 R2 小切片，不改变消息 payload，不改变错误文案和 hook 处理顺序。
+- 处理结果：已处理。`app-native-overrides.js` 新增 async `handleErrorMessage(data)` 并注册 `roomClient.registerMessageHandler('error', handleErrorMessage)`；legacy `handleMessage` switch 已删除 `error` case。`check-room-client-dispatcher.js` 已新增检查，要求 handler 存在、必须注册到 dispatcher、且 legacy switch 不得再包含该 case。完成度审计中 Renderer 粗略完成度更新为约 78%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`，均通过。
+
+### ARCH-SPLIT-P1-469 host-disconnected 仍停留在 native override 大 switch
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`host-disconnected` 仍在 native override 大 switch 中处理，逻辑只包含断开提示、清理 viewer upstream offer wait timer 和异步 `resetViewerState()`，适合作为 dispatcher 的第三个低风险迁移点。
+- 影响：viewer 断开清理类异步 handler 仍未通过 dispatcher 验证，后续迁移 `room-joined` 等更重状态分支时风险更集中。
+- 建议：迁移 `host-disconnected` 到 room-client dispatcher，保持原执行顺序和提示文案；同时扩展门禁防止该 case 回流。
+- 修改意见：按建议实施 R2 小切片，不改变消息 payload，不改变 viewer reset 时序，不触碰 offer/answer/ICE 分支。
+- 处理结果：已处理。`app-native-overrides.js` 新增 async `handleHostDisconnectedMessage()` 并注册 `roomClient.registerMessageHandler('host-disconnected', handleHostDisconnectedMessage)`；legacy `handleMessage` switch 已删除 `host-disconnected` case。`check-room-client-dispatcher.js` 已新增检查，要求 handler 存在、必须注册到 dispatcher、且 legacy switch 不得再包含该 case。完成度审计中 Renderer 粗略完成度更新为约 77%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`，均通过。
+
+### ARCH-SPLIT-P1-468 viewer-left 仍停留在 native override 大 switch
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`viewer-left` 仍在 native override 大 switch 中处理，虽然它只包含 viewer count 更新和关闭离开 viewer peer，适合作为 dispatcher 的第二个真实迁移点。
+- 影响：异步消息 handler 路径没有被实际验证，后续迁移更复杂的 `viewer-joined` / `room-joined` 时缺少对 async dispatcher 行为的确认。
+- 建议：迁移 `viewer-left` 到 room-client dispatcher，保持原执行顺序：先更新人数/app state，再 `await closeNativePeerConnectionImpl(viewerId, { clearRetryState: true })`；同时扩展门禁防止该 case 回流。
+- 修改意见：按建议实施 R2 小切片，不改变消息 payload，不改变人数计算逻辑，不改变 peer close 参数。
+- 处理结果：已处理。`app-native-overrides.js` 新增 async `handleViewerLeftMessage(data)` 并注册 `roomClient.registerMessageHandler('viewer-left', handleViewerLeftMessage)`；legacy `handleMessage` switch 已删除 `viewer-left` case。`check-room-client-dispatcher.js` 已新增检查，要求 handler 存在、必须注册到 dispatcher、且 legacy switch 不得再包含该 case。完成度审计中 Renderer 粗略完成度更新为约 76%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`，均通过。
+
+### ARCH-SPLIT-P1-485 Relay backend state 仍由文件级 static 持有
+
+- 位置：`media-agent/src/relay_dispatch.h`、`media-agent/src/relay_dispatch.cpp`、`media-agent/src/relay_hub.h`、`media-agent/src/relay_hub.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：M5 已建立 `RelayHub` facade 和 backend namespace，但 subscriber map、bootstrap cache、pending video queue 和 dispatch worker 仍通过 `relay_dispatch.cpp` 文件级 static accessor 持有，状态所有权还没有真正挂到 `RelayHub`。
+- 影响：后续拆多 relay runtime、多实例测试或多进程边界时，backend state 仍表现为进程级单例；`RelayHub` 只是 facade 包装，无法证明 relay runtime 生命周期由 Hub owner 管理。
+- 建议：引入 `relay_backend::Runtime` pimpl，把 relay backend 状态从文件级 static 移入 runtime 实例；`RelayHub` 私有持有 runtime，并在 shutdown/析构时停止 worker，保持现有 fanout/bootstrap/backpressure 行为不变。
+- 修改意见：按建议实施 M5 小切片，不改变 relay subscriber 注册/注销、不改变 bootstrap 发送、不改变 video queue 上限、不改变 encoded DataChannel 或 track sender 分支。
+- 处理结果：已处理。`relay_dispatch.h` 新增 `relay_backend::Runtime` pimpl 和 `create_runtime()`；backend API 统一接收 `Runtime&`。`relay_dispatch.cpp` 不再通过文件级 static accessor 持有 backend state，subscriber/bootstrap/queue/worker state 由 `Runtime::State` 承载。`RelayHub` 新增私有 `backend_runtime_`，构造时创建 runtime，所有 publish/register/query/shutdown 调用均绑定该实例，析构时显式 shutdown。ownership 文档和完成度审计已同步。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`npm run check:architecture`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过。首次 Release 验证暴露 `relay_dispatch.cpp` 音频 forwarding 成功分支漏传 `runtime` 参数，已补齐后重跑通过。
+
+### ARCH-SPLIT-P1-486 Relay backend 仍公开 legacy free function API
+
+- 位置：`media-agent/src/relay_dispatch.h`、`media-agent/src/relay_dispatch.cpp`、`media-agent/src/relay_hub.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`RelayHub` 已私有持有 `relay_backend::Runtime`，但 `relay_dispatch.h` 仍公开 `register_relay_subscriber()`、`fanout_relay_video_units()`、`fanout_relay_audio_frame()`、`query_relay_subscriber_state()` 等 free backend 函数，Hub 仍像 facade 一样调用这些临时 API。
+- 影响：backend API 边界仍不够像一个被 owner 持有的 runtime；后续继续拆 Hub 私有实现或多 runtime 时，free function 形态容易让调用方绕过 owner，或者重新把 relay 操作扩散到其它实现文件。
+- 建议：把 legacy free backend 函数成员化为 `relay_backend::Runtime` 方法，`RelayHub` 只通过私有 `backend_runtime_` 执行 register/query/fanout/shutdown；`create_runtime()` 保留为构造入口，行为和 dispatch 算法不变。
+- 修改意见：按建议实施 M5 小切片，不改变 relay subscriber/bootstrap/queue/worker 逻辑，不改变 EncodedFrameBus publish 行为，不改变 stats JSON 字段。
+- 处理结果：已处理。`relay_dispatch.h` 删除 legacy free backend API 声明，`Runtime` 新增 `register_subscriber()`、`unregister_subscriber()`、`clear_upstream_bootstrap_state()`、`shutdown_dispatch()`、`query_subscriber_state()`、`subscriber_runtime_json()`、`fanout_video_units()`、`fanout_audio_frame()` 成员方法；`relay_dispatch.cpp` 对应实现已改为 `Runtime::...`；`relay_hub.cpp` 已改为调用 `backend_runtime_->...`，不再调用 `relay_backend::fanout_relay_*` 或 `register_relay_subscriber()` 等 free functions。ownership 文档和完成度审计已同步。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`npm run check:architecture`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 验证包含构建、`vds-media-agent-unit-tests` 和 media-agent smoke test。
+
+### ARCH-SPLIT-P1-487 低风险 room message handler body 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-room-message-controller.js`、`server/public/index.html`、`scripts/check-renderer-entry.js`、`scripts/check-room-client-dispatcher.js`、`knip.json`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`viewer-count-updated`、`viewer-left`、`host-disconnected`、`error` 虽然已从 legacy switch 迁入 room-client dispatcher，但 handler body 仍定义并注册在 `app-native-overrides.js`，R2/R7 边界仍把低风险房间状态、错误处理和 viewer 清理 glue 留在 legacy 文件中。
+- 影响：`app-native-overrides.js` 继续承担轻量房间消息动作执行；后续拆复杂 `room-joined` / `room-created` / peer 信令 handler 时，门禁也无法表达“handler body 应逐步迁出 override”。
+- 建议：新增 `native/native-room-message-controller.js`，先承接四个低风险 handler body 和注册；`app-native-overrides.js` 只负责创建 controller 并调用 `registerHandlers()`。同步更新 renderer entry、knip 和 dispatcher 门禁，要求这四个 handler 不得回流到 override。
+- 修改意见：按建议实施 Renderer R2/R7 小切片，不改变消息 payload、不改变 viewer count 更新、不改变 viewer-left peer close 参数、不改变 host-disconnected reset 顺序、不改变 error hook 顺序。
+- 处理结果：已处理。新增 `server/public/native/native-room-message-controller.js`，通过 `VDS.nativeRoomMessages.createController()` 注入 roomClient、elements、p2pStateMachine、nativeSessionState、状态同步、viewer count、peer close、viewer reset 和 showError 依赖；四个 handler body 已迁入该 controller 并由 `registerHandlers()` 注册。`app-native-overrides.js` 删除对应本地 handler 和直接注册，只创建 controller 并调用 `nativeRoomMessages.registerHandlers()`。`index.html`、`scripts/check-renderer-entry.js`、`knip.json` 已加入新脚本；`check-room-client-dispatcher.js` 已改为数据驱动检查，要求这四个 handler 在 room message controller 中定义/注册，并禁止回流到 native override。Renderer 完成度审计已更新为约 88%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-room-message-controller.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:renderer-syntax`、`npm run check:room-client-dispatcher`、`npm run check:renderer-entry`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-488 Peer signaling message handler body 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-message-controller.js`、`server/public/index.html`、`scripts/check-renderer-entry.js`、`scripts/check-room-client-dispatcher.js`、`knip.json`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`answer`、`ice-candidate`、`offer` 已经走 room-client dispatcher，但 dispatcher handler body 仍定义并注册在 `app-native-overrides.js`。其中 answer/ICE 只是纯委托，offer 只额外处理 stale native peer error，适合从 legacy 文件迁出。
+- 影响：peer signaling 的 dispatcher 层仍混在 native override 中，R5/R7 无法证明“信令消息入口”和旧 UI/session glue 解耦；后续迁 `viewer-joined`、`connect-to-next` 等复杂 peer handler 时缺少独立 peer message controller 边界。
+- 建议：新增 `native/native-peer-message-controller.js`，承接 answer/ICE/offer 三个 dispatcher handler body；`app-native-overrides.js` 只负责创建 controller、注入现有 `handleOffer/handleAnswer/handleIceCandidate`、nativePeerController 和 diagnostics，并调用 `registerHandlers()`。同步更新 entry、knip 和 dispatcher 门禁，禁止三者回流到 override。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 answer/ICE payload，不改变 offer stale error 吞吐，不改变 `signal:offer:stale-ignored` 日志字段。
+- 处理结果：已处理。新增 `server/public/native/native-peer-message-controller.js`，通过 `VDS.nativePeerMessages.createController()` 注入 roomClient、nativePeerController、diagnostics 和现有 offer/answer/ice handler；`answer`、`ice-candidate`、`offer` handler body 已迁入该 controller 并由 `registerHandlers()` 注册。`app-native-overrides.js` 删除对应本地 handler 和直接注册，只创建 controller 并调用 `nativePeerMessages.registerHandlers()`。`index.html`、`scripts/check-renderer-entry.js`、`knip.json` 已加入新脚本；`check-room-client-dispatcher.js` 已改为同时检查 room message controller、peer message controller 和剩余 override handler。Renderer 完成度审计已更新为约 89%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-message-controller.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:renderer-syntax`、`npm run check:room-client-dispatcher`、`npm run check:renderer-entry`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-489 viewer-joined/connect-to-next handler body 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-message-controller.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`viewer-joined` 和 `connect-to-next` 已经走 room-client dispatcher，但 handler body 仍定义并直接注册在 `app-native-overrides.js`。这两条消息分别承接 host 侧 viewer offer 创建和 relay 下游 offer/retry，属于 peer message 编排边界，不应继续留在 legacy override 大文件。
+- 影响：peer message controller 只覆盖 answer/ICE/offer，host viewer joined 与 relay connect-to-next 仍把人数同步、manifest 记忆、offer 创建、stale error 吞吐和 relay retry 逻辑留在 legacy glue 中，R5/R7 边界不完整。
+- 建议：把 `viewer-joined` / `connect-to-next` 的 dispatcher handler body 迁入 `native/native-peer-message-controller.js`，通过依赖注入调用现有 `createOffer()`、`createOfferToNextViewer()`、`closeNativePeerConnectionImpl()` 和 `scheduleRelayOfferRetry()`；`app-native-overrides.js` 只创建 controller 并注入依赖。同步更新 dispatcher 门禁，禁止这两个 handler 回流到 override。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变消息 payload、不改变 viewer count 同步、不改变 offer force/reconnect 参数、不改变 stale peer error 吞吐、不改变 relay retry 和 recoverable warning 行为。
+- 处理结果：已处理。`native-peer-message-controller.js` 现在承接 `viewer-joined`、`connect-to-next`、`answer`、`ice-candidate`、`offer` 五个 peer message handler body，并由 `registerHandlers()` 统一注册。`app-native-overrides.js` 已删除 `handleViewerJoinedMessage()` / `handleConnectToNextMessage()` 及其直接 `roomClient.registerMessageHandler()` 调用，只向 peer message controller 注入 elements、manifest 记忆、host session 状态、app state 同步、viewer count 更新、offer 创建、relay close/retry 和 diagnostics 依赖。`check-room-client-dispatcher.js` 已把这两个 handler 纳入 migrated peer message 检查并禁止在 override 中定义或直接注册。Renderer 完成度审计已更新为约 90%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-message-controller.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:renderer-syntax`、`npm run check:room-client-dispatcher`、`npm run check:renderer-entry`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-490 chain-reconnect handler body 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-message-controller.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`chain-reconnect` 已经走 room-client dispatcher，但 handler body 仍定义并直接注册在 `app-native-overrides.js`，包含 relay retry 清理、manifest 记忆、链位/上游切换、viewer P2P wait timer 清理和 `viewer-reconnect-ready` 发送。
+- 影响：链路重选是 peer signaling/recovery 边界的一部分，继续留在 native override 会让 peer message controller 与 p2p-state-machine 的职责不完整，也让 R7 薄入口仍承担 viewer reconnect 编排。
+- 建议：把 `chain-reconnect` 迁入 `native/native-peer-message-controller.js`，通过依赖注入访问旧状态和回调；保持原重连判定、UI 文案回调、`viewer-reconnect-ready` payload 和 timer 清理顺序。同步扩展 dispatcher 门禁，禁止该 handler 回流到 override。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变链位计算、不改变上游选择、不改变已在切换中的判定、不改变 viewer reconnect ready 消息字段。
+- 处理结果：已处理。`native-peer-message-controller.js` 新增 `handleChainReconnectMessage(data)` 并注册 `chain-reconnect`；`app-native-overrides.js` 删除本地 handler 和直接注册，只向 peer message controller 注入 relay retry 清理、host/upstream/room/session 状态访问器、chain position setter、peer lookup、viewer reconnect pending 回调和 `sendMessage()`。`check-room-client-dispatcher.js` 已把 `chain-reconnect` 纳入 migrated peer message 检查，剩余 native override 直注册 handler 收窄为 `room-joined`、`room-created`、`session-resumed`。Renderer 完成度审计已更新为约 91%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-message-controller.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:renderer-syntax`、`npm run check:room-client-dispatcher`、`npm run check:renderer-entry`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-491 room-joined handler body 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-room-message-controller.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`room-joined` 已经走 room-client dispatcher，但 handler body 仍定义并直接注册在 `app-native-overrides.js`，包含 relay retry 清理、manifest 记忆、peer 清空、viewer room state 写入、P2P wait timer 和 viewer UI 切换。
+- 影响：viewer 入房生命周期仍由 legacy override 执行动作，`native-room-message-controller.js` 只承接轻量房间消息，R2/R7 的 room lifecycle 边界仍不完整。
+- 建议：把 `room-joined` 迁入 `native/native-room-message-controller.js`，通过依赖注入调用旧状态 setter、peer 清理、P2P wait timer 和 UI hook；保持消息 payload、执行顺序和显示文案不变。同步扩展 dispatcher 门禁，禁止该 handler 回流到 override。
+- 修改意见：按建议实施 Renderer R2/R7 小切片，不改变 viewer room/app state patch、不改变 clear peer 参数、不改变 upstream offer wait timer、不改变 viewer UI 切换顺序。
+- 处理结果：已处理。`native-room-message-controller.js` 新增 `handleRoomJoinedMessage(data)` 并注册 `room-joined`；`app-native-overrides.js` 删除本地 handler 和直接注册，只向 room message controller 注入 relay retry 清理、manifest 记忆、peer 清空、FPS 重置、viewer room state setter、viewer pending 标志、join 成功 hook、播放偏好 UI hook 和 viewer 状态文案 setter。`check-room-client-dispatcher.js` 已把 `room-joined` 纳入 migrated room message 检查，剩余 native override 直注册 handler 收窄为 `room-created`、`session-resumed`。Renderer 完成度审计已更新为约 92%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-room-message-controller.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:renderer-syntax`、`npm run check:room-client-dispatcher`、`npm run check:renderer-entry`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-492 room-created handler body 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-room-message-controller.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`room-created` 已经走 room-client dispatcher，但 handler body 仍定义并直接注册在 `app-native-overrides.js`，包含 OBS pending 释放、host media session ACK 校验、stale ACK 退房、OBS 等待退房、host room/app state、自动复制房间号、host P2P 状态和 stats polling。
+- 影响：host 建房 ACK 生命周期继续留在 legacy override，导致 `native-room-message-controller.js` 仍不能完整承接房间消息动作，也让 R7 薄入口继续承担 host 建房成功/失败分支。
+- 建议：把 `room-created` 迁入 `native/native-room-message-controller.js`，通过依赖注入保留 session state、diagnostics、sendMessage、host UI 和 stats polling 行为；保持 stale ACK、OBS waiting 和 host ready 三个分支顺序不变。
+- 修改意见：按建议实施 Renderer R2/R7 小切片，不改变 ACK 校验条件、不改变 stale/OBS leave-room payload、不改变自动复制参数、不改变 host status 文案和 stats polling 时机。
+- 处理结果：已处理。`native-room-message-controller.js` 新增 `handleRoomCreatedMessage(data)` 并注册 `room-created`；`app-native-overrides.js` 删除本地 handler 和直接注册，只向 room message controller 注入 host media session getter、native host running getter、diagnostics log、sendMessage、client/session token getter、OBS backend 判断、host room state setter、start pending UI reset、复制房间号 hook、公开列表渲染 hook、host stats polling、窗口恢复状态和 UI 同步回调。`check-room-client-dispatcher.js` 已把 `room-created` 纳入 migrated room message 检查，剩余 native override 直注册 handler 收窄为 `session-resumed`。Renderer 完成度审计已更新为约 93%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-room-message-controller.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:renderer-syntax`、`npm run check:room-client-dispatcher`、`npm run check:renderer-entry`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-493 session-resumed handler body 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-room-message-controller.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`session-resumed` 是最后一个仍由 `app-native-overrides.js` 定义并直接注册的 native message handler，包含基础 session state/manifest 同步、host 恢复路径和 viewer 恢复路径。
+- 影响：即使其他十二个消息 handler 已迁出，legacy override 仍保留会话恢复入口，R2/R7 不能证明 native message handler body 已全部由 controller 持有。
+- 建议：把 `session-resumed` 迁入 `native/native-room-message-controller.js`，保持先同步基础 session-resumed app state，再按 host/viewer 分支恢复 UI、stats polling、peer cleanup、upstream offer wait timer 和状态文案。同步扩展 dispatcher 门禁，要求 native override 不再直接注册任何 native message handler。
+- 修改意见：按建议实施 Renderer R2/R7 小切片，不改变 host/viewer 分支顺序、不改变 OBS active 恢复逻辑、不改变 viewer peer 清理参数、不改变恢复状态文案。
+- 处理结果：已处理。`native-room-message-controller.js` 新增 `handleSessionResumedMessage(data)` 并注册 `session-resumed`；`app-native-overrides.js` 删除本地 handler 和直接注册，只向 room message controller 注入 session room state setter、host/viewer resume state setter、isHost setter、host/upstream/chain/upstreamConnected getter、relay retry 清理、peer 清空、FPS 重置、viewer join 成功 hook、播放偏好 UI hook、host public listing hook、host stats polling 和窗口恢复 UI 回调。`check-room-client-dispatcher.js` 已把 `session-resumed` 纳入 migrated room message 检查，`nativeOverrideHandlers` 已收敛为空数组。Renderer 完成度审计已更新为约 94%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-room-message-controller.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:renderer-syntax`、`npm run check:room-client-dispatcher`、`npm run check:renderer-entry`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-494 media-agent 单 session registry facade 缺少防回退门禁
+
+- 位置：`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：Host/Audio/OBS 单 session registry 已经把 `current_` 私有化，并通过 `runtime_registry` 暴露 `current_*_session()` / `*_session_snapshot()` facade，但自动门禁只限制完整 runtime include、关键 registry 字段和 relay backend API，未明确阻止业务代码重新直接调用 `host_sessions.current_session()` / `audio_sessions.snapshot()` / `obs_ingest_sessions.current_session()`。
+- 影响：后续维护者可能绕过 `runtime_registry` facade 直接依赖兼容单 session registry 布局，削弱 M7 未来升级为真正多 session registry/snapshot owner 的可替换性。
+- 建议：扩展 `check-media-agent-boundary.js`，只允许 `runtime_registry.cpp` 直接访问 Host/Audio/OBS registry 的 `current_session()` / `snapshot()` facade；业务代码必须调用 `runtime_registry` 的显式函数。
+- 修改意见：按建议实施 M7 门禁小切片，不改变 C++ 行为、不改变 JSON-RPC、不改变 stats/status 输出，仅新增防回退扫描。
+- 处理结果：已处理。`check-media-agent-boundary.js` 新增 `allowedSessionRegistryFacadeUsers` 与 `sessionRegistryFacadePattern`，除 `media-agent/src/runtime_registry.cpp` 外，扫描到 `host_sessions.current_session()`、`audio_sessions.snapshot()`、`obs_ingest_sessions.current_session()` 等直接访问会失败并提示改走 `runtime_registry current_*_session()` 或 `*_session_snapshot()`。ownership 文档和完成度审计已同步，media-agent 粗略完成度更新为约 86%，自动门禁约 88%。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-495 native override 缺少 direct registerMessageHandler 防回退门禁
+
+- 位置：`scripts/check-room-client-dispatcher.js`、`server/public/app-native-overrides.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：十三个 native message handler body 已全部迁入 `native-room-message-controller.js` / `native-peer-message-controller.js`，但 dispatcher 门禁只逐项检查已迁移 handler，未用通用规则禁止 `app-native-overrides.js` 未来重新直接调用 `roomClient.registerMessageHandler(...)`。
+- 影响：后续维护者可能绕过 native message controller，在 legacy override 中新增直接注册 handler，使 R2/R7 边界回退而不被现有逐项检查发现。
+- 建议：扩展 `check-room-client-dispatcher.js`，只允许 `app-native-overrides.js` 调用 `nativeRoomMessages.registerHandlers()` / `nativePeerMessages.registerHandlers()`，禁止任何直接 `roomClient.registerMessageHandler(...)`。
+- 修改意见：按建议实施 Renderer R2/R7 门禁小切片，不改变消息 payload、不改变注册顺序、不改变 controller 内部 handler 行为，仅新增防回退扫描。
+- 处理结果：已处理。`check-room-client-dispatcher.js` 新增 `/roomClient\.registerMessageHandler\s*\(/` 通用扫描；如果 `app-native-overrides.js` 直接注册 room-client message handler，会失败并提示改用 native message controllers。`RENDERER_SPLIT_MAP` 和完成度审计已同步，自动门禁粗略完成度更新为约 89%。
+- 验证结果：已执行 `node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- scripts/check-room-client-dispatcher.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 的 LF/CRLF 转换警告，无 whitespace error。
+
+### ARCH-SPLIT-P1-496 host/viewer stats polling 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-stats-controller.js`、`server/public/index.html`、`scripts/check-renderer-entry.js`、`knip.json`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`app-native-overrides.js` 在 native message handler 迁出后仍持有 host/viewer stats polling、FPS DOM 指示、host encoder detail、OBS/minimized 状态刷新和 viewer media-ready 后的 viewer-ready 发送副作用，R3/R7 边界仍把周期性诊断/状态推进留在 legacy 文件中。
+- 影响：legacy override 继续承担高频状态轮询与 UI 副作用，后续排查画面卡顿、诊断刷屏或 viewer-ready 时序时仍需要进入大文件；也让 diagnostics 模块的 stats summary 只能完成“格式化”，不能承接完整 polling owner。
+- 建议：新增 `native/native-stats-controller.js`，承接 host/viewer polling、FPS DOM、host encoder detail 和 viewer media-ready 状态推进；`app-native-overrides.js` 只保留兼容 wrapper 和依赖注入，不改变 `mediaEngine.getStats()`、日志节流、viewer-ready payload 或 OBS/minimized 文案。
+- 修改意见：按建议实施 Renderer R3/R7 小切片，不改变 polling interval、不改变 host/viewer stats summary 结构、不改变 viewer-ready 发送条件、不改变 host capture diagnostic report 输出。
+- 处理结果：已处理。新增 `server/public/native/native-stats-controller.js`，通过 `VDS.nativeStats.createController()` 注入 mediaEngine、diagnostics、elements、nativeSessionState、viewer controls 和 p2p state machine；host/viewer stats polling、FPS indicator、host encoder detail、host capture diagnostic report 更新、OBS/minimized host UI 状态和 viewer media-ready/viewer-ready 副作用已迁入 controller。`app-native-overrides.js` 中对应函数已收薄为 `nativeStatsController.*` wrapper。`index.html`、`scripts/check-renderer-entry.js` 和 `knip.json` 已加入新脚本，renderer entry 检查更新为 20 个脚本。Renderer 完成度审计已更新为约 95%。
+- 验证结果：已执行 `node --check server/public/native/native-stats-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-entry.js`、`npm run check:renderer-entry`、`npm run check:renderer-syntax`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- server/public/native/native-stats-controller.js server/public/app-native-overrides.js server/public/index.html scripts/check-renderer-entry.js knip.json docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 LF/CRLF 转换警告，无 whitespace error。
+### ARCH-SPLIT-P1-497 answer/ICE 主体逻辑仍通过 native override 回调
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-message-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`answer` 和 `ice-candidate` 的消息注册已经在 `native-peer-message-controller.js`，但 handler body 仍只是回调 `app-native-overrides.js::handleAnswer()` / `handleIceCandidate()`，remote answer finalize、queued ICE flush UI/log、ICE finalize 和 P2P state effect 消费还留在 legacy 文件。
+- 影响：peer message controller 虽然持有 dispatcher 入口，但 answer/ICE 实际动作仍回流到 legacy override，R5/R7 无法证明 peer signaling message controller 已经拥有低风险信令消息的执行边界。
+- 建议：把 answer/ICE 的主体逻辑迁入 `native-peer-message-controller.js`，通过依赖注入读取 peer handle、current manifest 和 P2P state setter；`app-native-overrides.js` 只保留 `window.handleAnswer` / `window.handleIceCandidate` 的兼容 wrapper。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 answer/ICE payload、不改变 stale attempt 忽略日志、不改变 relay candidate block 日志、不改变 queued candidate flush UI 状态写回。
+- 处理结果：已处理。`native-peer-message-controller.js::handleAnswerMessage()` 现在直接执行 signal 日志、peer lookup、remote answer finalize、ignore 日志和 queued ICE flush result 的 UI/log；`handleIceCandidateMessage()` 现在直接执行 signal 日志、remote ICE finalize 和 P2P state/log effects。`app-native-overrides.js` 删除 native peer message controller 的 `handleAnswer` / `handleIceCandidate` 回调注入，只注入 `getCurrentMediaManifest` 与 `setP2pStateForPeer`，旧 `handleAnswer()` / `handleIceCandidate()` 收薄为兼容委托。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-message-controller.js`、`npm run check:renderer-syntax`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-message-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error。
+### ARCH-SPLIT-P1-498 offer 主体逻辑仍通过 native override 回调
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-message-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`offer` 已由 `native-peer-message-controller.js` 注册，但 `handleOfferMessage()` 仍只是回调 `app-native-overrides.js::handleOffer()`；upstream offer wait timer 清理、viewer upstream switch 状态写入、remote offer decision、flush queued ICE、recreate peer、viewer surface attach、flush+answer 和 stale upstream cleanup 调度都留在 legacy 文件。
+- 影响：answer/ICE 主体迁出后，offer 仍是 peer signaling message controller 最大回流点；后续继续拆 R5/R7 时，真实 offer 时序仍需要进入 legacy override 维护。
+- 建议：把 offer 主体逻辑迁入 `native-peer-message-controller.js`，通过依赖注入执行 viewer 状态写回、timer 清理、recreate peer、viewer stats polling 和 stale upstream cleanup；`app-native-overrides.js` 只保留 `window.handleOffer` 兼容 wrapper。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 offer payload、不改变 upstream switch 顺序、不改变 flush-before-answer 顺序、不改变 stale native peer error 吞吐和 `signal:offer:stale-ignored` 日志。
+- 处理结果：已处理。`native-peer-message-controller.js::handleOfferMessage()` 现在直接执行 offer signal 日志、upstream offer wait timer 清理、viewer upstream switch、manifest 记忆、remote offer decision、flush queued ICE、peer recreate、remote offer apply、viewer surface attach、flush+answer、viewer stats polling 和 stale upstream cleanup 调度。`app-native-overrides.js` 删除 native peer message controller 的 `handleOffer` 回调注入，只注入 `isHost`、viewer state/timer setters、stats polling 和 peer recreate；旧 `handleOffer()` 收薄为兼容委托。Renderer 完成度审计已更新为约 96%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-message-controller.js`、`npm run check:renderer-syntax`、`npm run check:room-client-dispatcher`、`npm run check:renderer-bridge`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-message-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error。
+
+### ARCH-SPLIT-P1-499 relay offer retry 编排仍通过 native override 回调
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-message-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`connect-to-next` handler 已迁入 `native-peer-message-controller.js`，但 relay 下游 offer 失败后的 retry 策略仍通过 `scheduleRelayOfferRetry()` 回调回到 `app-native-overrides.js`，包括 viewer role guard、non-retryable failfast、最大两次重试、耗尽日志和定时重试。
+- 影响：peer signaling/recovery 的关键策略仍回流到 legacy override，导致 R5/R7 无法证明 relay recovery 编排由 peer message controller 持有，也让后续收口 retry/backoff 策略时需要同时维护两个边界。
+- 建议：把 relay offer retry 的策略和清理方法迁入 `native-peer-message-controller.js`，直接使用 `nativePeerController.getPeerReconnectState()` / `schedulePeerReconnect()` / `clearPeerReconnect()` / `clearAllPeerReconnects()`；`app-native-overrides.js` 仅保留兼容 wrapper。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变重试次数、不改变默认延迟、不改变 failfast/exhausted 日志 key、不改变 retry 时重新调用 `createOfferToNextViewer()` 的行为。
+- 处理结果：已处理。`native-peer-message-controller.js::scheduleRelayOfferRetry()` 现在直接执行 viewer role guard、non-retryable failfast、两次重试上限、exhausted 日志和 `nativePeerController.schedulePeerReconnect()` 定时重试；`handleChainReconnectMessage()` 直接调用本 controller 的 `clearAllRelayOfferRetries()`。`app-native-overrides.js` 删除 `nativePeerMessages` 的 retry/clear 回调注入，只注入 `getSessionRole`，旧 `scheduleRelayOfferRetry()` / `clearAllRelayOfferRetries()` 收薄为兼容委托。Renderer 完成度审计已更新为约 97%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-message-controller.js`、`npm run check:renderer-syntax`、`npm run check:room-client-dispatcher`、`npm run check:renderer-bridge`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-message-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+
+### ARCH-SPLIT-P1-518 RelayHub 公开头仍泄漏 relay backend 实现类型名
+
+- 位置：`media-agent/src/relay_hub.h`、`media-agent/src/relay_hub.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`RelayHub` 已私有持有 relay backend runtime，但 `relay_hub.h` 仍前置声明并拼写 `vds::media_agent::relay_backend::Runtime`，公开头继续把 backend 实现命名空间暴露给所有 Hub 调用方。
+- 影响：M5 的 owner 边界仍不够干净；后续如果把 `relay_dispatch` 彻底并入 Hub 私有实现，公开头里的 backend 类型名会成为额外迁移面，也容易让新代码误以为可以依赖 backend 层。
+- 建议：在 `RelayHub` 内部增加私有 pimpl，公开头只声明 `RelayHub::Backend`，把 `relay_backend::Runtime` 的 include、构造和调用全部收进 `relay_hub.cpp`；边界脚本禁止 `relay_hub.h` 再出现 `relay_backend`。
+- 修改意见：按建议实施 M5/M7 边界收口，不改变 relay subscriber/bootstrap/backpressure/fanout 算法，不改变 `RelayHub` 公开方法签名，不改变 JSON-RPC 或 stats 输出。
+- 处理结果：已处理。`relay_hub.h` 删除 `relay_backend::Runtime` 前置声明和 `backend_runtime_` 成员，改为私有 `RelayHub::Backend` pimpl；`relay_hub.cpp` 定义 `RelayHub::Backend` 并在其中持有 `std::unique_ptr<relay_backend::Runtime>`，所有 register/query/fanout/shutdown 调用都通过该私有 pimpl 执行。`check-media-agent-boundary.js` 新增门禁，若 `relay_hub.h` 再拼写 `relay_backend` 会直接失败。ownership 文档和完成度审计已同步，media-agent 粗略完成度更新为约 91%，自动门禁约 92%。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`npm run check:architecture`、`npm run check:logging`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 验证包含 media-agent 构建、unit test 和 smoke test，输出仅包含 FFmpeg 头文件/`av_init_packet` 既有 warning。
+
+### ARCH-SPLIT-P1-521 registry active facade 仍回读 current_session 兼容别名
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/src/runtime_registry.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-520 后主业务路径已迁到 `active_*_session()`，但 runtime facade 内部仍调用 registry 的 `current_session()`，registry 内部状态成员也仍命名为 `current_`。
+- 影响：active owner 语义还只是外层命名包装，真正 registry owner 仍表现为 current 兼容单例；后续多 session registry 化时还要再次拆 active/current。
+- 建议：在 Host/Audio/OBS registry 内新增 `active_session()`，将状态成员改为 `active_`；`current_session()` 只作为兼容别名委托 `active_session()`。runtime 的 `active_*_session()` 直接调用 registry `active_session()`，并用门禁防止回退。
+- 修改意见：按建议实施 M7 registry owner 语义切片，不改变 registry 对外数据、不改变 active session id、不改变 JSON-RPC wire shape。
+- 处理结果：已处理。`HostSessionRegistry`、`AudioSessionRegistry`、`ObsIngestSessionRegistry` 新增 `active_session()` const/非 const API，内部状态成员从 `current_` 改为 `active_`；`current_session()` 与 `snapshot()` 委托 `active_session()`。`runtime_registry.cpp` 的 `active_host_session()`、`active_audio_session()`、`active_obs_ingest_session()` 改为直接调用 registry `active_session()`。`check-media-agent-boundary.js` 新增门禁，若 `active_*_session()` facade 再调用 `.current_session()` 会失败。ownership 文档和完成度审计已同步，media-agent 粗略完成度更新为约 93%，自动门禁约 95%。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`npm run check:architecture`、`npm run check:logging`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 验证包含 media-agent 构建、unit test 和 smoke test。
+
+### ARCH-SPLIT-P1-522 Host/Audio/OBS registry 仍是单 active 成员存储
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/tests/media_agent_unit_tests.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-521 后 registry 已有 `active_session()`，但 Host/Audio/OBS 仍各自持有单个 `active_` state 成员，距离真正多 session registry/snapshot cache 还差一层 session id -> state 映射。
+- 影响：后续引入多 host session、多 audio session 或多 OBS ingest owner 时，仍需要把单成员迁移成 map，风险会叠加到后续功能切片。
+- 建议：在保持默认单 active 行为不变的前提下，把三类 registry 内部改为 `std::map<sessionId, State>`，构造时创建默认 active id 对应 state；`active_session()` 从 map 取 active state，`current_session()` 和 `snapshot()` 继续作为兼容别名。补 unit test 和门禁。
+- 修改意见：按建议实施 M7 registry 结构切片，不新增 session 切换行为，不改变 active session id，不改变对外 JSON。
+- 处理结果：已处理。`HostSessionRegistry`、`AudioSessionRegistry`、`ObsIngestSessionRegistry` 内部状态已从单 `active_` 成员改为 `std::map<std::string, State> sessions_`，构造时 `try_emplace(active_session_id_)` 创建默认 active state；`active_session()` 通过 `sessions_.at(active_session_id_)` 获取当前 owner。media-agent unit test 新增 `test_session_registries()`，覆盖默认 active id、active/current/snapshot alias 行为。`check-media-agent-boundary.js` 新增门禁，禁止 Host/Audio/OBS registry 回退到单 `active_` state 成员。ownership 文档和完成度审计已同步，media-agent 粗略完成度更新为约 94%，自动门禁约 96%。
+- 验证结果：已执行 `npm run check:architecture`、`npm run check:logging`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 验证包含 media-agent 构建、unit test 和 smoke test。
+
+### ARCH-SPLIT-P1-524 Host/Audio/OBS registry count 缺少 status/stats 可观测面
+
+- 位置：`media-agent/src/runtime_registry.h`、`media-agent/src/runtime_registry.cpp`、`media-agent/src/agent_status_json.cpp`、`scripts/smoke-media-agent.ps1`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：Host/Audio/OBS registry 已有 `session_count()`，但 status/stats 只输出 active session id，不输出 registry count；外部无法观察 registry 是否已经从单对象推进到多 session 容器。
+- 影响：M7 的 registry 结构变化缺少运行时证据，后续多 session 切换或 snapshot cache 改动难以在 smoke 层防回退。
+- 建议：通过 `runtime_registry` 增加三类 session count facade，并在 `getStatus` / `getStats` 输出 `hostSessionCount`、`audioSessionCount`、`obsIngestSessionCount`；smoke test 断言字段存在且不小于 1。
+- 修改意见：按建议实施 M7 可观测性切片，不改变既有 active session id 字段，不改变 JSON-RPC method，不改变 media 行为。
+- 处理结果：已处理。`runtime_registry.h/cpp` 新增 `host_session_count()`、`audio_session_count()`、`obs_ingest_session_count()`；`build_status_json()` 与 `build_stats_json()` 输出三类 session count。`scripts/smoke-media-agent.ps1` 已扩展 id=3/status 和 id=4/stats 响应断言，要求三类 count 字段存在且值至少为 1。ownership 文档和完成度审计已同步，media-agent 粗略完成度更新为约 96%。
+- 验证结果：已执行 `npm run check:architecture`、`npm run check:logging`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 验证包含 media-agent 构建、unit test 和 smoke test，输出仅包含 FFmpeg 头文件/`av_init_packet` 既有 warning。
+
+### ARCH-SPLIT-P1-523 Host/Audio/OBS registry 缺少多 session 基础 API
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/tests/media_agent_unit_tests.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-522 后 Host/Audio/OBS registry 已经 map-backed，但仍只暴露 active/current/snapshot，缺少按 session id 创建、切换 active 和计数的基础 API。
+- 影响：registry 内部虽已是 map，但业务层未来仍无法通过明确接口创建或切换非默认 session；多 session 能力还停留在内部实现形态。
+- 建议：为三类 registry 增加 `ensure_session(sessionId)`、`activate_session(sessionId)`、`session_count()`，保持默认 active 行为不变；unit test 覆盖 secondary session 创建/激活和空 id 失败。
+- 修改意见：按建议实施 M7 多 session 基础 API 切片，不把 API 接入业务切换行为，不改变默认 active session id，不改变 JSON-RPC wire shape。
+- 处理结果：已处理。`HostSessionRegistry`、`AudioSessionRegistry`、`ObsIngestSessionRegistry` 均新增 `ensure_session()`、`activate_session()`、`session_count()`；`ensure_session("")` 返回当前 active state，`activate_session("")` 返回 false 且保持 active id。`test_session_registries()` 新增 secondary session 创建、计数、激活、active state 返回和空 id 激活失败断言。`check-media-agent-boundary.js` 新增门禁，要求三类 registry 都暴露这些多 session 基础 API。ownership 文档和完成度审计已同步，media-agent 粗略完成度更新为约 95%，自动门禁约 97%。
+- 验证结果：已执行 `npm run check:architecture`、`npm run check:logging`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 验证包含 media-agent 构建、unit test 和 smoke test。
+
+### ARCH-SPLIT-P1-519 agent lifecycle 仍散落绑定多个 current session owner
+
+- 位置：`media-agent/src/agent_lifecycle.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`agent_lifecycle.cpp` 虽已通过 `runtime_registry` facade 访问 host/audio/OBS session，但 refresh/init/shutdown 流程仍分别调用 `current_host_session()`、`current_audio_session()`、`current_obs_ingest_session()` 并临时构造 peer/surface/audio controller。
+- 影响：生命周期入口仍横向协调多个 owner，后续多 session 或多进程拆分时难以证明一次 lifecycle 操作绑定的是同一组 host/audio/OBS owner。
+- 建议：在 `agent_lifecycle.cpp` 内引入集中绑定结构，进入 lifecycle 流程时一次性绑定 host/audio/OBS current session、peer controller、surface controller 和 host audio dispatch facade；公开函数只使用这组绑定。增加门禁防止 current-session 调用重新散落。
+- 修改意见：按建议实施 M4/M7 边界收口，不改变 init/refresh/shutdown 顺序，不改变 status/stats/capabilities JSON，不改变 host/audio/OBS/relay shutdown 行为。
+- 处理结果：已处理。`agent_lifecycle.cpp` 新增内部 `AgentLifecycleSessions`，集中持有 `HostSessionState&`、`AudioSessionState&`、`ObsIngestState&`、`PeerSessionController`、`SurfaceSessionController` 和带 transport-ready provider 的 `HostAudioDispatchSession`；`refresh_agent_runtime_state()`、`initialize_agent_runtime()`、`shutdown_agent_runtime()`、surface stop/restart wrapper 改为复用该绑定。`check-media-agent-boundary.js` 新增检查，要求 `agent_lifecycle.cpp` 只能出现三处 current-session 调用，即集中绑定区。ownership 文档和完成度审计已同步，自动门禁粗略完成度更新为约 93%。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`npm run check:architecture`、`npm run check:logging`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 验证包含 media-agent 构建、unit test 和 smoke test。
+
+### ARCH-SPLIT-P1-520 主业务路径仍使用 current-session facade 表达 active owner
+
+- 位置：`media-agent/src/runtime_registry.h`、`media-agent/src/runtime_registry.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/agent_rpc_router.cpp`、`media-agent/src/host_session_controller.cpp`、`media-agent/src/host_session_start_pipeline.cpp`、`media-agent/src/host_session_stop_pipeline.cpp`、`media-agent/src/peer_refresh_pipeline.cpp`、`media-agent/src/obs_ingest_session.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：Host/Audio/OBS registry 已有 active session id，但主业务路径仍调用 `current_host_session()`、`current_audio_session()`、`current_obs_ingest_session()`，语义上仍像单例 current owner，而不是未来可切换的 active owner。
+- 影响：后续把单 session registry 升级成多 session registry 时，业务路径需要再次区分 current 兼容 wrapper 和 active owner；如果继续使用 current 命名，容易把兼容层扩散到新代码。
+- 建议：在 `runtime_registry` 增加 `active_host_session()`、`active_audio_session()`、`active_obs_ingest_session()` facade；主业务路径全部迁到 active 命名，旧 `current_*` 只保留在 runtime_registry 和 host_session_runtime 兼容 wrapper 中，并用门禁禁止回退。
+- 修改意见：按建议实施 M7 owner 语义切片，不改变 registry 存储结构，不改变 JSON-RPC wire shape，不改变 status/stats 字段，不改变 host/audio/OBS 行为。
+- 处理结果：已处理。`runtime_registry.h/cpp` 新增三类 active session facade；agent lifecycle、RPC loop、host session controller、host start/stop pipeline、peer refresh pipeline 和 OBS runtime access 已迁到 `active_*_session()`。`check-media-agent-boundary.js` 新增 `allowedCurrentSessionFacadeUsers`，除 `runtime_registry.h/cpp` 与 `host_session_runtime.h/cpp` 外，业务源码直接调用 `current_*_session()` 会失败；agent lifecycle 门禁也改为检查三处 active-session 集中绑定。ownership 文档和完成度审计已同步，media-agent 粗略完成度更新为约 92%，自动门禁约 94%。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`npm run check:architecture`、`npm run check:logging`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 验证包含 media-agent 构建、unit test 和 smoke test，输出仅包含 FFmpeg 头文件/`av_init_packet` 既有 warning。
+
+### ARCH-SPLIT-P1-514 host capture runtime 主流程仍回绕 current-session facade
+
+- 位置：`media-agent/src/host_session_runtime.h`、`media-agent/src/host_session_runtime.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/host_session_start_pipeline.cpp`、`media-agent/src/host_session_stop_pipeline.cpp`、`media-agent/src/host_session_controller.cpp`、`media-agent/src/peer_refresh_pipeline.cpp`、`media-agent/src/obs_ingest_session.cpp`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`host_session_runtime.*` 已经是 host capture/OBS 的窄 facade，但 `revalidate_current_host_capture_plan()`、`initialize_current_default_capture_runtime()`、`refresh_current_host_capture_runtime()`、`start_current_host_capture_process()`、`stop_current_host_capture_process()`、`set_current_host_video_codec()` 仍在主调用点内部隐式绑定 `current_host_session(runtime_state)`。
+- 影响：HostSession owner 边界仍依赖 current 单例语义，后续升级多 session、多 dll/exe 或明确 session id 时，start/stop/refresh/soft refresh/OBS codec 写回都会重新遇到隐藏 session 查找。
+- 建议：为 host capture runtime 增加显式 `HostSessionState&` owner API，让 start/stop pipeline、agent lifecycle、peer host video soft refresh 和 OBS codec 写回直接传入当前 session；旧 `current_*` 函数仅作为兼容 wrapper 保留。
+- 修改意见：按建议实施 M4/M7 切片，不改变 JSON-RPC method、不改变 host session start/stop 顺序、不改变 OBS prepare/start/stop 行为、不改变 capture process manifest persist 时机。
+- 处理结果：已处理。`host_session_runtime.*` 新增 `revalidate_host_capture_plan(runtime, session)`、`initialize_default_capture_runtime(runtime, session)`、`refresh_host_capture_runtime(runtime, session)`、`start_host_capture_process(runtime, session)`、`stop_host_capture_process(session, reason)`、`set_host_video_codec(session, codec)`；旧 `current_*` 函数改为兼容转发。`agent_lifecycle.cpp` 的 refresh/init/shutdown、`host_session_start_pipeline.cpp` 的 native start、`host_session_stop_pipeline.cpp` 的 drain/stop、`host_session_controller.cpp` 的 restart drain、`peer_refresh_pipeline.cpp` 的 host video sender soft refresh、`obs_ingest_session.cpp` 的 codec 写回均改为显式 session owner 调用。`check-media-agent-boundary.js` 已新增回退门禁，除 `host_session_runtime.h/cpp` 外禁止直接调用旧 current host runtime facade。media-agent 完成度审计已更新为约 88%。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`npm run check:architecture`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 构建、media-agent unit test 和 smoke test 通过，编译输出仅包含 FFmpeg 头文件/弃用 API 的既有 warning。
+
+### ARCH-SPLIT-P1-515 OBS ingest lifecycle 主流程仍回绕 current-session facade
+
+- 位置：`media-agent/src/host_session_runtime.h`、`media-agent/src/host_session_runtime.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/host_session_start_pipeline.cpp`、`media-agent/src/host_session_stop_pipeline.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：上一轮 host capture runtime 已改为显式 `HostSessionState&`，但 OBS ingest prepare/clear/start/stop 仍主要通过 `prepare_current_obs_ingest_session()`、`clear_current_obs_ingest_prepared()`、`start_current_obs_ingest_worker()`、`stop_current_obs_ingest_session()` 隐式绑定 `current_obs_ingest_session(runtime_state)`。
+- 影响：Host/OBS start-stop lifecycle 仍混有 current 单 session 语义，后续拆多 session、多 dll/exe 或明确 session id 时，OBS worker lifecycle 会继续藏在 runtime facade 内部查找 active session。
+- 建议：为 OBS ingest lifecycle 增加显式 `ObsIngestState&` owner API，host OBS start、native clear-prepared、host drain/stop 和 agent shutdown 主路径显式绑定 OBS session 后调用；旧 current OBS helper 仅保留兼容 wrapper，并用门禁禁止新调用点回退。
+- 修改意见：按建议实施 M4/M7 切片，不改变 OBS prepare/start/stop 顺序、不改变 media-state payload、不改变 host stop/restart drain 顺序、不改变 JSON-RPC wire shape。
+- 处理结果：已处理。`host_session_runtime.*` 新增 `prepare_obs_ingest_session(runtime, obs, ...)`、`clear_obs_ingest_prepared(runtime, obs)`、`start_obs_ingest_worker(runtime, obs)`、`stop_obs_ingest_session(runtime, obs)`；旧 `current_obs_*` 函数改为兼容转发。`host_session_start_pipeline.cpp`、`host_session_stop_pipeline.cpp`、`agent_lifecycle.cpp` 已显式绑定 `current_obs_ingest_session(state)` 后传入 owner API；`reset_host_session_to_default_native()` 也新增 `ObsIngestState&` overload 并由 stop 流程显式调用。`check-media-agent-boundary.js` 已扩展门禁，除 `host_session_runtime.h/cpp` 外禁止直接调用旧 current OBS runtime facade。media-agent 完成度审计已更新为约 89%，自动门禁约 90%。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 构建、media-agent unit test 和 smoke test 通过，编译输出仅包含 FFmpeg 头文件/弃用 API 的既有 warning。
+
+### ARCH-SPLIT-P1-517 disconnected recovery timer 动作仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-peer-controller.js` 已持有 disconnected recovery 的准备函数和 `requestPeerRecovery()`，但 `app-native-overrides.js::scheduleDisconnectedPeerRecovery()` 仍负责 arm timer、到点 retry 校验、`peer:disconnected-recovery` 日志、调用 recovery、失败回滚 `restartInProgress` 和 recoverable warning。
+- 影响：peer-state disconnected effect 的动作 owner 仍回到 legacy override，导致 R5 里 recovery timer 不是完整 peer lifecycle owner，也让 retry 失败回滚逻辑分散。
+- 建议：把 disconnected recovery timer 动作迁入 `native-peer-controller.js::scheduleDisconnectedRecovery()`；`applyPeerStateEffects()` 直接调用 controller 内部方法，`app-native-overrides.js` 删除本地函数和注入回调。
+- 修改意见：按建议实施 Renderer R5/R7 切片，不改变首次 4000ms 延迟、不改变后续 `[750,1500]` 延迟、不改变 `peer:disconnected-recovery` 日志 payload、不改变 recovery 失败 warning key/category/channel/fallbackLabel。
+- 处理结果：已处理。`native-peer-controller.js` 新增私有 `scheduleDisconnectedRecovery(peerId, handle)`，内部复用 `prepareDisconnectedRecovery()` / `prepareDisconnectedRecoveryRetry()` / `requestPeerRecovery()`，并持有 timer arm、日志、失败回滚和 recoverable warning；`applyPeerStateEffects()` 对 `scheduleDisconnectedRecovery` effect 直接调用该私有方法。`app-native-overrides.js` 删除本地 `scheduleDisconnectedPeerRecovery()` 和 `nativePeerController` 的同名注入回调，新增 `logRecoverableNativeWarning` 注入供 controller 使用；controller return API 删除 `armPeerDisconnectTimer`、`prepareDisconnectedRecovery`、`prepareDisconnectedRecoveryRetry` 暴露。`check-renderer-bridge.js` 已新增回退门禁，禁止 disconnected recovery timer 动作回流到 native override，也禁止这些内部 helper 再次出现在 `native-peer-controller` public API。Renderer 完成度审计已更新为约 99%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-516 OBS runtime access 仍隐藏绑定 current host session
+
+- 位置：`media-agent/src/obs_ingest_session.h`、`media-agent/src/obs_ingest_session.cpp`、`media-agent/src/host_session_runtime.h`、`media-agent/src/host_session_runtime.cpp`、`media-agent/src/agent_rpc_router.cpp`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/host_session_start_pipeline.cpp`、`media-agent/src/host_session_stop_pipeline.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：OBS ingest lifecycle 已显式传入 `ObsIngestState&`，但 `make_obs_ingest_runtime_access(runtime_state)` 内部仍通过 `current_host_session(state)` 为 host snapshot 和 video codec 写回绑定 host owner。
+- 影响：OBS worker 表面上脱离了完整 runtime 构造，但跨 session 写回仍隐藏依赖 current host session；后续多 session 或多进程拆分时，OBS worker 无法明确知道自己对应哪个 host session。
+- 建议：为 `make_obs_ingest_runtime_access()` 增加显式 `HostSessionState&` 入口，RPC loop 和 host session runtime 创建 OBS facade 时传入同一个 host session owner；单参数 overload 仅保留兼容，并用门禁禁止新调用点。
+- 修改意见：按建议实施 M4/M7 切片，不改变 OBS media-state payload 字段、不改变 codec 更新语义、不改变 RPC loop 持有 OBS facade 的时机。
+- 处理结果：已处理。`make_obs_ingest_runtime_access(runtime_state, host_session)` 现在显式捕获 `HostSessionState&`，host snapshot 读取和 `set_host_video_codec()` 写回都通过该引用执行；单参数 overload 仅保留为兼容 wrapper。`agent_rpc_router.cpp` 先绑定 `HostSessionState& host_session` 再构造 `ObsIngestSession`；`host_session_runtime.*` 的显式 OBS lifecycle API 也扩展为同时接收 `HostSessionState&` 与 `ObsIngestState&`。`check-media-agent-boundary.js` 已新增单参数 `make_obs_ingest_runtime_access(runtime_state)` 回退门禁。media-agent 完成度审计已更新为约 90%，自动门禁约 91%。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 构建、media-agent unit test 和 smoke test 通过，编译输出仅包含 FFmpeg 头文件/弃用 API 的既有 warning。
+
+### ARCH-SPLIT-P1-501 peer-state event/effects 串联仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-peer-controller.js` 已经持有 `applyPeerStateEvent()` 和 `applyPeerStateEffects()`，但 `app-native-overrides.js::handleNativePeerStateEvent()` 仍直接检查 peer id/handle，并手动串联 event 处理和 effects 消费。
+- 影响：peer-state 事件入口虽然大部分逻辑在 controller，但 legacy override 仍承担一层业务编排；后续迁 recovery/failure 外部动作时，入口 owner 不够清晰。
+- 建议：在 `native-peer-controller.js` 新增 `handlePeerStateEvent(params)`，由 controller 内部统一执行 `applyPeerStateEvent()` 与 `applyPeerStateEffects()`；`app-native-overrides.js` 仅保留 media-engine 事件转交。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 peer-state effects 内容、不改变 disconnected recovery/failure finalization 回调、不改变 missing peer/handle 的忽略行为。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `handlePeerStateEvent(params)`，内部先调用 `applyPeerStateEvent(params)`，仅在 `handled` 为真时消费 `result.effects`。`app-native-overrides.js::handleNativePeerStateEvent()` 删除本地 peer id/handle 检查和手动 effects 串联，收薄为 `nativePeerController.handlePeerStateEvent(params)`。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+
+### ARCH-SPLIT-P1-506 NAT mapping wait 超时动作仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-peer-controller.js::armPeerNatMappingWait()` 已持有 NAT mapping 后等待直连成功的 timer 和 7000ms 默认值，但 `app-native-overrides.js` 仍传入回调负责超时后的 ready 判断、P2P failed UI、viewer 失败文案和 close peer。
+- 影响：NAT mapping wait 的 timer owner 与超时动作 owner 分裂，和 connect failfast 默认路径收口后不一致。
+- 建议：让 `native-peer-controller.js::armPeerNatMappingWait()` 在未传外部 `onTimeout` 时使用默认超时处理：`prepareNatMappingWaitTimeout()` ready 判断、`setP2pStateForPeer(peerId, 'failed')`、viewer 文案和注入的 close peer；保留传入 `onTimeout` 的旧兼容签名。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变默认 7000ms、不改变 viewer 失败文案、不改变 close peer `{ clearRetryState: false }` 参数。
+- 处理结果：已处理。`native-peer-controller.js::armPeerNatMappingWait()` 现在在未传 `onTimeout` 时创建默认 NAT wait timeout callback，内部调用 `prepareNatMappingWaitTimeout()`、注入的 `setP2pStateForPeer()` / `setViewerConnectionState()` / `closePeerConnection()`；传入 `onTimeout` 时保留原兼容行为。`app-native-overrides.js` 向 peer controller 注入 `setP2pStateForPeer` 与 `setViewerConnectionState`，并在映射候选发送完成后直接调用 `nativePeerController.armPeerNatMappingWait(peerId)`，不再传本地 timeout callback。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+
+### ARCH-SPLIT-P1-505 connect failfast 超时动作仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-peer-controller.js::armPeerConnectFailfast()` 已持有 connect failfast timer 和默认 15000ms，但 `app-native-overrides.js::armPeerConnectFailfast()` 仍负责超时后调用 `prepareConnectFailfastTimeout()`、按 P2P state machine 分类失败原因，并触发 `finalizeP2pFailureWithNatMapping(..., 'connect-failfast')`。
+- 影响：connect failfast 的 timer owner 与超时动作 owner 分裂，R5 里 peer controller 仍不能完整拥有首连失败路径。
+- 建议：让 `native-peer-controller.js::armPeerConnectFailfast()` 在未传外部 `onTimeout` 时使用默认超时处理：ready 判断、失败原因分类、调用注入的 `finalizeP2pFailureWithNatMapping()`；保留传入 `onTimeout` 的旧兼容签名。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变默认 15000ms、不改变失败原因文案、不改变 `finalizeP2pFailureWithNatMapping(peerId, reason, 'connect-failfast')` 调用。
+- 处理结果：已处理。`native-peer-controller.js::armPeerConnectFailfast()` 现在在未传 `onTimeout` 时创建默认 failfast callback，内部调用 `prepareConnectFailfastTimeout()`、`classifyConnectionFailure(meta)` 和注入的 `finalizeP2pFailureWithNatMapping()`；传入 `onTimeout` 时保留原兼容行为。`app-native-overrides.js` 删除本地 `armPeerConnectFailfast()` helper，create peer 后直接调用 `nativePeerController.armPeerConnectFailfast(peerId)`。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+
+### ARCH-SPLIT-P1-504 peer recovery request 动作编排仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-peer-controller.js::preparePeerRecoveryRequest()` 已经持有 recovery decision 和 `viewer-reconnect-ready` payload 构造，但 `app-native-overrides.js::requestPeerRecovery()` 仍负责写 `peer:recovery-requested` 日志、执行 host force offer、关闭 viewer upstream peer 并发送 reconnect-ready。
+- 影响：disconnected recovery 的关键动作编排仍回到 legacy override，R5 无法证明 peer recovery request 已由 controller 拥有完整生命周期入口。
+- 建议：在 `native-peer-controller.js` 新增 `requestPeerRecovery(peerId, reason, options)`，由 controller 内部调用 `preparePeerRecoveryRequest()` 并执行日志、host force offer、viewer reconnect-ready 发送；room snapshot、create offer 和 close peer 通过依赖注入提供。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 attempt/source 参数、不改变 `peer:recovery-requested` 日志、不改变 host `{ force: true, reconnect: true }` offer、不改变 viewer close peer 的 `{ clearRetryState: false }` 参数和 reconnect-ready payload。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `requestPeerRecovery(peerId, reason, requestOptions)`，内部复用 `preparePeerRecoveryRequest()`，通过 `logNativeStep()` 输出原日志；host-downstream 通过注入的 `createOffer()` 执行强制 offer，viewer-upstream 通过注入的 `closePeerConnection()` 关闭旧 peer 后复用 `sendSignalMessage()` 发送 reconnect-ready。`app-native-overrides.js` 向 peer controller 注入 recovery room snapshot、createOffer 和 closePeerConnection；旧 `requestPeerRecovery()` 收薄为只传 `attemptId/source` 的兼容委托。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+
+### ARCH-SPLIT-P1-503 peer close cleanup effects 消费仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-peer-controller.js::preparePeerCloseCleanup()` 已经输出顺序化 cleanup effects，但 `app-native-overrides.js::applyPeerCloseCleanupEffects()` 仍逐项解释 `deleteNativePeerHandle/deletePeerConnection/deletePeerMeta/clearPendingRemoteCandidates/clearSignalState/clearTimer/renderDiagnostic` 等 effect。
+- 影响：peer close lifecycle 的执行串仍留在 legacy override；R5 只能证明 controller 负责决策，不能证明 close cleanup 的动作编排 owner 已迁出。
+- 建议：把 cleanup effects consumer 迁入 `native-peer-controller.js`，通过注入回调执行 renderer map/meta 删除、viewer wait timer 清理和诊断刷新；`closeNativePeerConnectionImpl()` finally 直接调用 controller。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 effects 顺序、不改变 `{ clearRetryState }` 语义、不改变 viewer upstream wait timer 清理、不改变诊断刷新时机。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `applyPeerCloseCleanupEffects(peerId, cleanupDecision)`，正常路径消费 `cleanupDecision.effects`，无 effects 时按 `buildPeerCloseCleanupEffects()` 兼容旧 flags；renderer peer/map meta 删除、viewer upstream offer wait timer、viewer reconnect peer reset 和 P2P 诊断刷新通过注入回调执行。`app-native-overrides.js` 删除本地 cleanup effects 解释器，`closeNativePeerConnectionImpl()` 的 finally 直接调用 `nativePeerController.applyPeerCloseCleanupEffects(peerId, closeCleanupDecision)`。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+
+### ARCH-SPLIT-P1-502 mediaEngine signal 编排仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-peer-controller.js` 已经持有 `handleLocalSignalEvent()`、candidate payload 决策和 `sendSignalMessage()`，但 `app-native-overrides.js::forwardNativeMediaSignal()` 仍负责 relay candidate block 日志、本地 candidate 统计和最终发送。
+- 影响：mediaEngine signal 入口仍是 legacy override 的一段业务编排，导致 R5 的“peer controller 只通过 roomClient 发信令”不能完全成立，也保留了无调用的 `rememberLocalIceCandidateForPeer()` facade。
+- 建议：在 `native-peer-controller.js` 新增 `handleLocalSignalEventAndSend(params, options)`，由 controller 内部串联 signal state/backlog、candidate payload 决策、blocked relay 日志、本地 candidate 统计和最终信令发送；`app-native-overrides.js` 只保留 signal 事件转交。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 relay candidate block 日志 scope/category、不改变本地 candidate 统计前的 P2P gathering UI 写入、不改变最终 `sendSignalMessage()` facade。
+- 处理结果：已处理。`native-peer-controller.js` 新增并导出 `handleLocalSignalEventAndSend(params, messageOptions)`，内部复用 `handleLocalSignalEvent()`、`logNativeStep()`、`rememberLocalIceCandidate()` 和 `sendSignalMessage()`；新增 `rememberLocalIceCandidateForSignal()` 保持原本 meta gate 与 P2P `gathering` UI 写入。`app-native-overrides.js::forwardNativeMediaSignal()` 收薄为 `nativePeerController.handleLocalSignalEventAndSend(params, { roomId: currentRoomId })`，并删除无调用的 `rememberLocalIceCandidateForPeer()`。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+
+### ARCH-SPLIT-P1-500 stale upstream cleanup 仍通过 native override 回调
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-message-controller.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`offer` 主体和 viewer upstream switch 决策已经迁入 `native-peer-message-controller.js`，但当 `viewerUpstreamSwitch.staleCleanupRequired` 为真时，旧上游 peer 清理由 `closeStaleViewerUpstreamPeers()` 回调回 `app-native-overrides.js` 执行。
+- 影响：offer 切换后的旧上游清理仍由 legacy override 持有，导致 peer message controller 不能完整拥有 offer 后续 recovery/cleanup 动作，也让 stale cleanup 的时序继续分散在两个文件中。
+- 建议：把 stale upstream cleanup 迁入 `native-peer-message-controller.js`，直接调用 `nativePeerController.scheduleStalePeerCleanup()`，通过已注入的 `closePeerConnection()` 执行旧 peer 关闭；删除 `app-native-overrides.js` 的回调注入和同名本地函数。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 250ms 延迟、不改变 active upstream 判定、不改变关闭旧 peer 时的 `{ clearRetryState: true }` 参数。
+- 处理结果：已处理。`native-peer-message-controller.js` 新增 `closeStaleViewerUpstreamPeers(activePeerId)`，在 offer answer 创建完成后直接执行 stale cleanup；内部继续使用 `nativePeerController.scheduleStalePeerCleanup()`、`getUpstreamPeerId` 和 `closePeerConnection(peerId, { clearRetryState: true })`。`app-native-overrides.js` 删除 `closeStaleViewerUpstreamPeers` 注入和本地函数，旧 offer wrapper 仍仅委托 `nativePeerMessages.handleOfferMessage()`。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-message-controller.js`、`npm run check:renderer-syntax`、`npm run check:room-client-dispatcher`、`npm run check:renderer-bridge`、`npm run check:architecture`、`npm run check:logging`，均通过。`git diff --check -- server/public/app-native-overrides.js server/public/native/native-peer-message-controller.js docs/RENDERER_SPLIT_MAP.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md docs/CODE_AUDIT_FINDINGS.md` 仅提示 `docs/CODE_AUDIT_FINDINGS.md` 与 `server/public/app-native-overrides.js` 的 LF/CRLF 转换警告，无 whitespace error；字面换行转义检查无命中。
+### ARCH-SPLIT-P1-525 P2P failure/NAT finalization public helper 泄漏到 legacy override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`scripts/check-renderer-bridge.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-peer-controller.js` 已经持有 P2P failure finalize、NAT mapping fallback、final apply 的底层 helper，但 `app-native-overrides.js::finalizeP2pFailureWithNatMapping()` 仍直接调用 `prepareP2pFailureFinalization()`、`attemptLastChanceNatMapping()` 和 `finalizeP2pConnectionFailureAndApply()`，导致 failure 收尾业务步骤继续通过 public API 泄漏给 legacy 层。
+- 影响：R5 peer controller 不能证明自己完整拥有 failfast/ICE failed 后的 failure lifecycle；legacy override 仍可绕过 controller 的内部顺序和门禁，后续重构时容易再次出现 timer owner、NAT fallback owner、final failed UI owner 分裂。
+- 建议：在 `native-peer-controller.js` 新增唯一公共入口 `finalizeP2pFailureWithNatMapping(peerId, reason, source, options)`，内部串联 prepare、clear connect timeout、NAT fallback 和 final apply；`app-native-overrides.js` 只传入 `roomId`；bridge 检查禁止 legacy 层调用内部 helper，并禁止 controller public API 泄漏这些 helper。
+- 修改意见：按建议实施 Renderer R5/R7 切片，不改变 NAT mapping 6000ms 超时、不改变 mapped ICE candidate 发送、不改变 `peer-connect-failed` 日志 payload、不改变 viewer 失败文案和 close peer `{ clearRetryState: false }` 语义。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `finalizeP2pFailureWithNatMapping()`，`armPeerConnectFailfast()` 默认路径和 `applyPeerStateEffects()` 的 `finalizeP2pFailure` effect 均改为调用 controller 内部入口；controller return API 删除 `prepareP2pFailureFinalization`、`finalizeP2pConnectionFailure`、`finalizeP2pConnectionFailureAndApply`、`attemptLastChanceNatMapping` 四个内部 helper，仅暴露统一 finalization facade。`app-native-overrides.js` 删除本地 `attemptLastChanceNatMapping()`，`finalizeP2pFailureWithNatMapping()` 收薄为一行 controller 委托并只补充当前 `roomId`。`check-renderer-bridge.js` 新增 legacy forbidden snippet 与 public API leak gate，防止 P2P failure/NAT finalization 内部 helper 回流。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。
+### ARCH-SPLIT-P1-526 peer 创建 lifecycle 仍由 legacy override 串联底层 helper
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`scripts/check-renderer-bridge.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`app-native-overrides.js::createNativePeerConnectionImpl()` 仍直接串联 `clearSignalState()`、`createPeerHandle()`、legacy `peerConnections.set()`、`initializePeerMetaForHandle()`、P2P gathering UI 和 connect failfast timer，导致 peer 创建 lifecycle 的第一步仍由 legacy override 编排。
+- 影响：R5 peer controller 仍不能完整拥有 peer create -> meta init -> UI gathering -> failfast arm 的生命周期入口；底层 handle/meta/signal helper 作为 public API 暴露，也给后续回退到 legacy 编排留下入口。
+- 建议：在 `native-peer-controller.js` 新增高层 `createPeerConnection(peerId, isInitiator, kind, options)`，内部完成 signal clear、handle create、legacy map 同步、meta 初始化、P2P gathering 和 failfast arm；`app-native-overrides.js` 只传入当前 media manifest 默认值；bridge gate 禁止底层 helper public leak。
+- 修改意见：按建议实施 Renderer R5/R7 切片，不改变 `encodedMediaDataChannel` 默认值、不改变 `currentMediaManifest` 兜底、不改变 P2P `gathering` 状态、不改变 connect failfast arm 时机。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `createPeerConnection()` 高层入口，内部调用私有 `clearSignalState()`、`createPeerHandle()`、`initializePeerMetaForHandle()` 并通过注入的 `setPeerConnection()` 同步 legacy `peerConnections` map，再设置 P2P gathering 并 arm failfast。controller public API 删除 `initializePeerMetaForHandle`、`createPeerHandle`、`clearSignalState` 和无外部调用的 `setPeerHandle`，仅暴露高层 create facade。`app-native-overrides.js::createNativePeerConnectionImpl()` 收薄为一行 controller 委托。`check-renderer-bridge.js` 新增 legacy 调用和 public API leak gate，防止底层 peer create helper 回流。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`npm run check:renderer-bridge`，均通过；后续完整快速门禁见本轮验证记录。
+### ARCH-SPLIT-P1-527 peer close lifecycle 仍由 legacy override 串联底层 helper
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`scripts/check-renderer-bridge.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`app-native-overrides.js::closeNativePeerConnectionImpl()` 仍直接取 peer handle、检查 legacy peer map、调用 `preparePeerCloseCleanup()`、detach peer surface、`closePeer()` 和 `applyPeerCloseCleanupEffects()`，导致 peer close lifecycle 的动作顺序继续由 legacy override 编排。
+- 影响：peer controller 虽然已经持有 cleanup decision/effects consumer，但 close 的高层入口仍分裂在 legacy 层；create lifecycle 收口后，close lifecycle 不对称，后续修改 surface detach、mediaEngine close 或 cleanup effects 顺序时容易再次跨文件耦合。
+- 建议：在 `native-peer-controller.js` 新增 `closePeerConnection(peerId, options)`，内部完成 handle 校验、cleanup decision、surface detach、mediaEngine close 和 cleanup effects；`app-native-overrides.js` 只保留兼容 wrapper；bridge gate 禁止 legacy 重新直接调用底层 close helper。
+- 修改意见：按建议实施 Renderer R5/R7 切片，不改变 unexpected renderer handle failfast、不改变 surface detach 在 mediaEngine close 前执行、不改变 cleanup effects 顺序、不改变 `{ clearRetryState }` 语义。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `closePeerConnection()` 高层入口，内部通过注入的 `getPeerConnection()` 保留 legacy unexpected handle failfast，通过 `getSessionRole()` / `getUpstreamPeerId()` 计算 cleanup context，调用私有 `preparePeerCloseCleanup()`，再执行 `surfaceController.detachPeerVideoSurface()`、私有 `closePeer()` 和私有 `applyPeerCloseCleanupEffects()`。controller public API 删除 `closePeer`、`preparePeerCloseCleanup`、`buildPeerCloseCleanupEffects`、`applyPeerCloseCleanupEffects`。`app-native-overrides.js::closeNativePeerConnectionImpl()` 收薄为一行 controller 委托。`check-renderer-bridge.js` 新增 close lifecycle 底层 helper 的 legacy 调用和 public API leak gate。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-bridge`，均通过；后续完整快速门禁见本轮验证记录。
+### ARCH-SPLIT-P1-528 closeAll/recreate peer 仍通过 legacy 注入 create/close 回调
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`scripts/check-renderer-bridge.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`clearNativePeerConnectionsImpl()` 仍向 `nativePeerController.closeAllPeers()` 注入单 peer close 回调；`recreateNativePeerForRemoteOffer()` 仍向 `recreatePeerForRemoteOffer()` 注入 close/create 回调。create/close lifecycle 已收进 controller 后，这些 callback 会重新把批量关闭和 remote offer recreate 的动作顺序拉回 legacy。
+- 影响：peer controller 虽然拥有单 peer create/close，但批量关闭和 offer recreate 仍依赖 legacy glue；后续调整 close cleanup、create manifest 或 stale peer recreate 顺序时仍需跨文件同步。
+- 建议：让 `native-peer-controller.js::closeAllPeers()` 无外部 close 回调时默认调用内部 `closePeerConnection()`；让 `recreatePeerForRemoteOffer()` 无外部 create/close 回调时默认调用内部 `closePeerConnection()` 和 `createPeerConnection()`；legacy 只传业务参数 `options/kind/mediaManifest/existingHandle`。
+- 修改意见：按建议实施 Renderer R5/R7 切片，不改变 closeAll 返回的 `peerIds/closedPeerIds`，不改变 remote offer recreate 的 `kind: upstream`，不改变 `mediaManifest` 透传，不改变 existing handle 判定。
+- 处理结果：已处理。`native-peer-controller.js::closeAllPeers()` 现在默认逐个调用内部 `closePeerConnection()`，保留外部 `closePeer` 回调兼容；`recreatePeerForRemoteOffer()` 现在默认用内部 `closePeerConnection()` 和 `createPeerConnection()` 完成关闭旧 peer 与创建 upstream peer，外部回调只作为兼容路径。`app-native-overrides.js::clearNativePeerConnectionsImpl()` 收薄为 `nativePeerController.closeAllPeers({ options })`，`recreateNativePeerForRemoteOffer()` 删除 create/close callback 注入，只传 `existingHandle/kind/mediaManifest`。`check-renderer-bridge.js` 新增相关 callback 回流 gate。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-bridge`，均通过；后续完整快速门禁见本轮验证记录。
+### ARCH-SPLIT-P1-529 runtime_registry 仍公开 current_*_session 兼容 facade
+
+- 位置：`media-agent/src/runtime_registry.h`、`media-agent/src/runtime_registry.cpp`、`media-agent/src/host_session_runtime.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：Host/Audio/OBS registry 已经推进到 map-backed `active_session()`，业务路径也已迁到 `active_*_session()`，但 `runtime_registry.h/cpp` 仍公开 `current_host_session/current_audio_session/current_obs_ingest_session` facade。
+- 影响：公共 runtime registry API 继续暴露 current 语义，会给新代码留下回退入口；后续多 session owner 选择和 session id 选择落地时，current/active 双语义会增加误用风险。
+- 建议：删除 `runtime_registry` 的 `current_*_session()` 声明和实现；`host_session_runtime.*` 仅保留旧 `prepare_current_*` / `stop_current_*` 等兼容函数名，但内部统一绑定 `active_*_session()`；边界门禁禁止 runtime_registry 再暴露 current facade。
+- 修改意见：按建议实施 M7 切片，不改变 Host/Audio/OBS 默认 active id，不改变旧 `host_session_runtime` current helper 函数名和 wire 行为，只删除 runtime registry 公开 current facade。
+- 处理结果：已处理。`runtime_registry.h/cpp` 删除 `current_host_session()`、`current_audio_session()`、`current_obs_ingest_session()` 六个重载；`host_session_runtime.cpp` 的 `bind_current_obs_ingest_session()`、`prepare_current_obs_ingest_session()`、`clear_current_obs_ingest_prepared()`、`start_current_obs_ingest_worker()`、`stop_current_obs_ingest_session()`、`reset_host_session_to_default_native(runtime_state, session)` 以及旧 current host capture wrapper 内部均改为调用 `active_host_session()` / `active_obs_ingest_session()`。`check-media-agent-boundary.js` 已把 `allowedCurrentSessionFacadeUsers` 收为空，并新增 runtime_registry current facade 暴露检查。media-agent ownership 计划和完成度审计已同步。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`npm run check:architecture`、`npm run check:logging`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 构建、media-agent unit test 和 smoke test 通过，编译输出仅包含 FFmpeg 头文件/弃用 API 的既有 warning。
+### ARCH-SPLIT-P1-530 Host/Audio/OBS registry 仍暴露 current_session/snapshot 兼容别名
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/src/runtime_registry.cpp`、`media-agent/tests/media_agent_unit_tests.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`runtime_registry` 公开 current facade 已删除后，`HostSessionRegistry` / `AudioSessionRegistry` / `ObsIngestSessionRegistry` 内部仍保留 `current_session()` 与 `snapshot()` 兼容别名，`runtime_registry` 的 snapshot facade 也仍通过 registry `.snapshot()` 读取。
+- 影响：registry owner 表面已经是 active session map，但公开 API 仍有 current/snapshot 双语义；后续业务层 session id 选择落地时，调用者仍可能绕过 runtime snapshot facade 直接依赖 registry 兼容别名。
+- 建议：删除三类 registry 的 `current_session()` / `snapshot()`；`runtime_registry` 的 `host_session_snapshot()` / `audio_session_snapshot()` / `obs_ingest_session_snapshot()` 直接返回 registry `active_session()`；单测改为验证 active session 和多 session 切换；边界门禁禁止 registry 重新暴露 current/snapshot alias。
+- 修改意见：按建议实施 M7 切片，不改变默认 active id，不改变 ensure/activate/session_count 行为，不改变 runtime snapshot facade 的对外函数名。
+- 处理结果：已处理。`session_registries.h` 删除 Host/Audio/OBS 三类 registry 的 `current_session()` 和 `snapshot()` 兼容别名；`runtime_registry.cpp` 的三类 snapshot facade 改为直接读取 `active_session()`；media-agent unit test 删除 current/snapshot alias 断言，保留 active session 默认状态和 secondary activation 覆盖。`check-media-agent-boundary.js` 新增 registry current/snapshot declaration gate，并把 direct registry facade 提示改为 `active_*_session()` / runtime snapshot facade。media-agent ownership 计划和完成度审计已同步。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`npm run check:architecture`、`npm run check:logging`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 构建、media-agent unit test 和 smoke test 通过。
+### ARCH-SPLIT-P1-531 Host/Audio/OBS 多 session 仅停留在 registry 测试能力，未接入业务 session id
+
+- 位置：`server/public/native/native-session-controller.js`、`media-agent/CMakeLists.txt`、`media-agent/src/runtime_registry.h`、`media-agent/src/runtime_registry.cpp`、`media-agent/src/agent_rpc_router.cpp`、`media-agent/tests/media_agent_unit_tests.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：Host/Audio/OBS registry 已具备 `ensure_session()` / `activate_session()`，但业务 RPC 路径仍只绑定默认 active session；renderer 也未确保 startHostSession/startAudioSession 请求带 `mediaSessionId`。
+- 影响：多 session 结构只有测试能力，真实开播仍无法按 media session owner 隔离 Host/Audio/OBS 状态；后续停止/重启/OBS 准备路径可能继续混用默认 session owner。
+- 建议：在 `runtime_registry` 暴露 Host/Audio/OBS activate facade；renderer startHostSession/startAudioSession 自动补 `mediaSessionId`；agent RPC 收到 `mediaSessionId` / `sessionId` 后激活对应 Host/Audio/OBS owner，并在每次命令处理时按当前 active owner 创建 controller/session facade，而不是在 RPC loop 启动时永久绑定默认 session。
+- 修改意见：按建议实施 M7/M4 切片，不改变缺 `mediaSessionId` 时的默认 active id 行为，不改变 JSON-RPC method 名，不改变 start/stop result payload shape。
+- 处理结果：已处理。`runtime_registry.h/cpp` 新增 `activate_host_session()`、`activate_audio_session()`、`activate_obs_ingest_session()` facade；`native-session-controller.js` 的 `startHostSession()` / `startAudioSession()` 在请求缺少 `mediaSessionId/sessionId` 时补充当前 `ensureMediaSessionId()`。`agent_rpc_router.cpp` 新增 session owner id 提取，`startHostSession` / `prepareObsIngest` / `stopHostSession` 激活 Host+Audio+OBS owner，`startAudioSession` / `stopAudioSession` 激活 Audio owner；HostSessionController、ObsIngestSession、HostAudioDispatchSession 改为在对应 RPC 分支内按当前 active owner 创建，避免 RPC loop 启动时永久绑定默认 session。media-agent unit test 新增 runtime activate facade、active id 和 session count 覆盖，`media-agent/CMakeLists.txt` 已把 `runtime_registry.cpp` 加入 unit test 目标以覆盖这些 facade。`check-media-agent-boundary.js` 新增 runtime activate facade 存在性门禁。media-agent ownership 计划和完成度审计已同步。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`node --check server/public/native/native-session-controller.js`、`npm run check:media-agent-boundary`、`npm run check:renderer-syntax`、`npm run check:architecture`、`npm run check:logging`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 构建、media-agent unit test 和 smoke test 通过。
+### ARCH-SPLIT-P1-532 stop/prepare 请求未显式透传 mediaSessionId
+
+- 位置：`server/public/native/native-session-controller.js`、`server/public/app-native-overrides.js`、`server/public/quality-settings.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`startHostSession()` / `startAudioSession()` 已补 `mediaSessionId`，但 `stopHostSession()` / `stopAudioSession()` 和 OBS prepare 请求仍可能不带 session id，agent 端只能使用当前 active owner 或默认 owner。
+- 影响：多 session owner 接入后，停止或 OBS prepare 若缺少显式 session id，仍可能在重启/并发/旧请求残留情况下作用到错误 active session。
+- 建议：renderer stop wrapper 和 OBS prepare 都补齐当前 media session id；OBS prepare 若尚未创建 session id，则通过 native session controller 的 ensure hook 创建并透传。
+- 修改意见：按建议实施 Renderer R6/M7 衔接切片，不改变 mediaEngine IPC method 名，不改变 prepareObsIngest 原 `refresh/port` 字段，不改变 stop fallback 行为。
+- 处理结果：已处理。`native-session-controller.js::stopHostSession()` / `stopAudioSession()` 现在与 start wrapper 一样，在请求缺少 `mediaSessionId/sessionId` 时补 `ensureMediaSessionId()`。`app-native-overrides.js` legacy global bindings 新增 `__vdsGetCurrentHostMediaSessionId` 与 `__vdsEnsureCurrentHostMediaSessionId`。`quality-settings.js` 的 OBS prepare 请求会调用 ensure/get hook 并把 `mediaSessionId` 随 `refresh/port` 一起传给 mediaEngine。media-agent ownership 计划和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/quality-settings.js`、`npm run check:renderer-syntax`、`npm run check:architecture`、`npm run check:logging`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 构建、media-agent unit test 和 smoke test 通过。
+### ARCH-SPLIT-P1-533 mediaSessionId owner 激活缺少 smoke 级证明
+
+- 位置：`scripts/smoke-media-agent.ps1`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：Host/Audio/OBS active owner 已接入 `mediaSessionId`，但 smoke test 只验证 session id/count 字段存在且不小于 1，没有证明 JSON-RPC 请求携带 `mediaSessionId` 后会激活对应 Host/Audio/OBS owner。
+- 影响：多 session owner 的关键业务路径只能由单测和静态门禁间接证明，Release smoke 无法防止 agent RPC loop 重新退回默认 active session。
+- 建议：扩展 smoke：`prepareObsIngest` 携带固定 `mediaSessionId`，随后再请求 `getStatus/getStats`，断言 `hostSessionId/audioSessionId/obsIngestSessionId` 均等于该 id，并断言三类 session count 至少为 2。
+- 修改意见：按建议实施验证切片，不改变 smoke 原有 ping/capabilities/status/stats/unknown/bad-request/OBS prepare 覆盖。
+- 处理结果：已处理。`scripts/smoke-media-agent.ps1` 新增 `$smokeMediaSessionId = 'media-smoke-session'`，`prepareObsIngest` 请求携带该 `mediaSessionId`，并新增 id=8 `getStatus`、id=9 `getStats` 的 post-activation 断言：三类 session id 必须等于 smoke id，三类 session count 必须 >= 2。media-agent ownership 计划和完成度审计已同步。
+- 验证结果：已执行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\smoke-media-agent.ps1`、`npm run check:architecture`、`npm run check:logging`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 构建、media-agent unit test 和 smoke test 通过。
+### ARCH-SPLIT-P1-534 room-created 退房仍在 room message controller 手拼 wire payload
+
+- 位置：`server/public/native/native-room-message-controller.js`、`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-room-message-controller.js::handleRoomCreatedMessage()` 在 stale ACK 和 OBS 等待推流两条路径里仍手写 `{ type: 'leave-room' }` 并依赖 legacy 注入的通用 `sendMessage()`。
+- 影响：`room-client.js` 已经拥有 `buildLeaveRoomMessage()` / `leaveRoom()`，但 room-created handler 仍保留信令 wire 细节，削弱 R2/R7 “房间信令 payload 由 room-client 统一构造”的边界。
+- 建议：让 room message controller 只调用 `roomClient.leaveRoom()`，删除 native override 对该 controller 的通用 `sendMessage` 注入，并在 dispatcher 门禁里禁止 room message controller 再手拼 `type: 'leave-room'`。
+- 修改意见：按建议实施 Renderer R2/R7 小切片，不改变 stale ACK 退房条件、不改变 OBS 等待推流时退房条件、不改变 `queueIfDisconnected: false`。
+- 处理结果：已处理。`native-room-message-controller.js` 新增 `sendLeaveRoom(optionsForLeave)`，两条 room-created 退房路径均改为调用 `roomClient.leaveRoom()` 并继续透传 `sendOptions: { queueIfDisconnected: false }`；`app-native-overrides.js` 删除 nativeRoomMessages 的通用 `sendMessage` 注入；`check-room-client-dispatcher.js` 新增门禁，禁止 room message controller 出现手拼 `type: 'leave-room'`，并要求存在 `sendLeaveRoom()` 到 `roomClient.leaveRoom()` 的委托。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/native/native-room-message-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。
+### ARCH-SPLIT-P1-535 viewer-reconnect-ready payload 构造仍散落在 native 层
+
+- 位置：`server/public/room-client.js`、`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`server/public/native/native-peer-message-controller.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`viewer-reconnect-ready` 在 upstream offer timeout、peer recovery 和 chain reconnect 路径里分别手拼 payload，native peer message controller 还依赖通用 `sendMessage` 注入。
+- 影响：链路重选的关键控制信令没有统一 owner，后续调整字段、校验或队列策略时容易出现三处不一致，也让 R2/R5 的“room-client/peer controller 边界”继续泄漏 wire 细节。
+- 建议：在 `room-client.js` 增加 `buildViewerReconnectReadyMessage()` / `sendViewerReconnectReady()`；native timeout、peer message controller 和 peer recovery 路径均调用该 facade；门禁禁止 native override / peer message controller 再手拼 `type: 'viewer-reconnect-ready'`。
+- 修改意见：按建议实施 Renderer R2/R5/R7 小切片，不改变 `roomId/clientId/sessionToken/chainPosition/upstreamPeerId/failedUpstreamPeerId/reason` 字段语义，不改变默认 queue 行为。
+- 处理结果：已处理。`room-client.js` 新增 viewer reconnect-ready builder/facade；upstream offer timeout 改为 `roomClient.sendViewerReconnectReady()`；`native-peer-message-controller.js` 的 chain reconnect 改为专用 helper 并删除通用 `sendMessage` 依赖；`native-peer-controller.js` 的 recovery path 改为输出 `reconnectReady` payload 并通过 roomClient facade 发送，缺 facade 时 failfast。`check-room-client-dispatcher.js` 新增 owner 门禁，要求 room-client 提供 builder/facade、要求 native controllers 通过 roomClient facade 发送，并禁止 native override / peer message controller 手拼该 type。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/room-client.js`、`node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-message-controller.js`、`node --check server/public/native/native-peer-controller.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。
+### ARCH-SPLIT-P1-536 viewer-ready payload 构造仍由 native stats controller 手拼
+
+- 位置：`server/public/room-client.js`、`server/public/native/native-stats-controller.js`、`server/public/app-native-overrides.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：viewer 媒体 ready 后，`native-stats-controller.js::applyViewerMediaReadyState()` 仍手写 `{ type: 'viewer-ready' }`，并依赖 `app-native-overrides.js` 注入的通用 `sendMessage()` 发送。
+- 影响：viewer ready 与 viewer reconnect-ready 同属 viewer 控制信令，但 payload owner 分裂；后续调整 session token、chain position 或发送队列策略时容易出现 ready/reconnect 两条路径不一致。
+- 建议：在 `room-client.js` 增加 `buildViewerReadyMessage()` / `sendViewerReady()`，native stats controller 只通过 roomClient facade 发送；删除 stats controller 的通用 `sendMessage` 注入；dispatcher 门禁禁止回退。
+- 修改意见：按建议实施 Renderer R2/R3 小切片，不改变 viewer ready 触发条件、不改变 `roomId/clientId/sessionToken/chainPosition` 字段语义、不改变默认 queue 行为。
+- 处理结果：已处理。`room-client.js` 新增 viewer-ready builder/facade；`native-stats-controller.js` 注入 `roomClient` 并新增 `sendViewerReady()` helper，媒体 ready 后改为调用 `roomClient.sendViewerReady()`；`app-native-overrides.js` 删除 nativeStats 的通用 `sendMessage` 注入；`check-room-client-dispatcher.js` 新增门禁，要求 room-client 持有 viewer-ready builder/facade、要求 nativeStats 注入 roomClient，并禁止 native override 手拼 viewer-ready 或重新注入通用 sendMessage。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/room-client.js`、`node --check server/public/native/native-stats-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。
+### ARCH-SPLIT-P1-537 native peer controller 仍保留 generic sendMessage fallback
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-peer-controller.js::sendSignalMessage()` 已支持 `options.roomClient.sendMessage()`，但 `app-native-overrides.js` 仍向 nativePeerController 注入通用 `sendMessage` fallback，controller 内部也保留 `options.sendMessage()` 回退。
+- 影响：R5 目标要求 peer controller 只通过 roomClient 发信令；generic callback 会让后续信令发送绕过 room-client 的 builder/facade、队列策略和门禁。
+- 建议：删除 nativePeerController 的 generic `sendMessage` 注入和 controller 内 fallback；保留 roomClient 注入，并用 dispatcher 门禁禁止 generic sendMessage 回流。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 offer/answer/ICE 的最终发送方法名，不改变 roomClient `sendMessage` 默认 queue 行为，不改变 viewer-ready/reconnect-ready facade。
+- 处理结果：已处理。`app-native-overrides.js` 删除 nativePeerController 的 `sendMessage: (message) => sendMessage(message)` 注入；`native-peer-controller.js::sendSignalMessage()` 删除 `options.sendMessage()` fallback，只接受 `roomClient.sendSignal()` / `roomClient.sendMessage()`；`check-room-client-dispatcher.js` 新增 nativePeerController 注入块门禁，要求存在 `roomClient` 注入并禁止 generic sendMessage 注入回流。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。
+### ARCH-SPLIT-P1-538 native session controller 仍手拼 create-room wire payload
+
+- 位置：`server/public/native/native-session-controller.js`、`scripts/check-room-client-dispatcher.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-session-controller.js::buildHostCreateRoomMessage()` 仍返回 `{ type: 'create-room', ... }`，虽然最终发送已经走 `roomClient.createRoom()`。
+- 影响：create-room wire payload owner 仍分裂在 native session controller 与 room-client 之间；后续调整 create-room 字段或校验时仍可能出现双处不一致。
+- 建议：native session controller 只构造 `roomClient.createRoom()` 的 options，不写 `type`；`type: 'create-room'` 只允许出现在 `room-client.js::buildCreateRoomMessage()`；dispatcher 门禁禁止回退。
+- 修改意见：按建议实施 Renderer R2/R6 小切片，不改变 `clientId/publicListing/mediaManifest/timeoutMs` 语义，不改变 create-room 发送前等待 WebSocket 和释放 pending UI 的顺序。
+- 处理结果：已处理。`buildHostCreateRoomMessage()` 改为 `buildHostCreateRoomOptions()`，返回不含 `type` 的 create-room options；`createHostRoom()` 继续等待 WebSocket、调用注入的 `sendHostCreateRoom(createRoomOptions)` 并释放 pending UI；controller public API 同步导出新名称。`check-room-client-dispatcher.js` 新增 native session controller 源码门禁，禁止出现 `type: 'create-room'`，并禁止 `buildHostCreateRoomMessage` 名称回流。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check scripts/check-room-client-dispatcher.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。
+### ARCH-SPLIT-P1-539 surface stats snapshot 聚合仍持有 mutable runtime 权限
+
+- 位置：`media-agent/src/session_registries.h`、`media-agent/src/runtime_registry.h`、`media-agent/src/runtime_registry.cpp`、`media-agent/src/surface_snapshot_aggregator.h`、`media-agent/src/surface_snapshot_aggregator.cpp`、`media-agent/src/surface_state_json.h`、`media-agent/src/surface_state_json.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`surface_session_stats_json()` 是只读 stats 聚合，但签名仍接收 `AgentRuntimeState&`，并通过 mutable `for_each_surface()` 迭代 `SurfaceAttachmentState&`；`surface_attachment_json()` 也只有 mutable overload。
+- 影响：只读 stats 聚合仍拥有写 runtime/surface 的权限，和 M3/M7 的 snapshot 聚合 owner 边界不一致；后续修改 surface JSON 时容易把 refresh/写状态副作用混入 stats 输出。
+- 建议：为 SurfaceSessionRegistry/runtime_registry 增加 const surface 遍历 facade；`surface_session_stats_json()` 改为 `const AgentRuntimeState&`；`surface_attachment_json()` 增加 const overload 专门用于只读格式化，mutable overload 保留给 attach/update result 刷新状态后复用 const formatter；边界门禁固化。
+- 修改意见：按建议实施 M3/M7 小切片，不改变 attach/update/detach result 的状态刷新行为，不改变 `getStats.surfaces[]` JSON shape。
+- 处理结果：已处理。`SurfaceSessionRegistry` 和 `runtime_registry` 新增 const `for_each_surface()` overload；`surface_session_stats_json()` 改为接收 `const AgentRuntimeState&` 并遍历 `const SurfaceAttachmentState&`；`surface_state_json` 新增 const `surface_attachment_json()` formatter，原 mutable overload 继续执行 peer/runtime sync 或 surface refresh 后委托 const formatter；`check-media-agent-boundary.js` 新增 surface snapshot const 签名、const surface iteration 和 const formatter 门禁。media-agent ownership 计划和完成度审计已同步。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:architecture`、`npm run check:logging`，均通过；Release 构建、media-agent unit test 和 smoke test 通过。
+### ARCH-SPLIT-P1-544 renderer viewer/room 状态写入仍散落在 native override 注入对象
+
+- 位置：`server/public/native/native-renderer-state-controller.js`、`server/public/app-native-overrides.js`、`server/public/index.html`、`scripts/check-renderer-entry.js`、`scripts/check-renderer-bridge.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`app-native-overrides.js` 向 room/stats/peer message controllers 注入的 `setViewerRoomState`、`setHostRoomState`、`setSessionRoomState`、`setViewerResumeState`、`setViewerMediaState`、`markViewerRoomJoinedPending` 等回调仍各自手写多字段 legacy 状态赋值。
+- 影响：viewer/room 状态 patch 的 ownership 分散在 override 注入对象中，后续迁到 `VDS.state` 或更薄 native entry 时容易漏字段，也让 R2/R7 的“状态机从 UI/legacy glue 剥离”继续卡在最后一层。
+- 建议：新增 `native-renderer-state-controller` facade，集中承接 legacy renderer room/viewer 状态 patch；override 只提供一个 `applyPatch` 写入口；bridge 门禁禁止多字段 viewer/room 状态 setter 回流到 override。
+- 修改意见：按建议实施 Renderer R2/R7 小切片，不改变现有 legacy 变量权威来源，不改变 room/peer message handler 行为，不改变 `VDS.state` 同步时序。
+- 处理结果：已处理。新增 `server/public/native/native-renderer-state-controller.js` 并加入 `index.html` 传统 script 顺序；`app-native-overrides.js` 新增 `applyNativeRendererStatePatch()` 单入口，并创建 `nativeRendererState` controller；room/stats/peer message controller 注入的 viewer/room/media 状态 setter 改为调用 facade；stop/OBS reset 路径的 viewer media 状态清理也改为 facade；`check-renderer-entry.js` 更新到 21 个脚本；`check-renderer-bridge.js` 新增门禁，要求 override 创建 nativeRendererState，并禁止关键 viewer/room 状态 setter 或直接 reset 赋值回流。拆分地图和完成度审计已同步。
+- 验证结果：已执行 `node --check server/public/native/native-renderer-state-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-entry`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:architecture`、`npm run check:logging`，均通过；`git diff --check -- server/public/native/native-renderer-state-controller.js server/public/app-native-overrides.js server/public/index.html scripts/check-renderer-entry.js scripts/check-renderer-bridge.js` 无 whitespace error，仅有既有 LF/CRLF 提示。
+### ARCH-SPLIT-P1-541 RPC router 仍直接承担 Host/Audio/OBS owner 激活策略
+
+- 位置：`media-agent/src/agent_rpc_router.cpp`、`media-agent/src/session_owner_activation.h`、`media-agent/src/session_owner_activation.cpp`、`media-agent/CMakeLists.txt`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`agent_rpc_router.cpp` 在 start/stop/prepare RPC 分支里仍直接解析 `mediaSessionId/sessionId` 并决定激活 Host、Audio、OBS 哪些 owner。
+- 影响：RPC router 应只负责 method 分发和调用 controller；把 owner 激活组合写在 router 内，会让后续多 session、多进程或 DLL 边界继续依赖分发层细节，也容易在新增 RPC 时绕过统一激活策略。
+- 建议：新增独立 `session_owner_activation` helper，集中解析 request session id，并提供 `activate_media_owner_sessions_from_request()` / `activate_audio_owner_session_from_request()`；RPC router 只调用 helper；边界门禁禁止业务文件直接调用底层 `activate_host_session()` / `activate_audio_session()` / `activate_obs_ingest_session()`。
+- 修改意见：按建议实施 M7/M4 小切片，不改变 JSON-RPC method，不改变 request/response shape，不改变空 session id 时保持当前 active owner 的兼容行为。
+- 处理结果：已处理。新增 `session_owner_activation.h/cpp`，集中承接 `mediaSessionId/sessionId` 解析和 Host/Audio/OBS owner 激活组合；`agent_rpc_router.cpp` 删除本地 helper，start/stop/OBS prepare 分支只调用新的 owner activation facade；`CMakeLists.txt` 已把新增 cpp 纳入 agent 与 unit test 构建；`check-media-agent-boundary.js` 新增门禁，除 `runtime_registry.*` 声明/实现和 `session_owner_activation.cpp` 外，禁止业务文件直接调用 Host/Audio/OBS 底层 activate facade。media-agent ownership 计划和完成度审计已同步。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`git diff --check -- media-agent/src/agent_rpc_router.cpp media-agent/src/session_owner_activation.h media-agent/src/session_owner_activation.cpp media-agent/CMakeLists.txt scripts/check-media-agent-boundary.js`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 构建、media-agent unit test 和 smoke test 通过。
+### ARCH-SPLIT-P1-542 RPC router 仍直接绑定 active owner session 实例
+
+- 位置：`media-agent/src/agent_rpc_router.cpp`、`media-agent/src/agent_rpc_session_bindings.h`、`media-agent/src/agent_rpc_session_bindings.cpp`、`media-agent/CMakeLists.txt`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-541 已把 session id 激活策略移出 router，但 `agent_rpc_router.cpp` 仍通过本地 helper 直接调用 `active_obs_ingest_session()`、`active_host_session()`、`active_audio_session()` 和 `make_obs_ingest_runtime_access()` 来绑定具体 owner 实例。
+- 影响：RPC router 仍知道 active owner 的绑定细节，和“router 只负责分发，owner/session 绑定由专门 facade 管”的 M7 方向不一致；后续如果 active session 切换、归档或多进程化，router 仍会是修改点。
+- 建议：新增 `agent_rpc_session_bindings` facade，集中创建当前 active `ObsIngestSession` 和 `HostAudioDispatchSession` 绑定；router 只调用 binding facade；门禁禁止 router 直接调用 active session facade 或 OBS runtime access。
+- 修改意见：按建议实施 M7/M4 小切片，不改变 start/stop/prepare 的调用顺序，不改变 controller 类型和结果输出。
+- 处理结果：已处理。新增 `agent_rpc_session_bindings.h/cpp`，承接 active OBS ingest session 与 host audio dispatch session 的绑定；`agent_rpc_router.cpp` 删除本地 bind helper 和 active session/runtime access 调用，只保留 RPC method 分发、owner activation facade 调用和 controller method 调用；`CMakeLists.txt` 已把新增 cpp 纳入 agent 构建；`check-media-agent-boundary.js` 新增门禁，禁止 `agent_rpc_router.cpp` 重新直接绑定 active owner session。media-agent ownership 计划和完成度审计已同步。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`git diff --check -- media-agent/src/agent_rpc_router.cpp media-agent/src/agent_rpc_session_bindings.h media-agent/src/agent_rpc_session_bindings.cpp media-agent/CMakeLists.txt scripts/check-media-agent-boundary.js`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 构建、media-agent unit test 和 smoke test 通过。
+### ARCH-SPLIT-P1-543 OBS ingest runtime access 仍暴露隐式完整 runtime 重载
+
+- 位置：`media-agent/src/obs_ingest_session.h`、`media-agent/src/obs_ingest_session.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`ObsIngestSession(AgentRuntimeState&)` 已删除，主路径也显式传入 `HostSessionState&`，但 `make_obs_ingest_runtime_access(AgentRuntimeState&)` 隐式重载仍在公开头文件里暴露。
+- 影响：新代码仍可只传完整 runtime 生成 OBS runtime access，并在 helper 内隐式查找 active host session，削弱 M4/M7 要求的显式 host owner 绑定边界。
+- 建议：删除 `make_obs_ingest_runtime_access(AgentRuntimeState&)` 声明和实现，只保留 `make_obs_ingest_runtime_access(AgentRuntimeState&, HostSessionState&)`；门禁禁止公开头重新暴露隐式重载。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 OBS prepare/start/stop 行为，不改变现有显式调用点。
+- 处理结果：已处理。`obs_ingest_session.h/cpp` 删除隐式 `make_obs_ingest_runtime_access(AgentRuntimeState&)` overload；现有 `agent_rpc_session_bindings.cpp` 与 `host_session_runtime.cpp` 均继续调用显式 `make_obs_ingest_runtime_access(runtime_state, host_session)`；`check-media-agent-boundary.js` 新增门禁，禁止 `obs_ingest_session.h` 重新暴露单参数隐式 overload。media-agent ownership 计划和完成度审计已同步。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`git diff --check -- media-agent/src/obs_ingest_session.h media-agent/src/obs_ingest_session.cpp scripts/check-media-agent-boundary.js`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 构建、media-agent unit test 和 smoke test 通过；构建仍有 FFmpeg 头文件 C4244/C4819 和 `av_init_packet` C4996 既有 warning。
+### ARCH-SPLIT-P1-540 agent status/stats JSON builders 仍接收 mutable runtime
+
+- 位置：`media-agent/src/agent_status_json.h`、`media-agent/src/agent_status_json.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`capabilities_json()`、`build_status_json()`、`build_agent_ready_json()`、`build_stats_json()` 都是只读 JSON builder，但仍接收 `AgentRuntimeState&`。
+- 影响：`getStatus/getStats/getCapabilities` 已经先 refresh runtime，再构造只读 JSON；builder 保持 mutable runtime 会让刷新和格式化权限继续混在一起，不利于 M7 的 snapshot cache / read-only aggregation 边界。
+- 建议：四个 JSON builder 改为接收 `const AgentRuntimeState&`，依赖 runtime_registry 的 const facade 读取 peer transport、FFmpeg probe、Host/Audio/OBS snapshot、surface/peer snapshot；边界门禁固化只读签名。
+- 修改意见：按建议实施 M7 小切片，不改变 JSON wire shape，不改变 `getStatus/getStats/getCapabilities` 先 refresh 再输出的行为。
+- 处理结果：已处理。`agent_status_json.h/cpp` 四个入口均改为 `const AgentRuntimeState&`；现有 `agent_lifecycle` 仍先调用 `refresh_agent_runtime_state(state)`，随后只读构造 JSON；`check-media-agent-boundary.js` 新增签名门禁，要求四个 builder 保持 const runtime。media-agent ownership 计划和完成度审计已同步。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:architecture`、`npm run check:logging`，均通过；Release 构建、media-agent unit test 和 smoke test 通过。
+
+### ARCH-SPLIT-P1-545 native session create-room helper 命名漂移与坏字面量污染
+
+- 位置：`server/public/native/native-session-controller.js`、`scripts/check-room-client-dispatcher.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-session-controller.js` 在 session/room 边界收口后仍有 create-room helper 命名漂移风险，门禁要求 `buildHostCreateRoomOptions(options = {})`，但清理过程中曾保留旧 `buildHostCreateRoomMessage()` 语义；同时文件内两处状态文案被坏 UTF-8 字面量污染，直接阻断 `node --check`。
+- 影响：create-room options owner 与 `room-client` 门禁不一致，会让 R2/R6 的房间创建边界回退；坏字面量会导致 native session controller 无法加载。
+- 建议：统一暴露 `buildHostCreateRoomOptions(options = {})`，只返回不含 `type` 的 room-client options；修复坏 UTF-8 状态文案，并用 `check:room-client-dispatcher` 固化命名门禁。
+- 修改意见：按建议实施 Renderer R2/R6 小切片，不改变 create-room wire payload，不改变 host start/OBS start 行为。
+- 处理结果：已处理。`createNativeCaptureHostRoom()` 已改为调用 `buildHostCreateRoomOptions(context)`；helper 签名统一为 `buildHostCreateRoomOptions(options = {})`，不再出现 `buildHostCreateRoomMessage`；两处损坏的中文状态文案已恢复为正常 UTF-8。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`npm run check:room-client-dispatcher`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+
+### ARCH-SPLIT-P1-546 stop-share direct wrapper 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：stop-share 流程中 `beginNativeStopShare()` 只是转发到 `nativeSessionController.beginStopShare()`，但仍作为 legacy direct wrapper 留在 `app-native-overrides.js`。
+- 影响：R6/R7 的 stop-share lifecycle owner 已在 native session controller，但 legacy wrapper 让入口表面上仍像由 override 持有，后续维护时容易继续把 stop-share 前置状态写回 legacy 文件。
+- 建议：删除 `beginNativeStopShare()` wrapper，在 `stopScreenShare()` 内直接调用 `nativeSessionController.beginStopShare(...)`；bridge 门禁禁止 wrapper 回流。
+- 修改意见：按建议实施 Renderer R6/R7 小切片，不改变 stop-share 参数、不改变 cleanup/finalize 顺序、不改变 UI 文案。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `beginNativeStopShare()`，`stopScreenShare()` 直接调用 `nativeSessionController.beginStopShare({ peerCount, hasRoom, sessionRole })`；`check-renderer-bridge.js` 新增 `function beginNativeStopShare(` 防回退扫描。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-bridge`、`npm run check:architecture`，均通过。
+
+
+### ARCH-SPLIT-P1-547 stats direct wrapper 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：host/viewer stats polling、FPS indicator 和 encoder detail 已由 `native-stats-controller.js` 持有，但 `app-native-overrides.js` 仍保留 `stopNativeViewerStatsPolling()`、`resetHostFpsIndicators()`、`updateHostEncoderDetail()` 等纯 direct wrapper。
+- 影响：R3/R7 的 stats owner 表面上仍被 legacy wrapper 分散，后续维护高频 stats 或诊断路径时容易继续在 override 中添加逻辑。
+- 建议：删除这些 pure forwarding wrapper，调用点直接使用 `nativeStatsController.*`；bridge 门禁禁止 wrapper 函数名回流。
+- 修改意见：按建议实施 Renderer R3/R7 批量小切片，不改变 polling interval、不改变 FPS DOM 更新、不改变 encoder detail 行为。
+- 处理结果：已处理。`app-native-overrides.js` 删除 11 个 stats direct wrapper，room/peer/session 注入和 reset 路径均直接调用 `nativeStatsController`；`check-renderer-bridge.js` 新增这些 wrapper 函数名的防回退扫描。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+
+### ARCH-SPLIT-P1-548 native audio start direct wrapper 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`startNativeAudioForShare(audioPid)` 只是把 audio pid 包装成 `nativeSessionController.startNativeAudioForShare({ pid, processName })`，但仍作为 legacy direct wrapper 留在 override。
+- 影响：native audio start 已由 session controller 持有，但 wrapper 会让 R6/R7 的 audio session lifecycle 边界继续表面分裂，后续容易把音频启动错误处理或参数归一化重新写回 override。
+- 建议：删除 wrapper，在 `startScreenShareWithAudio()` 中直接调用 `nativeSessionController.startNativeAudioForShare(...)`；bridge 门禁禁止 wrapper 回流。
+- 修改意见：按建议实施 Renderer R6/R7 小切片，不改变 audio start 参数、不改变错误提示、不改变日志 scope。
+- 处理结果：已处理。`app-native-overrides.js` 删除 `startNativeAudioForShare()`，`startScreenShareWithAudio()` 直接调用 `nativeSessionController.startNativeAudioForShare({ pid: Number(audioPid), processName: '' })`；`check-renderer-bridge.js` 新增 `function startNativeAudioForShare(` 防回退扫描。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+
+### ARCH-SPLIT-P1-549 peer/media event direct wrapper 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`finalizeP2pFailureWithNatMapping()`、`requestPeerRecovery()`、`handleNativePeerStateEvent()`、`forwardNativeMediaSignal()` 已由 peer controller 持有，但仍以 direct wrapper 或未调用残留形式留在 `app-native-overrides.js`。
+- 影响：peer recovery/failure 和 mediaEngine signal/peer-state 事件表面上仍经过 legacy glue，R5/R7 边界容易回退，也增加维护者误把逻辑写回 override 的概率。
+- 建议：删除未调用 wrapper，mediaEngine `signal` / `peer-state` 注入处直接调用 `nativePeerController`；bridge 门禁禁止这些 wrapper 名回流。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 signal payload、不改变 peer-state event handling、不改变 P2P recovery/failure 行为。
+- 处理结果：已处理。`app-native-overrides.js` 删除四个 peer/media event direct wrapper；`nativeMediaEngineController` 的 `onSignal` 和 `onPeerState` 注入已直接调用 `nativePeerController.handleLocalSignalEventAndSend(...)` 与 `nativePeerController.handlePeerStateEvent(...)`；`check-renderer-bridge.js` 新增四个 wrapper 名防回退扫描。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-550 media-state direct wrapper 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-545 到 P1-549 后，media-state effects 已由 `native-session-controller.js` 生成并消费，但 `app-native-overrides.js` 仍保留 `applyNativeMediaStateUpdate()` 纯转发 wrapper。
+- 影响：R6/R7 的 native session lifecycle owner 表面上仍通过 legacy override 命名暴露，后续维护 media-state 时容易把 stop 后忽略、OBS 状态、host-session-started/stopped 或 surface detached tracking 逻辑重新写回 override。
+- 建议：删除 `applyNativeMediaStateUpdate()` wrapper，`nativeMediaEngineController.onMediaState` 直接调用 `nativeSessionController.applyMediaStateUpdate(params, context)`；bridge 门禁禁止 wrapper 回流。
+- 修改意见：按建议实施 Renderer R6/R7 小切片，不改变 media-state payload、不改变 effects 消费顺序、不改变 stop 后 stale media-state 忽略行为。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `applyMediaStateUpdate(params, context)`，内部继续复用 `buildMediaStateUpdateEffects()` 和 controller effects consumer；`app-native-overrides.js` 删除 `applyNativeMediaStateUpdate()`，`nativeMediaEngineController.onMediaState` 直接调用 session controller；`check-renderer-bridge.js` 新增 `function applyNativeMediaStateUpdate(` 防回退扫描。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-bridge`、`npm run check:architecture`、`npm run check:logging`，均通过；已执行 `rg -n "applyNativeMediaStateUpdate|applyMediaStateUpdate|buildMediaStateUpdateEffects" server/public/app-native-overrides.js server/public/native/native-session-controller.js scripts/check-renderer-bridge.js docs/CODE_AUDIT_FINDINGS.md docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`，确认 legacy wrapper 已移除，仅保留 bridge 禁止项、session controller 定义/导出和 media engine 直接调用。
+
+### ARCH-SPLIT-P1-551 native peer create/close direct wrapper 仍留在 native override
+
+- 位置：`server/public/app-native-overrides.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`createNativePeerConnectionImpl()`、`closeNativePeerConnectionImpl()`、`clearNativePeerConnectionsImpl()` 只是转发到 `nativePeerController.createPeerConnection()` / `closePeerConnection()` / `closeAllPeers()`，但仍留在 legacy override。
+- 影响：R5/R7 要求 peer lifecycle 由 native peer controller 持有；这些本地 direct wrapper 会让 create/close/clear 的表面 owner 继续分裂，也给后续把 peer close cleanup 写回 override 留入口。
+- 建议：删除三个 direct wrapper，兼容入口和 controller 注入点直接调用 `nativePeerController`；bridge 门禁禁止 wrapper 函数名回流。
+- 修改意见：按建议实施 Renderer R5/R7 小切片，不改变 peer create 参数、不改变 close options、不改变 clearAllPeers 的 `{ options }` 形状。
+- 处理结果：已处理。`app-native-overrides.js` 删除三个 native peer create/close direct wrapper；`createPeerConnection()` 直接调用 `nativePeerController.createPeerConnection()` 并保留 encoded datachannel 与 mediaManifest 参数；room/peer/session controller 注入、existing peer close、公开 `closePeerConnection()` 和 `clearAllPeerConnections()` 均改为直接调用 `nativePeerController`；`check-renderer-bridge.js` 新增三个 wrapper 名防回退扫描。
+- 验证结果：已执行 `rg -n "createNativePeerConnectionImpl|closeNativePeerConnectionImpl|clearNativePeerConnectionsImpl" server/public/app-native-overrides.js`，确认无残留；已执行 `node --check server/public/app-native-overrides.js`、`npm run check:renderer-bridge`，均通过。
+
+### ARCH-SPLIT-P1-552 host session runtime 仍公开 current-* 兼容 facade
+
+- 位置：`media-agent/src/host_session_runtime.h`、`media-agent/src/host_session_runtime.cpp`、`scripts/check-media-agent-boundary.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：Host/Audio/OBS registry 已经迁到 active session / explicit session owner 模型，但 `host_session_runtime.*` 仍公开 `revalidate_current_host_capture_plan()`、`prepare_current_obs_ingest_session()`、`set_current_host_video_codec()` 等 `current_*` 兼容 facade；`.cpp` 内还保留未使用的 `bind_current_obs_ingest_session()`。
+- 影响：M4/M7 要求业务路径显式绑定 `HostSessionState&` / `ObsIngestState&` 或通过 active owner facade；继续保留 `current_*` API 会让新代码绕过显式 owner 绑定，重新把 host/OBS 操作退回“完整 runtime + 隐式当前会话”的旧模型。
+- 建议：删除未使用的 `current_*` host/OBS runtime facade 声明和实现，删除未使用的 `bind_current_obs_ingest_session()`；边界门禁不再白名单 `host_session_runtime.*`，任何源码重新出现这些函数调用都 failfast。
+- 修改意见：按建议实施 M4/M7 小切片，不改变现有显式 `revalidate_host_capture_plan()`、`prepare_obs_ingest_session()`、`set_host_video_codec()` 等 API，不改变 start/stop/OBS 行为。
+- 处理结果：已处理。`host_session_runtime.h` 删除 10 个 `current_*` 兼容 facade 声明；`host_session_runtime.cpp` 删除对应实现和未用 `bind_current_obs_ingest_session()`；`check-media-agent-boundary.js` 将 `allowedCurrentHostRuntimeFacadeUsers` 改为空集合，禁止兼容 facade 回流。
+- 验证结果：已执行 `rg -n "revalidate_current_host_capture_plan|initialize_current_default_capture_runtime|refresh_current_host_capture_runtime|start_current_host_capture_process|stop_current_host_capture_process|set_current_host_video_codec|prepare_current_obs_ingest_session|clear_current_obs_ingest_prepared|start_current_obs_ingest_worker|stop_current_obs_ingest_session|bind_current_obs_ingest_session" media-agent/src media-agent/tests scripts/check-media-agent-boundary.js`，确认源码/测试无残留，只有边界脚本禁止列表；已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`，均通过。
+- 补充验证：已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，通过 Release 构建、media-agent unit test 和 smoke test；构建仍有 FFmpeg 头文件 C4244/C4819 和 `av_init_packet` C4996 既有 warning。
+
+### ARCH-SPLIT-P1-553 viewer connection UI 状态仍由 native override 直接写 DOM
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-renderer-state-controller.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：viewer room/media 状态 patch 已收进 `native-renderer-state-controller.js`，但 `app-native-overrides.js::setViewerConnectionState()` 仍直接操作 `waitingMessage` / `connectionStatus` DOM，并被 room/peer/p2p 多个 controller 作为回调调用。
+- 影响：R2/R7 的 renderer 状态 owner 仍有一块 UI 状态写入留在 legacy override；后续连接等待、重连、failfast 文案维护时容易继续把 DOM 写入散落回 override。
+- 建议：让 `native-renderer-state-controller` 承接 viewer connection state DOM facade；override 创建 controller 时只注入元素，所有调用点改为 `nativeRendererState.setViewerConnectionState()`；bridge 门禁禁止本地函数回流，同时升级检查器识别 legacy binding 显式属性。
+- 修改意见：按建议实施 Renderer R2/R7 小切片，不改变任何中文文案、不改变 `waitingMessage` 显示逻辑、不改变 legacy global `setViewerConnectionState` 兼容名。
+- 处理结果：已处理。`native-renderer-state-controller.js` 新增 `setViewerConnectionState(message)`，集中更新 viewer waiting/connection DOM；`app-native-overrides.js` 创建 nativeRendererState 时注入 `waitingMessage` / `connectionStatus`，删除本地 `setViewerConnectionState()` 函数，p2p/room/peer message 注入与 chain reconnect 文案改为调用 `nativeRendererState`；legacy global binding 保留 `setViewerConnectionState` 兼容属性，但实现转发到 controller。`check-renderer-bridge.js` 已升级 legacy binding 解析，支持显式属性，并新增 `function setViewerConnectionState(` 防回退扫描。
+- 验证结果：已执行 `node --check server/public/native/native-renderer-state-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-bridge`、`npm run check:renderer-syntax`，均通过。
+
+### ARCH-SPLIT-P1-571 host default reset 仍保留隐式 active OBS owner overload
+
+- 位置：`media-agent/src/host_session_runtime.h`、`media-agent/src/host_session_runtime.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`HostSessionController` 和 host start/stop pipeline 已显式绑定 `HostSessionState&` 与 `ObsIngestState&`，但 `host_session_runtime.*` 仍保留 `reset_host_session_to_default_native(AgentRuntimeState&, HostSessionState&)` overload，内部再通过 `active_obs_ingest_session(runtime_state)` 隐式解析 OBS owner。
+- 影响：M4/M7 要求 Host/OBS lifecycle 显式绑定 owner；这个兼容 overload 会让新代码重新绕回“完整 runtime + 隐式 active OBS”的旧模型，后续多 session、多 DLL/exe 或 session id 切换时容易出现 Host owner 与 OBS owner 不一致。
+- 建议：删除隐式 overload，只保留 `reset_host_session_to_default_native(AgentRuntimeState&, HostSessionState&, ObsIngestState&)`；边界门禁禁止该二参 overload 回流。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 stop/reset 顺序，不改变默认 native reset 字段，不改变 OBS clear prepared 行为，不改变 JSON-RPC wire shape。
+- 处理结果：已处理。`host_session_runtime.h/cpp` 删除二参 `reset_host_session_to_default_native(runtime_state, session)` overload，stop pipeline 继续调用显式三参 owner 入口；`check-media-agent-boundary.js` 新增门禁，若 `host_session_runtime.h/cpp` 重新声明或实现该隐式 active OBS overload 会失败。media-agent 粗略完成度更新为约 99.52%。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:architecture`、`npm run check:logging`，均通过；Release 验证包含 media-agent build、unit tests、smoke test，并复制 runtime binary；`rg` 显式文件复查确认该 overload 与 `active_obs_ingest_session(runtime_state)` 回读无残留。
+
+### ARCH-SPLIT-P1-572 peer create finalize 仍通过公开 pipeline 暴露完整 runtime 写入口
+
+- 位置：`media-agent/src/peer_create_pipeline.h`、`media-agent/src/peer_create_pipeline.cpp`、`media-agent/src/peer_session_controller.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`PeerSessionController::create_from_request()` 已是 createPeer command owner，但 `peer_create_pipeline.h` 仍公开 `finalize_created_peer(AgentRuntimeState&, const PeerState&)`，该 free function 负责 `ensure_peer()` 落库、刷新 transport runtime、发送 `peer-state created`、warning 和 result JSON。
+- 影响：peer 创建最终写入阶段仍可被 controller 外部绕过调用，等于把完整 runtime 写入口暴露在 pipeline 头文件中；后续拆 PeerSession/transport owner 或多 DLL/exe 时，create finalize 的事务边界不清晰。
+- 建议：把 finalize 收回 `peer_session_controller.cpp` 的私有 helper；`peer_create_pipeline.*` 只保留 host-downstream attach 和 initial negotiation 两个无完整 runtime 写入的创建子步骤；边界门禁禁止 pipeline 头重新暴露 `AgentRuntimeState` 或 `finalize_created_peer()`。
+- 修改意见：按建议实施 M2/M7 小切片，不改变 createPeer request parsing，不改变 peer 落库顺序，不改变 `peer-state created` / warning / result JSON。
+- 处理结果：已处理。`peer_create_pipeline.h` 删除 `AgentRuntimeState` 前置声明、`peer_control_result.h` include 和 `finalize_created_peer()` 声明；`peer_create_pipeline.cpp` 删除 finalize 实现及其 `agent_events/json/runtime_registry/peer_refresh/peer_state_json` 依赖；同等 finalize 逻辑迁入 `peer_session_controller.cpp` 私有 helper。`check-media-agent-boundary.js` 新增门禁，禁止 `peer_create_pipeline.h` 重新暴露完整 runtime finalize helper。media-agent 粗略完成度更新为约 99.54%。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:architecture`、`npm run check:logging`，均通过；Release 验证包含 media-agent build、unit tests、smoke test，并复制 runtime binary。
+
+### ARCH-SPLIT-P1-573 host video/audio sender refresh 仍由公开 peer refresh pipeline 暴露
+
+- 位置：`media-agent/src/peer_refresh_pipeline.h`、`media-agent/src/peer_refresh_pipeline.cpp`、`media-agent/src/peer_session_controller.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`PeerSessionController::perform_host_video_sender_soft_refresh()` 与 `refresh_host_audio_senders()` 只是转发到公开 free function `refresh_all_host_video_senders(AgentRuntimeState&)` / `refresh_all_host_audio_senders(AgentRuntimeState&)`。这两个函数会读取 host/audio/OBS snapshot、重校验 capture plan、重绑 host video sender、配置/清理 host audio sender，并可能触发 renegotiation。
+- 影响：host video/audio sender refresh 是 peer controller 的批处理 command，但通过公开 pipeline 头暴露完整 runtime 入参，会让其它路径绕过 controller 调用；后续拆 PeerSession/HostSession/AudioSession owner 或多 DLL/exe 时，host sender refresh 事务边界不清晰。
+- 建议：把 host video sender soft refresh 和 host audio sender refresh 收回 `peer_session_controller.cpp` 私有 helper；`peer_refresh_pipeline.*` 仅保留 attach/detach media source 等共享路径仍需复用的 transport runtime refresh。边界门禁禁止公开 pipeline 重新暴露 host video/audio sender refresh。
+- 修改意见：按建议实施 M2/M6/M7 较大切片，不改变 soft refresh 条件、不改变 capture plan revalidate、不改变 host audio sender 配置/清理、不改变 audio renegotiation 失败 reason。
+- 处理结果：已处理。`peer_refresh_pipeline.h/cpp` 删除 `refresh_all_host_video_senders()` 与 `refresh_all_host_audio_senders()` 声明/实现及相关 host/audio/OBS include，只保留 `refresh_all_peer_transport_runtime()`；同等 host video/audio sender refresh 逻辑迁入 `peer_session_controller.cpp` 私有 helper，并由 `PeerSessionController::perform_host_video_sender_soft_refresh()` / `refresh_host_audio_senders()` 直接调用。`check-media-agent-boundary.js` 新增门禁，禁止 `peer_refresh_pipeline.h` 重新公开 host video/audio sender refresh。media-agent 粗略完成度更新为约 99.56%。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:architecture`、`npm run check:logging`，均通过；Release 验证包含 media-agent build、unit tests、smoke test，并复制 runtime binary。首次 Release 构建 failfast 暴露 `peer_refresh_pipeline.cpp` 清理 include 后缺 `refresh_peer_media_binding()` 声明，已通过保留 `peer_video_sender.h` 依赖修正。
+
+### ARCH-SPLIT-P1-569 legacy renderer app state patch 仍由 native override 解释字段
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-renderer-state-controller.js`、`scripts/check-renderer-bridge.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`native-renderer-state-controller.js` 已承接 viewer/room/media/connection/host reset/session effects 状态 facade，但 `app-native-overrides.js` 仍保留 `applyNativeRendererStatePatch()`，逐字段解释 `currentRoomId/sessionRole/currentSessionToken/myChainPosition/hostId/upstreamPeerId/upstreamConnected/viewerReadySent/videoStarted/isHost` 并直接写旧 `app.js` 局部变量。
+- 影响：legacy override 表面上仍像 renderer app state 的 owner；后续 room/session/reconnect 状态迁移时容易继续把 patch 语义写回大文件，而不是集中到 renderer-state controller。
+- 建议：在 `native-renderer-state-controller.js` 增加 legacy app state bridge，集中持有 patch 字段归一化；`app-native-overrides.js` 只注入旧局部变量 setter，作为 app.js 完全迁出前的低层兼容写入口。bridge 门禁禁止 `applyNativeRendererStatePatch()` 和逐字段 `hasOwnProperty(patch, ...)` 回流。
+- 修改意见：按建议实施 Renderer R2/R7 小切片，不改变旧 `app.js` 局部变量值，不改变 room/session/viewer reconnect 状态语义，不改变 `app-state.js` 镜像策略。
+- 处理结果：已处理。`native-renderer-state-controller.js` 新增 `createLegacyAppStateBridge()`，集中定义 legacy patch 字段和归一化规则；`app-native-overrides.js` 删除本地 `applyNativeRendererStatePatch()`，改为创建 `legacyAppStateBridge` 并只提供旧局部变量 setter，`nativeRendererState` 的 `applyPatch` 注入转发到 bridge。`check-renderer-bridge.js` 新增门禁，禁止 legacy override 重新出现 `applyNativeRendererStatePatch()` 或直接按 patch 字段解释 `currentRoomId/sessionRole/currentSessionToken`。Renderer 粗略完成度更新为约 99.987%。
+- 验证结果：已执行 `node --check server/public/native/native-renderer-state-controller.js`、`node --check server/public/app-native-overrides.js`、`node scripts/check-renderer-bridge.js`，均通过。
+
+### ARCH-SPLIT-P1-570 app-state 同步快照仍由 native override 组装
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-renderer-state-controller.js`、`scripts/check-renderer-bridge.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-569 后 legacy app state patch 字段解释已进入 renderer-state bridge，但 `app-native-overrides.js::syncRendererAppState()` 仍直接调用 `window.__vdsSyncAppState({ mediaManifest: currentMediaManifest, ...overrides }, { reason })`，继续在 legacy override 中持有 app-state 同步快照组装规则。
+- 影响：native room/peer/session controller 的状态同步表面上仍经过 legacy 文件拼快照；后续迁移 `app.js` 局部状态到 `app-state.js` 时，容易遗漏 mediaManifest 默认值或继续把同步规则写回大文件。
+- 建议：在 `native-renderer-state-controller.js` 增加 app-state sync bridge，负责合并当前 mediaManifest 与覆盖字段并调用旧 app sync 入口；`app-native-overrides.js` 只注入 `getMediaManifest` 与 `syncAppState` 低层能力。bridge 门禁禁止 legacy override 回退到直接构造 `window.__vdsSyncAppState({ ... })`。
+- 修改意见：按建议实施 Renderer R2/R7 小切片，不改变同步 reason，不改变 mediaManifest 默认补齐，不改变 `__vdsSyncAppState` wire shape。
+- 处理结果：已处理。`native-renderer-state-controller.js` 新增 `createAppStateSyncBridge()`，集中持有 `mediaManifest + overrides` 的同步快照构造；`app-native-overrides.js` 创建 `appStateSyncBridge`，`syncRendererAppState()` 已收薄为 `appStateSyncBridge.sync(reason, overrides)`。`check-renderer-bridge.js` 新增门禁，要求 app-state sync bridge 存在，并禁止 legacy override 重新直接构造 `window.__vdsSyncAppState({ ... })` 或写 `mediaManifest: currentMediaManifest || null`。Renderer 粗略完成度更新为约 99.988%。
+- 验证结果：已执行 `node --check server/public/native/native-renderer-state-controller.js`、`node --check server/public/app-native-overrides.js`、`node scripts/check-renderer-bridge.js`，均通过。
+
+### ARCH-SPLIT-P1-568 stop share 高层流程仍由 native override 编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`scripts/check-renderer-bridge.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-567 已把 native/OBS host start 高层流程迁入 session controller，但 `stopScreenShare()` 仍在 `app-native-overrides.js` 中直接串联 `beginStopShare()`、`cleanupStopResources()`、`finalizeStopState()` 和 `finishStopShare()`。
+- 影响：R6 的 start/stop lifecycle owner 不对称；后续修停止共享、stop in-flight guard、停止后 UI reset 或 room cleanup 时仍容易把流程写回 legacy override。
+- 建议：在 `native-session-controller.js` 新增 `runStopShare(context)` 持有 begin/cleanup/finalize/finally 顺序；override 的 `stopScreenShare()` 只传入 peerCount/hasRoom/sessionRole 并委托 controller。bridge 门禁禁止 stop 主流程关键调用回流。
+- 修改意见：按建议实施 Renderer R6/R7 小切片，不改变 stop guard、不改变 begin 日志字段、不改变 cleanup/finalize 顺序、不改变 legacy global `stopScreenShare` 入口。
+- 处理结果：已处理。`native-session-controller.js` 新增并导出 `runStopShare(context)`，内部执行 `beginStopShare()`、`cleanupStopResources()`、`finalizeStopState()` 和 `finishStopShare()`；`app-native-overrides.js::stopScreenShare()` 已收薄为调用 `nativeSessionController.runStopShare({ peerCount, hasRoom, sessionRole })`。`check-renderer-bridge.js` 新增 stop 主流程关键调用防回退扫描。Renderer 完成度审计已同步到约 99.985%。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:renderer-bridge`，均通过；已执行 `rg -n "nativeSessionController\\.beginStopShare\\(|nativeSessionController\\.cleanupStopResources\\(|nativeSessionController\\.finalizeStopState\\(|nativeSessionController\\.finishStopShare\\(" server/public/app-native-overrides.js`，无命中；已执行 `npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-567 native/OBS host start 高层流程仍由 native override 编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`scripts/check-renderer-bridge.js`、`docs/RENDERER_SPLIT_MAP.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：R6 已把 session RPC、manifest、generation、stop cleanup 和 OBS room teardown 收进 `native-session-controller.js`，但 `startScreenShareWithSource()` / `startScreenShareWithObsIngest()` 仍在 `app-native-overrides.js` 中直接串联 begin start、ensure native UI、ensure media engine、host session start、stale generation 判断、validation、preview attach/retry、create room 和 finish start。
+- 影响：host start lifecycle 的真实 owner 仍表面分裂；后续修预览、OBS start、stale start 或 create-room 时容易把流程继续写回 legacy override，R6/R7 无法把 override 压成薄入口。
+- 建议：在 `native-session-controller.js` 中新增 native capture start 和 OBS ingest start 的高层 runner，通过注入的 UI/mediaEngine/surface/log/error callback 复用原时序；override 只保留 legacy global wrapper。补充 bridge 门禁禁止 start 主流程关键调用回流。
+- 修改意见：按建议实施 Renderer R6/R7 较大切片，不改变 startHostSession request、不改变 preview fallback 两次尝试、不改变 stale generation stop 语义、不改变 OBS port 归一化、不改变 create-room payload。
+- 处理结果：已处理。`native-session-controller.js` 新增 `stopHostSession()` facade，修复 superseded/validation failed 分支此前调用缺失 controller API 的隐患；新增 `runNativeCaptureHostStart(sourceId, context)` 与 `runObsIngestHostStart(options)`，集中持有 native/OBS host start 的 begin/ensure/start/validate/effects/preview fallback/create-room/finally 流程。`app-native-overrides.js` 的 `startScreenShareWithSource()` 和 `startScreenShareWithObsIngest()` 已收薄为调用 controller runner，并向 controller 注入 `ensureNativeUiReady`、`ensureMediaEngineStarted`、`waitForHostUiReady`、`refreshQualitySettingsUi`、`attachHostPreviewSurface`、`showError`、`logNativeDebug`。`check-renderer-bridge.js` 新增 start 主流程关键调用防回退扫描。Renderer 完成度审计已同步到约 99.98%。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`npm run check:renderer-bridge`、`npm run check:renderer-syntax`、`npm run check:architecture`、`npm run check:logging`、`npm run test:server`，均通过。
+
+### ARCH-SPLIT-P1-565 host start/stop result JSON 仍回读 OBS runtime snapshot
+
+- 位置：`media-agent/src/host_session_start_pipeline.cpp`、`media-agent/src/host_session_stop_pipeline.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-564 已让 `HostSessionController` 显式注入 `ObsIngestState&`，但 start/stop pipeline 返回 `host_session_json(...)` 时仍调用 `obs_ingest_session_snapshot(state)`，导致 result JSON 路径继续绕回 runtime registry 读取 OBS owner。
+- 影响：M4 Host/OBS owner 边界仍不彻底；后续如果把 Host/OBS 拆成更明确的 session owner、DLL 或子进程，这类隐藏 runtime snapshot 回读会让 command result 的数据来源不清晰。
+- 建议：start/stop pipeline 直接用已注入的 `ObsIngestState& obs_ingest` 格式化 `host_session_json(session, obs_ingest)`；边界门禁禁止 pipeline 重新调用 `obs_ingest_session_snapshot(state)`。
+- 修改意见：按建议实施 M4 小切片，不改变 `host_session_json` 输出字段，不改变 start/stop/OBS 行为，不改变 JSON-RPC wire shape。
+- 处理结果：已处理。`start_obs_ingest_host_session()`、`start_native_capture_host_session()` 和 `stop_host_session()` 的 command result 均改为 `host_session_json(session, obs_ingest)`；`host_session_start_pipeline.cpp` / `host_session_stop_pipeline.cpp` 不再调用 `obs_ingest_session_snapshot(state)`；`check-media-agent-boundary.js` 已新增门禁，禁止这两个 pipeline 重新通过 runtime snapshot 读取 OBS result JSON。media-agent ownership 计划和完成度审计已同步，media-agent 粗略完成度更新为约 99.45%。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`，均通过；已执行 `rg -n "obs_ingest_session_snapshot\\(|active_obs_ingest_session\\(" media-agent/src/host_session_start_pipeline.cpp media-agent/src/host_session_stop_pipeline.cpp`，无命中；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测、smoke test 和 runtime binary/dependency 复制均通过；已执行 `npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-566 host start/stop 事件 transportReady 仍由 pipeline 横向读取 peer runtime
+
+- 位置：`media-agent/src/host_session_command.h`、`media-agent/src/agent_lifecycle.cpp`、`media-agent/src/host_session_start_pipeline.cpp`、`media-agent/src/host_session_stop_pipeline.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-565 已把 host start/stop result JSON 收到注入的 `ObsIngestState&` owner，但 host started/stopped `media-state` 事件里的 `transportReady` 字段仍由 start/stop pipeline 直接调用 `peer_transport_ready(state)` 读取 peer transport runtime。
+- 影响：Host/OBS pipeline 仍为了一个事件布尔值横向依赖 peer transport registry；后续拆 DLL/子进程时，这类读法会让 host command pipeline 同时依赖 host、OBS、peer transport 三个 owner。
+- 建议：在 `HostSessionControllerCallbacks` 增加 `transport_ready` provider，由 lifecycle/RPC 边界负责读取 peer transport snapshot 并注入；host start/stop pipeline 只消费 callback，不直接调用 `peer_transport_ready(state)`。
+- 修改意见：按建议实施 M4/M7 小切片，不改变 `media-state` 事件字段名和值语义，不改变 start/stop 流程，不改变 JSON-RPC wire shape。
+- 处理结果：已处理。`HostSessionControllerCallbacks` 新增 `std::function<bool()> transport_ready`；`make_start_host_session_callbacks()` 和 `make_stop_host_session_callbacks()` 注入 `peer_transport_ready(state)` snapshot provider；`host_session_start_pipeline.cpp` 与 `host_session_stop_pipeline.cpp` 的 `transportReady` 事件字段改为读取 `callbacks.transport_ready`，并移除 `runtime_registry.h` include。`check-media-agent-boundary.js` 新增门禁，禁止这两个 pipeline 重新调用 `peer_transport_ready(...)`。media-agent ownership 计划和完成度审计已同步，media-agent 粗略完成度更新为约 99.5%。
+- 验证结果：已执行 `npm run check:media-agent-boundary`，通过；已执行 `rg -n "peer_transport_ready\\(|obs_ingest_session_snapshot\\(|active_obs_ingest_session\\(" media-agent/src/host_session_start_pipeline.cpp media-agent/src/host_session_stop_pipeline.cpp`，无命中；已执行 `powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，Release 构建、media-agent 单测、smoke test 和 runtime binary/dependency 复制均通过。
+
+### ARCH-SPLIT-P1-561 peer offer lifecycle 主体仍由 native override 编排
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-peer-controller.js`、`scripts/check-renderer-bridge.js`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：R5 已把 answer/ICE/offer 消息处理迁入 peer message/controller，但 `createOffer()`、`createOfferToNextViewer()`、`createAndSendPeerOffer()`、encoded DataChannel capability 校验和 relay non-retryable error 仍在 `app-native-overrides.js` 中编排。
+- 影响：host-viewer 与 relay-viewer offer lifecycle 的 owner 仍表面分裂；后续调整 offer 复用、relay source、DataChannel 协议或重连策略时容易再次把 peer 业务逻辑写回 legacy override。
+- 建议：把 host-viewer offer 和 relay-viewer offer 的创建/复用/重建/发送逻辑收进 `native-peer-controller.js`，override 仅保留 legacy global 兼容转发；bridge 门禁禁止相关 helper 回流。
+- 修改意见：按建议实施 Renderer R5/R7 较大切片，不改变 offer/answer/ice wire payload，不改变 `__offerPromise` 去重语义，不改变 relay DataChannel 协议判断和 `nonRetryableRelay` 标记。
+- 处理结果：已处理。`native-peer-controller.js` 新增 `createAndSendPeerOffer()`、`createOfferForPeer()`、`createHostViewerOffer()`、`createRelayViewerOffer()`，集中处理已有 offer 复用、旧 peer 关闭、mediaManifest 注入、relay source 绑定、encoded DataChannel capability 校验和 offer 发送；`app-native-overrides.js` 的 `createOffer()` / `createOfferToNextViewer()` 改为纯 legacy global 转发，删除本地 `createAndSendPeerOffer()`、`supportsDataChannelEncodedMedia()`、`createNonRetryableRelayError()`。`native-peer-message-controller` 注入点改为直接调用 peer controller offer facade。`check-renderer-bridge.js` 新增 helper 名防回退扫描。完成度审计已同步到 Renderer 约 99.97%。
+- 验证结果：已执行 `node --check server/public/app-native-overrides.js`、`node --check server/public/native/native-peer-controller.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-bridge`、`npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-562 relay backend 仍保留 legacy relay_dispatch.h 公开声明头
+
+- 位置：`media-agent/src/relay_dispatch.h`、`media-agent/src/relay_backend_runtime.h`、`media-agent/src/relay_dispatch.cpp`、`media-agent/src/relay_hub.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：M5 已把 relay subscriber/bootstrap/queue/worker state 收进 `relay_backend::Runtime` 并由 `RelayHub` 私有持有，但后端 runtime 声明仍放在 `relay_dispatch.h`，文件名和语义仍像公开 dispatch API。
+- 影响：即使 include 白名单已限制，旧 header 继续存在也会诱导新代码 include backend API，削弱 “业务只依赖 RelayHub facade，backend 是 Hub 私有实现” 的边界；后续多 DLL/多进程拆 relay 时也更难区分 facade 和 backend。
+- 建议：删除 legacy `relay_dispatch.h`，新增 `relay_backend_runtime.h` 只声明 relay backend runtime；`relay_dispatch.cpp` 作为后端算法实现 include 该头，`relay_hub.cpp` 作为唯一 facade bridge include 该头；边界门禁禁止旧头回流和非 backend 文件 include backend runtime 头。
+- 修改意见：按建议实施 M5 较大切片，不改变 `RelayHub` 公开 API，不改变 subscriber/bootstrap/backpressure/worker 行为，不改变 relay audio/video fanout 语义。
+- 处理结果：已处理。新增 `relay_backend_runtime.h` 承载 `vds::media_agent::relay_backend::Runtime` 声明；`relay_dispatch.cpp` 与 `relay_hub.cpp` 改为 include 新 backend runtime 头；删除 `relay_dispatch.h`；`check-media-agent-boundary.js` 改为禁止任何源码 include 旧 `relay_dispatch.h`，并只允许 `relay_dispatch.cpp` / `relay_hub.cpp` include `relay_backend_runtime.h`。media-agent ownership 计划和完成度审计已同步，media-agent 粗略完成度更新为约 99.3%。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:architecture`、`npm run check:logging`，均通过；Release 验证包含 media-agent build、unit tests、smoke test，并复制 runtime binary。
+
+### ARCH-SPLIT-P1-564 host start/stop pipeline 仍自行解析 active OBS owner
+
+- 位置：`media-agent/src/host_session_controller.h`、`media-agent/src/host_session_controller.cpp`、`media-agent/src/host_session_start_pipeline.h`、`media-agent/src/host_session_start_pipeline.cpp`、`media-agent/src/host_session_stop_pipeline.h`、`media-agent/src/host_session_stop_pipeline.cpp`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`HostSessionController` 已绑定 active host owner，但 start/stop/drain pipeline 内部仍调用 `active_obs_ingest_session(state)` 自行解析 OBS owner。
+- 影响：M4 要求 Host/OBS lifecycle 由 host session controller 明确绑定 owner；pipeline 内部自行解析 active OBS owner 会让 session 选择分散，后续多 session、归档、切换 active owner 时容易出现 host owner 与 OBS owner 不一致。
+- 建议：`HostSessionController` 构造时同时绑定 active `HostSessionState&` 和 active `ObsIngestState&`；start/stop/drain pipeline 显式接收 `ObsIngestState&`，并增加门禁禁止 pipeline 回退调用 `active_obs_ingest_session(state)`。
+- 修改意见：按建议实施 M4 小切片，不改变 start/stop/drain 顺序，不改变 OBS prepare/clear/start/stop 行为，不改变 JSON-RPC request/response shape。
+- 处理结果：已处理。`HostSessionController` 新增 `obs_ingest_` 成员并在构造时绑定 `active_obs_ingest_session(state)`；`start_host_session_from_request()`、`start_obs_ingest_host_session()`、`start_native_capture_host_session()`、`drain_running_host_session()`、`stop_host_session()` 均新增显式 `ObsIngestState&` 参数；start/stop pipeline 内部删除 `active_obs_ingest_session(state)` 调用。`check-media-agent-boundary.js` 新增门禁，禁止 `host_session_start_pipeline.cpp` / `host_session_stop_pipeline.cpp` 重新解析 active OBS owner。media-agent ownership 计划和完成度审计已同步，media-agent 粗略完成度更新为约 99.4%。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:architecture`、`npm run check:logging`，均通过；Release 验证包含 media-agent build、unit tests、smoke test，并复制 runtime binary。
+
+### ARCH-SPLIT-P1-563 relay backend 实现文件仍沿用 dispatch 命名
+
+- 位置：`media-agent/src/relay_dispatch.cpp`、`media-agent/src/relay_backend_runtime.cpp`、`media-agent/CMakeLists.txt`、`scripts/check-media-agent-boundary.js`、`docs/MEDIA_AGENT_SESSION_OWNERSHIP_PLAN.md`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-562 删除了 `relay_dispatch.h` 并新增 `relay_backend_runtime.h`，但实现文件仍叫 `relay_dispatch.cpp`，命名上继续暗示它是公开 dispatch 层而不是 `RelayHub` 私有 backend runtime 实现。
+- 影响：M5 边界表达仍不够干净；后续维护者容易继续围绕 dispatch 概念添加 API，而不是把 relay 业务入口固定到 `RelayHub`、把后端状态和 worker 视作私有 runtime。
+- 建议：将 `relay_dispatch.cpp` 重命名为 `relay_backend_runtime.cpp`，同步 CMake 和边界门禁；旧 dispatch 命名只保留在历史审计记录中，不再作为当前源码结构。
+- 修改意见：按建议实施 M5 命名/边界切片，不改变 backend class、subscriber/bootstrap/queue/worker 行为，不改变 `RelayHub` 公开 API。
+- 处理结果：已处理。`relay_dispatch.cpp` 已重命名为 `relay_backend_runtime.cpp`；`media-agent/CMakeLists.txt` 改为编译新文件；`check-media-agent-boundary.js` 的 backend runtime include/API 白名单从旧 `relay_dispatch.cpp` 切到 `relay_backend_runtime.cpp`；ownership 计划和完成度审计已同步，media-agent 粗略完成度更新为约 99.35%。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:architecture`、`npm run check:logging`，均通过；Release 验证包含 media-agent build、unit tests、smoke test，并复制 runtime binary。
+
+### ARCH-SPLIT-P1-559 AgentRuntimeState 仍通过 wgc_capture.h 暴露完整采集 API
+
+- 位置：`media-agent/src/agent_runtime.h`、`media-agent/src/wgc_capture.h`、`media-agent/src/wgc_capture_state.h`、`scripts/check-media-agent-boundary.js`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`AgentRuntimeState` 只需要保存 WGC backend probe snapshot，但此前如果通过完整 `wgc_capture.h` 获取 `WgcCaptureProbe`，会把 frame source config、CPU buffer、frame source factory 等采集 API 一并传播到全局 runtime 头。
+- 影响：M7 要求 runtime 头只承载 registry/shared snapshot；继续暴露完整 WGC frame source API 会让采集实现边界污染所有 include runtime 的路径，后续拆 DLL/多进程时更难把 capture owner 独立出来。
+- 建议：拆出 `wgc_capture_state.h` 只承载 `WgcCaptureProbe`；`wgc_capture.h` include state header 并继续暴露 frame source API；`agent_runtime.h` 只 include state header；边界门禁禁止回退。
+- 修改意见：按建议实施 M7 小切片，不改变 WGC probe 字段，不改变 `probe_wgc_capture_backend()`、`create_wgc_frame_source()` 行为，不改变 status/capabilities JSON wire shape。
+- 处理结果：已处理。新增 `wgc_capture_state.h` 并把 `WgcCaptureProbe` 从完整 WGC capture API 中拆出；`wgc_capture.h` 改为 include state header；`agent_runtime.h` 改为 include `wgc_capture_state.h`，不再需要完整 frame source API。`check-media-agent-boundary.js` 新增门禁，禁止 `agent_runtime.h` 回退 include `wgc_capture.h`。完成度审计已同步。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 验证包含 media-agent build、unit tests、smoke test，并复制 runtime binary。
+
+### ARCH-SPLIT-P1-560 AgentRuntimeState 仍直接传播 native surface layout API
+
+- 位置：`media-agent/src/agent_runtime.h`、`media-agent/src/surface_attachment_state.h`、`media-agent/src/native_surface_layout.h`、`scripts/check-media-agent-boundary.js`、`docs/ARCHITECTURE_SPLIT_COMPLETION_AUDIT.md`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`AgentRuntimeState` 不直接使用 `NativeEmbeddedSurfaceLayout`，但此前直接 include `native_surface_layout.h`，导致 surface layout parser/formatter API 从 runtime 头向外传播。
+- 影响：M3/M7 要求 surface layout 属于 `SurfaceAttachmentState` / `SurfaceSessionController` 的内部边界；runtime 头直接包含 layout API 会让后续拆 surface DLL/子进程时继续出现跨 owner 编译依赖。
+- 建议：删除 `agent_runtime.h` 对 `native_surface_layout.h` 的直接 include，由 `surface_attachment_state.h` 作为唯一 surface state 入口持有 layout 字段；边界门禁禁止回退。
+- 修改意见：按建议实施 M7 小切片，不改变 `SurfaceAttachmentState.surface_layout` 字段，不改变 attach/update/detach JSON shape，不改变 surface layout parser/formatter 行为。
+- 处理结果：已处理。`agent_runtime.h` 删除 `#include "native_surface_layout.h"`，runtime 头只通过 `surface_attachment_state.h` 获得 surface registry state；`check-media-agent-boundary.js` 新增门禁，禁止 runtime 头重新直接 include surface layout API。完成度审计已同步到 media-agent 约 99.25%。
+- 验证结果：已执行 `node --check scripts/check-media-agent-boundary.js`、`npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`、`npm run check:architecture`、`npm run check:logging`，均通过；Release 验证包含 media-agent build、unit tests、smoke test，并复制 runtime binary。
+
+### ARCH-SPLIT-P1-556 native room/peer message controller 仍直接拥有房间 UI DOM
+
+- 位置：`server/public/native/native-room-message-controller.js`、`server/public/native/native-peer-message-controller.js`、`server/public/native/native-renderer-state-controller.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-553 到 P1-555 后 legacy override 的主要 UI 写入已迁入 `native-renderer-state-controller.js`，但 `native-room-message-controller.js` 仍直接写 `viewerCount`、viewer join UI、host room UI、OBS waiting status、session resume UI；`native-peer-message-controller.js` 仍直接写 `viewerCount` 和 `chainPosition`。
+- 影响：room/peer message controller 应只处理消息语义、状态同步和信令编排；继续直接拥有 DOM 会让 R2/R7 的 renderer UI ownership 分裂，后续 room-created/session-resumed/chain-reconnect 变更容易把 UI 细节重新写回消息处理器。
+- 建议：在 `native-renderer-state-controller.js` 增加 viewer joined/connected、host room active、viewer count read/write facade；room/peer message controller 通过注入 facade 调用，不再直接操作房间 UI DOM；bridge 门禁禁止 message controller 直接写这些元素。
+- 修改意见：按建议实施 Renderer R2/R7 小切片，不改变 room/session/peer 信令 payload，不改变 P2P status element 处理，不改变现有中文文案和按钮显隐语义。
+- 处理结果：已处理。`native-renderer-state-controller.js` 新增 `setViewerJoinedUi()`、`setViewerConnectedState()`、`getViewerCount()`、`setHostRoomActiveUi()`；`native-room-message-controller.js` 的 viewer count、viewer join、host room active、OBS waiting、session resume UI 全部改为调用 renderer-state facade，仅保留 `hostP2pStatus` 作为 P2P 状态机显示目标；`native-peer-message-controller.js` 删除 `elements` 依赖，viewer joined count 与 chain reconnect chainPosition UI 改为调用 renderer-state facade；`app-native-overrides.js` 补齐 facade 注入并移除 peer message controller 的 `elements` 注入。`check-renderer-bridge.js` 新增对 room/peer message controller 直接 DOM ownership 的防回退扫描。
+- 验证结果：已执行 `node --check server/public/native/native-renderer-state-controller.js`、`node --check server/public/native/native-room-message-controller.js`、`node --check server/public/native/native-peer-message-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-bridge`、`npm run check:renderer-syntax`，均通过。
+
+### ARCH-SPLIT-P1-557 stop/OBS reset lifecycle 仍由 native override 高层 wrapper 持有
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-session-controller.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-556 后 room/peer message controller 的 UI ownership 已收进 renderer-state controller，但 stop share 和 OBS room teardown 路径仍由 `app-native-overrides.js` 本地 `resetNativeRoomStateAfterStop()`、`resetNativePlaybackStateAfterStop()`、`resetNativeStopUiAfterStop()`、`resetObsRoomStatePreservingSession()`、`resetObsPlaybackStatePreservingSession()`、`resetObsRoomUiWaitingForStream()`、`teardownHostRoomPreservingSession()`、`ensureObsHostRoomCreated()` 高层 wrapper 串联。
+- 影响：R6 要求 native/OBS start-stop lifecycle 成为 session controller 的唯一入口；这些 wrapper 会让 room state reset、playback timer cleanup、mediaSession reset、OBS room UI reset 的执行 owner 继续停留在 legacy override，后续 stop/OBS 修复容易回写到大文件。
+- 建议：在 `native-session-controller.js` 中持有 clear room、reset playback、reset stop UI、reset OBS waiting UI 的流程；`app-native-overrides.js` 只注入低层动作，如 legacy state patch、manifest/relayStream setter、timer cleanup、UI facade 和 roomClient leave/create。bridge 门禁禁止 wrapper 名回流。
+- 修改意见：按建议实施 Renderer R6/R7 小切片，不改变 stop/OBS reset 顺序，不改变 leave-room/create-room payload，不改变 websocket timeout 错误提示，不改变现有按钮/状态文案。
+- 处理结果：已处理。`native-session-controller.js` 新增 `clearRoomState()`、`resetPlaybackState()`、`resetStopUiState()`、`resetObsRoomUiWaitingForStream()`，`teardownObsHostRoom()` 和 `finalizeStopState()` 直接调用这些 session-owned reset helper；`app-native-overrides.js` 删除八个高层 reset/OBS wrapper，改为向 session controller 注入 `patchRendererState`、`setCurrentMediaManifest`、`syncRendererAppState`、`setRelayStream`、viewer wait timer cleanup、host FPS reset、preview request resolver 和 renderer-state UI facade。`ensureObsHostRoomCreated` / `teardownObsHostRoom` 注入点直接调用 session controller，错误处理仍保留原 `websocket-timeout` 提示。`check-renderer-bridge.js` 新增 wrapper 名防回退扫描。
+- 验证结果：已执行 `node --check server/public/native/native-session-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-bridge`、`npm run check:renderer-syntax`、`npm run check:architecture`、`npm run check:logging`，均通过。`rg -n "resetNativeRoomStateAfterStop|resetNativePlaybackStateAfterStop|resetNativeStopUiAfterStop|resetObsRoomStatePreservingSession|resetObsPlaybackStatePreservingSession|teardownHostRoomPreservingSession|function ensureObsHostRoomCreated" server/public/app-native-overrides.js scripts/check-renderer-bridge.js docs/CODE_AUDIT_FINDINGS.md` 确认 `app-native-overrides.js` 无残留，只有 bridge 禁止项和审计历史。
+
+### ARCH-SPLIT-P1-558 AgentRuntimeState 仍通过 peer_transport.h 暴露完整 transport API
+
+- 位置：`media-agent/src/agent_runtime.h`、`media-agent/src/peer_transport.h`、`media-agent/src/peer_transport_state.h`、`media-agent/src/peer_transport_state_json.*`、`media-agent/src/agent_status_json.cpp`、`scripts/check-media-agent-boundary.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：`AgentRuntimeState` 只需要 `PeerTransportBackendInfo`，但此前通过 `#include "peer_transport.h"` 获取该结构，导致全局 runtime 头被完整 PeerTransportSession、callbacks、track config、send/receive API 污染。`agent_status_json.cpp` 也为了 `peer_transport_backend_json()` include 完整 transport API。
+- 影响：M7 要求 `AgentRuntimeState` 瘦身为 registry + shared services；继续 include 完整 transport API 会让 runtime 头成为 transport session API 的传播源，后续多 DLL/多进程拆分时 transport 边界更难收口。status/read-only 聚合路径也不应依赖完整 session API。
+- 建议：拆出 `peer_transport_state.h` 只承载 `PeerTransportBackendInfo`，`agent_runtime.h` 改为 include 轻量 state header；拆出 `peer_transport_state_json.*` 承载 backend JSON formatter，`agent_status_json.cpp` 不再 include `peer_transport.h`；边界门禁禁止回退。
+- 修改意见：按建议实施 M7 小切片，不改变 `PeerTransportBackendInfo` 字段，不改变 `get_peer_transport_backend_info()`、`peer_transport_snapshot_json()`、status/capabilities/agent-ready JSON wire shape，不改变 transport session 行为。
+- 处理结果：已处理。新增 `peer_transport_state.h` 并把 `PeerTransportBackendInfo` 从 `peer_transport.h` 迁入；`peer_transport.h` 改为 include state header 并继续暴露 transport session API。新增 `peer_transport_state_json.h/cpp`，将 `peer_transport_backend_json()` 从 `peer_transport.cpp` 迁出；`agent_status_json.cpp` 改为 include `peer_transport_state.h` 与 `peer_transport_state_json.h`，不再 include 完整 `peer_transport.h`。`media-agent/CMakeLists.txt` 已加入新 cpp。`check-media-agent-boundary.js` 新增门禁，禁止 `agent_runtime.h` 与 `agent_status_json.cpp` 回退 include 完整 `peer_transport.h`。
+- 验证结果：已执行 `npm run check:media-agent-boundary`、`powershell -ExecutionPolicy Bypass -File scripts\\verify-media-agent.ps1 -Configuration Release -AllowLocalFfmpegFallback`，均通过；Release 验证包含 media-agent build、unit tests、smoke test，并复制新 runtime binary。首次构建 failfast 暴露 `agent_status_json.cpp` 缺完整 `PeerTransportBackendInfo` 定义和命名空间限定，已通过 include `peer_transport_state.h` 与 `vds::media_agent::peer_transport_backend_json(...)` 修正。
+- 补充处理结果：`native-renderer-state-controller.js` 已继续新增 `setObsCreatingRoomUi()`，`app-native-overrides.js` 的 `setObsCreatingRoomUi` 注入改为转发到 renderer-state controller，OBS 节目流接入后“正在创建房间”文案不再由 legacy override 直接写 DOM；`check-renderer-bridge.js` 已增加该 direct DOM callback 防回退扫描。
+- 补充验证：已执行 `npm run check:architecture`、`npm run check:logging`，均通过。
+
+### ARCH-SPLIT-P1-554 host/OBS reset UI 仍由 native override 直接写 DOM
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-renderer-state-controller.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-553 后 viewer connection DOM 已进入 renderer-state controller，但 host stop、window restore、failed start、stop-share reset 和 OBS waiting UI 仍在 `app-native-overrides.js` 内直接操作 `btnStartShare`、`btnStopShare`、`hostStatus`、`roomInfo`、`viewerCount`、host preview container。
+- 影响：R2/R7 的 renderer UI state owner 仍被 legacy override 持有，host/OBS lifecycle 调整时容易继续把 DOM 写入和 native session 状态编排混在一起。
+- 建议：把纯 DOM reset facade 收进 `native-renderer-state-controller.js`；override 只保留 runtime 状态复位、stats reset、mediaSession 清理和必要注入回调。bridge 门禁禁止关键 direct DOM reset 和 host UI wrapper 回流。
+- 修改意见：按建议实施 Renderer R2/R6/R7 小切片，不改变按钮显隐、hostStatus 文案、OBS waiting 文案和 host preview visible 逻辑。
+- 处理结果：已处理。`native-renderer-state-controller.js` 新增 `setHostStopUiState()`、`syncHostWaitingWindowRestoreUi()`、`resetHostReadyUi()`、`resetStoppedRoomUi()`、`resetObsRoomUiWaitingForStream()` 和 host preview container facade；`app-native-overrides.js` 注入 host/room/button/status 元素，删除 `setHostStopUiState()` 与 `syncHostWaitingWindowRestoreUi()` 本地 wrapper，failed start/stop reset/OBS waiting UI 改为调用 renderer-state controller。`check-renderer-bridge.js` 新增 host UI wrapper 和关键 direct reset DOM 防回退扫描。
+- 验证结果：已执行 `node --check server/public/native/native-renderer-state-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-syntax`、`npm run check:renderer-bridge`，均通过。
+
+### ARCH-SPLIT-P1-555 native session effects UI 回调仍由 native override 直接写 DOM
+
+- 位置：`server/public/app-native-overrides.js`、`server/public/native/native-renderer-state-controller.js`、`scripts/check-renderer-bridge.js`、`docs/CODE_AUDIT_FINDINGS.md`
+- 问题：P1-554 后 host/OBS reset UI 已迁入 renderer-state controller，但 `native-session-controller` effects 注入中的 `setHostPreviewElementHidden`、`setRoomInfoHidden`、`setViewerCount`、`setShareButtons`、`setHostStatus` 仍在 `app-native-overrides.js` 中直接写 DOM。
+- 影响：R6 的 session effects owner 已经集中，但 effects 的 renderer 侧消费仍散落在 legacy override；新增 host start/media-state effect 时容易继续把 DOM 细节写回 override。
+- 建议：在 `native-renderer-state-controller.js` 增加通用 host UI effect facade，override 注入只转发给 controller；bridge 门禁禁止这些 direct DOM callback 回流。
+- 修改意见：按建议实施 Renderer R2/R6/R7 小切片，不改变 effect type，不改变 native-session-controller effects 协议，不改变 host preview、room info、viewer count、share button、host status 的显示语义。
+- 处理结果：已处理。`native-renderer-state-controller.js` 新增 `setHostPreviewElementHidden()`、`setRoomInfoHidden()`、`setViewerCount()`、`setShareButtons()`、`setHostStatus()`；`app-native-overrides.js` 的 session controller effects 注入改为全部转发到 renderer-state controller；`check-renderer-bridge.js` 新增 direct DOM effect callback 防回退扫描。
+- 验证结果：已执行 `node --check server/public/native/native-renderer-state-controller.js`、`node --check server/public/app-native-overrides.js`、`node --check scripts/check-renderer-bridge.js`、`npm run check:renderer-bridge`、`npm run check:renderer-syntax`，均通过。

@@ -8,6 +8,8 @@
 #include "host_pipeline.h"
 #include "obs_ingest_state.h"
 #include "platform_utils.h"
+#include "runtime_registry.h"
+#include "session_registries.h"
 #include "surface_target.h"
 #include "video_access_unit.h"
 
@@ -133,6 +135,56 @@ void test_surface_target() {
   expect_eq(extract_peer_id_from_media_source("host-session-video"), "", "non-peer media source returns empty id");
 }
 
+void test_session_registries() {
+  HostSessionRegistry host_registry;
+  AudioSessionRegistry audio_registry;
+  ObsIngestSessionRegistry obs_registry;
+
+  expect_eq(host_registry.active_session_id(), "host-default", "host registry default active session id");
+  expect_eq(audio_registry.active_session_id(), "audio-default", "audio registry default active session id");
+  expect_eq(obs_registry.active_session_id(), "obs-ingest-default", "OBS registry default active session id");
+
+  host_registry.active_session().capture_target_id = "host-session-test";
+  audio_registry.active_session().backend_mode = "audio-session-test";
+  obs_registry.active_session().video_codec = "obs-session-test";
+
+  expect_eq(host_registry.active_session().capture_target_id, "host-session-test", "host active session keeps default state");
+  expect_eq(audio_registry.active_session().backend_mode, "audio-session-test", "audio active session keeps default state");
+  expect_eq(obs_registry.active_session().video_codec, "obs-session-test", "OBS active session keeps default state");
+
+  host_registry.ensure_session("host-secondary").capture_target_id = "host-secondary-target";
+  audio_registry.ensure_session("audio-secondary").backend_mode = "audio-secondary-backend";
+  obs_registry.ensure_session("obs-secondary").video_codec = "obs-secondary-codec";
+  expect_eq_int(static_cast<int>(host_registry.session_count()), 2, "host registry tracks secondary session");
+  expect_eq_int(static_cast<int>(audio_registry.session_count()), 2, "audio registry tracks secondary session");
+  expect_eq_int(static_cast<int>(obs_registry.session_count()), 2, "OBS registry tracks secondary session");
+
+  expect_true(host_registry.activate_session("host-secondary"), "host registry activates secondary session");
+  expect_true(audio_registry.activate_session("audio-secondary"), "audio registry activates secondary session");
+  expect_true(obs_registry.activate_session("obs-secondary"), "OBS registry activates secondary session");
+  expect_eq(host_registry.active_session_id(), "host-secondary", "host active id switches to secondary");
+  expect_eq(audio_registry.active_session_id(), "audio-secondary", "audio active id switches to secondary");
+  expect_eq(obs_registry.active_session_id(), "obs-secondary", "OBS active id switches to secondary");
+  expect_eq(host_registry.active_session().capture_target_id, "host-secondary-target", "host active session returns secondary state");
+  expect_eq(audio_registry.active_session().backend_mode, "audio-secondary-backend", "audio active session returns secondary state");
+  expect_eq(obs_registry.active_session().video_codec, "obs-secondary-codec", "OBS active session returns secondary state");
+  expect_true(!host_registry.activate_session(""), "host registry rejects empty active session id");
+  expect_eq(host_registry.active_session_id(), "host-secondary", "failed host activation keeps active id");
+
+  AgentRuntimeState runtime_state;
+  expect_true(vds::media_agent::activate_host_session(runtime_state, "media-session-unit"), "runtime activates host session id");
+  expect_true(vds::media_agent::activate_audio_session(runtime_state, "media-session-unit"), "runtime activates audio session id");
+  expect_true(vds::media_agent::activate_obs_ingest_session(runtime_state, "media-session-unit"), "runtime activates OBS session id");
+  expect_eq(vds::media_agent::active_host_session_id(runtime_state), "media-session-unit", "runtime host active id switches");
+  expect_eq(vds::media_agent::active_audio_session_id(runtime_state), "media-session-unit", "runtime audio active id switches");
+  expect_eq(vds::media_agent::active_obs_ingest_session_id(runtime_state), "media-session-unit", "runtime OBS active id switches");
+  expect_eq_int(static_cast<int>(vds::media_agent::host_session_count(runtime_state)), 2, "runtime host session count tracks activated id");
+  expect_eq_int(static_cast<int>(vds::media_agent::audio_session_count(runtime_state)), 2, "runtime audio session count tracks activated id");
+  expect_eq_int(static_cast<int>(vds::media_agent::obs_ingest_session_count(runtime_state)), 2, "runtime OBS session count tracks activated id");
+  expect_true(!vds::media_agent::activate_host_session(runtime_state, ""), "runtime host rejects empty session id");
+  expect_eq(vds::media_agent::active_host_session_id(runtime_state), "media-session-unit", "runtime failed host activation keeps active id");
+}
+
 void test_video_access_unit() {
   using namespace vds::media_agent;
 
@@ -180,6 +232,7 @@ int main() {
   test_obs_ingest_state();
   test_host_pipeline_selection();
   test_surface_target();
+  test_session_registries();
   test_video_access_unit();
 
   if (g_failed_assertions != 0) {

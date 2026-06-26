@@ -47,6 +47,15 @@ function Test-AllowedLog([string] $relativePath, [string] $line, [string] $conte
         $line -match "console\.error\('\[media-engine\] native override init failed:'"
       )
     }
+    '^server/public/native/native-diagnostics\.js$' {
+      return (
+        ($context -match 'function logNativeDebug' -and $line -match 'console\.log') -or
+        ($context -match 'function logNativeStep' -and $line -match 'console\.log') -or
+        ($context -match 'function logMediaEngineEventSummary' -and $line -match 'console\.log') -or
+        ($context -match 'function logNativeStatsLine' -and $line -match 'console\.log') -or
+        ($context -match 'function logNativeWarningLine' -and $line -match 'console\.warn')
+      )
+    }
     '^desktop/main\.js$' {
       return (
         ($context -match 'function logMainProcessDebug' -and $line -match 'console\.log') -or

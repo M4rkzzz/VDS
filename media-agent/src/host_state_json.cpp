@@ -2,8 +2,9 @@
 
 #include <sstream>
 
-#include "agent_runtime.h"
+#include "host_session_state.h"
 #include "json_protocol.h"
+#include "obs_ingest_state.h"
 
 std::string host_pipeline_json(const HostPipelineState& pipeline) {
   std::ostringstream payload;
@@ -51,4 +52,32 @@ std::string host_capture_artifact_json(const HostCaptureArtifactProbe& probe) {
     << ",\"lastError\":\"" << vds::media_agent::json_escape(probe.last_error) << "\""
     << "}";
   return payload.str();
+}
+
+std::string host_session_json(const HostSessionState& session, const ObsIngestState& obs_ingest) {
+  std::ostringstream payload;
+  payload
+    << "{\"running\":" << (session.running ? "true" : "false")
+    << ",\"backend\":\"" << vds::media_agent::json_escape(session.backend) << "\""
+    << ",\"requestedCodec\":\"" << vds::media_agent::json_escape(session.requested_codec) << "\""
+    << ",\"codec\":\"" << vds::media_agent::json_escape(session.codec) << "\""
+    << ",\"effectiveCodec\":\"" << vds::media_agent::json_escape(session.codec) << "\""
+    << ",\"pipeline\":" << host_pipeline_json(session.pipeline)
+    << ",\"capturePlan\":" << host_capture_plan_json(session.capture_plan)
+    << ",\"obsIngest\":" << obs_ingest_json(obs_ingest)
+    << "}";
+  return payload.str();
+}
+
+void append_host_session_status_json_fields(std::ostream& payload, const HostSessionState& session) {
+  payload
+    << "\"hostSessionRunning\":" << (session.running ? "true" : "false")
+    << ",\"hostBackend\":\"" << vds::media_agent::json_escape(session.backend) << "\"";
+}
+
+void append_host_session_stats_json_fields(std::ostream& payload, const HostSessionState& session) {
+  payload
+    << "\"hostSessionRunning\":" << (session.running ? "true" : "false")
+    << ",\"hostPipeline\":" << host_pipeline_json(session.pipeline)
+    << ",\"hostCapturePlan\":" << host_capture_plan_json(session.capture_plan);
 }

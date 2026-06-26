@@ -4,8 +4,8 @@
 #include <mutex>
 #include <sstream>
 
-#include "agent_runtime.h"
 #include "json_protocol.h"
+#include "obs_ingest_session_state.h"
 
 std::string obs_ingest_json(const ObsIngestState& state) {
   std::lock_guard<std::mutex> lock(state.mutex);

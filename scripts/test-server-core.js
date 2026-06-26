@@ -304,6 +304,54 @@ async function testViewerMediaCapabilitiesAreForwarded() {
   });
 }
 
+async function testHalfReadyViewerIsNotSelectedAsUpstream() {
+  const instance = startServer({
+    port: 0,
+    publicDir: null,
+    updatesDir: null,
+    maxMessagesPerWindow: 20,
+    disconnectGraceMs: 80
+  });
+  await new Promise((resolve) => instance.server.once('listening', resolve));
+  const { port } = instance.server.address();
+  try {
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-half-ready', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port);
+    viewerA.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-half-ready-a' }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.upstreamPeerId, 'host-half-ready');
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    const viewerRecord = instance.rooms.get(created.roomId).viewers[0];
+    viewerRecord.mediaReady = true;
+    viewerRecord.relayEstablished = false;
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-half-ready-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-half-ready');
+    const hostMessages = await collectMessages(host, 120);
+    assert.ok(hostMessages.some((message) => message.type === 'viewer-joined' && message.viewerId === 'viewer-half-ready-b'));
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next' && message.nextViewerId === 'viewer-half-ready-b'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+  } finally {
+    for (const client of instance.wss.clients) {
+      client.close();
+    }
+    await new Promise((resolve) => instance.server.close(resolve));
+  }
+}
+
 async function testViewerReconnectReadyRenotifiesHost() {
   await withServer(async (port) => {
     const host = await openWs(port);
@@ -896,6 +944,7 @@ async function testBrowserRootUsesVdsWebWhenBuilt() {
   await testStaleLeaveRoomCannotRemoveCurrentRoom();
   await testStartServerSupportsRandomPort();
   await testViewerMediaCapabilitiesAreForwarded();
+  await testHalfReadyViewerIsNotSelectedAsUpstream();
   await testViewerReconnectReadyRenotifiesHost();
   await testViewerReconnectReselectsUpstreamWithFanoutLimit();
   await testStaleViewerReconnectReadyDoesNotReselectCurrentUpstream();
