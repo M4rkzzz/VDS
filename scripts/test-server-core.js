@@ -64,9 +64,9 @@ function collectMessages(ws, durationMs) {
   });
 }
 
-function openWs(port) {
+function openWs(port, headers = {}) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`, { headers });
     ws.once('open', () => resolve(ws));
     ws.once('error', reject);
   });
@@ -243,11 +243,19 @@ async function testViewerMediaCapabilitiesAreForwarded() {
   await withServer(async (port) => {
     const mediaCapabilities = {
       webViewer: true,
+      platform: 'desktop',
+      browser: 'Chrome 126\u0000\nInjected',
+      browserFamily: 'chromium',
+      audioOutput: true,
+      relayCapable: true,
+      relayEligibilityReason: 'relay-ready\u0000\nlocal',
       encodedMediaDataChannel: {
         protocol: 'vds-media-encoded-v1',
         protocolVersion: 1,
         supportedVideoCodecs: ['h264'],
         supportedAudioCodecs: ['opus'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw'],
         maxFrameBytes: 2097152,
         bootstrapRequired: true
       }
@@ -267,12 +275,20 @@ async function testViewerMediaCapabilitiesAreForwarded() {
     }));
     const joinedFirst = await onceMessage(firstViewer);
     assert.strictEqual(joinedFirst.type, 'room-joined');
+    assert.strictEqual(joinedFirst.mediaCapabilities.browser, 'Chrome 126Injected');
+    assert.strictEqual(joinedFirst.mediaCapabilities.localRelayEligibilityReason, 'relay-readylocal');
     assert.strictEqual(joinedFirst.mediaCapabilities.encodedMediaDataChannel.protocol, 'vds-media-encoded-v1');
+    assert.deepStrictEqual(joinedFirst.mediaCapabilities.encodedMediaDataChannel.supportedVideoPayloadFormats, ['annexb', 'avcc']);
+    assert.deepStrictEqual(joinedFirst.mediaCapabilities.encodedMediaDataChannel.supportedAudioPayloadFormats, ['opus-raw', 'raw']);
     assert.strictEqual(joinedFirst.mediaManifest.video.codec, 'h264');
 
     const hostNotice = await onceMessage(host);
     assert.strictEqual(hostNotice.type, 'viewer-joined');
+    assert.strictEqual(hostNotice.viewerMediaCapabilities.browser, 'Chrome 126Injected');
+    assert.strictEqual(hostNotice.viewerMediaCapabilities.localRelayEligibilityReason, 'relay-readylocal');
     assert.strictEqual(hostNotice.viewerMediaCapabilities.encodedMediaDataChannel.protocolVersion, 1);
+    assert.deepStrictEqual(hostNotice.viewerMediaCapabilities.encodedMediaDataChannel.supportedVideoPayloadFormats, ['annexb', 'avcc']);
+    assert.deepStrictEqual(hostNotice.viewerMediaCapabilities.encodedMediaDataChannel.supportedAudioPayloadFormats, ['opus-raw', 'raw']);
     assert.strictEqual(hostNotice.mediaManifest.protocol, 'vds-media-encoded-v1');
 
     firstViewer.send(JSON.stringify({
@@ -296,11 +312,1132 @@ async function testViewerMediaCapabilitiesAreForwarded() {
     const connectNext = await onceMessage(firstViewer);
     assert.strictEqual(connectNext.type, 'connect-to-next');
     assert.strictEqual(connectNext.nextViewerMediaCapabilities.encodedMediaDataChannel.protocol, 'vds-media-encoded-v1');
+    assert.deepStrictEqual(connectNext.nextViewerMediaCapabilities.encodedMediaDataChannel.supportedVideoPayloadFormats, ['annexb', 'avcc']);
     assert.strictEqual(connectNext.mediaManifest.audio.codec, 'opus');
 
     host.close();
     firstViewer.close();
     secondViewer.close();
+  });
+}
+
+async function testZeroRelayCapacityViewerIsNotSelectedAsUpstream() {
+  await withServer(async (port) => {
+    const noRelayCapabilities = {
+      webViewer: true,
+      mobile: true,
+      platform: 'ios',
+      browser: 'Forged Chrome 999',
+      browserFamily: 'safari',
+      audioOutput: true,
+      relayCapable: false,
+      maxDirectDownstreams: 0,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264', 'h265'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw', 'aac-adts'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-no-relay', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-no-relay-a',
+      mediaCapabilities: noRelayCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.upstreamPeerId, 'host-no-relay');
+    assert.strictEqual(joinedA.mediaCapabilities.maxDirectDownstreams, 0);
+    assert.strictEqual(joinedA.mediaCapabilities.platform, 'ios');
+    assert.strictEqual(joinedA.mediaCapabilities.audioOutput, true);
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-no-relay-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-no-relay-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-no-relay');
+
+    const hostMessages = await collectMessages(host, 120);
+    assert.ok(hostMessages.some((message) => message.type === 'viewer-joined' && message.viewerId === 'viewer-no-relay-b'));
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+  });
+}
+
+async function testNonRelayCapableWebViewerIsNotSelectedEvenWithPositiveLimit() {
+  await withServer(async (port) => {
+    const misleadingCapabilities = {
+      webViewer: true,
+      mobile: true,
+      platform: 'ios',
+      browser: 'Forged Chrome 999',
+      browserFamily: 'safari',
+      audioOutput: true,
+      relayCapable: false,
+      maxDirectDownstreams: 2,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264', 'h265'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw', 'aac-adts'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-non-relay-flag', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-non-relay-flag-a',
+      mediaCapabilities: misleadingCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.maxDirectDownstreams, 0);
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, false);
+    assert.strictEqual(joinedA.mediaCapabilities.audioOutput, true);
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-non-relay-flag-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-non-relay-flag-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-non-relay-flag');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+  });
+}
+
+async function testServerRejectsInvalidMobileRelayClaims() {
+  await withServer(async (port) => {
+    const invalidIosRelayCapabilities = {
+      webViewer: true,
+      mobile: true,
+      platform: 'ios',
+      browser: 'Forged Chrome 999',
+      browserFamily: 'safari',
+      audioOutput: true,
+      relayCapable: true,
+      maxDirectDownstreams: 5,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264', 'h265'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw', 'aac-adts'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-invalid-mobile-relay', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-invalid-ios-relay-a',
+      mediaCapabilities: invalidIosRelayCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, false);
+    assert.strictEqual(joinedA.mediaCapabilities.maxDirectDownstreams, 0);
+    assert.strictEqual(joinedA.mediaCapabilities.platform, 'ios');
+    assert.strictEqual(joinedA.mediaCapabilities.browser, 'Safari 18.0');
+    assert.strictEqual(joinedA.mediaCapabilities.browserFamily, 'safari');
+    assert.strictEqual(joinedA.mediaCapabilities.androidChrome, false);
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-invalid-ios-relay-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-invalid-ios-relay-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-invalid-mobile-relay');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+
+    await assertForgedIosLeaf(port, invalidIosRelayCapabilities, {
+      hostId: 'host-invalid-ipados-relay',
+      viewerId: 'viewer-invalid-ipados-relay',
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+      expectedBrowser: 'Safari 18.0'
+    });
+    await assertForgedIosLeaf(port, invalidIosRelayCapabilities, {
+      hostId: 'host-invalid-ios-chrome-relay',
+      viewerId: 'viewer-invalid-ios-chrome-relay',
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/126.0.0.0 Mobile/15E148 Safari/604.1',
+      expectedBrowser: 'Chrome iOS 126.0.0.0',
+      expectedBrowserFamily: 'chromium'
+    });
+    await assertForgedIosLeaf(port, invalidIosRelayCapabilities, {
+      hostId: 'host-invalid-ios-edge-relay',
+      viewerId: 'viewer-invalid-ios-edge-relay',
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) EdgiOS/126.0.0.0 Mobile/15E148 Safari/604.1',
+      expectedBrowser: 'Edge iOS 126.0.0.0',
+      expectedBrowserFamily: 'chromium'
+    });
+  });
+}
+
+async function testWebViewerWithoutRelayCapabilityIsNotSelectedAsUpstream() {
+  await withServer(async (port) => {
+    const legacyLikeCapabilities = {
+      webViewer: true,
+      mobile: true,
+      platform: 'android',
+      browser: 'Forged Chrome 999',
+      browserFamily: 'chromium',
+      androidChrome: false,
+      audioOutput: true,
+      maxDirectDownstreams: 1,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264', 'h265'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw', 'aac-adts'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-missing-relay-flag', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port);
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-missing-relay-flag-a',
+      mediaCapabilities: legacyLikeCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, false);
+    assert.strictEqual(joinedA.mediaCapabilities.androidChrome, false);
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-missing-relay-flag-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-missing-relay-flag-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-missing-relay-flag');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+  });
+}
+
+async function testServerSkipsWebRelayCandidateWithoutCodecCapability() {
+  await withServer(async (port) => {
+    const missingCodecCapabilities = {
+      webViewer: true,
+      mobile: false,
+      platform: 'desktop',
+      browserFamily: 'chromium',
+      androidChrome: false,
+      audioOutput: true,
+      relayCapable: true,
+      maxDirectDownstreams: 5,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-missing-codec-capability', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-missing-codec-capability-a',
+      mediaCapabilities: missingCodecCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, false);
+    assert.strictEqual(joinedA.mediaCapabilities.relayEligibilityReason, 'missing-video-codec');
+    assert.deepStrictEqual(joinedA.mediaCapabilities.encodedMediaDataChannel.supportedVideoCodecs, []);
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-missing-codec-capability-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-missing-codec-capability-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-missing-codec-capability');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+  });
+}
+
+async function testServerSkipsWebRelayCandidateWithoutPayloadFormatCapability() {
+  await withServer(async (port) => {
+    const missingPayloadFormatCapabilities = {
+      webViewer: true,
+      mobile: false,
+      platform: 'desktop',
+      browserFamily: 'chromium',
+      androidChrome: false,
+      audioOutput: true,
+      relayCapable: true,
+      maxDirectDownstreams: 1,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264', 'h265'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-missing-payload-capability', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-missing-payload-capability-a',
+      mediaCapabilities: missingPayloadFormatCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, false);
+    assert.strictEqual(joinedA.mediaCapabilities.relayEligibilityReason, 'missing-video-payload-format');
+    assert.deepStrictEqual(joinedA.mediaCapabilities.encodedMediaDataChannel.supportedVideoPayloadFormats, []);
+    assert.deepStrictEqual(joinedA.mediaCapabilities.encodedMediaDataChannel.supportedAudioPayloadFormats, []);
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-missing-payload-capability-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-missing-payload-capability-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-missing-payload-capability');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+  });
+}
+
+async function testServerSkipsWebRelayCandidateWithInvalidEncodedProtocol() {
+  await withServer(async (port) => {
+    const invalidProtocolCapabilities = {
+      webViewer: true,
+      mobile: true,
+      platform: 'android',
+      browserFamily: 'chromium',
+      androidChrome: true,
+      audioOutput: true,
+      relayCapable: true,
+      maxDirectDownstreams: 1,
+      encodedMediaDataChannel: {
+        protocol: 'legacy-encoded-media',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264', 'h265'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw', 'aac-adts'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-invalid-encoded-protocol', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-invalid-encoded-protocol-a',
+      mediaCapabilities: invalidProtocolCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, false);
+    assert.strictEqual(joinedA.mediaCapabilities.maxDirectDownstreams, 0);
+    assert.strictEqual(joinedA.mediaCapabilities.relayEligibilityReason, 'invalid-encoded-protocol');
+    assert.strictEqual(joinedA.mediaCapabilities.encodedMediaDataChannel.protocol, 'legacy-encoded-media');
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-invalid-encoded-protocol-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-invalid-encoded-protocol-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-invalid-encoded-protocol');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+  });
+}
+
+async function testServerSkipsWebRelayCandidateWithoutAudioOutput() {
+  await withServer(async (port) => {
+    const noAudioOutputCapabilities = {
+      webViewer: true,
+      mobile: true,
+      platform: 'android',
+      browserFamily: 'chromium',
+      androidChrome: true,
+      audioOutput: false,
+      relayCapable: true,
+      maxDirectDownstreams: 1,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264', 'h265'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw', 'aac-adts'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-missing-audio-output', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-missing-audio-output-a',
+      mediaCapabilities: noAudioOutputCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.audioOutput, false);
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, false);
+    assert.strictEqual(joinedA.mediaCapabilities.maxDirectDownstreams, 0);
+    assert.strictEqual(joinedA.mediaCapabilities.relayEligibilityReason, 'missing-audio-output');
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-missing-audio-output-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-missing-audio-output-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-missing-audio-output');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+  });
+}
+
+async function testServerUsesWebSocketUserAgentForAndroidChromeRelayClaims() {
+  await withServer(async (port) => {
+    const forgedAndroidChromeCapabilities = {
+      webViewer: true,
+      mobile: true,
+      platform: 'android',
+      browserFamily: 'chromium',
+      androidChrome: true,
+      audioOutput: true,
+      relayCapable: true,
+      maxDirectDownstreams: 1,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264', 'h265'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw', 'aac-adts'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-ua-relay-claim', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36 OPR/84.0.0.0'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-ua-opera-forged-relay-a',
+      mediaCapabilities: forgedAndroidChromeCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.platform, 'android');
+    assert.strictEqual(joinedA.mediaCapabilities.browser, 'Opera 84.0.0.0');
+    assert.strictEqual(joinedA.mediaCapabilities.browserFamily, 'chromium');
+    assert.strictEqual(joinedA.mediaCapabilities.androidChrome, false);
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, false);
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-ua-opera-forged-relay-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-ua-opera-forged-relay-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-ua-relay-claim');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    const viewerC = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36 EdgA/126.0.0.0'
+    });
+    viewerC.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-ua-edge-forged-relay-c',
+      mediaCapabilities: forgedAndroidChromeCapabilities
+    }));
+    const joinedC = await onceMessage(viewerC);
+    assert.strictEqual(joinedC.type, 'room-joined');
+    assert.strictEqual(joinedC.mediaCapabilities.platform, 'android');
+    assert.strictEqual(joinedC.mediaCapabilities.browser, 'Edge Android 126.0.0.0');
+    assert.strictEqual(joinedC.mediaCapabilities.browserFamily, 'chromium');
+    assert.strictEqual(joinedC.mediaCapabilities.androidChrome, false);
+    assert.strictEqual(joinedC.mediaCapabilities.relayCapable, false);
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+    viewerC.close();
+
+    await assertForgedAndroidLeaf(port, forgedAndroidChromeCapabilities, {
+      hostId: 'host-ua-webview-relay-claim',
+      viewerId: 'viewer-ua-webview-forged-relay',
+      expectedBrowser: 'Android WebView 126.0.0.0',
+      userAgent: 'Mozilla/5.0 (Linux; Android 15; Pixel 9 Build/AP3A.240905.015; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36'
+    });
+    await assertForgedAndroidLeaf(port, forgedAndroidChromeCapabilities, {
+      hostId: 'host-ua-huawei-relay-claim',
+      viewerId: 'viewer-ua-huawei-forged-relay',
+      expectedBrowser: 'Huawei Browser 15.0.0.0',
+      userAgent: 'Mozilla/5.0 (Linux; Android 15; HUAWEI) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36 HuaweiBrowser/15.0.0.0'
+    });
+  });
+}
+
+async function assertForgedIosLeaf(port, forgedCapabilities, options) {
+  const host = await openWs(port);
+  host.send(JSON.stringify({ type: 'create-room', clientId: options.hostId, mediaManifest: testMediaManifest() }));
+  const created = await onceMessage(host);
+  assert.strictEqual(created.type, 'room-created');
+
+  const viewer = await openWs(port, { 'User-Agent': options.userAgent });
+  viewer.send(JSON.stringify({
+    type: 'join-room',
+    roomId: created.roomId,
+    clientId: options.viewerId,
+    mediaCapabilities: forgedCapabilities
+  }));
+  const joined = await onceMessage(viewer);
+  assert.strictEqual(joined.type, 'room-joined');
+  assert.strictEqual(joined.mediaCapabilities.platform, 'ios');
+  assert.strictEqual(joined.mediaCapabilities.browser, options.expectedBrowser);
+  assert.strictEqual(joined.mediaCapabilities.browserFamily, options.expectedBrowserFamily || 'safari');
+  assert.strictEqual(joined.mediaCapabilities.androidChrome, false);
+  assert.strictEqual(joined.mediaCapabilities.relayCapable, false);
+
+  host.close();
+  viewer.close();
+}
+
+async function assertForgedAndroidLeaf(port, forgedCapabilities, options) {
+  const host = await openWs(port);
+  host.send(JSON.stringify({ type: 'create-room', clientId: options.hostId, mediaManifest: testMediaManifest() }));
+  const created = await onceMessage(host);
+  assert.strictEqual(created.type, 'room-created');
+
+  const viewer = await openWs(port, { 'User-Agent': options.userAgent });
+  viewer.send(JSON.stringify({
+    type: 'join-room',
+    roomId: created.roomId,
+    clientId: options.viewerId,
+    mediaCapabilities: forgedCapabilities
+  }));
+  const joined = await onceMessage(viewer);
+  assert.strictEqual(joined.type, 'room-joined');
+  assert.strictEqual(joined.mediaCapabilities.platform, 'android');
+  if (options.expectedBrowser) {
+    assert.strictEqual(joined.mediaCapabilities.browser, options.expectedBrowser);
+  }
+  assert.strictEqual(joined.mediaCapabilities.browserFamily, 'chromium');
+  assert.strictEqual(joined.mediaCapabilities.androidChrome, false);
+  assert.strictEqual(joined.mediaCapabilities.relayCapable, false);
+
+  host.close();
+  viewer.close();
+}
+
+async function testServerRejectsDesktopNonChromeRelayClaims() {
+  await withServer(async (port) => {
+    const forgedDesktopRelayCapabilities = {
+      webViewer: true,
+      mobile: false,
+      platform: 'desktop',
+      browser: 'Forged Chrome 999',
+      browserFamily: 'chromium',
+      audioOutput: true,
+      relayCapable: true,
+      maxDirectDownstreams: 1,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264', 'h265'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw', 'aac-adts'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-desktop-non-chrome-relay', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-desktop-firefox-forged-relay-a',
+      mediaCapabilities: forgedDesktopRelayCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.platform, 'desktop');
+    assert.strictEqual(joinedA.mediaCapabilities.browser, 'Firefox 126.0');
+    assert.strictEqual(joinedA.mediaCapabilities.browserFamily, 'firefox');
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, false);
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-desktop-firefox-forged-relay-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-desktop-firefox-forged-relay-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-desktop-non-chrome-relay');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+  });
+}
+
+async function testServerRejectsAndroidChromeRelayWithoutPayloadMatrix() {
+  await withServer(async (port) => {
+    const incompletePayloadCapabilities = {
+      webViewer: true,
+      mobile: true,
+      platform: 'android',
+      browserFamily: 'chromium',
+      androidChrome: true,
+      audioOutput: true,
+      relayCapable: true,
+      maxDirectDownstreams: 1,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264', 'h265'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        supportedVideoPayloadFormats: ['annexb'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-android-payload-matrix', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-android-payload-matrix-a',
+      mediaCapabilities: incompletePayloadCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, false);
+    assert.strictEqual(joinedA.mediaCapabilities.maxDirectDownstreams, 0);
+    assert.strictEqual(joinedA.mediaCapabilities.relayEligibilityReason, 'missing-android-relay-codec-matrix');
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-android-payload-matrix-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-android-payload-matrix-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-android-payload-matrix');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+  });
+}
+
+async function testServerSkipsWebRelayCandidateWhenManifestUnsupported() {
+  await withServer(async (port) => {
+    const h264OnlyRelayCapabilities = {
+      webViewer: true,
+      mobile: true,
+      platform: 'android',
+      browserFamily: 'chromium',
+      androidChrome: true,
+      audioOutput: true,
+      relayCapable: true,
+      maxDirectDownstreams: 1,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw', 'aac-adts'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-h265-web-relay-filter', mediaManifest: testMediaManifest({ videoCodec: 'h265' }) }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-h264-only-relay-a',
+      mediaCapabilities: h264OnlyRelayCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.upstreamPeerId, 'host-h265-web-relay-filter');
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, false);
+    assert.strictEqual(joinedA.mediaCapabilities.maxDirectDownstreams, 0);
+    assert.strictEqual(joinedA.mediaCapabilities.relayEligibilityReason, 'missing-android-relay-codec-matrix');
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-h264-only-relay-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-h265-downstream-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'host-h265-web-relay-filter');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+  });
+}
+
+async function testServerAllowsWebRelayCandidateWithCodecAliases() {
+  await withServer(async (port) => {
+    const aliasCapabilities = {
+      webViewer: true,
+      mobile: true,
+      platform: 'android',
+      browserFamily: 'chromium',
+      androidChrome: true,
+      audioOutput: true,
+      relayCapable: true,
+      maxDirectDownstreams: 5,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['avc1.640028', 'hvc1.1.6.L120.B0'],
+        supportedAudioCodecs: ['opus', 'mp4a.40.2'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw', 'aac-adts'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-alias-web-relay', mediaManifest: testMediaManifest({ videoCodec: 'h265', audioCodec: 'aac' }) }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-alias-relay-a',
+      mediaCapabilities: aliasCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.maxDirectDownstreams, 1);
+    assert.strictEqual(joinedA.upstreamPeerId, 'host-alias-web-relay');
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-alias-relay-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-alias-downstream-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'viewer-alias-relay-a');
+    assert.strictEqual((await onceMessage(viewerA)).type, 'connect-to-next');
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+  });
+}
+
+
+async function testAndroidChromeRelayCapacityIsCappedToOneDownstream() {
+  await withServer(async (port) => {
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-android-cap', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const androidChromeCapabilities = {
+      webViewer: true,
+      mobile: true,
+      platform: 'android',
+      browserFamily: 'chromium',
+      androidChrome: true,
+      audioOutput: true,
+      relayCapable: true,
+      maxDirectDownstreams: 5,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264', 'h265'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw', 'aac-adts'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-android-cap-a',
+      mediaCapabilities: androidChromeCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, true);
+    assert.strictEqual(joinedA.mediaCapabilities.maxDirectDownstreams, 1);
+    assert.strictEqual(joinedA.upstreamPeerId, 'host-android-cap');
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+    viewerA.send(JSON.stringify({ type: 'viewer-ready', roomId: created.roomId, clientId: 'viewer-android-cap-a', sessionToken: joinedA.sessionToken, chainPosition: 0 }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-android-cap-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'viewer-android-cap-a');
+    const connectB = await onceMessage(viewerA);
+    assert.strictEqual(connectB.type, 'connect-to-next');
+    assert.strictEqual(connectB.nextViewerId, 'viewer-android-cap-b');
+    viewerB.send(JSON.stringify({ type: 'viewer-ready', roomId: created.roomId, clientId: 'viewer-android-cap-b', sessionToken: joinedB.sessionToken, chainPosition: 1 }));
+
+    const viewerC = await openWs(port);
+    viewerC.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-android-cap-c' }));
+    const joinedC = await onceMessage(viewerC);
+    assert.strictEqual(joinedC.type, 'room-joined');
+    assert.strictEqual(joinedC.upstreamPeerId, 'viewer-android-cap-b');
+    const connectC = await onceMessage(viewerB);
+    assert.strictEqual(connectC.type, 'connect-to-next');
+    assert.strictEqual(connectC.nextViewerId, 'viewer-android-cap-c');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(!viewerAMessages.some((message) => message.type === 'connect-to-next' && message.nextViewerId === 'viewer-android-cap-c'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
+    viewerC.close();
+  });
+}
+
+async function testServerAllowsAndroidChromeRelayWhenPayloadAndroidChromeIsFalse() {
+  await withServer(async (port) => {
+    const androidChromeCapabilities = {
+      webViewer: true,
+      mobile: true,
+      platform: 'android',
+      browserFamily: 'chromium',
+      androidChrome: false,
+      audioOutput: true,
+      relayCapable: true,
+      maxDirectDownstreams: 1,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264', 'h265'],
+        supportedAudioCodecs: ['opus', 'aac'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw', 'aac-adts'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-ua-android-chrome-relay', mediaManifest: testMediaManifest() }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-ua-android-chrome-relay-a',
+      mediaCapabilities: androidChromeCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual(joinedA.mediaCapabilities.platform, 'android');
+    assert.strictEqual(joinedA.mediaCapabilities.browserFamily, 'chromium');
+    assert.strictEqual(joinedA.mediaCapabilities.androidChrome, true);
+    assert.strictEqual(joinedA.mediaCapabilities.relayCapable, true);
+    assert.strictEqual(joinedA.mediaCapabilities.relayEligibilityReason, 'relay-ready');
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-ua-android-chrome-relay-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-ua-android-chrome-relay-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'viewer-ua-android-chrome-relay-a');
+
+    const viewerAMessages = await collectMessages(viewerA, 80);
+    assert.ok(viewerAMessages.some((message) => message.type === 'connect-to-next'));
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
   });
 }
 
@@ -593,7 +1730,20 @@ async function testViewerCapabilityLimitsDirectDownstreams() {
       mediaCapabilities: {
         webViewer: true,
         maxDirectDownstreams: 1,
-        encodedMediaDataChannel: { protocol: 'vds-media-encoded-v1', protocolVersion: 1 }
+        platform: 'desktop',
+        browserFamily: 'chromium',
+        audioOutput: true,
+        relayCapable: true,
+        encodedMediaDataChannel: {
+          protocol: 'vds-media-encoded-v1',
+          protocolVersion: 1,
+          supportedVideoCodecs: ['h264'],
+          supportedAudioCodecs: ['opus'],
+          supportedVideoPayloadFormats: ['annexb', 'avcc'],
+          supportedAudioPayloadFormats: ['opus-raw', 'raw'],
+          maxFrameBytes: 2097152,
+          bootstrapRequired: true
+        }
       }
     }));
     const joinedA = await onceMessage(viewerA);
@@ -686,6 +1836,82 @@ async function testJoinRequiresHostMediaManifest() {
 
     host.close();
     viewer.close();
+  });
+}
+
+async function testHostMediaManifestUpdateReselectsIncompatibleWebRelay() {
+  await withServer(async (port) => {
+    const h264OnlyRelayCapabilities = {
+      webViewer: true,
+      mobile: false,
+      platform: 'desktop',
+      browserFamily: 'chromium',
+      androidChrome: false,
+      audioOutput: true,
+      relayCapable: true,
+      maxDirectDownstreams: 1,
+      encodedMediaDataChannel: {
+        protocol: 'vds-media-encoded-v1',
+        protocolVersion: 1,
+        supportedVideoCodecs: ['h264'],
+        supportedAudioCodecs: ['opus'],
+        supportedVideoPayloadFormats: ['annexb', 'avcc'],
+        supportedAudioPayloadFormats: ['opus-raw', 'raw'],
+        maxFrameBytes: 2097152,
+        bootstrapRequired: true
+      }
+    };
+
+    const host = await openWs(port);
+    host.send(JSON.stringify({ type: 'create-room', clientId: 'host-manifest-reselect', mediaManifest: testMediaManifest({ videoCodec: 'h264' }) }));
+    const created = await onceMessage(host);
+    assert.strictEqual(created.type, 'room-created');
+
+    const viewerA = await openWs(port, {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+    });
+    viewerA.send(JSON.stringify({
+      type: 'join-room',
+      roomId: created.roomId,
+      clientId: 'viewer-manifest-reselect-a',
+      mediaCapabilities: h264OnlyRelayCapabilities
+    }));
+    const joinedA = await onceMessage(viewerA);
+    assert.strictEqual(joinedA.type, 'room-joined');
+    assert.strictEqual((await onceMessage(host)).type, 'viewer-joined');
+    viewerA.send(JSON.stringify({
+      type: 'viewer-ready',
+      roomId: created.roomId,
+      clientId: 'viewer-manifest-reselect-a',
+      sessionToken: joinedA.sessionToken,
+      chainPosition: 0
+    }));
+
+    const viewerB = await openWs(port);
+    viewerB.send(JSON.stringify({ type: 'join-room', roomId: created.roomId, clientId: 'viewer-manifest-reselect-b' }));
+    const joinedB = await onceMessage(viewerB);
+    assert.strictEqual(joinedB.type, 'room-joined');
+    assert.strictEqual(joinedB.upstreamPeerId, 'viewer-manifest-reselect-a');
+    assert.strictEqual((await onceMessage(viewerA)).type, 'connect-to-next');
+
+    host.send(JSON.stringify({
+      type: 'host-media-manifest',
+      roomId: created.roomId,
+      clientId: 'host-manifest-reselect',
+      sessionToken: created.sessionToken,
+      mediaManifest: testMediaManifest({ videoCodec: 'h265', mediaSessionId: 'media-h265-reselect' })
+    }));
+    const ack = await onceMessage(host);
+    assert.strictEqual(ack.type, 'host-media-manifest-ack');
+    assert.strictEqual(ack.mediaSessionId, 'media-h265-reselect');
+    const reconnect = await onceMessage(viewerB);
+    assert.strictEqual(reconnect.type, 'chain-reconnect');
+    assert.strictEqual(reconnect.upstreamPeerId, 'host-manifest-reselect');
+    assert.strictEqual(reconnect.mediaManifest.video.codec, 'h265');
+
+    host.close();
+    viewerA.close();
+    viewerB.close();
   });
 }
 
@@ -910,6 +2136,37 @@ function testValidateInboundMessageRateLimit() {
   assert.strictEqual(sent[sent.length - 1].code, 'message-rate-limit');
 }
 
+function testServerSupportsOptionalHttpsForLanMobileWeb() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server/server-core.js'), 'utf8');
+  const entry = fs.readFileSync(path.join(__dirname, '..', 'server/index.js'), 'utf8');
+  assert.match(source, /const https = require\('https'\)/);
+  assert.match(source, /resolveHttpsOptions\(options\)/);
+  assert.match(source, /process\.env\.VDS_HTTPS_KEY_PATH/);
+  assert.match(source, /process\.env\.VDS_HTTPS_CERT_PATH/);
+  assert.match(source, /https\.createServer\(httpsOptions, app\)/);
+  assert.match(source, /logServerInfo\(`Server running on \$\{serverProtocol\}:\/\/localhost:\$\{actualPort\}`\)/);
+  assert.match(entry, /catch \(error\) \{/);
+}
+
+function testAdminDashboardShowsMobileWebCapabilities() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server/public/admin.html'), 'utf8');
+  assert.match(source, /function viewerCapabilitySummary\(mediaCapabilities\)/);
+  assert.match(source, /function viewerCapabilityPills\(mediaCapabilities\)/);
+  assert.match(source, /mediaCapabilities\.browser \|\| mediaCapabilities\.browserFamily/);
+  assert.match(source, /mediaCapabilities\.relayCapable === true \? 'web relay' : 'web leaf'/);
+  assert.match(source, /mediaCapabilities\.relayEligibilityReason/);
+  assert.match(source, /mediaCapabilities\.localRelayEligibilityReason/);
+  assert.match(source, /mediaCapabilities\.androidChrome === true/);
+  assert.match(source, /mediaCapabilities\.audioOutput === true \? 'audio out' : 'no audio out'/);
+  assert.match(source, /encoded\.supportedVideoCodecs/);
+  assert.match(source, /encoded\.supportedAudioCodecs/);
+  assert.match(source, /encoded\.supportedVideoPayloadFormats/);
+  assert.match(source, /encoded\.supportedAudioPayloadFormats/);
+  assert.match(source, /vf \$\{videoFormats\}/);
+  assert.match(source, /af \$\{audioFormats\}/);
+  assert.match(source, /node-row-capability/);
+}
+
 async function testBrowserRootUsesVdsWebWhenBuilt() {
   const publicDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vds-static-'));
   fs.writeFileSync(path.join(publicDir, 'index.html'), 'electron-entry');
@@ -918,9 +2175,19 @@ async function testBrowserRootUsesVdsWebWhenBuilt() {
 
   try {
     await withStaticServer(publicDir, async (port) => {
-      const browser = await getHttp(port, '/', { 'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0' });
-      assert.strictEqual(browser.statusCode, 200);
-      assert.strictEqual(browser.body, 'web-entry');
+      const browserUserAgents = [
+        'Mozilla/5.0 Chrome/120.0.0.0',
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+        'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/25.0 Chrome/126.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (Android 15; Mobile; rv:126.0) Gecko/126.0 Firefox/126.0'
+      ];
+      for (const userAgent of browserUserAgents) {
+        const browser = await getHttp(port, '/', { 'User-Agent': userAgent });
+        assert.strictEqual(browser.statusCode, 200);
+        assert.strictEqual(browser.body, 'web-entry');
+      }
 
       const electron = await getHttp(port, '/', { 'User-Agent': 'Mozilla/5.0 Electron/39.0.0' });
       assert.strictEqual(electron.statusCode, 200);
@@ -934,9 +2201,12 @@ async function testBrowserRootUsesVdsWebWhenBuilt() {
 (async () => {
   testGenerateRoomIdAvoidsCollision();
   testValidateInboundMessageRateLimit();
+  testServerSupportsOptionalHttpsForLanMobileWeb();
+  testAdminDashboardShowsMobileWebCapabilities();
   await testBrowserRootUsesVdsWebWhenBuilt();
   await testResumeTokenProtection();
   await testJoinRequiresHostMediaManifest();
+  await testHostMediaManifestUpdateReselectsIncompatibleWebRelay();
   await testOldHostSocketCannotForwardAfterResume();
   await testDuplicateCreateRoomOnSameSocketIsRejected();
   await testBoundViewerSocketCannotJoinAnotherRoom();
@@ -944,6 +2214,21 @@ async function testBrowserRootUsesVdsWebWhenBuilt() {
   await testStaleLeaveRoomCannotRemoveCurrentRoom();
   await testStartServerSupportsRandomPort();
   await testViewerMediaCapabilitiesAreForwarded();
+  await testZeroRelayCapacityViewerIsNotSelectedAsUpstream();
+  await testNonRelayCapableWebViewerIsNotSelectedEvenWithPositiveLimit();
+  await testServerRejectsInvalidMobileRelayClaims();
+  await testWebViewerWithoutRelayCapabilityIsNotSelectedAsUpstream();
+  await testServerSkipsWebRelayCandidateWithoutCodecCapability();
+  await testServerSkipsWebRelayCandidateWithoutPayloadFormatCapability();
+  await testServerSkipsWebRelayCandidateWithInvalidEncodedProtocol();
+  await testServerSkipsWebRelayCandidateWithoutAudioOutput();
+  await testServerUsesWebSocketUserAgentForAndroidChromeRelayClaims();
+  await testServerRejectsDesktopNonChromeRelayClaims();
+  await testServerRejectsAndroidChromeRelayWithoutPayloadMatrix();
+  await testServerSkipsWebRelayCandidateWhenManifestUnsupported();
+  await testServerAllowsWebRelayCandidateWithCodecAliases();
+  await testAndroidChromeRelayCapacityIsCappedToOneDownstream();
+  await testServerAllowsAndroidChromeRelayWhenPayloadAndroidChromeIsFalse();
   await testHalfReadyViewerIsNotSelectedAsUpstream();
   await testViewerReconnectReadyRenotifiesHost();
   await testViewerReconnectReselectsUpstreamWithFanoutLimit();

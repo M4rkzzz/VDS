@@ -1,6 +1,7 @@
 const { startServer } = require('./server-core');
 
-startServer({
+try {
+  startServer({
   baseDir: __dirname,
   port: process.env.PORT || 3000,
   adminPort: process.env.ADMIN_PORT || 3010,
@@ -12,4 +13,8 @@ startServer({
     }
     process.exitCode = 1;
   }
-});
+  });
+} catch (error) {
+  console.error('Server failed to start:', error && error.message ? error.message : error);
+  process.exitCode = 1;
+}

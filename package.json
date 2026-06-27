@@ -1,6 +1,6 @@
 {
   "name": "screenshare-relay",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Multi-viewer screen sharing with cascade relay (蜈蚣法) - Electron Edition",
   "main": "desktop/main.js",
   "scripts": {
@@ -17,6 +17,8 @@
     "server": "node server/index.js",
     "build:vds-web": "vite build --config vds_web/vite.config.ts",
     "check:vds-web": "tsc -p vds_web/tsconfig.json --noEmit",
+    "check:web-mobile-diagnostics": "node scripts/check-web-mobile-diagnostics.js --self-test",
+    "check:web-mobile-code": "npm run check:vds-web && npm run test:vds-web && npm run check:web-mobile-diagnostics && npm run test:server",
     "test:vds-web": "node scripts/test-vds-web-protocol.js",
     "build": "electron-builder",
     "build:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/build-media-agent.ps1 -Configuration Release",

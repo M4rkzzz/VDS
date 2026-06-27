@@ -162,6 +162,7 @@ function main() {
     'scripts/check-renderer-bridge.js',
     'scripts/check-room-client-dispatcher.js',
     'scripts/test-server-core.js',
+    'scripts/check-web-mobile-diagnostics.js',
     'scripts/release-check.js'
   ];
 
@@ -171,6 +172,7 @@ function main() {
 
   run('npm', ['run', 'check:vds-web']);
   run('npm', ['run', 'test:vds-web']);
+  run('npm', ['run', 'check:web-mobile-diagnostics']);
   if (mode === 'prebuild') {
     run('npm', ['run', 'build:vds-web']);
   }
@@ -178,7 +180,7 @@ function main() {
   run('npm', ['run', 'check:architecture']);
   run('npm', ['run', 'check:logging']);
   if (mode === 'prebuild') {
-    run('npm', ['run', 'verify:media-agent']);
+    run('powershell', ['-ExecutionPolicy', 'Bypass', '-File', 'scripts\\verify-media-agent.ps1', '-Configuration', 'Release', '-AllowLocalFfmpegFallback']);
   }
   run('npm', ['audit', '--omit=dev']);
   run('npm', ['--prefix', 'server', 'audit', '--omit=dev']);
@@ -193,4 +195,9 @@ function main() {
   console.log(`\nRelease ${mode} check passed.`);
 }
 
-main();
+try {
+  main();
+} catch (error) {
+  console.error(`\nRelease ${mode} check failed: ${error && error.message ? error.message : error}`);
+  process.exitCode = 1;
+}

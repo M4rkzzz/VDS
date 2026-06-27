@@ -2400,6 +2400,87 @@
       return typeof options.getCurrentMediaManifest === 'function' ? options.getCurrentMediaManifest() : null;
     }
 
+    function normalizeMediaCodecName(codec) {
+      const normalized = String(codec || '').trim().toLowerCase();
+      if (!normalized) {
+        return '';
+      }
+      if (normalized === 'hevc') {
+        return 'h265';
+      }
+      if (normalized === 'mp4a.40.2') {
+        return 'aac';
+      }
+      return normalized;
+    }
+
+    function normalizeCodecList(codecs) {
+      if (!Array.isArray(codecs)) {
+        return [];
+      }
+      return codecs.map(normalizeMediaCodecName).filter(Boolean);
+    }
+
+    function normalizePayloadFormat(value, fallback) {
+      return String(value || fallback || '').trim().toLowerCase();
+    }
+
+    function normalizePayloadFormatList(formats) {
+      if (!Array.isArray(formats)) {
+        return [];
+      }
+      return formats.map((format) => normalizePayloadFormat(format, '')).filter(Boolean);
+    }
+
+    function getManifestCodecCompatibilityFailure(mediaCapabilities, mediaManifest) {
+      if (!mediaManifest || typeof mediaManifest !== 'object') {
+        return 'host-media-manifest-missing';
+      }
+      if (mediaManifest.protocol && mediaManifest.protocol !== 'vds-media-encoded-v1') {
+        return 'host-media-manifest-protocol-unsupported';
+      }
+      const encoded = mediaCapabilities && mediaCapabilities.encodedMediaDataChannel;
+      const videoCodec = normalizeMediaCodecName(mediaManifest.video && mediaManifest.video.codec);
+      const supportedVideoCodecs = normalizeCodecList(encoded && encoded.supportedVideoCodecs);
+      if (supportedVideoCodecs.length === 0) {
+        return 'web-video-codec-capability-missing';
+      }
+      if (supportedVideoCodecs.length > 0 && (!videoCodec || !supportedVideoCodecs.includes(videoCodec))) {
+        return `web-video-codec-unsupported:${videoCodec || 'unknown'}`;
+      }
+      const videoPayloadFormat = normalizePayloadFormat(mediaManifest.video && mediaManifest.video.payloadFormat, 'annexb');
+      const supportedVideoPayloadFormats = normalizePayloadFormatList(encoded && encoded.supportedVideoPayloadFormats);
+      if (supportedVideoPayloadFormats.length > 0 && !supportedVideoPayloadFormats.includes(videoPayloadFormat)) {
+        return `web-video-payload-format-unsupported:${videoPayloadFormat || 'unknown'}`;
+      }
+      if (videoPayloadFormat !== 'annexb' && videoPayloadFormat !== 'avcc') {
+        return `web-video-payload-format-unsupported:${videoPayloadFormat || 'unknown'}`;
+      }
+      const audioCodec = normalizeMediaCodecName((mediaManifest.audio && mediaManifest.audio.codec) || 'opus');
+      const supportedAudioCodecs = normalizeCodecList(encoded && encoded.supportedAudioCodecs);
+      if (supportedAudioCodecs.length === 0) {
+        return 'web-audio-codec-capability-missing';
+      }
+      if (supportedAudioCodecs.length > 0 && (!audioCodec || !supportedAudioCodecs.includes(audioCodec))) {
+        return `web-audio-codec-unsupported:${audioCodec || 'unknown'}`;
+      }
+      const audioPayloadFormat = normalizePayloadFormat(
+        mediaManifest.audio && mediaManifest.audio.payloadFormat,
+        audioCodec === 'aac' ? 'aac-adts' : 'opus-raw'
+      );
+      const supportedAudioPayloadFormats = normalizePayloadFormatList(encoded && encoded.supportedAudioPayloadFormats);
+      if (supportedAudioPayloadFormats.length > 0 && !supportedAudioPayloadFormats.includes(audioPayloadFormat)) {
+        return `web-audio-payload-format-unsupported:${audioPayloadFormat || 'unknown'}`;
+      }
+      if (audioCodec === 'opus' && audioPayloadFormat !== 'opus-raw' && audioPayloadFormat !== 'raw') {
+        return `web-audio-payload-format-unsupported:${audioPayloadFormat || 'unknown'}`;
+      }
+      if (audioCodec === 'aac' && audioPayloadFormat !== 'aac-adts' && audioPayloadFormat !== 'raw') {
+        return `web-audio-payload-format-unsupported:${audioPayloadFormat || 'unknown'}`;
+      }
+      return '';
+    }
+
     function isReusableLocalOfferHandle(handle, force = false) {
       return Boolean(
         handle &&
@@ -2438,13 +2519,12 @@
       return handle;
     }
 
-    function supportsDataChannelEncodedMedia(mediaCapabilities) {
+    function getDataChannelEncodedMediaUnsupportedReason(mediaCapabilities, mediaManifest) {
       const encoded = mediaCapabilities && mediaCapabilities.encodedMediaDataChannel;
-      return Boolean(
-        encoded &&
-        encoded.protocol === 'vds-media-encoded-v1' &&
-        Number(encoded.protocolVersion || 0) === 1
-      );
+      if (!encoded || encoded.protocol !== 'vds-media-encoded-v1' || Number(encoded.protocolVersion || 0) !== 1) {
+        return 'datachannel-protocol-unsupported';
+      }
+      return getManifestCodecCompatibilityFailure(mediaCapabilities, mediaManifest || getCurrentMediaManifestSnapshot());
     }
 
     function createNonRetryableRelayError(message) {
@@ -2454,6 +2534,15 @@
     }
 
     async function createHostViewerOffer(viewerId, offerOptions = {}) {
+      if (offerOptions.viewerMediaCapabilities) {
+        const unsupportedReason = getDataChannelEncodedMediaUnsupportedReason(
+          offerOptions.viewerMediaCapabilities,
+          offerOptions.mediaManifest || getCurrentMediaManifestSnapshot()
+        );
+        if (unsupportedReason) {
+          throw createNonRetryableRelayError(unsupportedReason);
+        }
+      }
       return createOfferForPeer(viewerId, {
         ...offerOptions,
         kind: 'host-viewer',
@@ -2466,8 +2555,14 @@
       if (!nextViewerId) {
         throw new Error('native-relay-next-viewer-missing');
       }
-      if (nextViewerMediaCapabilities && !supportsDataChannelEncodedMedia(nextViewerMediaCapabilities)) {
-        throw createNonRetryableRelayError('datachannel-protocol-unsupported');
+      if (nextViewerMediaCapabilities) {
+        const unsupportedReason = getDataChannelEncodedMediaUnsupportedReason(
+          nextViewerMediaCapabilities,
+          getCurrentMediaManifestSnapshot()
+        );
+        if (unsupportedReason) {
+          throw createNonRetryableRelayError(unsupportedReason);
+        }
       }
       const isCurrentHost = typeof options.isHost === 'function' ? Boolean(options.isHost()) : Boolean(options.isHost);
       const sessionRole = typeof options.getSessionRole === 'function' ? options.getSessionRole() : '';

@@ -194,6 +194,7 @@
       font-size: 12px;
     }
     .node-row-id { font-family: Consolas, "Courier New", monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .node-row-capability { grid-column: 1 / -1; color: var(--muted); font-size: 11px; }
     pre {
       max-height: 360px;
       overflow: auto;
@@ -321,9 +322,9 @@
         });
 
       const nodeWidth = 190;
-      const nodeHeight = 88;
+      const nodeHeight = 118;
       const xGap = 250;
-      const yGap = 126;
+      const yGap = 156;
       const marginX = 32;
       const marginY = 26;
       const maxColumnSize = Math.max(1, ...Array.from(columns.values()).map((entries) => entries.length));
@@ -348,12 +349,57 @@
       return { nodes, nodeById, positions, width: graphWidth, height: graphHeight };
     }
 
+    function normalizeCodecList(value) {
+      return Array.isArray(value) ? value.map((item) => String(item || '').trim()).filter(Boolean) : [];
+    }
+
+    function viewerCapabilitySummary(mediaCapabilities) {
+      if (!mediaCapabilities || typeof mediaCapabilities !== 'object') return '';
+      const platform = String(mediaCapabilities.platform || '').trim();
+      const browser = String(mediaCapabilities.browser || mediaCapabilities.browserFamily || '').trim();
+      const androidChrome = mediaCapabilities.androidChrome === true ? 'android chrome' : '';
+      const relay = mediaCapabilities.relayCapable === true ? 'relay' : 'leaf';
+      const relayReason = String(mediaCapabilities.relayEligibilityReason || '').trim();
+      const localRelayReason = String(mediaCapabilities.localRelayEligibilityReason || '').trim();
+      const audioOutput = mediaCapabilities.audioOutput === true ? 'audio out' : 'no audio out';
+      const encoded = mediaCapabilities.encodedMediaDataChannel || {};
+      const video = normalizeCodecList(encoded.supportedVideoCodecs).join('/');
+      const audio = normalizeCodecList(encoded.supportedAudioCodecs).join('/');
+      const videoFormats = normalizeCodecList(encoded.supportedVideoPayloadFormats).join('/');
+      const audioFormats = normalizeCodecList(encoded.supportedAudioPayloadFormats).join('/');
+      return [platform, browser, androidChrome, relay, relayReason, localRelayReason && `local:${localRelayReason}`, audioOutput, video, audio, videoFormats && `vf:${videoFormats}`, audioFormats && `af:${audioFormats}`].filter(Boolean).join(' · ');
+    }
+
+    function viewerCapabilityPills(mediaCapabilities) {
+      if (!mediaCapabilities || typeof mediaCapabilities !== 'object') return [];
+      const result = [];
+      const platform = String(mediaCapabilities.platform || '').trim();
+      const browser = String(mediaCapabilities.browser || mediaCapabilities.browserFamily || '').trim();
+      const encoded = mediaCapabilities.encodedMediaDataChannel || {};
+      const video = normalizeCodecList(encoded.supportedVideoCodecs).join('/');
+      const audio = normalizeCodecList(encoded.supportedAudioCodecs).join('/');
+      const videoFormats = normalizeCodecList(encoded.supportedVideoPayloadFormats).join('/');
+      const audioFormats = normalizeCodecList(encoded.supportedAudioPayloadFormats).join('/');
+      if (platform || browser) result.push(pill([platform, browser].filter(Boolean).join('/'), 'info'));
+      if (mediaCapabilities.androidChrome === true) result.push(pill('android chrome', 'ok'));
+      result.push(pill(mediaCapabilities.relayCapable === true ? 'web relay' : 'web leaf', mediaCapabilities.relayCapable === true ? 'ok' : 'warn'));
+      if (mediaCapabilities.relayEligibilityReason) result.push(pill(String(mediaCapabilities.relayEligibilityReason), mediaCapabilities.relayCapable === true ? 'ok' : 'warn'));
+      if (mediaCapabilities.localRelayEligibilityReason) result.push(pill(`local ${String(mediaCapabilities.localRelayEligibilityReason)}`, mediaCapabilities.relayCapable === true ? 'ok' : 'warn'));
+      result.push(pill(mediaCapabilities.audioOutput === true ? 'audio out' : 'no audio out', mediaCapabilities.audioOutput === true ? 'ok' : 'warn'));
+      if (video) result.push(pill(video, 'info'));
+      if (audio) result.push(pill(audio, 'info'));
+      if (videoFormats) result.push(pill(`vf ${videoFormats}`, 'info'));
+      if (audioFormats) result.push(pill(`af ${audioFormats}`, 'info'));
+      return result;
+    }
+
     function renderGraphNode(node, position) {
       const status = [];
       status.push(pill(node.online ? 'online' : 'offline', node.online ? 'ok' : 'bad'));
       if (node.role === 'viewer') {
         status.push(pill(node.mediaReady ? 'media' : 'media wait', node.mediaReady ? 'ok' : 'warn'));
         status.push(pill(node.relayEstablished ? 'relay' : 'relay wait', node.relayEstablished ? 'ok' : 'warn'));
+        status.push(...viewerCapabilityPills(node.mediaCapabilities));
         if (node.connectRequestPending) status.push(pill('pending', 'warn'));
         if (node.needsChainReconnect) status.push(pill('reconnect', 'bad'));
       }
@@ -394,7 +440,8 @@
       const state = node.role === 'host'
         ? (node.online ? 'online' : 'offline')
         : `${node.online ? 'online' : 'offline'} · ${node.mediaReady ? 'media' : 'wait'} · ${node.relayEstablished ? 'relay' : 'relay wait'}`;
-      return `<div class="node-row"><span class="node-row-id" title="${escapeHtml(node.id)}">${escapeHtml(node.id)}</span><span>${escapeHtml(state)}</span></div>`;
+      const capability = node.role === 'viewer' ? viewerCapabilitySummary(node.mediaCapabilities) : '';
+      return `<div class="node-row"><span class="node-row-id" title="${escapeHtml(node.id)}">${escapeHtml(node.id)}</span><span>${escapeHtml(state)}</span>${capability ? `<span class="node-row-capability">${escapeHtml(capability)}</span>` : ''}</div>`;
     }
 
     function renderRoom(room) {

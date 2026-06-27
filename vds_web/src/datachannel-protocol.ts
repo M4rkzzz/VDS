@@ -17,6 +17,8 @@ type EncodedMediaCapabilities = {
   protocolVersion: number;
   supportedVideoCodecs: string[];
   supportedAudioCodecs: string[];
+  supportedVideoPayloadFormats: string[];
+  supportedAudioPayloadFormats: string[];
   maxFrameBytes: number;
   bootstrapRequired: boolean;
 };
@@ -28,6 +30,8 @@ type EncodedMediaControlMessage = {
   role?: 'sender' | 'receiver' | 'relay';
   supportedVideoCodecs?: string[];
   supportedAudioCodecs?: string[];
+  supportedVideoPayloadFormats?: string[];
+  supportedAudioPayloadFormats?: string[];
   maxFrameBytes?: number;
   bootstrapRequired?: boolean;
   mediaSessionId?: string;
@@ -56,11 +60,15 @@ export function webEncodedMediaCapabilities(options: {
   supportedVideoCodecs?: string[];
   supportedAudioCodecs?: string[];
 } = {}): EncodedMediaCapabilities {
+  const supportedVideoCodecs = sanitizeCodecList(options.supportedVideoCodecs);
+  const supportedAudioCodecs = sanitizeCodecList(options.supportedAudioCodecs);
   return {
     protocol: ENCODED_MEDIA_PROTOCOL,
     protocolVersion: ENCODED_MEDIA_PROTOCOL_VERSION,
-    supportedVideoCodecs: sanitizeCodecList(options.supportedVideoCodecs, ['h264']),
-    supportedAudioCodecs: sanitizeCodecList(options.supportedAudioCodecs, ['opus']),
+    supportedVideoCodecs,
+    supportedAudioCodecs,
+    supportedVideoPayloadFormats: supportedVideoCodecs.length > 0 ? ['annexb', 'avcc'] : [],
+    supportedAudioPayloadFormats: getSupportedAudioPayloadFormats(supportedAudioCodecs),
     maxFrameBytes: MAX_ENCODED_FRAME_BYTES,
     bootstrapRequired: true
   };
@@ -68,9 +76,10 @@ export function webEncodedMediaCapabilities(options: {
 
 export function helloMessage(
   role: 'sender' | 'receiver' | 'relay',
-  manifest?: { mediaSessionId?: unknown; manifestVersion?: unknown }
+  manifest?: { mediaSessionId?: unknown; manifestVersion?: unknown },
+  options: { supportedVideoCodecs?: string[]; supportedAudioCodecs?: string[] } = {}
 ): EncodedMediaControlMessage {
-  const capabilities = webEncodedMediaCapabilities();
+  const capabilities = webEncodedMediaCapabilities(options);
   return {
     protocol: ENCODED_MEDIA_PROTOCOL,
     type: 'hello',
@@ -78,6 +87,8 @@ export function helloMessage(
     protocolVersion: capabilities.protocolVersion,
     supportedVideoCodecs: capabilities.supportedVideoCodecs,
     supportedAudioCodecs: capabilities.supportedAudioCodecs,
+    supportedVideoPayloadFormats: capabilities.supportedVideoPayloadFormats,
+    supportedAudioPayloadFormats: capabilities.supportedAudioPayloadFormats,
     maxFrameBytes: capabilities.maxFrameBytes,
     bootstrapRequired: capabilities.bootstrapRequired,
     mediaSessionId: typeof manifest?.mediaSessionId === 'string' ? manifest.mediaSessionId : undefined,
@@ -272,11 +283,37 @@ export class EncodedFrameReassembler {
   }
 }
 
-function sanitizeCodecList(value: string[] | undefined, fallback: string[]): string[] {
+function sanitizeCodecList(value: string[] | undefined): string[] {
   const list = Array.isArray(value)
-    ? value.map((codec) => String(codec || '').toLowerCase()).filter(Boolean)
+    ? value.map(normalizeCapabilityCodecName).filter(Boolean)
     : [];
-  return Array.from(new Set(list.length ? list : fallback));
+  return Array.from(new Set(list));
+}
+
+function normalizeCapabilityCodecName(value: string): string {
+  const raw = String(value || '').toLowerCase().trim();
+  const compact = raw.replace(/[^a-z0-9]/g, '');
+  if (raw.startsWith('avc1') || raw.startsWith('avc3') || compact.startsWith('avc1') || compact.startsWith('avc3')) {
+    return 'h264';
+  }
+  if (raw.startsWith('hvc1') || raw.startsWith('hev1') || compact.startsWith('hvc1') || compact.startsWith('hev1') || compact === 'hevc') {
+    return 'h265';
+  }
+  if (compact === 'mp4a402') {
+    return 'aac';
+  }
+  return raw;
+}
+
+function getSupportedAudioPayloadFormats(supportedAudioCodecs: string[]): string[] {
+  const formats: string[] = [];
+  if (supportedAudioCodecs.includes('opus')) {
+    formats.push('opus-raw', 'raw');
+  }
+  if (supportedAudioCodecs.includes('aac')) {
+    formats.push('aac-adts', 'raw');
+  }
+  return Array.from(new Set(formats));
 }
 
 export function parseControlMessage(raw: string): EncodedMediaControlMessage | null {

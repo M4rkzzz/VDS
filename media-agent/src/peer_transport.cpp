@@ -257,6 +257,7 @@ std::uint64_t count_nack_requested_packets(const rtc::message_vector& messages) 
 constexpr const char* kEncodedMediaDataChannelLabel = "vds-media-encoded-v1";
 constexpr const char* kEncodedMediaProtocol = "vds-media-encoded-v1";
 constexpr std::size_t kEncodedMediaFrameHeaderLimit = 16 * 1024;
+constexpr std::size_t kEncodedMediaMaxFrameBytes = 2 * 1024 * 1024;
 constexpr std::size_t kEncodedMediaChunkPayloadBytes = 12 * 1024;
 
 bool string_contains(const std::string& value, const std::string& needle) {
@@ -320,7 +321,7 @@ std::string build_encoded_media_session_fields(const PeerTransportSnapshot& snap
 
 std::string build_encoded_media_hello(const PeerTransportSnapshot& snapshot) {
   return std::string("{\"protocol\":\"") + kEncodedMediaProtocol +
-    "\",\"type\":\"hello\",\"protocolVersion\":1,\"role\":\"relay\",\"supportedVideoCodecs\":[\"h264\",\"h265\"],\"supportedAudioCodecs\":[\"opus\",\"aac\",\"pcmu\"],\"maxFrameBytes\":2097152,\"bootstrapRequired\":true" +
+    "\",\"type\":\"hello\",\"protocolVersion\":1,\"role\":\"relay\",\"supportedVideoCodecs\":[\"h264\",\"h265\"],\"supportedAudioCodecs\":[\"opus\",\"aac\",\"pcmu\"],\"maxFrameBytes\":" + std::to_string(kEncodedMediaMaxFrameBytes) + ",\"bootstrapRequired\":true" +
     build_encoded_media_session_fields(snapshot) + "}";
 }
 
@@ -1024,6 +1025,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     if (frame.payload.size() <= kEncodedMediaChunkPayloadBytes) {
       send_payload("frame", frame.payload, frame.sequence, "", 0, 0, frame.payload.size());
     } else {
+      if (frame.payload.size() > kEncodedMediaMaxFrameBytes) {
+        throw std::runtime_error("datachannel-frame-too-large");
+      }
       const std::size_t chunk_count =
         (frame.payload.size() + kEncodedMediaChunkPayloadBytes - 1) / kEncodedMediaChunkPayloadBytes;
       const std::string frame_id =
@@ -1112,6 +1116,12 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       return false;
     }
     if (parsed.message_type == "frame") {
+      if (parsed.payload.size() > kEncodedMediaMaxFrameBytes) {
+        if (reason) {
+          *reason = "datachannel-frame-too-large";
+        }
+        return false;
+      }
       if (decoded_frame) {
         *decoded_frame = std::move(parsed);
       }
@@ -1121,7 +1131,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         parsed.chunk_count == 0 ||
         parsed.chunk_index >= parsed.chunk_count ||
         parsed.frame_payload_bytes == 0 ||
-        parsed.frame_payload_bytes > 2ull * 1024ull * 1024ull) {
+        parsed.frame_payload_bytes > kEncodedMediaMaxFrameBytes) {
       if (reason) {
         *reason = "datachannel-chunk-invalid-header";
       }

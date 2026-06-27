@@ -30,6 +30,7 @@ type SessionState = {
 
 const clientId = getClientId();
 let capability = detectCapabilities();
+let capabilityDetectionComplete = false;
 const diagnostics = new DiagnosticsStore(capability, clientId);
 const signaling = new VdsWebSignaling();
 
@@ -71,8 +72,10 @@ let copyDiagnosticsInFlight = false;
 let refreshRoomsSeq = 0;
 let refreshRoomsInFlight = false;
 let fullscreenTransitionPromise: Promise<void> | null = null;
+let mobileSuspendTimer: number | null = null;
 
 const statusBadge = getElement<HTMLSpanElement>('statusBadge');
+const capabilitySummary = getElement<HTMLParagraphElement>('capabilitySummary');
 const statusText = getElement<HTMLParagraphElement>('statusText');
 const errorText = getElement<HTMLParagraphElement>('errorText');
 const roomIdInput = getElement<HTMLInputElement>('roomIdInput');
@@ -97,6 +100,7 @@ const decodedAudioText = getElement<HTMLElement>('decodedAudioText');
 const waitingMessage = getElement<HTMLParagraphElement>('waitingMessage');
 const diagnosticsOutput = getElement<HTMLTextAreaElement>('diagnosticsOutput');
 const copyDiagnosticsButton = getElement<HTMLButtonElement>('copyDiagnosticsButton');
+const downloadDiagnosticsButton = getElement<HTMLButtonElement>('downloadDiagnosticsButton');
 const leaveButton = getElement<HTMLButtonElement>('leaveButton');
 const audioDelayInput = getElement<HTMLInputElement>('audioDelayInput');
 const audioDelayDecrease = getElement<HTMLButtonElement>('audioDelayDecrease');
@@ -161,6 +165,7 @@ signaling.onStatus((status) => {
 joinButton.addEventListener('click', () => void joinRoom(roomIdInput.value.trim()));
 refreshRoomsButton.addEventListener('click', () => void refreshRooms(true));
 copyDiagnosticsButton.addEventListener('click', () => void copyDiagnosticsReport());
+downloadDiagnosticsButton.addEventListener('click', () => downloadDiagnosticsReport());
 lobbyTabButton.addEventListener('click', () => setJoinMode('lobby'));
 directTabButton.addEventListener('click', () => setJoinMode('direct'));
 leaveButton.addEventListener('click', () => {
@@ -171,9 +176,15 @@ fullscreenButton.addEventListener('click', () => void toggleFullscreen());
 muteButton.addEventListener('click', toggleMute);
 playerVolumeInput.addEventListener('input', () => setPlayerVolume(Number(playerVolumeInput.value)));
 document.addEventListener('fullscreenchange', syncFullscreenButton);
+document.addEventListener('visibilitychange', handleVisibilityChange);
+document.addEventListener('pointerdown', unlockAudioFromUserGesture, { passive: true });
+document.addEventListener('touchend', unlockAudioFromUserGesture, { passive: true });
+document.addEventListener('keydown', unlockAudioFromUserGesture);
+window.addEventListener('pagehide', () => handleMobilePageSuspended('pagehide', true));
 audioDelayInput.addEventListener('change', () => setAudioDelay(Number(audioDelayInput.value)));
 audioDelayDecrease.addEventListener('click', () => setAudioDelay(Number(audioDelayInput.value) - 10));
 audioDelayIncrease.addEventListener('click', () => setAudioDelay(Number(audioDelayInput.value) + 10));
+setJoinPending(false);
 void bootstrap();
 
 async function bootstrap(): Promise<void> {
@@ -182,17 +193,25 @@ async function bootstrap(): Promise<void> {
 
   try {
     capability = await detectCapabilitiesAsync();
+    capabilityDetectionComplete = true;
     renderCapability(capability);
   } catch (error) {
     capability = { ...capability, ok: false, reasons: [...capability.reasons, errorToMessage(error)] };
+    capabilityDetectionComplete = true;
     renderCapability(capability);
   }
 
   if (!capability.ok) {
+    if (session) {
+      resetLocalViewerSession();
+    } else {
+      clearStoredSession();
+    }
     joinButton.disabled = true;
     setError(capability.reasons.join(' '));
     return;
   }
+  syncFullscreenAvailability();
   setJoinPending(false);
 
   try {
@@ -213,6 +232,10 @@ async function bootstrap(): Promise<void> {
 }
 
 async function joinRoom(roomId: string): Promise<void> {
+  if (!capabilityDetectionComplete) {
+    setError('浏览器能力检测尚未完成。');
+    return;
+  }
   if (!capability.ok) {
     setError(capability.reasons.join(' '));
     return;
@@ -246,7 +269,15 @@ async function joinRoom(roomId: string): Promise<void> {
       encodedRelayRequired: true,
       mediaCapabilities: {
         webViewer: true,
-        maxDirectDownstreams: 1,
+        maxDirectDownstreams: capability.maxDirectDownstreams,
+        mobile: capability.mobile,
+        platform: capability.platform,
+        browser: capability.browser,
+        browserFamily: capability.browserFamily,
+        androidChrome: capability.androidChrome,
+        audioOutput: capability.audioOutput,
+        relayCapable: capability.relayCapable,
+        relayEligibilityReason: capability.relayEligibilityReason,
         encodedMediaDataChannel: getWebEncodedMediaCapabilities()
       }
     });
@@ -361,7 +392,8 @@ function handleJoined(message: SignalMessage): void {
     hostId: session.hostId,
     upstreamPeerId: session.upstreamPeerId,
     chainPosition: session.chainPosition,
-    mediaManifest: message.mediaManifest
+    mediaManifest: message.mediaManifest,
+    serverMediaCapabilities: message.mediaCapabilities
   });
   setStatus('等待上游');
 }
@@ -462,6 +494,19 @@ async function handleIceCandidate(message: SignalMessage): Promise<void> {
 
 async function handleConnectToNext(message: SignalMessage): Promise<void> {
   if (!session) {
+    return;
+  }
+  if (!capability.relayCapable) {
+    diagnostics.update({
+      relayProtocolState: 'relay-disabled-for-mobile-browser',
+      relayFailureReason: 'web-mobile-relay-disabled',
+      reencodePathUsed: false
+    });
+    return;
+  }
+  const manifestFailure = getManifestCompatibilityFailure(message.mediaManifest);
+  if (manifestFailure) {
+    markRelayUnsupported(manifestFailure);
     return;
   }
 
@@ -643,7 +688,7 @@ function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): voi
     }
     window.clearTimeout(openTimer);
     diagnostics.update({ relayProtocolState: 'datachannel-hello-sent' });
-    channel.send(JSON.stringify(helloMessage('relay', getCurrentManifest())));
+    channel.send(JSON.stringify(helloMessage('relay', getCurrentManifest(), getWebEncodedMediaCapabilities())));
     relayHelloAckTimer = window.setTimeout(() => {
       if (!isCurrentDownstreamChannel(channel, peerId)) {
         return;
@@ -884,6 +929,43 @@ async function flushPendingIceCandidates(peerId: string, pc: RTCPeerConnection):
   }
 }
 
+function handleVisibilityChange(): void {
+  if (document.visibilityState === 'hidden') {
+    handleMobilePageSuspended('visibility-hidden', false);
+    return;
+  }
+  clearMobileSuspendTimer();
+}
+
+function handleMobilePageSuspended(reason: string, immediate: boolean): void {
+  if (!capability.mobile || !session) {
+    return;
+  }
+  clearMobileSuspendTimer();
+  const leave = () => {
+    if (!session) {
+      return;
+    }
+    diagnostics.update({
+      relayProtocolState: reason,
+      relayFailureReason: capability.relayCapable ? 'mobile-relay-suspended' : undefined
+    });
+    leaveCurrentRoom();
+  };
+  if (immediate) {
+    leave();
+    return;
+  }
+  mobileSuspendTimer = window.setTimeout(leave, 1500);
+}
+
+function clearMobileSuspendTimer(): void {
+  if (mobileSuspendTimer !== null) {
+    window.clearTimeout(mobileSuspendTimer);
+    mobileSuspendTimer = null;
+  }
+}
+
 function leaveCurrentRoom(): void {
   joinAttemptSeq += 1;
   clearJoinAckTimer();
@@ -907,6 +989,7 @@ function leaveCurrentRoom(): void {
 function resetLocalViewerSession(): void {
   joinAttemptSeq += 1;
   clearJoinAckTimer();
+  clearMobileSuspendTimer();
   setJoinPending(false);
   downstreamDataChannelReady = false;
   downstreamRelayForwarding = false;
@@ -1075,6 +1158,8 @@ function forwardDecodedDataChannelFrame(header: {
     }
     if (header.streamType === 'video') {
       diagnostics.incrementCounter('encodedFramesForwarded');
+    } else if (header.streamType === 'audio') {
+      diagnostics.incrementCounter('encodedAudioFramesForwarded');
     }
     diagnostics.incrementCounter('dataChannelFramesForwarded');
     markDownstreamRelayForwarding(`forwarding-${header.streamType}-${header.codec}`);
@@ -1189,7 +1274,19 @@ function getWebEncodedMediaCapabilities() {
 }
 
 function renderCapability(report: CapabilityReport): void {
-  diagnostics.update({ capability: report, status: report.ok ? '等待加入' : '能力不足' });
+  const relayText = report.relayCapable ? `relay x${report.maxDirectDownstreams}` : 'leaf only';
+  const browserText = report.browser || report.browserFamily;
+  const platformText = `${report.platform}/${browserText}`;
+  const videoText = report.supportedVideoCodecs.length ? report.supportedVideoCodecs.join('/') : 'no video';
+  const audioText = report.supportedAudioCodecs.length ? report.supportedAudioCodecs.join('/') : 'no audio';
+  const outputText = report.audioOutput ? 'audio out' : 'no audio out';
+  capabilitySummary.textContent = `${platformText} · ${relayText} · ${report.relayEligibilityReason} · ${videoText} · ${audioText} · ${outputText}`;
+  const status = !capabilityDetectionComplete ? '能力检测中' : report.ok ? '等待加入' : '能力不足';
+  diagnostics.update({ capability: report, status });
+}
+
+function unlockAudioFromUserGesture(): void {
+  void dataChannelAudioPlayer.resume().catch(() => {});
 }
 
 function setJoinPending(pending: boolean): void {
@@ -1198,7 +1295,7 @@ function setJoinPending(pending: boolean): void {
     pendingJoinRoomId = '';
   }
   joinPending = pending;
-  const disabled = pending || !capability.ok;
+  const disabled = pending || !capabilityDetectionComplete || !capability.ok;
   joinButton.disabled = disabled;
   roomIdInput.disabled = disabled;
   refreshRoomsButton.disabled = disabled || refreshRoomsInFlight;
@@ -1245,7 +1342,9 @@ function renderDiagnostics(): void {
     lastConsoleDiagnosticsAt = now;
     logVdsWebInfo(`[vds-web][diagnostics] ${toConsoleJson(snapshot)}`);
   }
-  diagnosticsOutput.value = diagnostics.format();
+  const formattedDiagnostics = diagnostics.format();
+  diagnosticsOutput.value = formattedDiagnostics;
+  syncDiagnosticsDownloadHint(formattedDiagnostics);
   viewerRoomId.textContent = snapshot.roomId || '-';
   chainPositionText.textContent = formatChainPosition(snapshot.chainPosition);
   decodedVideoText.textContent = String(snapshot.webDecodedVideoFrames || 0);
@@ -1315,9 +1414,51 @@ async function copyDiagnosticsReport(): Promise<void> {
   }
 }
 
+function diagnosticsFixtureFilename(content: string): string {
+  try {
+    const parsed = JSON.parse(content) as { recommendedFixtureFilename?: unknown };
+    const filename = String(parsed.recommendedFixtureFilename || '').trim();
+    if (/^[a-z0-9-]+\.json$/i.test(filename)) {
+      return filename;
+    }
+  } catch {
+    // Fall through to a generic name if the report cannot be parsed.
+  }
+  return 'vds-web-diagnostics.json';
+}
+
+function syncDiagnosticsDownloadHint(content: string): void {
+  const filename = diagnosticsFixtureFilename(content);
+  downloadDiagnosticsButton.title = `保存为 ${filename}`;
+  downloadDiagnosticsButton.setAttribute('aria-label', `保存诊断为 ${filename}`);
+}
+
+function downloadDiagnosticsReport(): void {
+  const content = diagnostics.format();
+  if (!content) {
+    setError('诊断内容为空。');
+    return;
+  }
+  const blob = new Blob([content], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = diagnosticsFixtureFilename(content);
+  link.rel = 'noopener';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  setStatus(`诊断已保存为 ${link.download}`);
+}
+
 async function toggleFullscreen(): Promise<void> {
   if (fullscreenTransitionPromise) {
     return fullscreenTransitionPromise;
+  }
+  if (!isFullscreenSupported()) {
+    setError('当前浏览器不支持网页全屏。');
+    return;
   }
   fullscreenTransitionPromise = (async () => {
     try {
@@ -1339,6 +1480,14 @@ function syncFullscreenButton(): void {
   const active = document.fullscreenElement === playerShell;
   fullscreenButton.setAttribute('aria-label', active ? '退出全屏' : '全屏');
   fullscreenButton.setAttribute('title', active ? '退出全屏' : '全屏');
+}
+
+function isFullscreenSupported(): boolean {
+  return document.fullscreenEnabled !== false && typeof playerShell.requestFullscreen === 'function';
+}
+
+function syncFullscreenAvailability(): void {
+  fullscreenButton.classList.toggle('hidden', !isFullscreenSupported());
 }
 
 function setPlayerVolume(value: number): void {
@@ -1400,23 +1549,50 @@ function getManifestCompatibilityFailure(mediaManifest: unknown): string {
   }
   const manifest = mediaManifest as {
     protocol?: unknown;
-    video?: { codec?: unknown };
-    audio?: { codec?: unknown };
+    video?: { codec?: unknown; payloadFormat?: unknown };
+    audio?: { codec?: unknown; payloadFormat?: unknown };
   };
   if (manifest.protocol !== ENCODED_MEDIA_PROTOCOL) {
     return 'host-media-manifest-protocol-unsupported';
   }
-  const videoCodec = String(manifest.video?.codec || '').toLowerCase();
-  const normalizedVideoCodec = videoCodec === 'hevc' ? 'h265' : videoCodec;
+  const normalizedVideoCodec = normalizeManifestCodecName(manifest.video?.codec);
   if (!capability.supportedVideoCodecs.includes(normalizedVideoCodec)) {
     return `web-video-codec-unsupported:${normalizedVideoCodec || 'unknown'}`;
   }
-  const audioCodec = String(manifest.audio?.codec || 'opus').toLowerCase();
-  const normalizedAudioCodec = audioCodec === 'mp4a.40.2' ? 'aac' : audioCodec;
+  const videoPayloadFormat = String(manifest.video?.payloadFormat || 'annexb').toLowerCase();
+  if (videoPayloadFormat !== 'annexb' && videoPayloadFormat !== 'avcc') {
+    return `web-video-payload-format-unsupported:${videoPayloadFormat || 'unknown'}`;
+  }
+  const normalizedAudioCodec = normalizeManifestCodecName(manifest.audio?.codec || 'opus');
   if (!capability.supportedAudioCodecs.includes(normalizedAudioCodec)) {
     return `web-audio-codec-unsupported:${normalizedAudioCodec || 'unknown'}`;
   }
+  const audioPayloadFormat = String(manifest.audio?.payloadFormat || (normalizedAudioCodec === 'aac' ? 'aac-adts' : 'opus-raw')).toLowerCase();
+  if (normalizedAudioCodec === 'opus' && audioPayloadFormat !== 'opus-raw' && audioPayloadFormat !== 'raw') {
+    return `web-audio-payload-format-unsupported:${audioPayloadFormat || 'unknown'}`;
+  }
+  if (normalizedAudioCodec === 'aac' && audioPayloadFormat !== 'aac-adts' && audioPayloadFormat !== 'raw') {
+    return `web-audio-payload-format-unsupported:${audioPayloadFormat || 'unknown'}`;
+  }
   return '';
+}
+
+function normalizeManifestCodecName(value: unknown): string {
+  const raw = String(value || '').toLowerCase().trim();
+  const compact = raw.replace(/[^a-z0-9]/g, '');
+  if (raw.startsWith('avc1') || raw.startsWith('avc3') || compact.startsWith('avc1') || compact.startsWith('avc3')) {
+    return 'h264';
+  }
+  if (raw.startsWith('hvc1') || raw.startsWith('hev1') || compact.startsWith('hvc1') || compact.startsWith('hev1') || compact === 'hevc') {
+    return 'h265';
+  }
+  if (compact === 'mp4a402') {
+    return 'aac';
+  }
+  if (raw === 'opus' || raw === 'aac' || raw === 'h264' || raw === 'h265') {
+    return raw;
+  }
+  return raw;
 }
 
 function getCurrentManifest(): { mediaSessionId?: unknown; manifestVersion?: unknown } | undefined {
@@ -1446,8 +1622,7 @@ function getControlManifestFailure(control: { mediaSessionId?: unknown; manifest
 
 function getManifestVideoCodec(): string {
   const manifest = diagnostics.getSnapshot().mediaManifest as { video?: { codec?: unknown } } | undefined;
-  const codec = String(manifest?.video?.codec || '').toLowerCase();
-  return codec === 'hevc' ? 'h265' : codec;
+  return normalizeManifestCodecName(manifest?.video?.codec);
 }
 
 function applyAudioManifestFormat(mediaManifest: unknown): void {

@@ -13,6 +13,10 @@ type AudioDecoderLike = {
   close: () => void;
 };
 
+type AudioContextConstructor = {
+  new(contextOptions?: AudioContextOptions): AudioContext;
+};
+
 declare global {
   interface Window {
     AudioDecoder?: {
@@ -30,6 +34,7 @@ declare global {
         data: BufferSource;
       }): EncodedAudioChunk;
     };
+    webkitAudioContext?: AudioContextConstructor;
   }
 }
 
@@ -43,6 +48,7 @@ export class WebCodecsAudioPlayer {
   private nextPlaybackTime = 0;
   private sampleRate = 48000;
   private numberOfChannels = 2;
+  private configuredDescriptionKey = '';
 
   constructor(private readonly diagnostics: AudioDiagnostics) {}
 
@@ -60,8 +66,10 @@ export class WebCodecsAudioPlayer {
       this.diagnostics.onDroppedBlock('webcodecs-audio-codec-unsupported');
       return;
     }
-    if (!this.decoder || this.configuredCodec !== codec) {
-      const configured = await this.configure(codec);
+    const description = codec === 'mp4a.40.2' ? buildAacAudioSpecificConfig(payload) : undefined;
+    const descriptionKey = description ? bytesToHex(description) : '';
+    if (!this.decoder || this.configuredCodec !== codec || this.configuredDescriptionKey !== descriptionKey) {
+      const configured = await this.configure(codec, description);
       if (!configured) {
         this.diagnostics.onDroppedBlock(`webcodecs-${codec}-config-unsupported`);
         return;
@@ -91,6 +99,7 @@ export class WebCodecsAudioPlayer {
     this.decoder?.close();
     this.decoder = null;
     this.configuredCodec = '';
+    this.configuredDescriptionKey = '';
     this.nextPlaybackTime = 0;
     this.gainNode = null;
     void this.context?.close().catch(() => {});
@@ -118,17 +127,21 @@ export class WebCodecsAudioPlayer {
     this.numberOfChannels = Math.max(1, Math.min(8, normalizedChannels));
   }
 
-  private async configure(codec: string): Promise<boolean> {
+  private async configure(codec: string, description?: Uint8Array): Promise<boolean> {
     this.decoder?.close();
     this.nextPlaybackTime = 0;
     this.decoder = null;
     this.configuredCodec = '';
+    this.configuredDescriptionKey = '';
 
     const config: AudioDecoderConfig = {
       codec,
       sampleRate: this.sampleRate,
       numberOfChannels: this.numberOfChannels
     };
+    if (description && description.byteLength > 0) {
+      config.description = description;
+    }
     if (window.AudioDecoder?.isConfigSupported) {
       const support = await window.AudioDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
       if (!support.supported) {
@@ -146,6 +159,7 @@ export class WebCodecsAudioPlayer {
     }
     decoder.configure(config);
     this.configuredCodec = codec;
+    this.configuredDescriptionKey = description ? bytesToHex(description) : '';
     this.diagnostics.onState(`webcodecs-audio-configured-${codec}`);
     return true;
   }
@@ -182,7 +196,11 @@ export class WebCodecsAudioPlayer {
 
   private ensureContext(sampleRate: number): AudioContext {
     if (!this.context) {
-      this.context = new AudioContext({ sampleRate });
+      const AudioContextCtor = getAudioContextCtor();
+      if (!AudioContextCtor) {
+        throw new Error('web-audio-context-unavailable');
+      }
+      this.context = new AudioContextCtor({ sampleRate });
       this.gainNode = null;
     }
     return this.context;
@@ -198,15 +216,42 @@ export class WebCodecsAudioPlayer {
   }
 }
 
+function getAudioContextCtor(): AudioContextConstructor | null {
+  return window.AudioContext || window.webkitAudioContext || null;
+}
+
 function normalizeAudioCodec(codec: string): string {
-  const normalized = String(codec || '').toLowerCase();
+  const normalized = String(codec || '').toLowerCase().trim();
+  const compact = normalized.replace(/[^a-z0-9]/g, '');
   if (normalized === 'opus') {
     return 'opus';
   }
-  if (normalized === 'aac' || normalized === 'mp4a.40.2') {
+  if (normalized === 'aac' || compact === 'mp4a402') {
     return 'mp4a.40.2';
   }
   return '';
+}
+
+function buildAacAudioSpecificConfig(payload: ArrayBuffer): Uint8Array | undefined {
+  const bytes = new Uint8Array(payload);
+  if (bytes.length < 7 || bytes[0] !== 0xff || (bytes[1] & 0xf0) !== 0xf0) {
+    return undefined;
+  }
+  const profileMinusOne = (bytes[2] >> 6) & 0x03;
+  const audioObjectType = profileMinusOne + 1;
+  const samplingFrequencyIndex = (bytes[2] >> 2) & 0x0f;
+  const channelConfig = ((bytes[2] & 0x01) << 2) | ((bytes[3] >> 6) & 0x03);
+  if (audioObjectType <= 0 || audioObjectType > 31 || samplingFrequencyIndex === 0x0f || channelConfig < 0 || channelConfig > 7) {
+    return undefined;
+  }
+  return new Uint8Array([
+    (audioObjectType << 3) | (samplingFrequencyIndex >> 1),
+    ((samplingFrequencyIndex & 0x01) << 7) | (channelConfig << 3)
+  ]);
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes).map((value) => value.toString(16).padStart(2, '0')).join('');
 }
 
 function stripAacAdtsHeader(payload: ArrayBuffer): ArrayBuffer {

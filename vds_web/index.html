@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>VDS Web Viewer</title>
   </head>
   <body>
@@ -22,6 +22,7 @@
           <p class="viewer-side-label">join</p>
           <h1>加入</h1>
           <p id="statusBadge" class="viewer-p2p-status">P2P：能力检测中</p>
+          <p id="capabilitySummary" class="viewer-capability-summary">检测浏览器能力...</p>
         </header>
 
         <section id="joinCard" class="workspace-card join-card">
@@ -30,7 +31,7 @@
               <button id="lobbyTabButton" class="segment-btn active" type="button">大厅</button>
               <button id="directTabButton" class="segment-btn" type="button">直连</button>
             </div>
-            <button id="refreshRoomsButton" type="button" class="btn btn-small btn-secondary refresh-icon" aria-label="刷新公开房间列表" title="刷新公开房间列表">
+            <button id="refreshRoomsButton" type="button" class="btn btn-small btn-secondary refresh-icon" aria-label="刷新公开房间列表" title="刷新公开房间列表" disabled>
               <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M20 12a8 8 0 1 1-2.34-5.66" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                 <path d="M20 4v6h-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -45,7 +46,7 @@
 
           <div id="directJoinPanel" class="join-mode-panel hidden">
             <input id="roomIdInput" type="text" inputmode="text" autocomplete="off" maxlength="6" placeholder="输入房间号" />
-            <button id="joinButton" type="button" class="btn btn-primary">加入</button>
+            <button id="joinButton" type="button" class="btn btn-primary" disabled>加入</button>
           </div>
         </section>
 
@@ -62,6 +63,7 @@
           <div>
             <span>P2P 诊断</span>
             <button id="copyDiagnosticsButton" type="button" class="btn btn-small btn-secondary">复制</button>
+            <button id="downloadDiagnosticsButton" type="button" class="btn btn-small btn-secondary">保存</button>
           </div>
           <textarea id="diagnosticsOutput" readonly></textarea>
         </section>

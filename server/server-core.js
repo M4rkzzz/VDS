@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
@@ -98,9 +99,11 @@ function startServer(options = {}) {
     path.join(baseDir, 'updates'),
     path.resolve(baseDir, '../server/updates')
   ]);
+  const httpsOptions = resolveHttpsOptions(options);
+  const serverProtocol = httpsOptions ? 'https' : 'http';
 
   const app = express();
-  const server = http.createServer(app);
+  const server = httpsOptions ? https.createServer(httpsOptions, app) : http.createServer(app);
   const wss = new WebSocket.Server({ server, maxPayload });
   let adminServer = null;
   const rooms = new Map();
@@ -207,7 +210,7 @@ function startServer(options = {}) {
     });
   });
 
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
     if (activeConnections >= maxConnections) {
       sendJson(ws, {
         type: 'error',
@@ -219,6 +222,7 @@ function startServer(options = {}) {
     }
 
     activeConnections += 1;
+    ws.__vdsUserAgent = String((req && req.headers && req.headers['user-agent']) || '');
     ws.__vdsRateWindowStartedAt = Date.now();
     ws.__vdsRateWindowCount = 0;
     logServerDebug('New WebSocket connection');
@@ -304,7 +308,7 @@ function startServer(options = {}) {
       host: {
         clientId: data.clientId,
         sessionToken: hostToken,
-        mediaCapabilities: sanitizeMediaCapabilities(data.mediaCapabilities),
+        mediaCapabilities: sanitizeMediaCapabilities(data.mediaCapabilities, ws.__vdsUserAgent),
         ws: ws,
         disconnectTimer: null
       },
@@ -367,7 +371,7 @@ function startServer(options = {}) {
       const previousWs = existingViewer.ws;
       clearDisconnectTimer(existingViewer);
       existingViewer.ws = ws;
-      existingViewer.mediaCapabilities = sanitizeMediaCapabilities(data.mediaCapabilities) || existingViewer.mediaCapabilities;
+      existingViewer.mediaCapabilities = sanitizeMediaCapabilities(data.mediaCapabilities, ws.__vdsUserAgent) || existingViewer.mediaCapabilities;
       attachSocketMetadata(ws, roomId, clientId, 'viewer');
       retireSocket(previousWs, 'viewer-rebound', ws);
 
@@ -416,7 +420,7 @@ function startServer(options = {}) {
       clientId,
       sessionToken: viewerToken,
       ws,
-      mediaCapabilities: sanitizeMediaCapabilities(data.mediaCapabilities),
+      mediaCapabilities: sanitizeMediaCapabilities(data.mediaCapabilities, ws.__vdsUserAgent),
       chainPosition,
       upstreamPeerId,
       mediaReady: false,
@@ -715,6 +719,7 @@ function startServer(options = {}) {
       return;
     }
     room.mediaManifest = mediaManifest;
+    reselectManifestIncompatibleWebUpstreams(room, maxDownstreamsPerUpstream);
     sendJson(ws, {
       type: 'host-media-manifest-ack',
       roomId: room.id,
@@ -722,6 +727,7 @@ function startServer(options = {}) {
       manifestVersion: mediaManifest.manifestVersion,
       mediaManifest
     });
+    notifyReconnectTargets(room);
   }
 
   function handleDisconnect(ws, immediate) {
@@ -858,7 +864,7 @@ function startServer(options = {}) {
   server.listen(port, () => {
     const address = server.address();
     const actualPort = address && typeof address === 'object' ? address.port : port;
-    console.log(`Server running on http://localhost:${actualPort}`);
+    logServerInfo(`Server running on ${serverProtocol}://localhost:${actualPort}`);
   });
 
   if (adminPort > 0) {
@@ -1131,32 +1137,198 @@ function isElectronUserAgent(req) {
   return /\bElectron\//i.test(userAgent);
 }
 
-function sanitizeMediaCapabilities(value) {
+function sanitizeMediaCapabilities(value, userAgent = '') {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return null;
   }
 
   const encoded = value.encodedMediaDataChannel;
+  const uaCapabilities = inferWebClientCapabilitiesFromUserAgent(userAgent);
+  const platform = uaCapabilities.platform !== 'unknown'
+    ? uaCapabilities.platform
+    : sanitizeEnum(value.platform, ['ios', 'android', 'desktop', 'unknown'], 'unknown');
+  const browserFamily = uaCapabilities.browserFamily !== 'other'
+    ? uaCapabilities.browserFamily
+    : sanitizeEnum(value.browserFamily, ['chromium', 'safari', 'firefox', 'other'], 'other');
+  const browser = uaCapabilities.browser || sanitizeDisplayString(value.browser, 96);
+  const localRelayEligibilityReason = sanitizeDisplayString(value.relayEligibilityReason, 96);
+  const androidChrome = uaCapabilities.hasUserAgent
+    ? uaCapabilities.androidChrome
+    : platform === 'android' && browserFamily === 'chromium' && value.androidChrome === true;
+  const desktopRelayTarget = uaCapabilities.hasUserAgent
+    ? uaCapabilities.desktopChromeOrEdge
+    : platform === 'desktop' && browserFamily === 'chromium';
   if (!encoded || typeof encoded !== 'object' || Array.isArray(encoded)) {
+    const relayEligibility = getWebRelayEligibility(value.relayCapable, platform, androidChrome, desktopRelayTarget, value.audioOutput === true, null);
     return {
       webViewer: value.webViewer === true,
-      maxDirectDownstreams: normalizePositiveInt(value.maxDirectDownstreams, DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM),
+      maxDirectDownstreams: sanitizeWebMaxDirectDownstreams(value.maxDirectDownstreams, relayEligibility.relayCapable, platform, value.mobile === true),
+      mobile: value.mobile === true,
+      platform,
+      browser,
+      browserFamily,
+      androidChrome,
+      audioOutput: value.audioOutput === true,
+      relayCapable: relayEligibility.relayCapable,
+      relayEligibilityReason: relayEligibility.reason,
+      localRelayEligibilityReason,
       encodedMediaDataChannel: null
     };
   }
 
+  const supportedVideoCodecs = sanitizeStringList(encoded.supportedVideoCodecs, 8, 32);
+  const supportedAudioCodecs = sanitizeStringList(encoded.supportedAudioCodecs, 8, 32);
+  const supportedVideoPayloadFormats = sanitizeStringList(encoded.supportedVideoPayloadFormats, 8, 32);
+  const supportedAudioPayloadFormats = sanitizeStringList(encoded.supportedAudioPayloadFormats, 8, 32);
+  const relayEligibility = getWebRelayEligibility(value.relayCapable, platform, androidChrome, desktopRelayTarget, value.audioOutput === true, {
+    protocol: String(encoded.protocol || '').slice(0, 64),
+    protocolVersion: Number(encoded.protocolVersion || 0),
+    supportedVideoCodecs,
+    supportedAudioCodecs,
+    supportedVideoPayloadFormats,
+    supportedAudioPayloadFormats
+  });
+
   return {
     webViewer: value.webViewer === true,
-    maxDirectDownstreams: normalizePositiveInt(value.maxDirectDownstreams, DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM),
+    maxDirectDownstreams: sanitizeWebMaxDirectDownstreams(value.maxDirectDownstreams, relayEligibility.relayCapable, platform, value.mobile === true),
+    mobile: value.mobile === true,
+    platform,
+    browser,
+    browserFamily,
+    androidChrome,
+    audioOutput: value.audioOutput === true,
+    relayCapable: relayEligibility.relayCapable,
+    relayEligibilityReason: relayEligibility.reason,
+    localRelayEligibilityReason,
     encodedMediaDataChannel: {
       protocol: String(encoded.protocol || '').slice(0, 64),
       protocolVersion: Number(encoded.protocolVersion || 0),
-      supportedVideoCodecs: sanitizeStringList(encoded.supportedVideoCodecs, 8, 32),
-      supportedAudioCodecs: sanitizeStringList(encoded.supportedAudioCodecs, 8, 32),
+      supportedVideoCodecs,
+      supportedAudioCodecs,
+      supportedVideoPayloadFormats,
+      supportedAudioPayloadFormats,
       maxFrameBytes: normalizePositiveInt(encoded.maxFrameBytes, 0),
       bootstrapRequired: encoded.bootstrapRequired === true
     }
   };
+}
+
+function sanitizeWebMaxDirectDownstreams(value, relayCapable, platform, mobile) {
+  if (relayCapable !== true) {
+    return 0;
+  }
+  const requested = normalizeNonNegativeInt(value, DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM);
+  if (platform === 'android' || platform === 'ios' || mobile === true) {
+    return Math.min(requested, 1);
+  }
+  return requested;
+}
+
+function sanitizeDisplayString(value, maxLength) {
+  return String(value || '').replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, maxLength);
+}
+
+function inferWebClientCapabilitiesFromUserAgent(userAgent) {
+  const value = String(userAgent || '');
+  if (!value) {
+    return {
+      hasUserAgent: false,
+      platform: 'unknown',
+      browser: '',
+      browserFamily: 'other',
+      androidChrome: false,
+      desktopChromeOrEdge: false
+    };
+  }
+  const platform = detectClientPlatformFromUserAgent(value);
+  const browserFamily = detectClientBrowserFamilyFromUserAgent(value);
+  const browser = browserNameFromUserAgent(value);
+  const androidChrome = platform === 'android' &&
+    browserFamily === 'chromium' &&
+    isAndroidChromeUserAgent(value);
+  const desktopChromeOrEdge = platform === 'desktop' && isDesktopChromeOrEdgeUserAgent(value);
+  const recognizedBrowser = platform !== 'desktop' || browserFamily !== 'other';
+  return {
+    hasUserAgent: recognizedBrowser,
+    platform,
+    browser,
+    browserFamily,
+    androidChrome,
+    desktopChromeOrEdge
+  };
+}
+
+function isAndroidChromeUserAgent(userAgent) {
+  if (!/\bChrome\//i.test(userAgent)) {
+    return false;
+  }
+  return !/\b(Edg|EdgA|OPR|SamsungBrowser|HuaweiBrowser|MiuiBrowser|HeyTapBrowser|VivoBrowser|Quark)\/|;\s*wv\b|\bVersion\/4\.0\b/i.test(userAgent);
+}
+
+function isDesktopChromeOrEdgeUserAgent(userAgent) {
+  if (!/\b(Chrome|Edg)\//i.test(userAgent)) {
+    return false;
+  }
+  return !/\b(Firefox|OPR|SamsungBrowser|HuaweiBrowser|MiuiBrowser|HeyTapBrowser|VivoBrowser|Quark)\//i.test(userAgent);
+}
+
+function browserNameFromUserAgent(userAgent) {
+  const value = String(userAgent || '');
+  const opera = /\bOPR\/([\d.]+)/.exec(value);
+  if (opera) return `Opera ${opera[1]}`;
+  const samsung = /\bSamsungBrowser\/([\d.]+)/.exec(value);
+  if (samsung) return `Samsung Internet ${samsung[1]}`;
+  const huawei = /\bHuaweiBrowser\/([\d.]+)/.exec(value);
+  if (huawei) return `Huawei Browser ${huawei[1]}`;
+  const miui = /\bMiuiBrowser\/([\d.]+)/.exec(value);
+  if (miui) return `MIUI Browser ${miui[1]}`;
+  const heyTap = /\bHeyTapBrowser\/([\d.]+)/.exec(value);
+  if (heyTap) return `HeyTap Browser ${heyTap[1]}`;
+  const vivo = /\bVivoBrowser\/([\d.]+)/.exec(value);
+  if (vivo) return `Vivo Browser ${vivo[1]}`;
+  const quark = /\bQuark\/([\d.]+)/.exec(value);
+  if (quark) return `Quark ${quark[1]}`;
+  const crios = /\bCriOS\/([\d.]+)/.exec(value);
+  if (crios) return `Chrome iOS ${crios[1]}`;
+  const edgios = /\bEdgiOS\/([\d.]+)/.exec(value);
+  if (edgios) return `Edge iOS ${edgios[1]}`;
+  const edgeAndroid = /\bEdgA\/([\d.]+)/.exec(value);
+  if (edgeAndroid) return `Edge Android ${edgeAndroid[1]}`;
+  const edge = /\bEdg\/([\d.]+)/.exec(value);
+  if (edge) return `Edge ${edge[1]}`;
+  const webViewChrome = /\bChrome\/([\d.]+)/.exec(value);
+  if (webViewChrome && (/;\s*wv\b/i.test(value) || /\bVersion\/4\.0\b/i.test(value))) return `Android WebView ${webViewChrome[1]}`;
+  const chrome = /\bChrome\/([\d.]+)/.exec(value);
+  if (chrome) return `Chrome ${chrome[1]}`;
+  const firefox = /\bFirefox\/([\d.]+)/.exec(value);
+  if (firefox) return `Firefox ${firefox[1]}`;
+  const safari = /\bVersion\/([\d.]+).*\bSafari\//.exec(value);
+  if (safari) return `Safari ${safari[1]}`;
+  return '';
+}
+
+function detectClientPlatformFromUserAgent(userAgent) {
+  if (/\b(iPhone|iPad|iPod)\b/i.test(userAgent) || (/\bMacintosh\b/i.test(userAgent) && /\bMobile\/\w+\b/i.test(userAgent))) {
+    return 'ios';
+  }
+  if (/\bAndroid\b/i.test(userAgent)) {
+    return 'android';
+  }
+  return 'desktop';
+}
+
+function detectClientBrowserFamilyFromUserAgent(userAgent) {
+  if (/\b(Firefox|FxiOS)\//i.test(userAgent)) {
+    return 'firefox';
+  }
+  if (/\b(Chrome|CriOS|Edg|EdgA|EdgiOS|SamsungBrowser|OPR)\//i.test(userAgent)) {
+    return 'chromium';
+  }
+  if (/\bSafari\//i.test(userAgent) && !/\b(Chrome|CriOS|Edg|EdgA|EdgiOS|FxiOS|OPR|SamsungBrowser)\//i.test(userAgent)) {
+    return 'safari';
+  }
+  return 'other';
 }
 
 function sanitizeMediaManifest(value) {
@@ -1352,6 +1524,94 @@ function normalizePositiveInt(value, fallback) {
   return Math.floor(numeric);
 }
 
+function normalizeNonNegativeInt(value, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return fallback;
+  }
+  return Math.floor(numeric);
+}
+
+function sanitizeEnum(value, allowed, fallback) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return allowed.includes(normalized) ? normalized : fallback;
+}
+
+function sanitizeWebRelayCapable(value, platform, androidChrome, desktopRelayTarget) {
+  if (value !== true) {
+    return false;
+  }
+  if (platform === 'ios') {
+    return false;
+  }
+  if (platform === 'android') {
+    return androidChrome === true;
+  }
+  return platform === 'desktop' && desktopRelayTarget === true;
+}
+
+function getWebRelayEligibility(value, platform, androidChrome, desktopRelayTarget, audioOutput, encoded) {
+  if (value !== true) {
+    return { relayCapable: false, reason: 'relay-not-requested' };
+  }
+  if (platform === 'ios') {
+    return { relayCapable: false, reason: 'ios-leaf' };
+  }
+  if (platform === 'android' && androidChrome !== true) {
+    return { relayCapable: false, reason: 'android-non-chrome-leaf' };
+  }
+  if (platform === 'desktop' && desktopRelayTarget !== true) {
+    return { relayCapable: false, reason: 'desktop-non-chrome-leaf' };
+  }
+  if (platform !== 'android' && platform !== 'desktop') {
+    return { relayCapable: false, reason: 'platform-leaf' };
+  }
+  if (audioOutput !== true) {
+    return { relayCapable: false, reason: 'missing-audio-output' };
+  }
+  if (!encoded || typeof encoded !== 'object') {
+    return { relayCapable: false, reason: 'missing-encoded-capabilities' };
+  }
+  if (encoded.protocol !== 'vds-media-encoded-v1' || encoded.protocolVersion !== 1) {
+    return { relayCapable: false, reason: 'invalid-encoded-protocol' };
+  }
+  if (!Array.isArray(encoded.supportedVideoCodecs) || encoded.supportedVideoCodecs.length === 0) {
+    return { relayCapable: false, reason: 'missing-video-codec' };
+  }
+  if (!Array.isArray(encoded.supportedAudioCodecs) || encoded.supportedAudioCodecs.length === 0) {
+    return { relayCapable: false, reason: 'missing-audio-codec' };
+  }
+  if (!Array.isArray(encoded.supportedVideoPayloadFormats) || encoded.supportedVideoPayloadFormats.length === 0) {
+    return { relayCapable: false, reason: 'missing-video-payload-format' };
+  }
+  if (!Array.isArray(encoded.supportedAudioPayloadFormats) || encoded.supportedAudioPayloadFormats.length === 0) {
+    return { relayCapable: false, reason: 'missing-audio-payload-format' };
+  }
+  if (platform === 'android' && androidChrome === true && !hasAndroidChromeRelayTargetMatrix(encoded)) {
+    return { relayCapable: false, reason: 'missing-android-relay-codec-matrix' };
+  }
+  return { relayCapable: true, reason: 'relay-ready' };
+}
+
+function hasAndroidChromeRelayTargetMatrix(encoded) {
+  return codecListIncludes(encoded.supportedVideoCodecs, 'h264') &&
+    codecListIncludes(encoded.supportedVideoCodecs, 'h265') &&
+    codecListIncludes(encoded.supportedAudioCodecs, 'opus') &&
+    codecListIncludes(encoded.supportedAudioCodecs, 'aac') &&
+    stringListAllows(encoded.supportedVideoPayloadFormats, 'annexb') &&
+    stringListAllows(encoded.supportedVideoPayloadFormats, 'avcc') &&
+    stringListAllows(encoded.supportedAudioPayloadFormats, 'opus-raw') &&
+    stringListAllows(encoded.supportedAudioPayloadFormats, 'raw') &&
+    stringListAllows(encoded.supportedAudioPayloadFormats, 'aac-adts');
+}
+
+function codecListIncludes(values, target) {
+  if (!Array.isArray(values)) {
+    return false;
+  }
+  return values.some((value) => normalizeCapabilityCodecName(value) === target);
+}
+
 function validateInboundMessage(ws, data, maxMessagesPerWindow, messageRateWindowMs) {
   if (!data || typeof data !== 'object' || typeof data.type !== 'string' || data.type.length > 64) {
     sendJson(ws, {
@@ -1483,6 +1743,21 @@ function resolveExistingPath(candidates) {
   return null;
 }
 
+function resolveHttpsOptions(options = {}) {
+  const keyPath = options.httpsKeyPath || process.env.VDS_HTTPS_KEY_PATH || process.env.HTTPS_KEY_PATH;
+  const certPath = options.httpsCertPath || process.env.VDS_HTTPS_CERT_PATH || process.env.HTTPS_CERT_PATH;
+  if (!keyPath && !certPath) {
+    return null;
+  }
+  if (!keyPath || !certPath) {
+    throw new Error('HTTPS requires both VDS_HTTPS_KEY_PATH and VDS_HTTPS_CERT_PATH.');
+  }
+  return {
+    key: fs.readFileSync(path.resolve(keyPath)),
+    cert: fs.readFileSync(path.resolve(certPath))
+  };
+}
+
 function getViewerUpstreamId(room, viewer) {
   if (!room || !viewer || !viewer.upstreamPeerId) {
     return '';
@@ -1518,13 +1793,25 @@ function getUpstreamDirectDownstreamLimit(room, upstreamPeerId, globalLimit) {
     return limit;
   }
   const upstreamViewer = findViewerById(room, upstreamPeerId);
+  if (upstreamViewer && upstreamViewer.mediaCapabilities && upstreamViewer.mediaCapabilities.webViewer && upstreamViewer.mediaCapabilities.relayCapable !== true) {
+    return 0;
+  }
+  if (upstreamViewer && upstreamViewer.mediaCapabilities && upstreamViewer.mediaCapabilities.webViewer && !webViewerSupportsMediaManifest(upstreamViewer.mediaCapabilities, room.mediaManifest)) {
+    return 0;
+  }
   const capabilityLimit = upstreamViewer && upstreamViewer.mediaCapabilities
-    ? normalizePositiveInt(upstreamViewer.mediaCapabilities.maxDirectDownstreams, limit)
+    ? normalizeNonNegativeInt(upstreamViewer.mediaCapabilities.maxDirectDownstreams, limit)
     : limit;
-  return Math.max(1, Math.min(limit, capabilityLimit));
+  return Math.min(limit, capabilityLimit);
 }
 
 function isUpstreamCandidateReady(room, upstreamPeerId) {
+  if (upstreamPeerId !== (room && room.host && room.host.clientId)) {
+    const upstreamViewer = findViewerById(room, upstreamPeerId);
+    if (upstreamViewer && upstreamViewer.mediaCapabilities && upstreamViewer.mediaCapabilities.webViewer && !webViewerSupportsMediaManifest(upstreamViewer.mediaCapabilities, room.mediaManifest)) {
+      return false;
+    }
+  }
   if (!room || !upstreamPeerId) {
     return false;
   }
@@ -1533,6 +1820,64 @@ function isUpstreamCandidateReady(room, upstreamPeerId) {
   }
   const upstreamViewer = findViewerById(room, upstreamPeerId);
   return Boolean(upstreamViewer && upstreamViewer.mediaReady && upstreamViewer.relayEstablished && isSocketOpen(upstreamViewer.ws));
+}
+
+function webViewerSupportsMediaManifest(mediaCapabilities, mediaManifest) {
+  if (!mediaManifest || !mediaCapabilities || mediaCapabilities.webViewer !== true) {
+    return true;
+  }
+  const encoded = mediaCapabilities.encodedMediaDataChannel;
+  if (!encoded || typeof encoded !== 'object') {
+    return true;
+  }
+  const videoCodec = normalizeCodecName(mediaManifest.video && mediaManifest.video.codec);
+  const videoPayloadFormat = normalizePayloadFormat(mediaManifest.video && mediaManifest.video.payloadFormat, 'annexb');
+  const audioCodec = normalizeCodecName((mediaManifest.audio && mediaManifest.audio.codec) || 'opus');
+  const audioPayloadFormat = normalizePayloadFormat(
+    mediaManifest.audio && mediaManifest.audio.payloadFormat,
+    audioCodec === 'aac' ? 'aac-adts' : 'opus-raw'
+  );
+  return codecListAllows(encoded.supportedVideoCodecs, videoCodec) &&
+    codecListAllows(encoded.supportedAudioCodecs, audioCodec) &&
+    stringListAllows(encoded.supportedVideoPayloadFormats, videoPayloadFormat) &&
+    stringListAllows(encoded.supportedAudioPayloadFormats, audioPayloadFormat);
+}
+
+function stringListAllows(value, expected) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return false;
+  }
+  const normalizedExpected = String(expected || '').trim().toLowerCase();
+  return value.map((item) => String(item || '').trim().toLowerCase()).includes(normalizedExpected);
+}
+
+function codecListAllows(value, expected) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return false;
+  }
+  const normalizedExpected = normalizeCapabilityCodecName(expected);
+  return value.map(normalizeCapabilityCodecName).includes(normalizedExpected);
+}
+
+function normalizeCapabilityCodecName(value) {
+  const normalized = normalizeCodecName(value);
+  if (normalized.startsWith('avc1') || normalized.startsWith('avc3')) {
+    return 'h264';
+  }
+  if (normalized.startsWith('hvc1') || normalized.startsWith('hev1')) {
+    return 'h265';
+  }
+  if (normalized === 'hevc') {
+    return 'h265';
+  }
+  if (normalized === 'mp4a402') {
+    return 'aac';
+  }
+  return normalized;
+}
+
+function normalizePayloadFormat(value, fallback) {
+  return String(value || fallback || '').trim().toLowerCase();
 }
 
 function wouldCreateUpstreamCycle(room, viewerId, upstreamPeerId) {
@@ -1635,6 +1980,28 @@ function rebalanceViewerUpstreams(room, options = {}) {
       return;
     }
     const nextUpstreamId = selectViewerUpstream(room, index, limit, viewer.clientId, failedUpstreamId);
+    markViewerForReconnect(viewer, nextUpstreamId);
+  });
+}
+
+function reselectManifestIncompatibleWebUpstreams(room, maxDownstreamsPerUpstream) {
+  const limit = Math.max(1, Number(maxDownstreamsPerUpstream) || DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM);
+  if (!room || !Array.isArray(room.viewers)) {
+    return;
+  }
+  room.viewers.forEach((viewer, index) => {
+    const currentUpstreamId = getViewerUpstreamId(room, viewer);
+    if (!currentUpstreamId || currentUpstreamId === room.host.clientId) {
+      return;
+    }
+    const upstreamViewer = findViewerById(room, currentUpstreamId);
+    if (!upstreamViewer || !upstreamViewer.mediaCapabilities || upstreamViewer.mediaCapabilities.webViewer !== true) {
+      return;
+    }
+    if (webViewerSupportsMediaManifest(upstreamViewer.mediaCapabilities, room.mediaManifest)) {
+      return;
+    }
+    const nextUpstreamId = selectViewerUpstream(room, index, limit, viewer.clientId, currentUpstreamId);
     markViewerForReconnect(viewer, nextUpstreamId);
   });
 }

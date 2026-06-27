@@ -34,6 +34,8 @@ type VideoDecoderLike = {
   close: () => void;
 };
 
+type WebCodecsPayloadFormat = 'annexb' | 'avcc';
+
 declare global {
   interface Window {
     VideoDecoder?: {
@@ -58,6 +60,7 @@ export class WebCodecsVideoPlayer {
   private decoder: VideoDecoderLike | null = null;
   private configuredCodec = '';
   private configuredVideoCodec: 'h264' | 'h265' | '' = '';
+  private configuredPayloadFormat: WebCodecsPayloadFormat = 'annexb';
   private waitingForKeyframe = true;
   private expectedDisplayWidth = 0;
   private expectedDisplayHeight = 0;
@@ -89,7 +92,9 @@ export class WebCodecsVideoPlayer {
       this.diagnostics.onDroppedFrame(`webcodecs-${normalizedCodec}-payload-format-unsupported`);
       return;
     }
-    this.diagnostics.onPayloadFormat(header.payloadFormat || 'annexb');
+    const avcc = header.payloadFormat === 'avcc' && !looksLikeAnnexB(payload)
+      ? payload
+      : convertAnnexBToLengthPrefixed(annexB);
 
     const hevcMinLevel = normalizedCodec === 'h265' ? this.getMinimumHevcLevel() : 0;
     const codec = normalizedCodec === 'h265'
@@ -100,10 +105,10 @@ export class WebCodecsVideoPlayer {
         this.diagnostics.onDroppedFrame('webcodecs-waiting-for-keyframe');
         return;
       }
-      const configured = normalizedCodec === 'h265'
-        ? await this.configureAny(buildHevcCodecCandidates(annexB, hevcMinLevel), codec, normalizedCodec)
-        : await this.configure(codec, normalizedCodec);
-      if (!configured) {
+      const configuredFormat = normalizedCodec === 'h265'
+        ? await this.configureAny(buildHevcCodecCandidates(annexB, hevcMinLevel), codec, normalizedCodec, Boolean(avcc))
+        : await this.configure(codec, normalizedCodec, Boolean(avcc));
+      if (!configuredFormat) {
         this.diagnostics.onDroppedFrame(`webcodecs-${normalizedCodec}-config-unsupported`);
         return;
       }
@@ -115,10 +120,16 @@ export class WebCodecsVideoPlayer {
     }
 
     try {
+      const decodePayload = this.configuredPayloadFormat === 'avcc' ? avcc : annexB;
+      if (!decodePayload) {
+        this.diagnostics.onDroppedFrame(`webcodecs-${normalizedCodec}-${this.configuredPayloadFormat}-payload-unavailable`);
+        return;
+      }
+      this.diagnostics.onPayloadFormat(`${header.payloadFormat || 'annexb'}:${this.configuredPayloadFormat}`);
       this.decoder?.decode(new window.EncodedVideoChunk({
         type: header.keyframe ? 'key' : 'delta',
         timestamp: Math.max(0, Math.trunc(header.timestampUs || 0)),
-        data: annexB
+        data: decodePayload
       }));
       this.waitingForKeyframe = false;
     } catch (error) {
@@ -132,6 +143,7 @@ export class WebCodecsVideoPlayer {
     this.decoder = null;
     this.configuredCodec = '';
     this.configuredVideoCodec = '';
+    this.configuredPayloadFormat = 'annexb';
     this.waitingForKeyframe = true;
     this.renderedFrameCount = 0;
   }
@@ -141,7 +153,7 @@ export class WebCodecsVideoPlayer {
     this.expectedDisplayHeight = normalizeOptionalDimension(height);
   }
 
-  private async configure(codec: string, videoCodec: 'h264' | 'h265'): Promise<boolean> {
+  private async configure(codec: string, videoCodec: 'h264' | 'h265', hasAvccPayload: boolean): Promise<WebCodecsPayloadFormat | null> {
     this.decoder?.close();
     this.decoder = new window.VideoDecoder!({
       output: (frame) => this.renderFrame(frame),
@@ -151,43 +163,51 @@ export class WebCodecsVideoPlayer {
       }
     });
 
-    const configs = this.buildDecoderConfigs(codec, videoCodec);
+    const configs = this.buildDecoderConfigs(codec, videoCodec, hasAvccPayload);
     let selectedConfig: Record<string, unknown> | null = null;
+    let selectedPayloadFormat: WebCodecsPayloadFormat | null = null;
     for (const config of configs) {
+      const candidateConfig = { ...config };
+      const candidatePayloadFormat = candidateConfig.__vdsPayloadFormat as WebCodecsPayloadFormat;
+      delete candidateConfig.__vdsPayloadFormat;
       if (!window.VideoDecoder?.isConfigSupported) {
-        selectedConfig = config;
+        selectedConfig = candidateConfig;
+        selectedPayloadFormat = candidatePayloadFormat;
         break;
       }
-      const support = await window.VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
+      const support = await window.VideoDecoder.isConfigSupported(candidateConfig).catch(() => ({ supported: false }));
       if (support.supported) {
-        selectedConfig = config;
+        selectedConfig = candidateConfig;
+        selectedPayloadFormat = candidatePayloadFormat;
         break;
       }
     }
-    if (!selectedConfig) {
-      return false;
+    if (!selectedConfig || !selectedPayloadFormat) {
+      return null;
     }
 
     this.decoder.configure(selectedConfig);
     this.configuredCodec = codec;
     this.configuredVideoCodec = videoCodec;
-    this.diagnostics.onState(`webcodecs-configured-${codec}`);
-    return true;
+    this.configuredPayloadFormat = selectedPayloadFormat;
+    this.diagnostics.onState(`webcodecs-configured-${codec}-${selectedPayloadFormat}`);
+    return selectedPayloadFormat;
   }
 
   private async configureAny(
     candidates: string[],
     preferredCodec: string,
-    videoCodec: 'h264' | 'h265'
-  ): Promise<boolean> {
+    videoCodec: 'h264' | 'h265',
+    hasAvccPayload: boolean
+  ): Promise<WebCodecsPayloadFormat | null> {
     const ordered = uniqueStrings([preferredCodec, ...candidates, 'hev1.1.6.L93.B0', 'hvc1.1.6.L93.B0']);
     for (const codec of ordered) {
-      const configured = await this.configure(codec, videoCodec);
+      const configured = await this.configure(codec, videoCodec, hasAvccPayload);
       if (configured) {
-        return true;
+        return configured;
       }
     }
-    return false;
+    return null;
   }
 
   private renderFrame(frame: VideoFrame): void {
@@ -284,24 +304,29 @@ export class WebCodecsVideoPlayer {
     return 93;
   }
 
-  private buildDecoderConfigs(codec: string, videoCodec: 'h264' | 'h265'): Record<string, unknown>[] {
-    const base: Record<string, unknown> = {
-      codec,
-      optimizeForLatency: true
-    };
-    if (videoCodec === 'h264') {
-      base.avc = { format: 'annexb' };
-    } else {
-      base.hevc = { format: 'annexb' };
-    }
+  private buildDecoderConfigs(codec: string, videoCodec: 'h264' | 'h265', hasAvccPayload: boolean): Record<string, unknown>[] {
+    const formats: WebCodecsPayloadFormat[] = hasAvccPayload ? ['annexb', 'avcc'] : ['annexb'];
+    const bases = formats.map((format) => {
+      const base: Record<string, unknown> = {
+        codec,
+        optimizeForLatency: true,
+        __vdsPayloadFormat: format
+      };
+      if (videoCodec === 'h264') {
+        base.avc = { format: format === 'avcc' ? 'avc' : 'annexb' };
+      } else {
+        base.hevc = { format: format === 'avcc' ? 'hevc' : 'annexb' };
+      }
+      return base;
+    });
 
     const width = this.expectedDisplayWidth;
     const height = this.expectedDisplayHeight;
     if (width <= 0 || height <= 0) {
-      return [base];
+      return bases;
     }
 
-    return [
+    return bases.flatMap((base) => [
       {
         ...base,
         codedWidth: getExpectedCodedDimension(videoCodec, width),
@@ -310,7 +335,7 @@ export class WebCodecsVideoPlayer {
         displayAspectHeight: height
       },
       base
-    ];
+    ]);
   }
 }
 
@@ -352,6 +377,26 @@ function convertAvccToAnnexB(payload: ArrayBuffer): ArrayBuffer | null {
     writeOffset += startCode.length;
     output.set(unit, writeOffset);
     writeOffset += unit.length;
+  }
+  return output.buffer;
+}
+
+function convertAnnexBToLengthPrefixed(payload: ArrayBuffer): ArrayBuffer | null {
+  const units = splitAnnexBNalUnits(payload);
+  if (units.length === 0) {
+    return null;
+  }
+  const output = new Uint8Array(units.reduce((sum, unit) => sum + 4 + unit.length, 0));
+  let offset = 0;
+  for (const unit of units) {
+    const size = unit.length;
+    output[offset] = (size >>> 24) & 0xff;
+    output[offset + 1] = (size >>> 16) & 0xff;
+    output[offset + 2] = (size >>> 8) & 0xff;
+    output[offset + 3] = size & 0xff;
+    offset += 4;
+    output.set(unit, offset);
+    offset += unit.length;
   }
   return output.buffer;
 }
@@ -431,8 +476,12 @@ function hex(value: number): string {
 }
 
 function normalizeVideoCodec(codec: string): 'h264' | 'h265' | string {
-  const normalized = String(codec || '').toLowerCase().replace(/\./g, '');
-  if (normalized === 'hevc') {
+  const raw = String(codec || '').toLowerCase().trim();
+  const normalized = raw.replace(/[^a-z0-9]/g, '');
+  if (raw.startsWith('avc1') || raw.startsWith('avc3') || normalized.startsWith('avc1') || normalized.startsWith('avc3')) {
+    return 'h264';
+  }
+  if (raw.startsWith('hvc1') || raw.startsWith('hev1') || normalized.startsWith('hvc1') || normalized.startsWith('hev1') || normalized === 'hevc') {
     return 'h265';
   }
   return normalized;

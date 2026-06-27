@@ -2,9 +2,9 @@
 
 VDS is an Electron desktop client plus a Node.js signaling server for cascade screen sharing.
 
-## 1.7.0 Overview
+## 1.7.1 Overview
 
-Version `1.7.0` focuses on renderer/native-authority modularization, media-agent session ownership, native/OBS lifecycle reliability, and Web/native relay topology robustness.
+Version `1.7.1` focuses on renderer/native-authority modularization, media-agent session ownership, native/OBS lifecycle reliability, and Web/native relay topology robustness.
 
 Highlights:
 
@@ -33,7 +33,7 @@ Highlights:
 - `desktop/`: Electron main process, preload bridge, updater, native agent bridge
 - `server/`: deployable Node signaling server, Docker context, admin dashboard, update feed output
 - `server/public/`: Electron renderer assets served by the local/deployed server
-- `vds_web/`: Chrome/Edge web viewer source; build output is copied to `server/public/vds_web/`
+- `vds_web/`: desktop Chrome/Edge plus mobile iOS Safari / Android browser viewer source; build output is copied to `server/public/vds_web/`
 - `media-agent/`: native capture, encode, decode, relay, preview, and viewer surface implementation
 - `runtime/`: generated native runtime copied into Electron packages; not committed
 - `scripts/`: local test, release, server, and native build scripts
@@ -42,6 +42,7 @@ Highlights:
 - `MEDIA_REFACTOR_PLAN.md`: current media architecture and unreleased-change truth source
 
 More detail: [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md).
+Mobile web device QA: [docs/WEB_MOBILE_DEVICE_QA.md](docs/WEB_MOBILE_DEVICE_QA.md).
 
 ## Core Commands
 
@@ -55,12 +56,35 @@ npm run dev:dual:web
 npm run dev:triple:native
 npm run triple:nwn
 npm run check:vds-web
+npm run check:web-mobile-diagnostics
+npm run check:web-mobile-code
 npm run test:vds-web
 npm run test:server
 npm run build:vds-web
 npm run build:media-agent
 npm run build:release
 ```
+
+## LAN Mobile Web HTTP
+
+LAN HTTP is supported for mobile Web testing. Open `http://<LAN-IP>:3000/` from the phone; the Web viewer treats RFC1918/link-local LAN addresses as an allowed local test context and still probes the real browser APIs. If a browser hides WebRTC/WebCodecs on LAN HTTP, diagnostics will report the specific missing API.
+
+HTTPS remains available as an optional stricter path:
+
+```powershell
+$env:VDS_HTTPS_KEY_PATH='C:\\path\\to\\lan-key.pem'
+$env:VDS_HTTPS_CERT_PATH='C:\\path\\to\\lan-cert.pem'
+npm run server
+```
+
+Then open `https://<LAN-IP>:3000/` on the phone. iOS Safari usually requires the certificate authority or self-signed certificate to be trusted on the device before WebSocket and media APIs work reliably.
+
+## Release Gates
+
+Mobile Web real-device diagnostics are manual QA evidence, not an automated release gate. Before mobile-focused QA, collect diagnostics from the Web viewer diagnostics panel `保存` button and check individual reports with `node scripts/check-web-mobile-diagnostics.js <scenario> <file>` when needed.
+
+Use `npm run check:web-mobile-code` before manual mobile QA. That command verifies the code-level mobile Web gates without requiring real-device fixture JSON.
+
 
 ## Native Test Flows
 
