@@ -1,50 +1,51 @@
 # VDS
 
-VDS is an Electron desktop client plus a Node.js signaling server for cascade screen sharing.
+VDS 是一个面向多观看端的级联屏幕共享系统，由 Windows Electron 客户端、Node.js 信令服务器、原生 media-agent 和 Web 观看端组成。它的核心目标是低延迟共享桌面、窗口或 OBS 推流，并通过链式 relay 减轻房主上行压力。
 
-## 1.7.1 Overview
+## 1.7.1 版本概览
 
-Version `1.7.1` focuses on renderer/native-authority modularization, media-agent session ownership, native/OBS lifecycle reliability, and Web/native relay topology robustness.
+`1.7.1` 重点完善了 renderer/native authority 拆分后的稳定性、media-agent session ownership、native/OBS 生命周期、Web/native relay 拓扑，以及移动浏览器 Web 观看端能力检测。
 
-Highlights:
+主要变化：
 
-- split renderer responsibilities into dedicated app state, room client, UI, native session, peer, surface, diagnostics, and P2P state-machine modules
-- tightened media-agent ownership around Host, Peer, Surface, Relay, Audio, and OBS ingest session controllers
-- fixed native/OBS share start, stop-share, repeated share, room creation, room-code display, public-room discovery, and stale-manifest cleanup
-- fixed OBS ingest audio and AAC manifest behavior for downstream playback and relay
-- improved source thumbnail and WGC preview timing with async thumbnail loading and diagnostic WGC preview failures
-- strengthened chain-first Web/native relay routing with server-side upstream reselection and per-upstream downstream limits
-- added renderer/native bridge, room-client, media-agent boundary, logging, server, VDS_web, and media-agent release gates
-- improved the 3010 signal admin dashboard with live topology, node/edge state, capacity, and manifest visualization
+- Renderer 侧拆分为 app state、room client、调试面板、源选择、画质设置、更新 UI、native session、peer、surface、diagnostics 和 P2P 状态机等职责模块。
+- media-agent 收紧 Host、Peer、Surface、Relay、Audio、OBS ingest 的 session/controller ownership，减少共享大状态带来的时序风险。
+- 修复 native/OBS 开播、停止共享、重复开播、房间创建、房间号显示、公开房间发现和 stale manifest 清理问题。
+- 修复 OBS ingest 音频与 AAC manifest，OBS 推流后可正确向下游播放和 relay。
+- 源缩略图改为异步加载，改进 WGC 预览时序和诊断，降低源选择、预览黑屏和预览异常对主流程的影响。
+- 强化链式 relay 拓扑：默认优先链式，上游不可达时由服务端重新选择上游，并限制单上游下游容量。
+- Web 观看端增强 iOS Safari、Android Chrome 和其它 Android 浏览器的能力检测、诊断导出、codec/payload format 判断和 LAN HTTP 测试路径。
+- 3010 信令后台支持实时房间、拓扑、节点状态、边状态、容量和 manifest 可视化。
+- 完整发布流程包含 renderer、server、Web、logging、media-agent、打包产物和 GitHub Release 校验。
 
-## Current Media Path
+## 当前媒体路径
 
-- host backend: native capture or local OBS ingest
-- native host capture: Windows Graphics Capture
-- OBS ingest: local-only MPEG-TS over SRT on `127.0.0.1`
-- transport: native `libdatachannel`
-- video: `H.264 / H.265`
-- audio: native host uses `Opus 48k stereo`, OBS ingest uses `AAC 48k`
-- relay: encoded fanout, not browser re-encode
-- rendering: native preview / native viewer surface; web viewer uses WebCodecs
+- 房主后端：原生采集或本地 OBS ingest。
+- 原生采集：Windows Graphics Capture。
+- OBS ingest：本机 `127.0.0.1` SRT / MPEG-TS 输入。
+- P2P 传输：原生 `libdatachannel`。
+- 视频：`H.264 / H.265`。
+- 音频：原生房主使用 `Opus 48k stereo`，OBS ingest 使用 `AAC 48k`。
+- Relay：转发已编码音视频帧，不做浏览器端重新编码。
+- 渲染：native preview / native viewer surface；Web 观看端使用 WebCodecs。
 
-## Repository Layout
+## 仓库结构
 
-- `desktop/`: Electron main process, preload bridge, updater, native agent bridge
-- `server/`: deployable Node signaling server, Docker context, admin dashboard, update feed output
-- `server/public/`: Electron renderer assets served by the local/deployed server
-- `vds_web/`: desktop Chrome/Edge plus mobile iOS Safari / Android browser viewer source; build output is copied to `server/public/vds_web/`
-- `media-agent/`: native capture, encode, decode, relay, preview, and viewer surface implementation
-- `runtime/`: generated native runtime copied into Electron packages; not committed
-- `scripts/`: local test, release, server, and native build scripts
-- `tools/`: helper tools such as the VDS test launcher
-- `docs/`: audit notes, logging policy, media-agent notes, and project structure docs
-- `MEDIA_REFACTOR_PLAN.md`: current media architecture and unreleased-change truth source
+- `desktop/`：Electron 主进程、preload bridge、更新器和 native agent bridge。
+- `server/`：可部署的 Node.js 信令服务器、Docker 上下文、3010 后台和更新源输出。
+- `server/public/`：Electron renderer 静态资源。
+- `vds_web/`：桌面 Chrome/Edge、iOS Safari、Android 浏览器 Web 观看端源码，构建产物复制到 `server/public/vds_web/`。
+- `media-agent/`：原生采集、编码、解码、relay、预览和 viewer surface 实现。
+- `runtime/`：构建生成的原生运行时，打包时复制进 Electron，不提交。
+- `scripts/`：本地测试、发布、server 和 native 构建脚本。
+- `tools/`：辅助工具，例如 VDS 测试启动器。
+- `docs/`：架构、审计、日志策略、media-agent 和移动 Web QA 文档。
+- `MEDIA_REFACTOR_PLAN.md`：当前媒体架构和未发布改动记录来源。
 
-More detail: [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md).
-Mobile web device QA: [docs/WEB_MOBILE_DEVICE_QA.md](docs/WEB_MOBILE_DEVICE_QA.md).
+更多结构说明见 [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md)。
+移动 Web 真机 QA 见 [docs/WEB_MOBILE_DEVICE_QA.md](docs/WEB_MOBILE_DEVICE_QA.md)。
 
-## Core Commands
+## 常用命令
 
 ```bash
 npm install
@@ -65,11 +66,11 @@ npm run build:media-agent
 npm run build:release
 ```
 
-## LAN Mobile Web HTTP
+## 局域网手机 Web HTTP
 
-LAN HTTP is supported for mobile Web testing. Open `http://<LAN-IP>:3000/` from the phone; the Web viewer treats RFC1918/link-local LAN addresses as an allowed local test context and still probes the real browser APIs. If a browser hides WebRTC/WebCodecs on LAN HTTP, diagnostics will report the specific missing API.
+移动端局域网 HTTP 测试是支持路径。手机打开 `http://<局域网IP>:3000/` 即可，Web 观看端会把 RFC1918 / link-local 局域网地址识别为允许的本地测试上下文，并继续探测真实浏览器 API。如果某个浏览器在局域网 HTTP 下隐藏 WebRTC 或 WebCodecs，诊断会明确显示缺少的 API。
 
-HTTPS remains available as an optional stricter path:
+HTTPS 仍可作为更严格的可选路径：
 
 ```powershell
 $env:VDS_HTTPS_KEY_PATH='C:\\path\\to\\lan-key.pem'
@@ -77,80 +78,84 @@ $env:VDS_HTTPS_CERT_PATH='C:\\path\\to\\lan-cert.pem'
 npm run server
 ```
 
-Then open `https://<LAN-IP>:3000/` on the phone. iOS Safari usually requires the certificate authority or self-signed certificate to be trusted on the device before WebSocket and media APIs work reliably.
+然后手机访问 `https://<局域网IP>:3000/`。iOS Safari 通常需要先在设备上信任证书或证书颁发机构，WebSocket 和媒体 API 才会稳定工作。
 
-## Release Gates
+## 发布门禁
 
-Mobile Web real-device diagnostics are manual QA evidence, not an automated release gate. Before mobile-focused QA, collect diagnostics from the Web viewer diagnostics panel `保存` button and check individual reports with `node scripts/check-web-mobile-diagnostics.js <scenario> <file>` when needed.
+移动 Web 真机诊断是人工 QA 证据，不是自动发布硬门禁。手机专项测试前建议先运行：
 
-Use `npm run check:web-mobile-code` before manual mobile QA. That command verifies the code-level mobile Web gates without requiring real-device fixture JSON.
+```bash
+npm run check:web-mobile-code
+```
 
+该命令只验证代码层移动 Web 适配，不要求三份真实手机诊断 JSON。需要核对某次手机导出的诊断时，可按场景单独运行：
 
-## Native Test Flows
+```bash
+node scripts/check-web-mobile-diagnostics.js ios-safari-leaf path/to/report.json
+node scripts/check-web-mobile-diagnostics.js android-chrome-relay path/to/report.json
+node scripts/check-web-mobile-diagnostics.js android-non-chrome-leaf path/to/report.json
+```
 
-- `npm run dev:single:native`
-  - local server + 1 native client
-- `npm run dev:dual:native`
-  - local server + 1 host + 1 native viewer
-- `npm run dev:dual:web`
-  - local server + native host + web viewer flow
-- `npm run dev:triple:native`
-  - local server + 1 host + 2 native viewers
-- `npm run triple:nwn`
-  - native host + web relay/viewer + native viewer scenario
+## Native 测试流程
 
-## Quality Settings
+- `npm run dev:single:native`：本地 server + 1 个 native 客户端。
+- `npm run dev:dual:native`：本地 server + 1 个房主 + 1 个 native 观看端。
+- `npm run dev:dual:web`：本地 server + native 房主 + Web 观看端。
+- `npm run dev:triple:native`：本地 server + 1 个房主 + 2 个 native 观看端。
+- `npm run triple:nwn`：native 房主 + Web relay / viewer + native 观看端。
 
-Current desktop UI supports:
+## 画质设置
 
-- host backend tabs: `Native Push / OBS Push`
-- codec: `H.264 / H.265`
-- resolution: `360p / 480p / 720p / 1080p / 2k / 4k`
-- frame rate: `5 / 30 / 60 / 90`
-- bitrate: step `1000 kbps`
-- hardware acceleration toggle
-- local preview toggle
-- hardware encoder selection: auto or manually select validated hardware encoders
-- encoder preset: `quality / balanced / speed`
-- tune: `fastdecode / zerolatency`
-- keyframe interval controls
+桌面 UI 当前支持：
 
-OBS mode currently behaves like this:
+- 房主后端：`Native Push / OBS Push`。
+- 编码：`H.264 / H.265`。
+- 分辨率：`360p / 480p / 720p / 1080p / 2k / 4k`。
+- 帧率：`5 / 30 / 60 / 90`。
+- 码率：按 `1000 kbps` 步进。
+- 硬件加速开关。
+- 本地预览开关。
+- 硬件编码器：自动或手动选择已验证编码器。
+- 编码 preset：`quality / balanced / speed`。
+- tune：`fastdecode / zerolatency`。
+- 关键帧间隔策略。
 
-- VDS prepares a local SRT address and waits for OBS to push a valid program stream
-- default port is `61080`
-- the user can optionally save a custom local port for OBS
-- VDS does not control OBS and does not use `obs-websocket`
-- OBS mode is local-only and not a generic remote SRT gateway
+OBS 模式当前行为：
 
-Viewer join mode currently behaves like this:
+- VDS 准备一个本机 SRT 地址，并等待 OBS 推送有效节目流。
+- 默认端口为 `61080`。
+- 用户可以保存自定义本地端口。
+- VDS 不控制 OBS，也不依赖 `obs-websocket`。
+- OBS 模式只面向本机 ingest，不是通用远程 SRT 网关。
 
-- default tab is `Lobby`
-- the lobby polls `/api/public-rooms` while the join panel is open
-- hosts choose whether a room is public before starting share
-- manual room code entry remains available in the `Direct` tab
+观看端加入当前行为：
 
-## Release and Deployment
+- 默认页签为 `Lobby`。
+- 加入面板打开时，Lobby 会轮询 `/api/public-rooms`。
+- 房主开播前可以选择房间是否公开。
+- `Direct` 页签仍支持手动输入房间码。
+
+## 发布与部署
 
 - `npm run build:release`
-  - runs prebuild checks, including VDS_web build and media-agent verification
-  - builds Electron installer
-  - refreshes `server/updates/`
-  - validates packaged media-agent runtime against `runtime/media-agent`
-  - validates `dist/` and `server/updates/` update manifests
-  - publishes the GitHub Release through `gh`
+  - 执行发布前检查，包括 VDS_web 构建和 media-agent verification。
+  - 构建 Electron 安装包。
+  - 刷新 `server/updates/`。
+  - 校验打包内 media-agent runtime 与 `runtime/media-agent` 一致。
+  - 校验 `dist/` 与 `server/updates/` 更新 manifest 一致。
+  - 通过 GitHub CLI 发布 GitHub Release。
 - `npm run release:github`
-  - requires GitHub CLI `gh` and an authenticated session
-  - creates tag `v<version>` if needed, pushes it, and uploads installer, blockmap, and `latest.yml`
-  - refuses dirty worktrees unless `ALLOW_DIRTY_GITHUB_RELEASE=1` is set
-- `server/` is the deployable server directory
-- desktop auto-update feed is served from `server/updates/`
-- release notes for recent versions are tracked in [CHANGELOG.md](CHANGELOG.md)
+  - 要求已安装并登录 GitHub CLI `gh`。
+  - 创建并推送 `v<version>` tag，上传安装包、blockmap 和 `latest.yml`。
+  - 默认拒绝 dirty worktree，除非显式设置 `ALLOW_DIRTY_GITHUB_RELEASE=1`。
+- `server/` 是可部署 server 目录。
+- 桌面自动更新源由 `server/updates/` 提供。
+- 历史发布说明见 [CHANGELOG.md](CHANGELOG.md)。
 
-## Source Control Rules
+## 源码管理规则
 
-- build outputs are not committed
-- `runtime/` binaries are not committed
-- `server/public/vds_web/` is generated by `npm run build:vds-web` and is not committed
-- update artifacts in `server/updates/` are deployment outputs, not source
-- `docs/CODE_AUDIT_FINDINGS.md` records discovered issues and handling results for audit continuity
+- 构建输出不提交。
+- `runtime/` 二进制不提交。
+- `server/public/vds_web/` 由 `npm run build:vds-web` 生成，不提交。
+- `server/updates/` 是部署输出，不作为源码提交。
+- [docs/CODE_AUDIT_FINDINGS.md](docs/CODE_AUDIT_FINDINGS.md) 记录发现的问题和处理结果，用于审计连续性。

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.7.1
+
+### 中文
+
+- 发布完整 1.7.1 Windows 安装包、blockmap 与 `latest.yml`，并上传到 GitHub Release。
+- 完成 GitHub 发布流程校验：发布前检查、Electron 打包、server 更新源准备、发布后 artifact 一致性校验和 GitHub asset 上传均通过。
+- 移动 Web 真机诊断改为人工 QA 证据，不再作为自动发布硬门禁；保留单份诊断 JSON 的场景校验能力。
+- README 改为中文主页，补充当前媒体路径、局域网手机 HTTP、测试命令、发布门禁、画质设置和部署说明。
+- 继续保留 1.7.x 主线改动：renderer/native authority 模块化、media-agent session/controller ownership、native/OBS 生命周期修复、Web/native relay 拓扑增强、3010 后台拓扑可视化和移动浏览器 Web 观看端适配。
+
+### English
+
+- Published the full 1.7.1 Windows installer, blockmap, and `latest.yml` to GitHub Release.
+- Completed release validation: precheck, Electron packaging, server update-feed preparation, postbuild artifact consistency checks, and GitHub asset upload all passed.
+- Changed mobile Web real-device diagnostics from an automated release gate to manual QA evidence while keeping per-report scenario validation.
+- Localized the GitHub README homepage to Chinese with media path, LAN mobile HTTP, test commands, release gates, quality settings, and deployment notes.
+- Kept the 1.7.x mainline improvements around renderer/native-authority modularization, media-agent session ownership, native/OBS lifecycle fixes, Web/native relay topology, the 3010 topology dashboard, and mobile browser Web viewer support.
+
 ## 1.7.0
 
 ### 中文
