@@ -211,6 +211,8 @@ OBS 模式当前行为：
 
 管理后台现在需要 `ADMIN_TOKEN`。未配置时管理数据接口返回 503；访问后台页面后输入同一令牌即可查看拓扑。普通观看端和公开房间列表不需要该令牌。
 
+恢复旧 Docker 部署、保留更新源和校验证书的步骤见 [服务端维护说明](docs/SERVER_OPERATIONS.md)。
+
 ```powershell
 $env:ADMIN_TOKEN = '替换为随机生成的管理令牌'
 npm run server
