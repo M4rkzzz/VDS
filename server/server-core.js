@@ -88,7 +88,6 @@ function startServer(options = {}) {
   const messageRateWindowMs = normalizePositiveInt(options.messageRateWindowMs || process.env.WS_MESSAGE_RATE_WINDOW_MS, DEFAULT_MESSAGE_RATE_WINDOW_MS);
   const adminPort = options.adminPort === undefined ? 0 : normalizePositiveInt(options.adminPort, 0);
   const adminHost = String(options.adminHost || process.env.ADMIN_HOST || '127.0.0.1');
-  const adminToken = String(options.adminToken ?? process.env.ADMIN_TOKEN ?? '').trim();
   const appVersion = resolveAppVersion(baseDir);
   const iceServers = buildIceServers();
   const publicDir = resolveExistingPath([
@@ -198,22 +197,8 @@ function startServer(options = {}) {
     });
   });
 
-  function authorizeAdmin(req, res, next) {
-    res.set('Cache-Control', 'no-store');
-    if (!adminToken) {
-      res.status(503).json({ code: 'admin-disabled', message: 'Configure ADMIN_TOKEN to enable the dashboard' });
-      return;
-    }
-    const match = /^Bearer (.+)$/i.exec(String(req.headers.authorization || ''));
-    if (!match || !isValidSessionToken(adminToken, match[1])) {
-      res.set('WWW-Authenticate', 'Bearer realm="VDS admin"');
-      res.status(401).json({ code: 'admin-unauthorized', message: 'Admin token is required' });
-      return;
-    }
-    next();
-  }
-
   function sendAdminSnapshot(_req, res) {
+    res.set('Cache-Control', 'no-store');
     res.json(buildAdminSnapshot(rooms, maxDownstreamsPerUpstream, activeConnections, {
       maxRooms,
       maxViewersPerRoom,
@@ -222,7 +207,7 @@ function startServer(options = {}) {
     }));
   }
 
-  app.get('/api/admin/rooms', authorizeAdmin, sendAdminSnapshot);
+  app.get('/api/admin/rooms', sendAdminSnapshot);
 
   wss.on('connection', (ws, req) => {
     // Protocol errors (including maxPayload) belong to this connection, not the process.
@@ -921,7 +906,7 @@ function startServer(options = {}) {
 
   if (adminPort > 0) {
     const adminApp = express();
-    adminApp.get('/api/rooms', authorizeAdmin, sendAdminSnapshot);
+    adminApp.get('/api/rooms', sendAdminSnapshot);
     if (publicDir) {
       adminApp.get('/', (_req, res, next) => {
         res.set('Cache-Control', 'no-store');
@@ -941,7 +926,7 @@ function startServer(options = {}) {
     adminServer.listen(adminPort, adminHost, () => {
       const address = adminServer.address();
       const actualPort = address && typeof address === 'object' ? address.port : adminPort;
-      logServerInfo(`Admin dashboard running on http://${adminHost}:${actualPort} (${adminToken ? 'token required' : 'disabled: configure ADMIN_TOKEN'})`);
+      logServerInfo(`Admin dashboard running on http://${adminHost}:${actualPort}`);
     });
   }
 

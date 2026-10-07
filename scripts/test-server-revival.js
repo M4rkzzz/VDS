@@ -90,26 +90,29 @@ async function testViewerCanSwitchRooms() {
   });
 }
 
-async function testAdminAuthorization() {
+async function testAdminDirectAccess() {
   await withServer(async (_instance, port) => {
     const host = await connect(port);
     const room = await request(host, { type: 'create-room', clientId: 'private-host', mediaManifest: manifest });
+    const viewer = await connect(port);
+    const joined = await request(viewer, { type: 'join-room', roomId: room.roomId, clientId: 'private-viewer' });
     assert.deepStrictEqual(JSON.parse((await get(port, '/api/public-rooms')).body).rooms, []);
-    assert.strictEqual((await get(port, '/api/admin/rooms')).status, 401);
-    assert.strictEqual((await get(port, '/api/admin/rooms', { Authorization: 'Bearer wrong' })).status, 401);
-    const authenticated = await get(port, '/api/admin/rooms', { Authorization: 'Bearer test-only-admin-token' });
-    assert.strictEqual(authenticated.status, 200);
-    const snapshot = JSON.parse(authenticated.body);
+    const response = await get(port, '/api/admin/rooms');
+    assert.strictEqual(response.status, 200);
+    const snapshot = JSON.parse(response.body);
     assert.strictEqual(snapshot.roomCount, 1);
     assert.strictEqual(snapshot.rooms[0].roomId, room.roomId);
-    assert.ok(!authenticated.body.includes(room.sessionToken));
-    assert.strictEqual(authenticated.headers['cache-control'], 'no-store');
-    assert.strictEqual(authenticated.headers['access-control-allow-origin'], undefined);
-  }, { adminToken: 'test-only-admin-token' });
-  await withServer(async (_instance, port) => {
-    assert.strictEqual((await get(port, '/api/admin/rooms')).status, 503);
+    assert.strictEqual(snapshot.rooms[0].viewerCount, 1);
+    assert.deepStrictEqual(snapshot.rooms[0].nodes.map((node) => node.id), ['private-host', 'private-viewer']);
+    assert.ok(!response.body.includes(room.sessionToken));
+    assert.ok(!response.body.includes(joined.sessionToken));
+    assert.strictEqual(response.headers['cache-control'], 'no-store');
+    assert.strictEqual(response.headers['access-control-allow-origin'], undefined);
+    assert.strictEqual(response.headers['www-authenticate'], undefined);
+    assert.strictEqual((await get(port, '/api/admin/rooms', { Authorization: 'Bearer stale-browser-header' })).status, 200);
+    assert.strictEqual((await get(port, '/admin')).status, 200);
     assert.strictEqual((await get(port, '/api/version')).status, 200);
-  }, { adminToken: '' });
+  });
 
   const reservation = http.createServer();
   reservation.listen(0, '127.0.0.1');
@@ -118,16 +121,20 @@ async function testAdminAuthorization() {
   await new Promise((resolve) => reservation.close(resolve));
   await withServer(async (instance, port) => {
     assert.strictEqual(instance.adminServer.address().address, '127.0.0.1');
-    assert.strictEqual((await get(adminPort, '/api/rooms')).status, 401);
-    const authorized = await get(adminPort, '/api/rooms', { Authorization: 'Bearer test-only-admin-token' });
-    assert.strictEqual(authorized.status, 200);
-    assert.strictEqual((await get(port, '/api/ADMIN/rooms', { Authorization: 'Bearer test-only-admin-token' })).headers['access-control-allow-origin'], undefined);
+    const response = await get(adminPort, '/api/rooms');
+    assert.strictEqual(response.status, 200);
+    assert.strictEqual(JSON.parse(response.body).roomCount, 0);
+    assert.strictEqual(response.headers['cache-control'], 'no-store');
+    assert.strictEqual(response.headers['www-authenticate'], undefined);
+    const mainSnapshot = await get(port, '/api/ADMIN/rooms');
+    assert.strictEqual(mainSnapshot.status, 200);
+    assert.strictEqual(mainSnapshot.headers['access-control-allow-origin'], undefined);
     assert.strictEqual((await get(port, '/admin')).status, 200);
     assert.strictEqual((await get(adminPort, '/')).status, 200);
-  }, { adminPort, adminHost: '127.0.0.1', adminToken: 'test-only-admin-token' });
+  }, { adminPort, adminHost: '127.0.0.1' });
 }
 
-const tests = { oversized: testOversizedPayload, switch: testViewerCanSwitchRooms, admin: testAdminAuthorization };
+const tests = { oversized: testOversizedPayload, switch: testViewerCanSwitchRooms, admin: testAdminDirectAccess };
 
 async function main() {
   if (process.argv.includes('--oversize-child')) return oversizedChild();

@@ -12,5 +12,4 @@ services:
       PORT: 3000
       ADMIN_PORT: 3010
       ADMIN_HOST: 0.0.0.0
-      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       DISCONNECT_GRACE_MS: 30000

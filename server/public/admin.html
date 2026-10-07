@@ -46,14 +46,6 @@
     h2, h3 { margin: 0; }
     main { padding: 16px 20px 28px; }
     .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
-    .toolbar input {
-      width: 190px;
-      border: 1px solid var(--line);
-      background: var(--panel-3);
-      color: var(--text);
-      border-radius: 6px;
-      padding: 7px 10px;
-    }
     .toolbar button {
       border: 1px solid var(--line);
       background: var(--panel-2);
@@ -234,9 +226,6 @@
   <header>
     <h1>信令服务器后台</h1>
     <div class="toolbar">
-      <label for="adminTokenInput">管理令牌</label>
-      <input id="adminTokenInput" type="password" autocomplete="off" placeholder="输入管理令牌">
-      <button id="connectButton" type="button">连接</button>
       <span id="statusText">连接中</span>
       <span id="updatedText">-</span>
       <button id="refreshButton" type="button">刷新</button>
@@ -252,15 +241,9 @@
     const statusText = document.getElementById('statusText');
     const updatedText = document.getElementById('updatedText');
     const refreshButton = document.getElementById('refreshButton');
-    const adminTokenInput = document.getElementById('adminTokenInput');
-    const connectButton = document.getElementById('connectButton');
-    const ADMIN_TOKEN_STORAGE_KEY = 'vds-admin-token';
     const adminApiPath = /^\/admin(?:\.html)?\/?$/.test(window.location.pathname)
       ? '/api/admin/rooms'
       : '/api/rooms';
-    let adminToken = '';
-    try { adminToken = sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || ''; } catch (_error) {}
-    adminTokenInput.value = adminToken;
     let refreshTimer = null;
     let refreshController = null;
     let refreshSeq = 0;
@@ -522,10 +505,6 @@
     }
 
     async function refreshAdminSnapshot({ manual = false } = {}) {
-      if (!adminToken) {
-        statusText.textContent = '请输入管理令牌';
-        return;
-      }
       if (document.hidden && !manual) {
         return;
       }
@@ -545,16 +524,10 @@
       try {
         const response = await fetch(adminApiPath, {
           cache: 'no-store',
-          signal: controller.signal,
-          headers: { Authorization: `Bearer ${adminToken}` }
+          signal: controller.signal
         });
         if (!response.ok) {
-          const message = response.status === 401 ? '管理令牌无效，请重新输入'
-            : response.status === 503 ? '后台尚未启用，请在服务端配置 ADMIN_TOKEN'
-            : `HTTP ${response.status}`;
-          const error = new Error(message);
-          error.status = response.status;
-          throw error;
+          throw new Error(`HTTP ${response.status}`);
         }
         const snapshot = await response.json();
         if (seq !== refreshSeq) {
@@ -567,12 +540,7 @@
         }
         statusText.textContent = '连接失败';
         updatedText.textContent = `错误：${formatTime(Date.now())}`;
-        if (error.status === 401 || error.status === 503) {
-          adminToken = '';
-          try { sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY); } catch (_error) {}
-          summaryEl.innerHTML = '';
-          roomsEl.innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
-        } else if (!roomsEl.children.length) {
+        if (!roomsEl.children.length) {
           roomsEl.innerHTML = `<div class="error">${escapeHtml(error.message || error)}</div>`;
         }
       } finally {
@@ -584,19 +552,6 @@
       }
     }
 
-    function connectAdmin() {
-      adminToken = adminTokenInput.value.trim();
-      try {
-        if (adminToken) sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, adminToken);
-        else sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
-      } catch (_error) {}
-      refreshAdminSnapshot({ manual: true });
-    }
-
-    connectButton.addEventListener('click', connectAdmin);
-    adminTokenInput.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') connectAdmin();
-    });
     refreshButton.addEventListener('click', () => refreshAdminSnapshot({ manual: true }));
     refresh();
     refreshTimer = window.setInterval(refresh, REFRESH_INTERVAL_MS);

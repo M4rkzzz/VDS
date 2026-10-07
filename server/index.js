@@ -6,7 +6,6 @@ try {
     port: process.env.PORT || 3000,
     adminPort: process.env.ADMIN_PORT || 3010,
     adminHost: process.env.ADMIN_HOST || '127.0.0.1',
-    adminToken: process.env.ADMIN_TOKEN || '',
     onError: (error) => {
       if (error && error.code === 'EADDRINUSE') {
         console.error(`Server port ${error.port || process.env.PORT || 3000} is already in use. Close the existing process or set PORT to another value.`);

@@ -90,7 +90,7 @@ UDP 端口预测条件见 [RFC 5128](https://www.rfc-editor.org/rfc/rfc5128.html
 | --- | --- | --- | --- |
 | REVIVAL-P1-001 | `server/server-core.js` WebSocket connection | 超过 maxPayload 的消息触发未监听的 socket error，整个服务进程退出。已用独立子进程复现。 | 已监听每条连接的 error；超限连接关闭 1009，HTTP 与新连接继续可用。 |
 | REVIVAL-P2-002 | `server/server-core.js::finalizeViewerDisconnect` | viewer 主动退出后保留 socket 绑定，进入其他房间被拒绝。 | 已清除原 socket 元数据、旧 viewer token 与 ws 引用；同连接换房及旧 leave 消息隔离回归通过。 |
-| REVIVAL-P1-003 | `server/server-core.js`、`server/public/admin.html`、`server/docker-compose.yml` | 两个管理数据 API 无鉴权暴露私有房间与拓扑；主端口后台请求路径不正确。 | 已统一 Bearer `ADMIN_TOKEN` 鉴权，空配置 503、无效令牌 401、响应 no-store；修正后台路径，管理端口/宿主映射默认仅本机。 |
+| REVIVAL-P1-003 | `server/server-core.js`、`server/public/admin.html`、`server/docker-compose.yml` | 管理接口返回房间与拓扑；主端口后台请求路径不正确。 | 已修正后台路径，响应 no-store，快照不包含房间会话令牌；管理端口/宿主映射默认仅本机。初期加入的管理鉴权已按用户 2026-10-07 明确要求移除，页面和两个只读 API 直接访问；房间恢复身份校验保留。 |
 | REVIVAL-P1-004 | `desktop/media-agent-manager.js` | stop 或 RPC 超时后启动新进程，旧进程退出/stream 回调可清除新进程与请求。并发 start 也未共享完整握手。 | 已协调停启并共享握手，通过 child 身份隔离旧回调；5 项行为回归通过。 |
 | REVIVAL-P1-005 | `media-agent/src/session_owner_activation.cpp`、`agent_rpc_router.cpp` | 活动 OBS owner A 被直接切换到 B，A worker 未 join；EOF 实测退出码 -1073740791。 | 已在创建 registry 条目或改 active id 前预检全部 owner；冲突返回 `MEDIA_SESSION_ACTIVE`，原会话保持正常。新增单元及真实 RPC 生命周期回归。 |
 | REVIVAL-P1-006 | `server/public/native/native-session-controller.js` | 旧 capture start 在预览/信令 await 后继续 fallback、建房或 stop，可能干扰用户刚重启的新 host。 | 已在异步边界检查 generation；过期流程停止后续动作，不清理新会话/新 UI。正常预览失败仍可重试。 |
