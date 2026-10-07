@@ -16,7 +16,8 @@
   let wsReconnectAttempts = 0;
   let wsReconnectTimer = null;
   let pendingReconnect = false;
-  let wsManualClose = false;
+  let wsGeneration = 0;
+  let wsCancelConnect = null;
 
   function installLegacyAdapter(adapter) {
     legacyAdapter = adapter && typeof adapter === 'object' ? adapter : null;
@@ -296,23 +297,51 @@
       return wsConnectPromise;
     }
 
-    wsManualClose = false;
     pendingReconnect = false;
+    if (wsReconnectTimer) {
+      clearTimeout(wsReconnectTimer);
+      wsReconnectTimer = null;
+    }
+
+    const generation = ++wsGeneration;
+    const previousSocket = ws;
+    ws = null;
+    wsConnected = false;
+    if (previousSocket) {
+      previousSocket.close();
+    }
+
+    let socket;
+    try {
+      socket = new WebSocket(getWebSocketUrl());
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    ws = socket;
+    const isCurrentConnection = () => generation === wsGeneration && ws === socket;
 
     wsConnectPromise = new Promise((resolve, reject) => {
       let settled = false;
+      let cancelConnect = null;
 
       const settle = (callback, value) => {
         if (settled) {
           return;
         }
         settled = true;
+        if (wsCancelConnect === cancelConnect) {
+          wsCancelConnect = null;
+        }
         callback(value);
       };
 
-      ws = new WebSocket(getWebSocketUrl());
+      cancelConnect = () => settle(reject, new Error('websocket-connect-cancelled'));
+      wsCancelConnect = cancelConnect;
 
-      ws.onopen = () => {
+      socket.onopen = () => {
+        if (!isCurrentConnection()) {
+          return;
+        }
         debugLog('connection', 'WebSocket connected');
         wsConnected = true;
         wsReconnectAttempts = 0;
@@ -329,7 +358,10 @@
         settle(resolve);
       };
 
-      ws.onmessage = async (event) => {
+      socket.onmessage = async (event) => {
+        if (!isCurrentConnection()) {
+          return;
+        }
         try {
           const data = JSON.parse(event.data);
           if (!data || typeof data !== 'object') {
@@ -341,16 +373,16 @@
         }
       };
 
-      ws.onclose = () => {
-        debugLog('connection', 'WebSocket disconnected');
-        wsConnected = false;
-        wsConnectPromise = null;
-        callOptionalAdapter('onWebSocketClose', [{ manualClose: wsManualClose }]);
-
-        if (wsManualClose) {
-          debugLog('connection', 'Manual close, skipping reconnect');
+      socket.onclose = () => {
+        if (!isCurrentConnection()) {
           return;
         }
+        debugLog('connection', 'WebSocket disconnected');
+        wsConnected = false;
+        ws = null;
+        wsConnectPromise = null;
+        settle(reject, new Error('websocket-connect-closed'));
+        callOptionalAdapter('onWebSocketClose', [{ manualClose: false }]);
 
         const shouldReconnect = callOptionalAdapter('onWebSocketUnexpectedClose', [], true);
         if (shouldReconnect !== false) {
@@ -358,7 +390,10 @@
         }
       };
 
-      ws.onerror = (error) => {
+      socket.onerror = (error) => {
+        if (!isCurrentConnection()) {
+          return;
+        }
         debugLog('connection', 'WebSocket error:', error && error.message ? error.message : String(error));
 
         if (!settled) {
@@ -373,9 +408,14 @@
 
   function disconnectWebSocket() {
     clearPendingSignalingQueues('disconnect');
-    wsManualClose = true;
+    wsGeneration += 1;
     pendingReconnect = false;
     wsConnectPromise = null;
+    const cancelConnect = wsCancelConnect;
+    wsCancelConnect = null;
+    if (cancelConnect) {
+      cancelConnect();
+    }
 
     if (wsReconnectTimer) {
       clearTimeout(wsReconnectTimer);
@@ -383,12 +423,13 @@
     }
     wsReconnectAttempts = 0;
 
-    if (ws) {
-      ws.close();
-      ws = null;
-    }
-
+    const socket = ws;
+    ws = null;
     wsConnected = false;
+    if (socket) {
+      socket.close();
+      callOptionalAdapter('onWebSocketClose', [{ manualClose: true }]);
+    }
     callOptionalAdapter('onWebSocketDisconnected', []);
   }
 

@@ -22,18 +22,26 @@ This document is the maintenance map for the VDS repository. It separates source
 
 - `vds_web/`
   - TypeScript Chrome/Edge web viewer source.
+  - `src/main.ts` coordinates room signaling, upstream/downstream connections, UI, and encoded-frame relay; relay keyframe caching stays here.
+  - `src/playback-session.ts` owns frame reassembly, video scheduling, the local audio/video players, and media-session cleanup. Its complete encoded frames can be relayed independently of local decoding.
+  - `src/upstream-recovery.ts` handles connection failure timers; `src/webcodecs-*` implement decoding and output. Playback diagnostics are separate from connection/relay state.
   - Builds to `server/public/vds_web/` through `npm run build:vds-web`.
   - The build output is generated deployment content and is ignored by git.
 
 - `media-agent/`
   - Native C++ media runtime.
   - Owns Windows capture, FFmpeg/native encode/decode, native surfaces, WGC preview, peer transport, audio capture/playback, relay dispatch, OBS ingest, and JSON RPC.
+  - `src/nat_port_prediction.h` implements bounded port prediction and neighborhood generation from verified observations. `src/peer_stun_config.*` validates the pure STUN pool.
+  - `third_party/ice-patches/` contains tracked patches for hash-pinned libjuice/libdatachannel sources; `cmake/VdsEnhancedIce.cmake` selects and verifies the patched installation. The actual ICE socket gathers mappings and runs connectivity checks.
+  - `tests/nat_port_prediction_tests.cpp` covers the pure algorithm; `tests/juice_stun_probe_tests.cpp` exercises actual local STUN requests and response validation; `tests/nat_traversal_e2e.cpp` uses local virtual NATs and real ICE/DataChannel traffic.
   - Builds into `runtime/media-agent/` through the media-agent build/verify scripts.
 
 - `scripts/`
   - Test, build, release, and local environment launch scripts.
   - JavaScript scripts are usually release/server checks.
   - PowerShell scripts usually launch local test environments or build/verify native runtime.
+  - `build-media-agent.ps1` invokes `build-vds-ice.ps1` to rebuild the pinned enhanced ICE libraries before building the agent; `test-native-nat-contract.js` exercises transport generation and candidate admission through real native RPC.
+  - `test-native-nat.js` is the Windows `verify:nat` entry; `native-runtime-integrity.js` compares the current algorithm/patch stamps and hashes of the agent plus both ICE DLLs across the build, runtime, and packaged runtime.
 
 - `tools/`
   - Local helper tools. Currently includes the VDS test launcher.
@@ -54,6 +62,7 @@ These paths should not be treated as source:
 - `server/updates/`: generated desktop auto-update feed and installer copy.
 - `server/public/vds_web/`: generated VDS_web static build output.
 - `media-agent/build/`: native build tree.
+- `media-agent/build/vds-ice/`: extracted dependency sources, patched builds, and the generated enhanced ICE installation.
 - `tools/**/bin/` and `tools/**/obj/`: .NET build output.
 
 ## Command Groups
@@ -86,6 +95,7 @@ Native runtime:
 npm run build:media-agent
 npm run verify:media-agent
 npm run smoke:media-agent
+npm run verify:nat
 ```
 
 Release:
@@ -105,7 +115,8 @@ When building media-agent in the local workspace, set `VDS_FFMPEG_SOURCE` to the
 
 - Signaling/topology bugs usually start in `server/server-core.js` and then fan out to `server/public/app-native-overrides.js` or `vds_web/src/main.ts`.
 - Native preview, capture, encode, decode, and surface bugs usually start in `media-agent/src/*`; renderer fixes should only coordinate state or display diagnostics.
-- Web viewer bugs usually start in `vds_web/src/main.ts`, `vds_web/src/capabilities.ts`, `vds_web/src/webcodecs-*`, or `vds_web/src/datachannel-protocol.ts`.
+- NAT sampling, port prediction, and authenticated connectivity checks cross `media-agent/src/nat_port_prediction.h` and `media-agent/third_party/ice-patches/`. STUN selection and pool wiring start in `desktop/stun-server-selector.js` and `desktop/main.js`; queued candidate ownership lives in the native peer controller and Web connection code. VDS forbids TURN.
+- Web room/relay bugs usually start in `vds_web/src/main.ts`; frame scheduling and cleanup start in `vds_web/src/playback-session.ts`; decoding/output start in `vds_web/src/webcodecs-*`. Capability detection and the frame wire format remain in `capabilities.ts` and `datachannel-protocol.ts`.
 - Packaged-only native differences usually involve `desktop/main.js`, `runtime/media-agent/`, `dist/win-unpacked/resources/runtime/media-agent/`, or release-check runtime hash validation.
 - Admin dashboard changes should stay in `server/public/admin.html` plus server snapshot fields in `server/server-core.js`.
 

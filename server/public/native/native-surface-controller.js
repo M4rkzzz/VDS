@@ -47,6 +47,7 @@
   function createController(options = {}) {
     const surfaceRegistry = createSurfaceRegistry();
     const recoverableSurfaceSyncWarnings = new Map();
+    const surfaceOperations = new Map();
     let surfaceSyncRafId = 0;
     let surfaceSyncInFlight = false;
     let surfaceSyncPending = false;
@@ -399,7 +400,7 @@
     }
 
     function removeSurfaceTracking(surfaceId, reason) {
-      incrementSurfaceGeneration(surfaceId);
+      const generation = incrementSurfaceGeneration(surfaceId);
       deleteSurfaceEntry(surfaceId);
       clearRecoverableSurfaceSyncWarning(surfaceId);
       if (getSurfaceCount() === 0) {
@@ -408,11 +409,25 @@
       if (typeof options.onSurfaceTrackingRemoved === 'function') {
         options.onSurfaceTrackingRemoved(surfaceId, reason);
       }
+      return generation;
     }
 
-    async function attachSurface(surfaceId, target, element) {
-      if (!element) {
-        throw new Error(`缺少承载容器:${surfaceId}`);
+    function queueSurfaceOperation(surfaceId, operation) {
+      const previous = surfaceOperations.get(surfaceId) || Promise.resolve();
+      const pending = previous.then(operation, operation);
+      surfaceOperations.set(surfaceId, pending);
+      const release = () => {
+        if (surfaceOperations.get(surfaceId) === pending) {
+          surfaceOperations.delete(surfaceId);
+        }
+      };
+      pending.then(release, release);
+      return pending;
+    }
+
+    async function performSurfaceAttach(surfaceId, target, element, attachGeneration) {
+      if (getSurfaceGeneration(surfaceId) !== attachGeneration) {
+        return null;
       }
       if (!options.mediaEngine || typeof options.mediaEngine.attachSurface !== 'function') {
         throw new Error('native-surface-media-engine-unavailable');
@@ -420,7 +435,6 @@
 
       const layout = buildSurfaceLayout(element);
       const layoutKey = getSurfaceLayoutKey(layout);
-      const attachGeneration = incrementSurfaceGeneration(surfaceId);
       const payload = {
         surface: surfaceId,
         target,
@@ -434,6 +448,7 @@
       });
       const result = await options.mediaEngine.attachSurface(payload);
       if (getSurfaceGeneration(surfaceId) !== attachGeneration) {
+        // Cleanup stays inside this job, before a replacement can attach.
         if (typeof options.mediaEngine.detachSurface === 'function') {
           await options.mediaEngine.detachSurface({ surface: surfaceId }).catch(() => {});
         }
@@ -451,15 +466,28 @@
       return result;
     }
 
+    async function attachSurface(surfaceId, target, element) {
+      if (!element) {
+        throw new Error(`缺少承载容器:${surfaceId}`);
+      }
+      if (!options.mediaEngine || typeof options.mediaEngine.attachSurface !== 'function') {
+        throw new Error('native-surface-media-engine-unavailable');
+      }
+      const generation = incrementSurfaceGeneration(surfaceId);
+      return queueSurfaceOperation(surfaceId, () => performSurfaceAttach(surfaceId, target, element, generation));
+    }
+
     async function detachSurface(surfaceId) {
       if (!options.mediaEngine || typeof options.mediaEngine.detachSurface !== 'function') {
         throw new Error('native-surface-media-engine-unavailable');
       }
       removeSurfaceTracking(surfaceId, 'detach-requested');
-      logNativeStep('detachSurface:request', { surfaceId });
-      const result = await options.mediaEngine.detachSurface({ surface: surfaceId });
-      logNativeStep('detachSurface:result', { surfaceId, result });
-      return result;
+      return queueSurfaceOperation(surfaceId, async () => {
+        logNativeStep('detachSurface:request', { surfaceId });
+        const result = await options.mediaEngine.detachSurface({ surface: surfaceId });
+        logNativeStep('detachSurface:result', { surfaceId, result });
+        return result;
+      });
     }
 
     async function recoverSurface(surfaceId, entry, reason = 'surface-sync-failed') {
@@ -468,14 +496,27 @@
         return null;
       }
 
-      removeSurfaceTracking(surfaceId, reason);
+      if (getSurfaceEntry(surfaceId) !== entry) {
+        return null;
+      }
+
+      const generation = removeSurfaceTracking(surfaceId, reason);
+      return queueSurfaceOperation(surfaceId, () => performSurfaceRecovery(surfaceId, entry, reason, generation));
+    }
+
+    async function performSurfaceRecovery(surfaceId, entry, reason, generation) {
+      if (getSurfaceGeneration(surfaceId) !== generation) {
+        return null;
+      }
       if (options.mediaEngine && typeof options.mediaEngine.detachSurface === 'function') {
         await options.mediaEngine.detachSurface({ surface: surfaceId }).catch(() => {});
       }
-
+      if (getSurfaceGeneration(surfaceId) !== generation) {
+        return null;
+      }
       logNativeStep('surface-tracking:reattach', { surfaceId, target: entry.target, reason }, 'video');
-      const result = await attachSurface(surfaceId, entry.target, entry.element);
-      if (result && surfaceId === (options.hostPreviewSurfaceId || 'embedded-host-preview')) {
+      const result = await performSurfaceAttach(surfaceId, entry.target, entry.element, generation);
+      if (result && getSurfaceGeneration(surfaceId) === generation && surfaceId === (options.hostPreviewSurfaceId || 'embedded-host-preview')) {
         setHostPreviewAttached(true);
       }
       return result;
@@ -496,7 +537,12 @@
       const target = options.hostPreviewTarget || 'host-capture-artifact';
       const element = options.hostPreviewElement;
       logNativeStep('attachNativeHostPreviewSurface:start', { surfaceId, target });
-      const result = await attachSurface(surfaceId, target, element);
+      const pending = attachSurface(surfaceId, target, element);
+      const generation = getSurfaceGeneration(surfaceId);
+      const result = await pending;
+      if (getSurfaceGeneration(surfaceId) !== generation) {
+        return null;
+      }
       setHostPreviewAttached(Boolean(result));
       if (result) {
         forceResyncBurst();
@@ -506,9 +552,6 @@
     }
 
     async function detachHostPreviewSurface() {
-      if (!isHostPreviewAttached()) {
-        return null;
-      }
       const surfaceId = options.hostPreviewSurfaceId || 'embedded-host-preview';
       setHostPreviewAttached(false);
       return detachSurface(surfaceId);
@@ -538,6 +581,19 @@
         return null;
       }
 
+      const generation = getSurfaceGeneration(surfaceId);
+      return queueSurfaceOperation(surfaceId, () => performSurfaceUpdate(surfaceId, entry, generation));
+    }
+
+    function isCurrentSurfaceEntry(surfaceId, entry, generation) {
+      return getSurfaceGeneration(surfaceId) === generation && getSurfaceEntry(surfaceId) === entry;
+    }
+
+    async function performSurfaceUpdate(surfaceId, entry, generation) {
+      if (!isCurrentSurfaceEntry(surfaceId, entry, generation)) {
+        return null;
+      }
+
       const layout = buildSurfaceLayout(entry.element, { log: false });
       const layoutKey = getSurfaceLayoutKey(layout);
       if (layoutKey === entry.lastLayoutKey) {
@@ -561,17 +617,24 @@
       try {
         result = await options.mediaEngine.updateSurface(payload);
       } catch (error) {
+        if (!isCurrentSurfaceEntry(surfaceId, entry, generation)) {
+          return null;
+        }
         const message = error && error.message ? error.message : String(error);
         if (message.includes('Surface is not attached')) {
-          removeSurfaceTracking(surfaceId, 'surface-not-attached');
+          const recoveryGeneration = removeSurfaceTracking(surfaceId, 'surface-not-attached');
           if (shouldShowDebugLogsFor('video', 'nativeSteps')) {
-            logNativeStep('updateSurface:detached-skip', { surfaceId, message }, 'video');
+            logNativeStep('updateSurface:detached-recover', { surfaceId, message }, 'video');
           }
-          return null;
+          // This update already owns the queue; recover without enqueueing again.
+          return performSurfaceRecovery(surfaceId, entry, 'surface-not-attached', recoveryGeneration);
         }
         throw error;
       }
 
+      if (!isCurrentSurfaceEntry(surfaceId, entry, generation)) {
+        return null;
+      }
       clearRecoverableSurfaceSyncWarning(surfaceId);
       entry.lastLayoutKey = layoutKey;
       if (shouldShowDebugLogsFor('video')) {
@@ -587,7 +650,11 @@
       const jobs = [];
       const maxConsecutiveFailures = getMaxConsecutiveSyncFailures();
       forEachSurface((entry, surfaceId) => {
+        const generation = getSurfaceGeneration(surfaceId);
         jobs.push(updateSurface(surfaceId).catch((error) => {
+          if (!isCurrentSurfaceEntry(surfaceId, entry, generation)) {
+            return null;
+          }
           logRecoverableSurfaceSyncWarning(surfaceId, error);
           const failureCount = incrementSurfaceFailureCount(surfaceId);
           if (failureCount >= maxConsecutiveFailures) {

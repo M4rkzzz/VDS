@@ -3,6 +3,9 @@
   "version": "1.7.1",
   "description": "Multi-viewer screen sharing with cascade relay (蜈蚣法) - Electron Edition",
   "main": "desktop/main.js",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "start": "powershell -ExecutionPolicy Bypass -File scripts/start-electron-dev.ps1 .",
     "dev": "powershell -ExecutionPolicy Bypass -File scripts/start-electron-dev.ps1 .",
@@ -19,12 +22,20 @@
     "check:vds-web": "tsc -p vds_web/tsconfig.json --noEmit",
     "check:web-mobile-diagnostics": "node scripts/check-web-mobile-diagnostics.js --self-test",
     "check:web-mobile-code": "npm run check:vds-web && npm run test:vds-web && npm run check:web-mobile-diagnostics && npm run test:server",
-    "test:vds-web": "node scripts/test-vds-web-protocol.js",
+    "test:vds-web": "node scripts/test-vds-web-protocol.js && node scripts/test-vds-web-frame-validation.js && node scripts/test-vds-web-player-lifecycle.js && node --test tests/web/*.test.js",
+    "verify:playback": "npm run build:vds-web && node scripts/test-vds-web-playback.js && node scripts/test-local-playback-e2e.js",
+    "verify:nat": "node scripts/test-native-nat.js",
     "build": "electron-builder",
     "build:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/build-media-agent.ps1 -Configuration Release",
     "smoke:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/smoke-media-agent.ps1",
     "test:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/test-media-agent.ps1 -Configuration Release",
     "test:server": "node scripts/test-server-core.js",
+    "test:server-revival": "node scripts/test-server-revival.js",
+    "test:server-reconnect": "node scripts/test-server-reconnect.js",
+    "test:desktop": "node --test tests/desktop/*.test.js",
+    "test": "npm run check",
+    "check": "npm run check:architecture && npm run check:logging && npm run check:web-mobile-code && npm run test:server-revival && npm run test:server-reconnect && npm run test:desktop",
+    "check:dependencies": "npm audit --omit=dev && npm --prefix server audit --omit=dev",
     "verify:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/verify-media-agent.ps1 -Configuration Release",
     "check:architecture": "npm run check:renderer-entry && npm run check:renderer-syntax && npm run check:renderer-bridge && npm run check:room-client-dispatcher && npm run check:media-agent-boundary",
     "check:media-agent-boundary": "node scripts/check-media-agent-boundary.js",
@@ -43,18 +54,18 @@
     "build:release": "npm run release:precheck && npm run build && npm run prepare-server-release && npm run release:check && npm run release:github"
   },
   "dependencies": {
-    "electron-updater": "^6.8.3",
-    "express": "^4.22.2",
-    "koffi": "^2.15.1",
+    "electron-updater": "^6.8.9",
+    "express": "^4.22.3",
+    "koffi": "^2.16.3",
     "process-audio-capture": "^1.0.14",
-    "ws": "^8.21.0"
+    "ws": "^8.22.0"
   },
   "devDependencies": {
-    "electron": "^39.0.0",
-    "electron-builder": "^25.1.8",
-    "electron-rebuild": "^3.2.9",
+    "electron": "^42.11.11",
+    "electron-builder": "^26.15.3",
+    "@electron/rebuild": "^4.2.1",
     "typescript": "^6.0.3",
-    "vite": "^8.0.10"
+    "vite": "^8.3.3"
   },
   "build": {
     "appId": "com.vds.app",

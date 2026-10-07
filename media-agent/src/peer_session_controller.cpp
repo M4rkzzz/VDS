@@ -1,5 +1,6 @@
 #include "peer_session_controller.h"
 
+#include <regex>
 #include "agent_diagnostics.h"
 #include "agent_events.h"
 #include "audio_session_state.h"
@@ -32,6 +33,16 @@ namespace {
 
 void emit_peer_close_breadcrumb(const std::string& step) {
   emit_agent_breadcrumb(step);
+}
+
+bool stale_transport_request(const PeerState& peer, const std::string& request_json) {
+  const bool specified = std::regex_search(request_json, std::regex("\"transportGeneration\"\\s*:"));
+  return specified && extract_string_value(request_json, "transportGeneration") != peer.transport.transport_generation;
+}
+
+bool has_predicted_candidate(const std::string& text) {
+  static const std::regex extension("(^|\\s)vds-predicted\\s+1(\\s|$)");
+  return std::regex_search(text, extension);
 }
 
 void emit_peer_create_breadcrumb(const std::string& step) {
@@ -164,7 +175,9 @@ PeerControlCommandResult PeerSessionController::create_from_request(const std::s
       transport_ready,
       peer,
       request_json,
-      config.encoded_media_data_channel);
+      config.encoded_media_data_channel,
+      config.stun_server,
+      config.stun_servers);
   }
 
   const ObsIngestSessionSnapshot obs_ingest =
@@ -185,6 +198,9 @@ PeerControlCommandResult PeerSessionController::close_from_request(const std::st
   emit_peer_close_breadcrumb(std::string("closePeer:begin peer=") + peer_id);
   PeerState* peer = find_peer(runtime_state_, peer_id);
   if (peer) {
+    if (stale_transport_request(*peer, request_json)) {
+      return error_peer_control_result("STALE_TRANSPORT", "The transport has been replaced");
+    }
     SurfaceSessionController surface_sessions(runtime_state_);
     surface_sessions.detach_peer_surfaces(peer_id, "peer-closed");
     emit_peer_close_breadcrumb(std::string("closePeer:after-stop-surfaces peer=") + peer_id);
@@ -233,9 +249,16 @@ PeerControlCommandResult PeerSessionController::set_remote_description_from_requ
   const std::string peer_id = extract_string_value(request_json, "peerId");
   const std::string description_type = extract_string_value(request_json, "type");
   const std::string sdp = extract_string_value(request_json, "sdp");
+  if (has_predicted_candidate(sdp) &&
+      extract_string_value(request_json, "transportGeneration").empty()) {
+    return error_peer_control_result("BAD_REQUEST", "Predicted candidates require the current transport generation");
+  }
   PeerState* peer = find_peer(runtime_state_, peer_id);
   if (!peer) {
     return error_peer_control_result("PEER_NOT_FOUND", "Peer has not been created");
+  }
+  if (stale_transport_request(*peer, request_json)) {
+    return error_peer_control_result("STALE_TRANSPORT", "The transport has been replaced");
   }
   apply_media_manifest_to_peer(*peer, request_json);
 
@@ -261,9 +284,16 @@ PeerControlCommandResult PeerSessionController::add_remote_ice_candidate_from_re
   const std::string peer_id = extract_string_value(request_json, "peerId");
   const std::string candidate = extract_string_value(request_json, "candidate");
   const std::string sdp_mid = extract_string_value(request_json, "sdpMid");
+  if (has_predicted_candidate(candidate) &&
+      extract_string_value(request_json, "transportGeneration").empty()) {
+    return error_peer_control_result("BAD_REQUEST", "Predicted candidates require the current transport generation");
+  }
   PeerState* peer = find_peer(runtime_state_, peer_id);
   if (!peer) {
     return error_peer_control_result("PEER_NOT_FOUND", "Peer has not been created");
+  }
+  if (stale_transport_request(*peer, request_json)) {
+    return error_peer_control_result("STALE_TRANSPORT", "The transport has been replaced");
   }
 
   if (peer->transport_session) {
@@ -289,6 +319,10 @@ PeerMediaBindingCommandResult PeerSessionController::attach_media_source_from_re
 }
 
 PeerMediaBindingCommandResult PeerSessionController::detach_media_source_from_request(const std::string& request_json) {
+  const PeerState* peer = find_peer(runtime_state_, extract_string_value(request_json, "peerId"));
+  if (peer && stale_transport_request(*peer, request_json)) {
+    return {false, {}, "STALE_TRANSPORT", "The transport has been replaced"};
+  }
   return detach_peer_media_source_command(runtime_state_, request_json);
 }
 

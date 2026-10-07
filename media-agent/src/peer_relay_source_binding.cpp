@@ -1,5 +1,8 @@
 #include "peer_relay_source_binding.h"
 
+#include <algorithm>
+#include <memory>
+
 #include "audio_transport_config.h"
 #include "peer_session_state.h"
 #include "peer_transport.h"
@@ -12,6 +15,25 @@ namespace {
 using vds::media_agent::normalize_video_codec;
 using vds::media_agent::to_lower_copy;
 
+void install_relay_keyframe_request_handler(
+  const std::shared_ptr<PeerTransportSession>& downstream,
+  const std::shared_ptr<PeerTransportSession>& upstream) {
+  const std::weak_ptr<PeerTransportSession> weak_upstream = upstream;
+  set_peer_transport_keyframe_request_handler(downstream,
+    [weak_upstream](const std::string& reason) -> std::string {
+      const auto source = weak_upstream.lock();
+      if (!source) return "relay-upstream-keyframe-unavailable";
+      std::size_t length = std::min<std::size_t>(reason.size(), 64);
+      // Preserve UTF-8 boundaries when a remote reason is truncated.
+      while (length > 0 && length < reason.size() &&
+             (static_cast<unsigned char>(reason[length]) & 0xc0) == 0x80) --length;
+      std::string request_error;
+      return request_peer_transport_keyframe(source, "relay-downstream:" + reason.substr(0, length), &request_error)
+        ? "relay-upstream-keyframe-requested"
+        : "relay-upstream-keyframe-unavailable";
+    });
+}
+
 }  // namespace
 
 bool attach_relay_video_media_binding(
@@ -19,11 +41,16 @@ bool attach_relay_video_media_binding(
   PeerState& peer,
   const std::string& source,
   std::string* error) {
+  const auto clear_failed_binding = [&peer]() {
+    relay_hub().unregister_subscriber(peer.peer_id);
+    set_peer_transport_keyframe_request_handler(peer.transport_session, {});
+    return false;
+  };
   if (!peer.transport_session) {
     if (error) {
       *error = "peer-transport-session-missing";
     }
-    return false;
+    return clear_failed_binding();
   }
 
   const std::string& upstream_peer_id = context.upstream_peer_id;
@@ -43,7 +70,7 @@ bool attach_relay_video_media_binding(
     if (error) {
       *error = "relay-upstream-not-ready";
     }
-    return false;
+    return clear_failed_binding();
   }
 
   const std::string upstream_video_codec = to_lower_copy(
@@ -53,7 +80,7 @@ bool attach_relay_video_media_binding(
     if (error) {
       *error = "relay-upstream-video-codec-unsupported";
     }
-    return false;
+    return clear_failed_binding();
   }
 
   PeerVideoTrackConfig video_config;
@@ -79,6 +106,7 @@ bool attach_relay_video_media_binding(
   if (use_encoded_data_channel) {
     relay_hub().unregister_subscriber(peer.peer_id);
     relay_hub().register_subscriber(upstream_peer_id, peer.peer_id, peer.transport_session, audio_enabled);
+    install_relay_keyframe_request_handler(peer.transport_session, upstream_peer.transport_session);
     peer.transport = get_peer_transport_snapshot(peer.transport_session);
     peer.media_binding.attached = true;
     peer.media_binding.active = peer.transport.encoded_media_data_channel_open;
@@ -115,6 +143,7 @@ bool attach_relay_video_media_binding(
 
   if (already_attached) {
     relay_hub().register_subscriber(upstream_peer_id, peer.peer_id, peer.transport_session, audio_enabled);
+    install_relay_keyframe_request_handler(peer.transport_session, upstream_peer.transport_session);
     peer.transport = get_peer_transport_snapshot(peer.transport_session);
     peer.media_binding.active = peer.transport.video_track_open;
     peer.media_binding.video_encoder_backend = "relay-copy";
@@ -128,7 +157,7 @@ bool attach_relay_video_media_binding(
   }
 
   if (!configure_peer_transport_video_sender(peer.transport_session, video_config, error)) {
-    return false;
+    return clear_failed_binding();
   }
 
   if (audio_enabled) {
@@ -144,7 +173,7 @@ bool attach_relay_video_media_binding(
       upstream_audio_codec == "pcmu" ? 64 : static_cast<int>(kTransportAudioBitrateKbps);
     if (!configure_peer_transport_audio_sender(peer.transport_session, audio_config, error)) {
       clear_peer_transport_video_sender(peer.transport_session, nullptr);
-      return false;
+      return clear_failed_binding();
     }
   } else {
     clear_peer_transport_audio_sender(peer.transport_session, nullptr);
@@ -152,6 +181,7 @@ bool attach_relay_video_media_binding(
 
   relay_hub().unregister_subscriber(peer.peer_id);
   relay_hub().register_subscriber(upstream_peer_id, peer.peer_id, peer.transport_session, audio_enabled);
+  install_relay_keyframe_request_handler(peer.transport_session, upstream_peer.transport_session);
   peer.transport = get_peer_transport_snapshot(peer.transport_session);
   peer.media_binding.attached = true;
   peer.media_binding.active = peer.transport.video_track_open;

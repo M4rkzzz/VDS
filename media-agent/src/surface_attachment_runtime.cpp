@@ -101,6 +101,11 @@ bool start_peer_video_surface_attachment(
   config.window_title = window_title;
   config.codec = codec_path;
   config.layout = runtime.surface_layout;
+  {
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    config.on_keyframe_needed = runtime.on_keyframe_needed;
+    config.frame_rate = runtime.expected_video_frame_rate;
+  }
 
   std::string create_error;
   auto surface = create_native_video_surface(config, &create_error);

@@ -7,13 +7,23 @@
 #include "media_audio.h"
 #include "native_video_surface.h"
 #include "peer_transport.h"
+#include "viewer_audio_playback.h"
 
 void begin_close_peer_video_receiver_runtime(PeerVideoReceiverRuntime& runtime) {
-  std::lock_guard<std::mutex> lock(runtime.mutex);
-  runtime.closing = true;
-  runtime.pending_video_annexb_bytes.clear();
-  runtime.startup_video_decoder_config_au.clear();
-  runtime.reason = "peer-closing";
+  std::string source_id;
+  {
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    runtime.closing = true;
+    runtime.pending_video_annexb_bytes.clear();
+    runtime.startup_video_decoder_config_au.clear();
+    runtime.on_keyframe_needed = {};
+    runtime.reason = "peer-closing";
+    source_id = runtime.peer_id + "/" + runtime.source_generation;
+  }
+  // Joining the playback worker must happen outside the receiver lock: its
+  // final decode callback may still be finishing against this receiver.
+  stop_viewer_audio_playback_source(source_id);
+  stop_viewer_audio_playback_source(source_id + "/rtp-audio");
 }
 
 void close_peer_video_receiver_handles(PeerVideoReceiverRuntime& runtime) {
@@ -44,6 +54,19 @@ void refresh_peer_video_receiver_runtime(PeerVideoReceiverRuntime& runtime) {
   runtime.decoder_ready = snapshot.decoder_ready;
   runtime.process_id = snapshot.process_id;
   runtime.decoded_frames_rendered = snapshot.decoded_frames_rendered;
+  runtime.decoded_frames = snapshot.decoded_frames;
+  runtime.painted_frames = snapshot.painted_frames;
+  runtime.dropped_decoded_frames = snapshot.dropped_decoded_frames;
+  runtime.dropped_encoded_frames = snapshot.dropped_encoded_frames;
+  runtime.reference_chain_resets = snapshot.reference_chain_resets;
+  runtime.decode_late_frames = snapshot.decode_late_frames;
+  runtime.presentation_late_frames = snapshot.presentation_late_frames;
+  runtime.max_decode_lateness_ms = snapshot.max_decode_lateness_ms;
+  runtime.max_presentation_lateness_ms = snapshot.max_presentation_lateness_ms;
+  runtime.pending_decoded_frames = snapshot.pending_decoded_frames;
+  runtime.pending_encoded_frames = snapshot.pending_encoded_frames;
+  runtime.buffer_delay_ms = snapshot.buffer_delay_ms;
+  runtime.needs_keyframe = snapshot.needs_keyframe;
   runtime.frame_interval_stddev_ms = snapshot.frame_interval_stddev_ms;
   runtime.codec_path = snapshot.codec_path;
   runtime.implementation = snapshot.implementation;
@@ -85,6 +108,21 @@ std::string peer_video_receiver_runtime_json(
     << ",\"dispatchedAudioBlocks\":" << runtime->dispatched_audio_blocks
     << ",\"droppedVideoUnits\":" << runtime->dropped_video_units
     << ",\"droppedAudioBlocks\":" << runtime->dropped_audio_blocks
+    << ",\"decodedFrames\":" << runtime->decoded_frames
+    << ",\"paintedFrames\":" << runtime->painted_frames
+    << ",\"droppedDecodedFrames\":" << runtime->dropped_decoded_frames
+    << ",\"droppedEncodedFrames\":" << runtime->dropped_encoded_frames
+    << ",\"referenceChainResets\":" << runtime->reference_chain_resets
+    << ",\"decodeLateFrames\":" << runtime->decode_late_frames
+    << ",\"presentationLateFrames\":" << runtime->presentation_late_frames
+    << ",\"maxDecodeLatenessMs\":" << runtime->max_decode_lateness_ms
+    << ",\"maxPresentationLatenessMs\":" << runtime->max_presentation_lateness_ms
+    << ",\"pendingDecodedFrames\":" << runtime->pending_decoded_frames
+    << ",\"pendingEncodedFrames\":" << runtime->pending_encoded_frames
+    << ",\"bufferDelayMs\":" << runtime->buffer_delay_ms
+    << ",\"needsKeyframe\":" << (runtime->needs_keyframe ? "true" : "false")
+    << ",\"retiredEpochFramesDropped\":" << runtime->retired_epoch_frames_dropped
+    << ",\"sourceEpoch\":\"" << vds::media_agent::json_escape(runtime->source_epochs.current()) << "\""
     << ",\"reason\":\"" << vds::media_agent::json_escape(runtime->reason) << "\""
     << ",\"lastError\":\"" << vds::media_agent::json_escape(runtime->last_error) << "\""
     << "}";

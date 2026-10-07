@@ -24,5 +24,6 @@ struct PeerMediaBindingState {
   unsigned long long avg_source_memcpy_us = 0;
   unsigned long long avg_source_total_readback_us = 0;
   unsigned long long frames_sent = 0;
+  unsigned long long next_video_sequence = 0;
   std::shared_ptr<PeerVideoSenderRuntime> runtime;
 };

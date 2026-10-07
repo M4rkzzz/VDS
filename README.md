@@ -18,6 +18,8 @@ VDS 是一套为“把画面稳定地给很多人看”而做的屏幕共享工�
 - 适合人群：需要比普通聊天软件更可控的屏幕共享、OBS 分发、局域网观看或多人 relay 的用户。
 - 如果这个项目刚好解决了你的屏幕分享痛点，可以给仓库点一个 Star，后续更新和排障记录都会继续公开在这里。
 
+本轮连接、播放和增强 ICE 改动尚未公开发布；上方 GitHub 1.7.1 下载属于既有 release。本轮源码与本地验证产物的状态见 [项目现状报告](docs/PROJECT_STATUS.md)。
+
 ## 为什么值得试试
 
 - **比聊天软件更专注**：不做群聊和社交，只把屏幕共享链路做好。
@@ -84,12 +86,18 @@ VDS 是一套为“把画面稳定地给很多人看”而做的屏幕共享工�
 - `MEDIA_REFACTOR_PLAN.md`：当前媒体架构和未发布改动记录来源。
 
 更多结构说明见 [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md)。
+项目定位、本轮复兴结果和剩余验收项见 [项目现状报告](docs/PROJECT_STATUS.md)。
+连接与播放的真实本机回归可执行 `npm run verify:playback`，需要已构建的原生 runtime 和支持 SRT 的 FFmpeg。该验证覆盖合成输入、浏览器解码、刷新及接力恢复；跨运营商连通需两端另测。
 移动 Web 真机 QA 见 [docs/WEB_MOBILE_DEVICE_QA.md](docs/WEB_MOBILE_DEVICE_QA.md)。
 
 ## 常用命令
 
+开发环境需要 Node.js 22.12 或更高版本。桌面端当前使用 Electron 42；首次启动时 Electron 会下载对应运行时。
+
 ```bash
 npm install
+npm run check
+npm run check:dependencies
 npm run dev
 npm run server
 npm run dev:single:native
@@ -102,10 +110,33 @@ npm run check:web-mobile-diagnostics
 npm run check:web-mobile-code
 npm run test:vds-web
 npm run test:server
+npm run test:desktop
+npm run test:server-reconnect
+npm run verify:nat
+npm run verify:playback
 npm run build:vds-web
 npm run build:media-agent
 npm run build:release
 ```
+
+`npm run check` 汇总架构、日志、Web、服务端和桌面生命周期回归；`npm run check:dependencies` 检查根目录与 server 的生产依赖。原生 C++ 构建与真实音画测试需另行执行。
+
+`npm run verify:nat` 在 Windows 上校验增强 ICE runtime 与源码/构建一致，运行端口算法、实际 STUN 报文、虚拟 NAT 真实 DataChannel 和原生 RPC 合约；需先执行 `npm run build:media-agent`。虚拟 NAT 验证通过不代表跨运营商已经完成验收。
+
+## 纯 P2P 连接
+
+项目禁止 TURN 服务器中继。服务器下发的 `ICE_SERVERS_JSON` 可配置 STUN 池；桌面端探测可达性，将首选服务放在最前，与最多四个 STUN 一并传入原生 ICE。真正承载媒体的 UDP socket 向多个端点采样：至少三个连续有效样本显示同一 IPv4 地址和稳定非零步长时做端口预测；其他情况仅对已验证映射端口的邻域做有限多端口尝试。每个 peer 最多发布 16 个推测候选，通过实际 ICE 检查后才用于媒体，选中可用候选对后停止其余推测检查。
+
+实现保存在项目的端口算法和 libjuice/libdatachannel 补丁中，没有移植 UU 代码。诊断可查看 `peerTransport` 中的 `selectedStunServer`、`stunServers`、`natProbeObservations`、`natPortStep`、推测候选计数及 `transportGeneration`。候选使用当前 ICE 凭据和连接代次隔离；STUN 全部超时时仍允许局域网 host 候选尝试。
+
+```powershell
+$env:ICE_SERVERS_JSON = '[{"urls":"stun:stun.linphone.org:3478"},{"urls":"stun:stun.cloudflare.com:3478"},{"urls":"stun:stun.freeswitch.org:3478"},{"urls":"stun:stun.pjsip.org:3478"}]'
+npm run server
+```
+
+示例沿用当前默认池，实际可达性以连接诊断为准。最多配置四个 URL，每个 URL 最多解析两个地址并去重；线性预测需要至少三个不同、可达的 IPv4 STUN 端点。仅配两个端点时仍支持普通 ICE 和有限邻域尝试，解析后地址重复或采样缺失时不能确认线性步长。浏览器的 UDP socket 和打洞时序由浏览器 ICE 管理，Web 端可以接收原生端的推测候选。
+
+当前 TCP active 模式不能为两个原生客户端提供 TCP 直连备用通道；STUN 可达和有限端口预测也不保证任意 NAT 一定可穿透。桌面端保留 NAT-PMP/PCP 端口映射尝试，已修正源地址和多网卡匹配。真实移动宽带与联通宽带互连仍需两端验收，详见现状报告。
 
 ## 局域网手机 Web HTTP
 
@@ -177,6 +208,15 @@ OBS 模式当前行为：
 - `Direct` 页签仍支持手动输入房间码。
 
 ## 发布与部署
+
+管理后台现在需要 `ADMIN_TOKEN`。未配置时管理数据接口返回 503；访问后台页面后输入同一令牌即可查看拓扑。普通观看端和公开房间列表不需要该令牌。
+
+```powershell
+$env:ADMIN_TOKEN = '替换为随机生成的管理令牌'
+npm run server
+```
+
+管理端口默认只监听 `127.0.0.1:3010`。Docker 同样仅将管理端口映射到宿主本机，并从环境读取 `ADMIN_TOKEN`；需要远程管理时，可经受保护的 HTTPS 反向代理访问主端口的 `/admin`。
 
 - `npm run build:release`
   - 执行发布前检查，包括 VDS_web 构建和 media-agent verification。

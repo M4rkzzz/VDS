@@ -19,6 +19,7 @@ class MediaAgentManager extends EventEmitter {
     this.pendingRequests = new Map();
     this.requestId = 1;
     this.startPromise = null;
+    this.stopPromise = null;
     this.defaultInvokeTimeoutMs = Number(options.defaultInvokeTimeoutMs || DEFAULT_INVOKE_TIMEOUT_MS);
     this.pingTimeoutMs = Number(options.pingTimeoutMs || DEFAULT_PING_TIMEOUT_MS);
     this.recentStderrLines = [];
@@ -51,7 +52,7 @@ class MediaAgentManager extends EventEmitter {
   }
 
   getStatus() {
-    if (this.child && !this.child.killed) {
+    if (this.child && !this.child.killed && this.child.exitCode === null && this.child.signalCode === null) {
       return { ...this.status };
     }
 
@@ -68,12 +69,24 @@ class MediaAgentManager extends EventEmitter {
   }
 
   async start() {
-    if (this.child && !this.child.killed && this.child.exitCode === null && this.child.signalCode === null) {
-      return this.getStatus();
+    if (this.stopPromise) {
+      const interruptedStart = this.startPromise;
+      await this.stopPromise;
+      if (interruptedStart) {
+        try {
+          await interruptedStart;
+        } catch (_error) {
+          // A stop can reject the previous startup ping before its promise settles.
+        }
+      }
     }
 
     if (this.startPromise) {
       return this.startPromise;
+    }
+
+    if (this.child && !this.child.killed && this.child.exitCode === null && this.child.signalCode === null) {
+      return this.getStatus();
     }
 
     this.startPromise = this.startInternal();
@@ -85,6 +98,10 @@ class MediaAgentManager extends EventEmitter {
   }
 
   async stop() {
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
+
     if (!this.child) {
       this.updateStatus({
         state: 'idle',
@@ -98,13 +115,22 @@ class MediaAgentManager extends EventEmitter {
     this.child = null;
     this.disposeLineReader();
     this.rejectAllPending(new Error('media-agent-stopped'));
-    await this.stopChildProcess(child);
-    this.updateStatus({
-      state: 'idle',
-      running: false,
-      reason: 'stopped'
-    });
-    return this.getStatus();
+    this.stopPromise = (async () => {
+      await this.stopChildProcess(child);
+      if (!this.child) {
+        this.updateStatus({
+          state: 'idle',
+          running: false,
+          reason: 'stopped'
+        });
+      }
+      return this.getStatus();
+    })();
+    try {
+      return await this.stopPromise;
+    } finally {
+      this.stopPromise = null;
+    }
   }
 
   async stopChildProcess(child, timeoutMs = 5000) {
@@ -113,7 +139,7 @@ class MediaAgentManager extends EventEmitter {
     }
 
     child.__vdsExpectedExit = true;
-    child.__vdsExpectedExitReason = 'manager-stop';
+    child.__vdsExpectedExitReason = child.__vdsExpectedExitReason || 'manager-stop';
 
     await new Promise((resolve) => {
       let settled = false;
@@ -218,6 +244,7 @@ class MediaAgentManager extends EventEmitter {
         if (child && this.child === child) {
           child.__vdsExpectedExit = true;
           child.__vdsExpectedExitReason = 'invoke-timeout';
+          this.disposeLineReader();
           this.stopChildProcess(child, 1000).catch(() => {});
           this.child = null;
           this.updateStatus({
@@ -415,6 +442,9 @@ class MediaAgentManager extends EventEmitter {
 
     child.stdin.setDefaultEncoding('utf8');
     child.stdin.on('error', (error) => {
+      if (this.child !== child) {
+        return;
+      }
       this.recordStderr(error && error.message ? error.message : String(error));
       this.rejectAllPending(error);
       this.updateStatus({
@@ -427,6 +457,9 @@ class MediaAgentManager extends EventEmitter {
       });
     });
     child.stderr.on('data', (chunk) => {
+      if (this.child !== child) {
+        return;
+      }
       const message = String(chunk || '').trim();
       if (message) {
         this.recordStderr(message);
@@ -435,6 +468,9 @@ class MediaAgentManager extends EventEmitter {
     });
 
     child.once('error', (error) => {
+      if (this.child !== child) {
+        return;
+      }
       this.rejectAllPending(error);
       this.updateStatus({
         state: 'failed',
@@ -447,9 +483,12 @@ class MediaAgentManager extends EventEmitter {
     });
 
     child.once('exit', (code, signal) => {
-      this.disposeLineReader();
       const expectedExit = Boolean(child.__vdsExpectedExit);
       const exitReason = child.__vdsExpectedExitReason || 'process-exit';
+      if (this.child !== child) {
+        return;
+      }
+      this.disposeLineReader();
       if (expectedExit) {
         this.rejectAllPending(new Error('media-agent-stopped'));
         this.logger.log(`[media-agent] process exited as expected: code=${code ?? 'null'} signal=${signal ?? 'null'} reason=${exitReason}`);
@@ -471,7 +510,7 @@ class MediaAgentManager extends EventEmitter {
     });
 
     this.child = child;
-    this.attachStdoutReader(child.stdout);
+    this.attachStdoutReader(child.stdout, child);
     this.updateStatus({
       state: 'running',
       available: true,
@@ -483,17 +522,23 @@ class MediaAgentManager extends EventEmitter {
     try {
       await this.invoke('ping', {}, { timeoutMs: this.pingTimeoutMs });
     } catch (error) {
-      await this.stop();
+      if (this.child === child) {
+        await this.stop();
+      }
       throw error;
     }
 
     return this.getStatus();
   }
 
-  attachStdoutReader(stdout) {
+  attachStdoutReader(stdout, child = this.child) {
     this.disposeLineReader();
     this.lineReader = readline.createInterface({ input: stdout });
-    this.lineReader.on('line', (line) => this.handleAgentLine(line));
+    this.lineReader.on('line', (line) => {
+      if (this.child === child) {
+        this.handleAgentLine(line);
+      }
+    });
   }
 
   disposeLineReader() {

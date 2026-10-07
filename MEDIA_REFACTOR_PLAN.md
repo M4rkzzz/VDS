@@ -17,9 +17,11 @@
 - 未完成项必须明确写成风险或下一步。
 - 不用“未来可能”掩盖当前事实。
 
-最近一次对齐日期：`2026-06-21`
+最近一次对齐日期：`2026-10-07`
 
-当前发布版本：`1.7.0`
+两种播放器的轻量稳帧改造已落地，见 [播放稳帧改造与验收](docs/PLAYBACK_STABILITY_PLAN.md)。共享源 PTS、媒体代次、参考链背压、解码与呈现分离及输出音频时钟已接入。队列随源帧率、短突发和实际音频进度调整，合法长音频单元按实际时长消费，不增加固定帧率、分辨率、换源次数或运行时长限制。统一 `npm run check`、原生 CTest 15/15、Web 行为回归 125/125、实际 1080p30/60 与零音量八阶段恢复，以及本地安装包一致性与实际启动均通过。
+
+当前源码版本：`1.7.1`。2026-10-07 的复兴修改已在本地构建验证，尚未发布。
 
 ## 2. 未发布改动记录
 
@@ -27,14 +29,40 @@
 
 当前未发布改动：
 
-- 1.7.0 发布候选：renderer/native authority 已按职责拆出 app state、room client、debug panel、source selection、quality settings、update UI、native session/peer/surface/diagnostics/P2P state machine 等边界模块。
-- 1.7.0 发布候选：media-agent 已收紧 session/controller ownership，Host、Peer、Surface、Relay、Audio、OBS ingest 通过更清晰的 session owner、registry 与 facade 协作。
-- 1.7.0 发布候选：native/OBS 开播、停止共享、重复开播、房间号显示、公开房间发现、OBS AAC manifest、Web/native relay 拓扑与 3010 后台均已纳入本次发布说明。
+- 连接与播放专项：修复旧 socket、取消/迟到 join 确认、surface 串行挂载与丢失恢复；服务端换上游先确认，浏览器刷新和失联后恢复媒体握手。
+- 播放器专项：WebCodecs 探测/关闭/并发/失效恢复，有界待处理帧；原生音频 packet padding、空包忽略与 waveOut 在途背压。
+- 播放架构整理：Web 新增 `EncodedMediaPlaybackSession`，集中帧重组、视频调度、音视频播放器和关闭清理；`main.ts` 保留房间、连接与编码接力，播放状态和错误不再覆盖连接/接力诊断。保留现有媒体协议和两种解码后端。
+- 两端稳帧：原生增加独立解码和调度 worker，约 20 ms 序号缺口等待与关键帧恢复，窗口线程只画 GDI。压缩输入按源帧率、250 ms 突发窗口和实际音频领先量伸缩，原生另有 32 MiB 压缩内存预算和已到期 500 ms 陈旧数据清理；不裁掉正常聚包来满足固定帧数。Web 按真实 decodeQueueSize、待输出数和 B 帧重排量预留呈现位置，manifest 的 frameRate/fps 都用于源帧率估计。原生待呈现通常 2 帧，Web 通常 2 帧、B 帧时通常 3 帧；32 MiB BGRA 估算是软目标，4K 通常保留 1 帧，合法单幅大图仍可播放。预算不含解码器与当前显示资源。
+- 媒体时钟与源切换：房主共享 64 位源 PTS，修正 OBS 时间基换算，旧 RTP 兼容入口单独处理回绕；v1 增加可选 sourceEpoch，接力每个媒体绑定生成新的短输出代次并在上游换代时更新，支持保留下游连接的 A → B → A 切源。退役代次保留到接收会话关闭，不设换源次数上限，旧代次不能借历史淘汰重新播放。WGC 使用捕获 QPC，其他 Annex B 与 WASAPI 入口仍含源采样时间估计。
+- 输出与效率：有效 waveOut/Web Audio 输出位置驱动视频，无音频回退单调时钟，目标缓冲 20–60 ms。原生设备目标 60 ms、总积压目标 120 ms 加用户延迟，合法的不可拆长单元可临时扩大软件预算；8 kHz AAC 128 ms 单帧仍能正常播放，消费后恢复目标。已有音频 worker 从压缩块游标逐个取 AAC ADTS 单元或短 PCMU 段，500 ms 清理只针对已到期且设备输出未继续前进的数据。复用 swresample 转换非 48 kHz 双声道，不另加线程或变速系统。Web 按实际音频单元时长等待，AAC 用可信输入源 PTS 排程，兼容 Chrome 输出样本时钟连续但源 PTS 有间隙的情况。原生音频空闲事件等待，Web 诊断 JSON/DOM 最多刷新 4 Hz。
+- Web 重连追赶与静音：仅在已配置、运行且同 codec 的较新源 PTS/序号到达时取消旧待提交音频尾部、重新锚定，正常 235 ms 聚包完整消费。已确认的 B 帧在等待呈现时暂停内部停滞工作计时，恢复提交后真正无输出仍恢复；未声明帧率时用实际帧间隔伸缩输入。用户零音量时视频回退单调时钟，恢复音量后接回当前音频位置，不重建上下文或音源。
+- 实际关键帧恢复：严格校验真实 DataChannel keyframe-request、当前连接与 manifest 身份，并以 500 ms 合并节流。桌面把已接受的请求接到现有房主软刷新控制路径，首次 bootstrap 期间不反复刷新；OBS 等待外部编码器 IDR。刷新请求待处理 peer 集合跟随当前生命周期清理，不增加 peer 数量硬限。
+- 纯 P2P 专项：原生端接收服务器 STUN 池，按可达性将首选服务排在最前，与最多四个服务一起从实际 ICE UDP socket 采样；有效样本符合稳定步长时线性预测，其他情况做有限邻域多端口检查，每个 peer 最多 16 个推测候选。自行实现端口算法及 libjuice/libdatachannel 补丁，不移植 UU 代码。transport 代次和 ICE ufrag 隔离旧候选与请求；修复 PCP 源地址、响应关联、多网卡网关与并发映射，保持禁止 TURN。
+- 原生依赖可重复构建：固定 libjuice 1.7.0、libdatachannel 0.24.1 源包哈希，仓库保存增强 ICE 补丁；CMake 校验安装标记与补丁版本，构建和 runtime 使用配套 DLL。
+- 实际本机媒体验证：最终增强 runtime 的合成 OBS SRT → native → Web 播放、刷新、Web 二跳和上游离线恢复通过；真实 H264/AAC/Opus 解码和打包应用的 NAT/IPv6/代次 IPC 验证通过。`npm run verify:playback` 与 `npm run verify:nat` 可重复执行；跨运营商连通与长时音画仍需两端验收。
 
-当前未发布改动已验证：
+- 小范围依赖更新：Electron 42.11.11、electron-builder 26.17.0、electron-updater 6.8.9、Vite 8.3.3；保留 TypeScript 6、Express 4、Koffi 2，替换废弃的 electron-rebuild 包。
+- 修复媒体代理停启、跨活动 session owner 切换、过期 host start 和 OBS 断流清理；加入生命周期行为回归。
+- 修复 Web 信令与 peer 的过期回调、取消加入、关键帧缓存跨会话残留，以及 Annex B 转 AVCC 的 NAL 边界。
+- 修复服务端 WebSocket 错误隔离、退出后换房和管理后台鉴权；增加统一 `npm run check` 与生产依赖检查。
 
-- 发布前继续执行 `npm run release:precheck`。
-- 完整发布继续执行 `npm run build:release`，该命令会构建安装包、准备更新目录、运行 postbuild 校验并发布 GitHub Release。
+稳帧改造当前已验证：
+
+- 当前原生 Release 与 CTest 15/15 通过，79.65 秒；调度 17591 项、音频 1420 项、源代次 8251 项及实际 DataChannel 关键帧控制 210 项断言通过，含新配置缓存更新回归。真实隐藏窗口 FFmpeg/GDI 覆盖 H.264 B 帧、独立配置加同序号 IDR、正常 60 fps 聚包、关闭重开及并发提交关闭。约 235 ms 同批 14 视频帧和 11 AAC 单元的专项中，280 视频帧全部解码、265 帧绘制、220 AAC 单元全部消费，压缩视频/音频预算丢弃与参考链重置为 0，峰值压缩输入 16 帧、待呈现 2 帧。原生 NAT 合约与 runtime 完整性检查通过；runtime SHA256 为 `94AF26910AEB58103B13B5991B6F858A9E39FF834706D930613CE0047382ABC1`。
+- 最终源码的统一 `npm run check` 通过，含 Web 125/125 行为回归、3 个协议/帧/生命周期脚本与 TypeScript，视频 49 项、音频 45 项，桌面 88/88 回归。最终 Electron 42 真解码分别消费 H.264 3 帧、AAC 9 块、Opus 9 块、8 kHz AAC 6 块、带源 PTS 间隙 AAC 9 块，各项无丢弃，画布色彩断言通过；B 帧等待、重连音频追赶、零音量回退与合法音频软预算均有行为回归。
+- 实际 SRT → native → Web 的 1080p30 B2、1080p60 B0 八阶段均通过，含同 peer 两次源重启及 Web 二跳恢复，使用同一原生 runtime。30 fps 测试持续 30.201 秒呈现 901 帧即 29.833 fps，消费 1409 AAC 即 46.654 单元/秒，视频和音频均无新增丢弃。60 fps 测试持续 30.146 秒呈现 1781 帧即 59.079 fps，消费 1394 AAC 即 46.242 单元/秒，音频无新增丢弃，视频新增 5 次迟到呈现丢弃。
+- 30/60 fps 每秒采样的 ready 峰值分别为 3/2 帧，压缩待处理峰值 9/17 帧，decoderQueue 均为 0，BGRA 估算 25,067,520/16,711,680 字节；滚动 128 样本迟到 P95 的最大采样值为 13.035/14.518 ms，60 fps 记录最大迟到 42.866 ms。这些是采样峰值而非全过程峰值。两次源重启时，30 fps 分别丢弃 24/24 个、60 fps 分别丢弃 48/24 个旧积压 AAC 以恢复实时播放；稳态零音频丢弃不代表恢复阶段零丢弃。
+- 用户零音量的实际 1080p30 B2 八阶段通过，持续 30.001 秒呈现 895 帧即 29.832 fps，消费 1397 AAC，期间视频和音频均无新增丢弃，audioClockValid=false，确认视频使用既有单调时钟回退。该场景不是全零源或物理输出音画验收。
+- 新版 E2E 使用 60 fps offscreen、音频图音量 100% 与 webContents 静音；静音仍可能使用软件虚拟输出，不能证明物理听感或音画偏差。改造前的隐藏窗口即时绘制基线约 29.9/59.8 fps，环境不同，不用于宣称 CPU 或内存下降。GDI/Canvas 计数不能替代物理 Vsync；真实 50 ms 音画仍需实机验收。
+- 当前 `npm run build -- --publish never` 的 NSIS 产物为 `dist/VDS-Setup-1.7.1.exe`，239,871,520 字节，SHA256 `5B3255317DA7E000126FF944F403DFEE2A56AA70B1BEBD0744400DE9A6C26154`。35 个源码/静态资源与 ASAR 精确匹配；Agent/juice/datachannel 与 build/runtime/package 一致，latest.yml SHA512 与 blockmap 验证通过。实际打包 Electron 42.11.11 的 preload/native API、四 STUN 含 IPv6、transport 代次与关闭、14 项捕获枚举、音频平台和正常退出通过，无测试进程残留或诊断异常。未运行安装向导，未签名、未发布，版本保持 1.7.1。
+
+此前连接复兴阶段已验证：
+
+- `npm run check`、桌面回归 75/75、Web 行为回归 17/17、Web 构建及 Docker context 检查通过；原生 Release 和 CTest 6/6 分两组执行通过，含 54 条 RPC 生命周期序列；`npm run verify:nat` 通过算法、实际 STUN 报文、真实 DataChannel、Manager 合约及 runtime 一致性。播放会话 7 项行为回归及最终 runtime 的六阶段实际 Web 播放通过。
+- 本机严格虚拟 NAT 的 8 个场景通过：标准候选基线不能连通；四 STUN 预测、100 ms 分批 trickle、双方按远端地址端口分别映射及过滤的场景均建立真实 DataChannel，双向传输 4096 字节。成功场景步长 1，每侧实际检查 5 个推测端口。单 STUN 邻域和噪声分配场景做有限检查但未连通；预算外不扩张尝试，关闭后停止发包。真实跨运营商连接仍需两端验收。
+- 稳帧改造前的增强 ICE 版本也已通过本地 Windows NSIS、源码/静态资源、原生 DLL 与安装包 manifest 一致性及实际打包应用冒烟。当前稳帧版本的产物与核验结果见上方记录，仍为本地未签名、未公开发布的 1.7.1。
+- 两套生产依赖 `npm audit --omit=dev` 均为 0；开发构建工具链仍有 8 个 moderate 告警，无 high/critical，未强制降级或覆盖传递依赖。
+- 本机真实解码、短时持续合成 SRT、刷新与接力恢复已验证；发布前仍需跨运营商双端、实际采集、长时音画、手机浏览器和预览 stop/restart 验收。具体问题和未修改范围见 `docs/CODE_AUDIT_FINDINGS.md` 的 2026-10-07 记录。
 
 ## 3. 当前结论
 
@@ -175,6 +203,8 @@
 - viewer 播放只保留 `passthrough` 路线。
 - 旧 `synced` / A/V sync worker 已退出主路径。
 - 用户可调项保留手动音频延迟。
+- 当前原生解码和 PTS 调度在 worker 中完成，窗口线程只绘制；有效 waveOut 输出时钟驱动视频，短缓冲按源帧率与输出进度调整。
+- 浏览器 viewer 使用 `EncodedMediaPlaybackSession`、WebCodecs、单 rAF Canvas 与 Web Audio；纯编码接力独立于本地显示丢帧。
 
 音频能力：
 
@@ -192,21 +222,22 @@
 - `v1` 创建下游 relay peer。
 - `attachPeerMediaSource` 绑定 `peer-video:<upstreamPeerId>`。
 - native 直接把编码帧扇出给下游。
-- relay 音频 track 按上游真实 codec 配置。
+- 音视频沿 DataChannel 按上游真实 codec 转发编码内容；旧 RTP 兼容入口保留独立时钟换算。
 
 已完成能力：
 
 - H.264 / H.265 decoder config 与 random access bootstrap 缓存。
 - 新下游接入时先发 bootstrap，再进入 steady-state。
-- relay fanout 已从 `main.cpp` 模块化到 `relay_dispatch`。
+- relay fanout 已从 `main.cpp` 拆到 `relay_backend_runtime` 与独立 bootstrap/timing 模块。
 - triple native 端到端人工验证已通过。
+- Web 编码接力、本机 SRT 至 Web 二跳与接力节点离线后恢复已有实际页面自动验收。
 
-拓扑约束：
+拓扑与容量：
 
-- relay 按严格链式设计。
-- 不做动态“尽量浅链”分配。
-- 正常目标观众数以 3 人为主。
-- 极限场景按不超过 5 人规划。
+- 服务端优先选择前一个已就绪观看者，失败或容量不足时查找其他可用观看者或房主；拓扑可以分支。
+- 每个上游的容量与实际能力参与分配，leaf 观看者不承担 relay。
+- 房间容量由既有服务端配置决定，当前默认每房间 16 位观看者；3/5 人是历史联调规模，不是当前程序的观众硬上限。
+- 本轮播放器与刷新队列未新增 peer 总数限制，跨运营商成功率和多人带宽承载仍按实机样本验收。
 
 ## 6. UI 和产品形态
 
@@ -399,8 +430,9 @@ server 单元测试覆盖：
 - 差分更新成功率还需要持续实测。
 - `H.265` 已进入主链路，但仍建议继续做长时间 soak、晚加入、断线重连验证。
 - OBS ingest 已通过端到端验证，但仍建议继续覆盖端口占用、断流恢复、长时间 soak、H.264/H.265 双 codec。
-- 三端联调目前仍主要依赖人工观察，缺少真正自动化 UI harness。
-- viewer 如果后续要重新优化播放顺滑度，必须基于新方案设计，不能回滚旧 `synced` 路线。
+- 合成 SRT、真实房间服务和实际 Web 页面已有自动端到端 harness；WGC 实际采集、三台设备、物理显示与听感仍需实机观察。
+- viewer 轻量稳帧已通过本机实际 1080p30/60 和同 peer 换源恢复；下一步重点是实际采集、真实网络抖动、全零音频源及长时物理音画验收，不回滚旧 `synced` 路线。
+- 纯 P2P 增强 ICE 已通过严格虚拟 NAT 与真实 DataChannel；实际移动宽带和联通宽带互通仍需两端样本。双方 UDP 无法通过或 NAT 任意随机分配时可能无法建立连接，不能据本机结果承诺与 UU 相同的成功率。
 
 ## 11. 下一阶段顺序
 
@@ -413,8 +445,8 @@ server 单元测试覆盖：
 - 明确采用 `DataChannel encoded frame relay`，不再继续尝试标准 WebRTC media sender 注入式 relay。
 - 定义协议名：`vds-media-encoded-v1`。已完成。
 - 定义握手字段：`protocolVersion`、`role`、`supportedVideoCodecs`、`supportedAudioCodecs`、`maxFrameBytes`、`bootstrapRequired`。已完成；`clockRate` 后续按音视频分流补齐。
-- 定义数据帧 envelope：`streamType`、`codec`、`timestampUs`、`sequence`、`keyframe`、`config`、`payload`。已完成初版。
-- 定义控制消息：`hello`、`hello-ack`、`keyframe-request`、`bootstrap`、`stats`、`error`、`close`。已完成初版类型定义，当前已接入 `hello/hello-ack/error`。
+- 定义数据帧 envelope：`streamType`、`codec`、`timestampUs`、`sequence`、`keyframe`、`config`、`payload`。已接入；v1 可选 `sourceEpoch` 隔离 retained peer 下的媒体换源，保留旧帧兼容。
+- 定义控制消息：`hello`、`hello-ack`、`keyframe-request`、`bootstrap`、`stats`、`error`、`close`。握手及错误通路已接入，`keyframe-request` 已贯通真实 DataChannel 接收、relay 传递和当前房主软刷新；配置与 IDR 的媒体 bootstrap 由现有帧协议承载。
 - 禁止把 DataChannel bytes 静默转换成 canvas/WebCodecs 重编码 relay 作为“成功”。
 
 ### Phase W2：Windows native 自动检测与 failfast 适配
@@ -445,13 +477,13 @@ server 单元测试覆盖：
 
 ### Phase W4：解码与播放边界
 
-目标：
+当前实现与验收边界：
 
-- Web 观看第一阶段只承诺 `H.264 + Opus`。
-- `H.265 / AAC` 在 Web 端不作为默认承诺能力；检测到不支持时拒绝加入或提示主持端切换。
-- Win native 继续支持 `H.264/H.265 + Opus/AAC/PCMU`。
-- 如果 Web 后续要播放 DataChannel encoded stream，必须单独设计 WebCodecs/AudioWorklet 播放器和音画同步，不混入当前 WebRTC `<video>` 路线。
-- 当前已落地最小 H.264 WebCodecs canvas 播放验证；音频播放、音画同步、H.265/AAC 仍不承诺。
+- Web 使用 WebCodecs 视频与音频解码、Canvas 呈现和已有 Web Audio 输出；支持矩阵按设备实际探测的 `H.264/H.265 + Opus/AAC` 和 payload format 决定，不默认宣称全部支持。
+- Win native 继续支持 `H.264/H.265 + Opus/AAC/PCMU`，解码与显示保持原生 authority。
+- `EncodedMediaPlaybackSession` 持有帧重组、媒体代次、短重排、两个播放器和关闭清理；房间、连接恢复与原编码内容接力独立于本地呈现。
+- 视频按源 PTS 和有效音频输出时钟呈现；无音频时回退单调时钟。不增加第二套播放体系、AudioWorklet 或重编码接力。
+- 自动化已覆盖真实 H.264/AAC/Opus、合法长音频单元及生命周期恢复；H.265、手机、真实采集和长期可见可听的音画精度仍按实机验收。
 
 ### Phase W5：回归与发布门禁
 
@@ -473,6 +505,8 @@ server 单元测试覆盖：
 - 为旧 browser relay 再补长期兼容层。
 - 用抽象层掩盖当前还没稳定的真实问题。
 - 回滚旧 `synced` / A/V sync 作为 viewer 播放问题的默认方案。
+- 增加固定帧率、分辨率、换源次数、peer 总数或运行时长上限来规避正常输入；容量与停滞判断必须结合源时长、实际输出进度和参考链状态。
+- 接入 TURN 或服务器媒体中继；端口预测与多端口检查继续在实际 ICE socket 和既有纯 P2P 通路内完成。
 
 ## 13. 给下一个 Agent 的交接说明
 

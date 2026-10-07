@@ -12,12 +12,17 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <regex>
+#include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
 
 #include "json_protocol.h"
+#include "peer_stun_config.h"
+#include "media_source_epoch.h"
 
 #ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
 #ifdef RTC_ENABLE_MEDIA
@@ -44,11 +49,35 @@ using vds::media_agent::current_time_millis;
 
 std::atomic<std::uint32_t> g_next_video_ssrc { 0x24500000u };
 std::atomic<std::uint32_t> g_next_audio_ssrc { 0x24600000u };
+std::atomic<std::uint64_t> g_next_transport_generation { 1 };
+
+std::string candidate_extension(const std::string& candidate, const std::string& name) {
+  std::istringstream fields(candidate);
+  std::string field;
+  // The first eight fields are the ICE candidate itself, not extension names.
+  for (int index = 0; index < 8; ++index) {
+    if (!(fields >> field)) return {};
+  }
+  std::string result;
+  std::string value;
+  while (fields >> field) {
+    if (!(fields >> value)) {
+      if (field == name) throw std::runtime_error("invalid-candidate-extension");
+      break;
+    }
+    if (field != name) continue;
+    if (!result.empty() && result != value) throw std::runtime_error("conflicting-candidate-extension");
+    result = value;
+  }
+  return result;
+}
 
 std::vector<std::string> default_ice_servers() {
   return {
     "stun:stun.cloudflare.com:3478",
-    "stun:stun.linphone.org:3478"
+    "stun:stun.linphone.org:3478",
+    "stun:stun.freeswitch.org:3478",
+    "stun:stun.pjsip.org:3478"
   };
 }
 
@@ -79,6 +108,40 @@ void ensure_rtc_logger() {
   std::call_once(g_rtc_logger_once, []() {
     rtc::InitLogger(rtc::LogLevel::None);
   });
+}
+
+bool validate_remote_nat_candidate(
+    rtc::Candidate parsed,
+    const std::string& expected_ufrag,
+    std::set<std::string>& confirmed_addresses,
+    std::set<std::string>& predicted_targets) {
+  if (parsed.type() == rtc::Candidate::Type::Relayed) {
+    throw std::runtime_error("relay-candidates-forbidden");
+  }
+  const std::string candidate = parsed.candidate();
+  const bool predicted = candidate_extension(candidate, "vds-predicted") == "1";
+  const std::string ufrag = candidate_extension(candidate, "ufrag");
+  if ((!ufrag.empty() && ufrag != expected_ufrag) || (predicted && ufrag.empty())) {
+    throw std::runtime_error("stale-candidate-ice-credentials");
+  }
+  if (predicted) {
+    if (parsed.type() != rtc::Candidate::Type::ServerReflexive ||
+        parsed.transportType() != rtc::Candidate::TransportType::Udp ||
+        !parsed.resolve(rtc::Candidate::ResolveMode::Simple) ||
+        parsed.family() != rtc::Candidate::Family::Ipv4 || parsed.port().value_or(0) < 1024 ||
+        confirmed_addresses.count(parsed.address().value_or("")) == 0) {
+      throw std::runtime_error("predicted-candidate-without-confirmed-address");
+    }
+    const std::string target = parsed.address().value() + ":" + std::to_string(parsed.port().value());
+    if (predicted_targets.count(target)) return false;
+    if (predicted_targets.size() >= 16) throw std::runtime_error("predicted-candidate-budget-exhausted");
+    predicted_targets.insert(target);
+  } else if (parsed.type() == rtc::Candidate::Type::ServerReflexive &&
+             parsed.resolve(rtc::Candidate::ResolveMode::Simple) &&
+             parsed.family() == rtc::Candidate::Family::Ipv4) {
+    confirmed_addresses.insert(parsed.address().value());
+  }
+  return true;
 }
 
 class PcmuRtpDepacketizerCompat final : public rtc::RtpDepacketizer {
@@ -347,9 +410,80 @@ struct EncodedMediaControlMessage {
   std::string reason;
 };
 
+bool validate_keyframe_control_json(const std::string& json) {
+  // This control has a flat schema. Validate the entire object before using the
+  // compatibility field extractors, which otherwise accept 1.9 as integer 1.
+  std::size_t position = 0;
+  const auto whitespace = [&] {
+    while (position < json.size() && (json[position] == ' ' || json[position] == '\t' ||
+      json[position] == '\r' || json[position] == '\n')) ++position;
+  };
+  const auto string_token = [&](std::string* raw) {
+    if (position >= json.size() || json[position++] != '"') return false;
+    const auto start = position;
+    while (position < json.size()) {
+      const auto character = static_cast<unsigned char>(json[position++]);
+      if (character == '"') { *raw = json.substr(start, position - start - 1); return true; }
+      if (character < 0x20) return false;
+      if (character == '\\') {
+        if (position >= json.size()) return false;
+        const auto escaped = json[position++];
+        if (escaped == 'u') {
+          for (unsigned index = 0; index < 4; ++index) {
+            if (position >= json.size() || !std::isxdigit(static_cast<unsigned char>(json[position++]))) return false;
+          }
+        } else if (std::string("\"\\/bfnrt").find(escaped) == std::string::npos) return false;
+      }
+    }
+    return false;
+  };
+  std::set<std::string> fields;
+  bool version_present = false;
+  if (json.empty() || json[position++] != '{') return false;
+  whitespace();
+  while (position < json.size() && json[position] != '}') {
+    std::string key;
+    if (!string_token(&key) || !fields.insert(key).second) return false;
+    whitespace();
+    if (position >= json.size() || json[position++] != ':') return false;
+    whitespace();
+    const bool string_value = position < json.size() && json[position] == '"';
+    std::string value;
+    if (string_value) {
+      if (!string_token(&value)) return false;
+    } else {
+      const auto begin = position;
+      while (position < json.size() && json[position] != ',' && json[position] != '}' &&
+        !std::isspace(static_cast<unsigned char>(json[position]))) ++position;
+      value = json.substr(begin, position - begin);
+      static const std::regex number("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?");
+      if (value != "true" && value != "false" && value != "null" && !std::regex_match(value, number)) return false;
+    }
+    if (key == "protocolVersion") {
+      if (string_value || value != "1") return false;
+      version_present = true;
+    } else if (key == "manifestVersion") {
+      if (string_value || value.empty() || value.find_first_not_of("0123456789") != std::string::npos ||
+          value.size() > 9) return false;
+    } else if (key == "protocol" || key == "type" || key == "mediaSessionId" || key == "reason") {
+      if (!string_value) return false;
+    }
+    whitespace();
+    if (position >= json.size()) return false;
+    if (json[position] == '}') break;
+    if (json[position++] != ',') return false;
+    whitespace();
+    if (position >= json.size() || json[position] == '}') return false;
+  }
+  if (position >= json.size() || json[position++] != '}') return false;
+  whitespace();
+  return version_present && position == json.size();
+}
+
 EncodedMediaControlMessage parse_encoded_media_control_message(const std::string& text) {
   EncodedMediaControlMessage message;
   const std::string trimmed = vds::media_agent::trim_copy(text);
+  if (trimmed.size() > 4096) return message;
   if (trimmed.size() < 2 || trimmed.front() != '{' || trimmed.back() != '}') {
     return message;
   }
@@ -359,13 +493,16 @@ EncodedMediaControlMessage parse_encoded_media_control_message(const std::string
   message.protocol_version = vds::media_agent::extract_int_value(trimmed, "protocolVersion", -1);
   if (message.protocol != kEncodedMediaProtocol ||
       message.protocol_version != 1 ||
-      (message.type != "hello" && message.type != "hello-ack" && message.type != "error")) {
+      (message.type != "hello" && message.type != "hello-ack" && message.type != "error" &&
+       message.type != "keyframe-request")) {
     return message;
   }
 
   message.media_session_id = vds::media_agent::extract_string_value(trimmed, "mediaSessionId");
   message.manifest_version = vds::media_agent::extract_int_value(trimmed, "manifestVersion", 0);
   message.reason = vds::media_agent::extract_string_value(trimmed, "reason");
+  if (trimmed.size() > 4096 || message.media_session_id.size() > 128 || message.reason.size() > 128) return message;
+  if (message.type == "keyframe-request" && !validate_keyframe_control_json(trimmed)) return message;
   message.valid = true;
   return message;
 }
@@ -417,11 +554,27 @@ bool decode_encoded_media_frame_message(
     return false;
   }
 
+  const std::string source_epoch = vds::media_agent::extract_string_value(header, "sourceEpoch");
+  if (!vds::media_agent::media_source_epoch_is_valid(source_epoch)) {
+    if (reason) *reason = "datachannel-frame-invalid-source-epoch";
+    return false;
+  }
+  const auto source_epoch_key = header.find("\"sourceEpoch\"");
+  if (source_epoch_key != std::string::npos) {
+    const auto colon = header.find(':', source_epoch_key + 13);
+    const auto value = colon == std::string::npos ? std::string::npos : header.find_first_not_of(" \t\r\n", colon + 1);
+    if (value == std::string::npos || header[value] != '"') {
+      if (reason) *reason = "datachannel-frame-invalid-source-epoch";
+      return false;
+    }
+  }
+
   if (decoded_frame) {
     decoded_frame->message_type = message_type;
     decoded_frame->stream_type = vds::media_agent::extract_string_value(header, "streamType");
     decoded_frame->codec = to_lower_ascii(vds::media_agent::extract_string_value(header, "codec"));
     decoded_frame->payload_format = to_lower_ascii(vds::media_agent::extract_string_value(header, "payloadFormat"));
+    decoded_frame->source_epoch = source_epoch;
     decoded_frame->timestamp_us = extract_uint64_json_value(header, "timestampUs", 0);
     decoded_frame->sequence = extract_uint64_json_value(header, "sequence", 0);
     decoded_frame->keyframe = vds::media_agent::extract_bool_value(header, "keyframe", false);
@@ -473,12 +626,22 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     std::string peer_id_value,
     bool initiator_value,
     PeerTransportCallbacks callbacks_value,
-    bool encoded_media_data_channel_value
+    bool encoded_media_data_channel_value,
+    const std::string& stun_server,
+    const std::vector<std::string>& stun_servers
   ) : peer_id(std::move(peer_id_value)),
       initiator(initiator_value),
       callbacks(std::move(callbacks_value)),
       encoded_media_data_channel_requested(encoded_media_data_channel_value) {
+    keyframe_request_handler = callbacks.on_keyframe_requested;
     snapshot.transport_ready = true;
+    snapshot.selected_stun_server = stun_server;
+    snapshot.stun_servers = stun_servers.empty() ? default_ice_servers() : stun_servers;
+    snapshot.transport_generation = std::to_string(vds::media_agent::current_time_millis()) + "-" +
+      std::to_string(g_next_transport_generation.fetch_add(1));
+#ifdef VDS_MEDIA_AGENT_ENHANCED_ICE
+    snapshot.nat_traversal_enabled = true;
+#endif
     snapshot.encoded_media_data_channel_requested = encoded_media_data_channel_requested;
     if (encoded_media_data_channel_requested) {
       snapshot.data_channel_label = kEncodedMediaDataChannelLabel;
@@ -494,8 +657,23 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     rtc::Configuration config;
     config.enableIceTcp = true;
     config.disableAutoNegotiation = true;
-    for (const auto& server : default_ice_servers()) {
-      config.iceServers.emplace_back(server);
+    for (const auto& server : snapshot.stun_servers) {
+      // The upstream URI constructor splits at the first colon, including
+      // inside bracketed IPv6. Use its STUN host/port constructor instead.
+      std::string host;
+      std::string service;
+      const std::string authority = server.substr(5);
+      if (authority.front() == '[') {
+        const std::size_t end = authority.find(']');
+        host = authority.substr(1, end - 1);
+        if (end + 1 < authority.size()) service = authority.substr(end + 2);
+      } else {
+        const std::size_t separator = authority.find(':');
+        host = authority.substr(0, separator);
+        if (separator != std::string::npos) service = authority.substr(separator + 1);
+      }
+      const auto port = static_cast<std::uint16_t>(service.empty() ? 3478 : std::stoi(service));
+      config.iceServers.emplace_back(host, port);
     }
 
     pc = std::make_shared<rtc::PeerConnection>(config);
@@ -517,6 +695,29 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     }
 
     const rtc::Description remote_description(sdp, type);
+    const std::string next_ufrag = remote_description.iceUfrag().value_or("");
+    std::set<std::string> confirmed_addresses;
+    std::set<std::string> predicted_targets;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (closed) throw std::runtime_error("peer-transport-closed");
+      if (remote_ice_ufrag == next_ufrag) {
+        confirmed_addresses = remote_srflx_addresses;
+        predicted_targets = predicted_remote_targets;
+      }
+    }
+    // SDP and trickle must share the same checks. Validate ordinary candidates
+    // first so an embedded prediction can only use a confirmed address.
+    for (const auto& remote_candidate : remote_description.candidates()) {
+      if (candidate_extension(remote_candidate.candidate(), "vds-predicted") != "1") {
+        validate_remote_nat_candidate(remote_candidate, next_ufrag, confirmed_addresses, predicted_targets);
+      }
+    }
+    for (const auto& remote_candidate : remote_description.candidates()) {
+      if (candidate_extension(remote_candidate.candidate(), "vds-predicted") == "1") {
+        validate_remote_nat_candidate(remote_candidate, next_ufrag, confirmed_addresses, predicted_targets);
+      }
+    }
     if (to_lower_ascii(type) == "offer") {
       ensure_video_receiver_for_offer(remote_description);
       ensure_audio_receiver_for_offer(remote_description);
@@ -531,6 +732,10 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     {
       std::lock_guard<std::mutex> lock(mutex);
       snapshot.remote_description_set = true;
+      remote_ice_ufrag = next_ufrag;
+      remote_srflx_addresses = std::move(confirmed_addresses);
+      predicted_remote_targets = std::move(predicted_targets);
+      snapshot.predicted_remote_candidates = static_cast<int>(predicted_remote_targets.size());
       snapshot.reason = "remote-description-set";
       snapshot.last_error.clear();
       refresh_from_peer_connection_locked();
@@ -554,16 +759,26 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       throw std::runtime_error("peer-transport-not-initialized");
     }
 
-    if (!sdp_mid.empty()) {
-      pc->addRemoteCandidate(rtc::Candidate(candidate, sdp_mid));
-    } else {
-      pc->addRemoteCandidate(rtc::Candidate(candidate));
+    rtc::Candidate parsed = sdp_mid.empty() ? rtc::Candidate(candidate) : rtc::Candidate(candidate, sdp_mid);
+    const bool predicted = candidate_extension(candidate, "vds-predicted") == "1";
+    std::set<std::string> confirmed_addresses;
+    std::set<std::string> predicted_targets;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (closed) throw std::runtime_error("peer-transport-closed");
+      confirmed_addresses = remote_srflx_addresses;
+      predicted_targets = predicted_remote_targets;
+      if (!validate_remote_nat_candidate(parsed, remote_ice_ufrag, confirmed_addresses, predicted_targets)) return;
     }
+    pc->addRemoteCandidate(parsed);
 
     PeerTransportSnapshot snapshot_copy;
     {
       std::lock_guard<std::mutex> lock(mutex);
+      remote_srflx_addresses = std::move(confirmed_addresses);
+      predicted_remote_targets = std::move(predicted_targets);
       snapshot.remote_candidate_count += 1;
+      if (predicted) snapshot.predicted_remote_candidates += 1;
       snapshot.reason = "remote-candidate-added";
       snapshot.last_error.clear();
       refresh_from_peer_connection_locked();
@@ -608,6 +823,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
 
       closed = true;
+      keyframe_request_handler = {};
+      ++keyframe_request_handler_revision;
       snapshot.connection_state = "closed";
       snapshot.ice_state = "closed";
       snapshot.signaling_state = "closed";
@@ -709,9 +926,11 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       if (!self) {
         return;
       }
-      std::lock_guard<std::mutex> lock(self->mutex);
-      self->snapshot.pli_requests_received += 1;
-      self->snapshot.reason = "pli-received";
+      {
+        std::lock_guard<std::mutex> lock(self->mutex);
+        self->snapshot.pli_requests_received += 1;
+      }
+      self->handle_keyframe_request("rtcp-pli");
     });
     if (use_h265) {
       auto packetizer = std::make_shared<rtc::H265RtpPacketizer>(
@@ -773,6 +992,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       std::lock_guard<std::mutex> lock(mutex);
       local_video_track = std::move(video_track);
       video_rtp_config.reset();
+      keyframe_request_handler = {};
+      ++keyframe_request_handler_revision;
       snapshot.video_track_configured = false;
       snapshot.video_track_open = false;
       snapshot.reason = "video-track-cleared";
@@ -964,6 +1185,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
   }
 
   void send_encoded_media_frame(const PeerEncodedMediaDataChannelFrame& frame) {
+    if (!vds::media_agent::media_source_epoch_is_valid(frame.source_epoch)) {
+      throw std::runtime_error("datachannel-frame-invalid-source-epoch");
+    }
     std::shared_ptr<rtc::DataChannel> local_data_channel;
 
     {
@@ -994,6 +1218,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       ",\"sequence\":" + std::to_string(sequence) +
       ",\"keyframe\":" + (frame.keyframe ? "true" : "false") +
       ",\"config\":" + (frame.config ? "true" : "false");
+      if (!frame.source_epoch.empty()) {
+        header += ",\"sourceEpoch\":\"" + vds::media_agent::json_escape(frame.source_epoch) + "\"";
+      }
       if (message_type == "chunk") {
         header +=
           ",\"frameId\":\"" + vds::media_agent::json_escape(frame_id) +
@@ -1031,7 +1258,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       const std::size_t chunk_count =
         (frame.payload.size() + kEncodedMediaChunkPayloadBytes - 1) / kEncodedMediaChunkPayloadBytes;
       const std::string frame_id =
-        frame.stream_type + ":" + std::to_string(frame.timestamp_us) + ":" +
+        frame.stream_type + ":" + frame.source_epoch + ":" + std::to_string(frame.timestamp_us) + ":" +
         std::to_string(frame.sequence) + ":" + std::to_string(frame.payload.size());
       for (std::size_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
         const std::size_t start = chunk_index * kEncodedMediaChunkPayloadBytes;
@@ -1076,18 +1303,99 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
   void request_keyframe(const std::string& reason) {
     std::shared_ptr<rtc::Track> local_inbound_video_track;
+    std::shared_ptr<rtc::DataChannel> local_data_channel;
+    PeerTransportSnapshot request_snapshot;
     {
       std::lock_guard<std::mutex> lock(mutex);
+      if (closed) throw std::runtime_error("peer-transport-closed");
+      const auto now = vds::media_agent::current_time_micros_steady();
+      if (last_keyframe_request_sent_us >= 0 && now - last_keyframe_request_sent_us < 500000) {
+        ++snapshot.keyframe_requests_throttled;
+        return;
+      }
       local_inbound_video_track = inbound_video_track;
-      snapshot.keyframe_requests_sent += 1;
+      if (snapshot.encoded_media_data_channel_ready && data_channel && data_channel->isOpen()) {
+        local_data_channel = data_channel;
+      }
+      if (!local_data_channel && !local_inbound_video_track) {
+        throw std::runtime_error("peer-keyframe-source-unavailable");
+      }
+      last_keyframe_request_sent_us = now;
+      request_snapshot = snapshot;
+    }
+    if (local_data_channel) {
+      const auto bounded_reason = reason.substr(0, 128);
+      local_data_channel->send(std::string("{\"protocol\":\"") + kEncodedMediaProtocol +
+        "\",\"type\":\"keyframe-request\",\"protocolVersion\":1,\"reason\":\"" +
+        vds::media_agent::json_escape(bounded_reason) + "\"" + build_encoded_media_session_fields(request_snapshot) + "}");
+    } else {
+      local_inbound_video_track->requestKeyframe();
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (closed) return;
+      ++snapshot.keyframe_requests_sent;
       if (reason == "decoder-recovery" || reason == "waiting-for-random-access") {
         snapshot.decoder_recovery_count += 1;
       }
       snapshot.reason = reason.empty() ? "keyframe-requested" : reason;
     }
-    if (local_inbound_video_track) {
-      local_inbound_video_track->requestKeyframe();
+  }
+
+  void set_keyframe_request_handler(PeerKeyframeRequestHandler handler) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (closed) return;
+    keyframe_request_handler = std::move(handler);
+    ++keyframe_request_handler_revision;
+    snapshot.keyframe_request_action = keyframe_request_handler
+      ? "keyframe-handler-ready" : "keyframe-producer-unavailable";
+  }
+
+  void handle_keyframe_request(
+    const std::string& reason,
+    const EncodedMediaControlMessage* expected_control = nullptr) {
+    PeerKeyframeRequestHandler handler;
+    std::uint64_t handler_revision = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (closed) return;
+      // The message was first validated before this lock-free dispatch. A
+      // manifest may have changed in between; never target the replacement.
+      if (expected_control &&
+          (expected_control->media_session_id != snapshot.media_session_id ||
+           expected_control->manifest_version != snapshot.media_manifest_version)) return;
+      ++snapshot.keyframe_requests_received;
+      const auto now = vds::media_agent::current_time_micros_steady();
+      if (last_keyframe_request_received_us >= 0 && now - last_keyframe_request_received_us < 500000) {
+        ++snapshot.keyframe_requests_throttled;
+        return;
+      }
+      last_keyframe_request_received_us = now;
+      handler = keyframe_request_handler;
+      handler_revision = keyframe_request_handler_revision;
     }
+    std::string action = "keyframe-producer-unavailable";
+    try {
+      if (handler) action = handler(reason.substr(0, 128));
+    } catch (const std::exception&) {
+      action = "keyframe-handler-failed";
+    }
+    PeerTransportSnapshot refresh_snapshot;
+    bool notify_host_refresh = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      // A lock-free producer callback may finish after the source was rebound.
+      // Its result must not overwrite diagnostics for the replacement source.
+      if (!closed && handler_revision == keyframe_request_handler_revision) {
+        snapshot.keyframe_request_action = std::move(action);
+        notify_host_refresh = snapshot.keyframe_request_action == "host-encoder-refresh-requested";
+        if (notify_host_refresh) refresh_snapshot = snapshot;
+      }
+    }
+    // Wake the controller's existing RPC owner; do not restart an encoder from
+    // a media callback. Throttled or retired handlers never emit this signal.
+    if (notify_host_refresh && callbacks.on_state_change)
+      callbacks.on_state_change(refresh_snapshot, "host-video-refresh-requested");
   }
 
   void add_dropped_video_units(std::uint64_t count) {
@@ -1161,7 +1469,11 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       entry.created_at_unix_ms = now_ms;
     }
     if (entry.chunks.size() != static_cast<std::size_t>(parsed.chunk_count) ||
-        entry.payload_bytes != static_cast<std::size_t>(parsed.frame_payload_bytes)) {
+        entry.payload_bytes != static_cast<std::size_t>(parsed.frame_payload_bytes) ||
+        entry.header.source_epoch != parsed.source_epoch ||
+        entry.header.stream_type != parsed.stream_type || entry.header.codec != parsed.codec ||
+        entry.header.timestamp_us != parsed.timestamp_us || entry.header.sequence != parsed.sequence ||
+        entry.header.keyframe != parsed.keyframe || entry.header.config != parsed.config) {
       pending_encoded_media_chunks.erase(parsed.frame_id);
       if (reason) {
         *reason = "datachannel-chunk-mismatch";
@@ -1509,7 +1821,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       if (self->callbacks.on_local_description) {
         self->callbacks.on_local_description(
           description_type,
-          ensure_video_rtcp_feedback_lines(std::string(description))
+          ensure_video_rtcp_feedback_lines(std::string(description)),
+          self->snapshot.transport_generation
         );
       }
       if (self->callbacks.on_state_change) {
@@ -1530,12 +1843,23 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
           return;
         }
         self->snapshot.reason = "local-candidate-gathered";
+        if (candidate_extension(candidate.candidate(), "vds-predicted") == "1") {
+          self->snapshot.predicted_local_candidates += 1;
+          const std::string step = candidate_extension(candidate.candidate(), "vds-nat-step");
+          if (!step.empty()) self->snapshot.nat_port_step = std::stoi(step);
+        } else if (!candidate_extension(candidate.candidate(), "vds-probe-index").empty()) {
+          const std::string observations = candidate_extension(candidate.candidate(), "vds-probe-count");
+          if (!observations.empty()) {
+            self->snapshot.nat_probe_observations = std::max(
+              self->snapshot.nat_probe_observations, std::stoi(observations));
+          }
+        }
         self->refresh_from_peer_connection_locked();
         candidate_mid = candidate.mid();
       }
 
       if (self->callbacks.on_local_candidate) {
-        self->callbacks.on_local_candidate(candidate.candidate(), candidate_mid);
+        self->callbacks.on_local_candidate(candidate.candidate(), candidate_mid, self->snapshot.transport_generation);
       }
     });
 
@@ -1748,6 +2072,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         bool send_version_error = false;
         bool send_session_error = false;
         bool invalid_control = false;
+        bool request_keyframe = false;
         std::string session_error;
         PeerTransportSnapshot snapshot_copy;
         {
@@ -1792,6 +2117,20 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
               self->snapshot.reason = "encoded-media-datachannel-ready";
               send_ack = control.type == "hello";
             }
+          } else if (control.type == "keyframe-request") {
+            if (!self->snapshot.encoded_media_data_channel_ready) {
+              session_error = "datachannel-keyframe-request-not-ready";
+            } else if (control.media_session_id != self->snapshot.media_session_id) {
+              session_error = "datachannel-media-session-mismatch";
+            } else if (control.manifest_version != self->snapshot.media_manifest_version) {
+              session_error = "datachannel-media-manifest-version-mismatch";
+            }
+            if (!session_error.empty()) {
+              send_session_error = true;
+              self->snapshot.last_error = session_error;
+            } else {
+              request_keyframe = true;
+            }
           } else if (control.type == "error") {
             self->snapshot.encoded_media_data_channel_state = "remote-error";
             self->snapshot.last_error = control.reason.empty() ? "datachannel-remote-error" : control.reason;
@@ -1799,6 +2138,10 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
           snapshot_copy = self->snapshot;
         }
 
+        if (request_keyframe) {
+          self->handle_keyframe_request(control.reason, &control);
+          snapshot_copy = self->get_snapshot();
+        }
         if (send_ack) {
           self->send_data_channel_text(build_encoded_media_hello_ack(snapshot_copy));
         } else if (send_version_error) {
@@ -1906,6 +2249,13 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
   std::mutex mutex;
   PeerTransportSnapshot snapshot;
   bool closed = false;
+  PeerKeyframeRequestHandler keyframe_request_handler;
+  std::uint64_t keyframe_request_handler_revision = 0;
+  std::int64_t last_keyframe_request_sent_us = -1;
+  std::int64_t last_keyframe_request_received_us = -1;
+  std::string remote_ice_ufrag;
+  std::set<std::string> remote_srflx_addresses;
+  std::set<std::string> predicted_remote_targets;
   std::shared_ptr<rtc::PeerConnection> pc;
   std::shared_ptr<rtc::DataChannel> data_channel;
   std::shared_ptr<rtc::Track> video_track;
@@ -1922,6 +2272,17 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 };
 
 #endif
+
+void set_peer_transport_keyframe_request_handler(
+  const std::shared_ptr<PeerTransportSession>& session,
+  PeerKeyframeRequestHandler handler) {
+#ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
+  if (session) session->set_keyframe_request_handler(std::move(handler));
+#else
+  (void)session;
+  (void)handler;
+#endif
+}
 
 PeerTransportBackendInfo get_peer_transport_backend_info() {
   PeerTransportBackendInfo info;
@@ -1949,11 +2310,23 @@ std::shared_ptr<PeerTransportSession> create_peer_transport_session(
   bool initiator,
   const PeerTransportCallbacks& callbacks,
   bool encoded_media_data_channel,
+  const std::string& stun_server,
+  const std::vector<std::string>& stun_servers,
   std::string* error
 ) {
+  if (!stun_server.empty() && !vds::media_agent::is_valid_peer_stun_server(stun_server)) {
+    if (error) { *error = "invalid-stun-server"; }
+    return nullptr;
+  }
+  if (stun_servers.size() > 4 || std::any_of(stun_servers.begin(), stun_servers.end(), [](const std::string& server) {
+        return !vds::media_agent::is_valid_peer_stun_server(server);
+      })) {
+    if (error) *error = "invalid-stun-pool";
+    return nullptr;
+  }
 #ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
   try {
-    auto session = std::make_shared<PeerTransportSession>(peer_id, initiator, callbacks, encoded_media_data_channel);
+    auto session = std::make_shared<PeerTransportSession>(peer_id, initiator, callbacks, encoded_media_data_channel, stun_server, stun_servers);
     session->initialize();
     return session;
   } catch (const std::exception& ex) {
@@ -1970,6 +2343,8 @@ std::shared_ptr<PeerTransportSession> create_peer_transport_session(
   (void)initiator;
   (void)callbacks;
   (void)encoded_media_data_channel;
+  (void)stun_server;
+  (void)stun_servers;
   return nullptr;
 #endif
 }
@@ -2430,6 +2805,13 @@ std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot) 
     << ",\"encodedMediaDataChannelOpen\":" << (snapshot.encoded_media_data_channel_open ? "true" : "false")
     << ",\"encodedMediaDataChannelReady\":" << (snapshot.encoded_media_data_channel_ready ? "true" : "false")
     << ",\"remoteCandidateCount\":" << snapshot.remote_candidate_count
+    << ",\"remoteDescriptionSet\":" << (snapshot.remote_description_set ? "true" : "false")
+    << ",\"natTraversalEnabled\":" << (snapshot.nat_traversal_enabled ? "true" : "false")
+    << ",\"natProbeObservations\":" << snapshot.nat_probe_observations
+    << ",\"natPortStep\":" << snapshot.nat_port_step
+    << ",\"predictedLocalCandidates\":" << snapshot.predicted_local_candidates
+    << ",\"predictedRemoteCandidates\":" << snapshot.predicted_remote_candidates
+    << ",\"transportGeneration\":\"" << vds::media_agent::json_escape(snapshot.transport_generation) << "\""
     << ",\"videoFramesSent\":" << snapshot.video_frames_sent
     << ",\"audioFramesSent\":" << snapshot.audio_frames_sent
     << ",\"remoteVideoFramesReceived\":" << snapshot.remote_video_frames_received
@@ -2441,6 +2823,9 @@ std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot) 
     << ",\"nackRetransmissions\":" << snapshot.nack_retransmissions
     << ",\"pliRequestsReceived\":" << snapshot.pli_requests_received
     << ",\"keyframeRequestsSent\":" << snapshot.keyframe_requests_sent
+    << ",\"keyframeRequestsReceived\":" << snapshot.keyframe_requests_received
+    << ",\"keyframeRequestsThrottled\":" << snapshot.keyframe_requests_throttled
+    << ",\"keyframeRequestAction\":\"" << vds::media_agent::json_escape(snapshot.keyframe_request_action) << "\""
     << ",\"decoderRecoveryCount\":" << snapshot.decoder_recovery_count
     << ",\"droppedVideoUnits\":" << snapshot.dropped_video_units
     << ",\"connectionState\":\"" << vds::media_agent::json_escape(snapshot.connection_state) << "\""
@@ -2449,6 +2834,8 @@ std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot) 
     << ",\"encodedMediaDataChannelState\":\"" << vds::media_agent::json_escape(snapshot.encoded_media_data_channel_state) << "\""
     << ",\"selectedLocalCandidate\":\"" << vds::media_agent::json_escape(snapshot.selected_local_candidate) << "\""
     << ",\"selectedRemoteCandidate\":\"" << vds::media_agent::json_escape(snapshot.selected_remote_candidate) << "\""
+    << ",\"selectedStunServer\":\"" << vds::media_agent::json_escape(snapshot.selected_stun_server) << "\""
+    << ",\"stunServers\":" << vds::media_agent::json_array_from_strings(snapshot.stun_servers)
     << ",\"reason\":\"" << vds::media_agent::json_escape(snapshot.reason) << "\""
     << ",\"lastError\":\"" << vds::media_agent::json_escape(snapshot.last_error) << "\""
     << ",\"roundTripTimeMs\":";

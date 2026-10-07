@@ -2,6 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
+const { validateNativeRuntime } = require('./native-runtime-integrity');
+const { assertNatTestsRegistered } = require('./test-native-nat');
 
 const projectRoot = path.resolve(__dirname, '..');
 const mode = process.argv.includes('--prebuild')
@@ -53,32 +55,12 @@ function fileSha512(filePath) {
   return crypto.createHash('sha512').update(fs.readFileSync(filePath)).digest('base64');
 }
 
-function fileSha256Hex(filePath) {
-  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex').toUpperCase();
-}
-
 function validatePackagedMediaAgentRuntime() {
-  const runtimeBinaryPath = path.join(projectRoot, 'runtime', 'media-agent', 'vds-media-agent.exe');
-  const packagedBinaryPath = path.join(projectRoot, 'dist', 'win-unpacked', 'resources', 'runtime', 'media-agent', 'vds-media-agent.exe');
-
-  ensureFile(runtimeBinaryPath);
-  ensureFile(packagedBinaryPath);
-
-  const runtimeHash = fileSha256Hex(runtimeBinaryPath);
-  const packagedHash = fileSha256Hex(packagedBinaryPath);
-
-  if (runtimeHash !== packagedHash) {
-    throw new Error(
-      [
-        'Packaged media-agent binary differs from runtime/media-agent.',
-        `runtime/media-agent/vds-media-agent.exe sha256=${runtimeHash}`,
-        `dist/win-unpacked/resources/runtime/media-agent/vds-media-agent.exe sha256=${packagedHash}`,
-        'Run npm run build after npm run verify:media-agent so the installer includes the current agent.'
-      ].join('\n')
-    );
-  }
-
-  console.log('\nPackaged media-agent runtime matches runtime/media-agent.');
+  const artifacts = validateNativeRuntime({
+    packagedDir: path.join(projectRoot, 'dist', 'win-unpacked', 'resources', 'runtime', 'media-agent')
+  });
+  for (const artifact of artifacts) console.log(`Native runtime verified: ${artifact.name} sha256=${artifact.sha256}`);
+  console.log('\nPackaged EXE and enhanced ICE DLLs match the current native build and runtime.');
 }
 
 function validateLatestManifest(dirPath, version, label) {
@@ -163,6 +145,10 @@ function main() {
     'scripts/check-room-client-dispatcher.js',
     'scripts/test-server-core.js',
     'scripts/check-web-mobile-diagnostics.js',
+    'scripts/native-runtime-integrity.js',
+    'scripts/test-native-runtime-integrity.js',
+    'scripts/test-native-nat.js',
+    'scripts/test-native-nat-contract.js',
     'scripts/release-check.js'
   ];
 
@@ -177,10 +163,18 @@ function main() {
     run('npm', ['run', 'build:vds-web']);
   }
   run('npm', ['run', 'test:server']);
+  run('npm', ['run', 'test:server-revival']);
+  run('npm', ['run', 'test:server-reconnect']);
+  run('npm', ['run', 'test:desktop']);
   run('npm', ['run', 'check:architecture']);
   run('npm', ['run', 'check:logging']);
   if (mode === 'prebuild') {
     run('powershell', ['-ExecutionPolicy', 'Bypass', '-File', 'scripts\\verify-media-agent.ps1', '-Configuration', 'Release', '-AllowLocalFfmpegFallback']);
+    // verify-media-agent has already run all registered CTests, including NAT.
+    assertNatTestsRegistered();
+    validateNativeRuntime();
+    run('node', ['--test', 'scripts/test-native-runtime-integrity.js']);
+    run('node', ['scripts/test-native-nat-contract.js', path.join(projectRoot, 'runtime', 'media-agent', 'vds-media-agent.exe')]);
   }
   run('npm', ['audit', '--omit=dev']);
   run('npm', ['--prefix', 'server', 'audit', '--omit=dev']);

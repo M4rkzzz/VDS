@@ -30,6 +30,14 @@ void emit_peer_host_source_breadcrumb(const std::string& step) {
   emit_agent_breadcrumb(step);
 }
 
+void install_obs_keyframe_request_handler(const std::shared_ptr<PeerTransportSession>& session) {
+  set_peer_transport_keyframe_request_handler(session, [](const std::string&) {
+    // SRT carries encoded media; this process has no encoder control channel
+    // back to OBS. A periodic, fresh IDR is the honest recovery boundary.
+    return std::string("obs-awaiting-periodic-idr");
+  });
+}
+
 bool attach_obs_ingest_media_binding(
   const HostSessionState& host_session,
   const ObsIngestSessionSnapshot& obs_ingest,
@@ -82,6 +90,7 @@ bool attach_obs_ingest_media_binding(
   if (use_encoded_data_channel) {
     relay_hub().unregister_subscriber(peer.peer_id);
     relay_hub().register_subscriber(kObsIngestVirtualUpstreamPeerId, peer.peer_id, peer.transport_session, audio_enabled);
+    install_obs_keyframe_request_handler(peer.transport_session);
     peer.transport = get_peer_transport_snapshot(peer.transport_session);
     peer.media_binding.attached = true;
     peer.media_binding.active = peer.transport.encoded_media_data_channel_open;
@@ -118,6 +127,7 @@ bool attach_obs_ingest_media_binding(
 
   if (already_attached) {
     relay_hub().register_subscriber(kObsIngestVirtualUpstreamPeerId, peer.peer_id, peer.transport_session, audio_enabled);
+    install_obs_keyframe_request_handler(peer.transport_session);
     peer.transport = get_peer_transport_snapshot(peer.transport_session);
     peer.media_binding.active = peer.transport.video_track_open;
     peer.media_binding.video_encoder_backend = "obs-ingest-relay";
@@ -153,6 +163,7 @@ bool attach_obs_ingest_media_binding(
 
   relay_hub().unregister_subscriber(peer.peer_id);
   relay_hub().register_subscriber(kObsIngestVirtualUpstreamPeerId, peer.peer_id, peer.transport_session, audio_enabled);
+  install_obs_keyframe_request_handler(peer.transport_session);
   peer.transport = get_peer_transport_snapshot(peer.transport_session);
   peer.media_binding.attached = true;
   peer.media_binding.active = peer.transport.video_track_open;

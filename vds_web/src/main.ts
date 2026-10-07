@@ -6,8 +6,6 @@ import {
   ENCODED_MEDIA_CHANNEL_LABEL,
   ENCODED_MEDIA_PROTOCOL,
   ENCODED_MEDIA_PROTOCOL_VERSION,
-  EncodedFrameReassembler,
-  type EncodedFrameHeader,
   encodeFrameMessages,
   helloAckMessage,
   helloMessage,
@@ -16,8 +14,8 @@ import {
 } from './datachannel-protocol';
 import { DiagnosticsStore } from './diagnostics';
 import { fetchPublicRooms, fetchServerConfig, VdsWebSignaling, type SignalMessage } from './signaling';
-import { WebCodecsAudioPlayer } from './webcodecs-audio-player';
-import { WebCodecsVideoPlayer } from './webcodecs-player';
+import { EncodedMediaPlaybackSession } from './playback-session';
+import { UpstreamRecovery } from './upstream-recovery';
 
 type SessionState = {
   roomId: string;
@@ -33,6 +31,8 @@ let capability = detectCapabilities();
 let capabilityDetectionComplete = false;
 const diagnostics = new DiagnosticsStore(capability, clientId);
 const signaling = new VdsWebSignaling();
+const upstreamRecovery = new UpstreamRecovery();
+let upstreamRecoveryAttempts = 0;
 
 let serverConfig: { iceServers: RTCIceServer[]; version?: string } = { iceServers: [] };
 let session: SessionState | null = readStoredSession(clientId);
@@ -44,6 +44,7 @@ let joinAckTimer: number | null = null;
 let upstreamPc: RTCPeerConnection | null = null;
 let downstreamPc: RTCPeerConnection | null = null;
 let downstreamDataChannel: RTCDataChannel | null = null;
+let upstreamMediaChannel: RTCDataChannel | null = null;
 let downstreamDataChannelReady = false;
 let downstreamRelayForwarding = false;
 let downstreamCloseExpected = false;
@@ -52,15 +53,20 @@ let webEdgeAttemptSeq = 0;
 let upstreamEdgeAttemptId: number | null = null;
 let downstreamEdgeAttemptId: number | null = null;
 let downstreamPeerId = '';
+let relaySourceEpoch = '';
 let viewerReadySent = false;
-const pendingIceCandidates = new Map<string, RTCIceCandidateInit[]>();
-const inboundFrameReassembler = new EncodedFrameReassembler();
+type PendingIceCandidate = {
+  candidate: RTCIceCandidateInit;
+  attemptId: number | null;
+  iceUfrag: string;
+  pc: RTCPeerConnection | null;
+};
+const pendingIceCandidates = new Map<string, PendingIceCandidate[]>();
 const DATA_CHANNEL_MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
 const DATA_CHANNEL_BUFFERED_LOW_BYTES = 2 * 1024 * 1024;
-const VIDEO_DECODE_DELAY_MS = 20;
-const MAX_PENDING_VIDEO_DECODE_TIMERS = 12;
-const pendingVideoDecodeTimers = new Map<number, { keyframe: boolean }>();
 let lastVideoKeyframeForRelay: {
+  codec: string;
+  sourceEpoch?: string;
   timestampUs: number;
   sequence: number;
   payload: ArrayBuffer;
@@ -68,6 +74,8 @@ let lastVideoKeyframeForRelay: {
 } | null = null;
 let lastBootstrapFrameId = '';
 let lastConsoleDiagnosticsAt = 0;
+let lastVideoDropLogAt = -Infinity;
+let lastAudioDropLogAt = -Infinity;
 let copyDiagnosticsInFlight = false;
 let refreshRoomsSeq = 0;
 let refreshRoomsInFlight = false;
@@ -106,51 +114,75 @@ const audioDelayInput = getElement<HTMLInputElement>('audioDelayInput');
 const audioDelayDecrease = getElement<HTMLButtonElement>('audioDelayDecrease');
 const audioDelayIncrease = getElement<HTMLButtonElement>('audioDelayIncrease');
 const dataChannelCanvas = getElement<HTMLCanvasElement>('dataChannelCanvas');
-const dataChannelVideoPlayer = new WebCodecsVideoPlayer(dataChannelCanvas, {
+const playback = new EncodedMediaPlaybackSession(dataChannelCanvas, {
+  onMetrics: (metrics) => diagnostics.update({ webPlaybackMetrics: metrics }),
+  onKeyframeNeeded: () => requestUpstreamKeyframe(),
+  onSourceChanged: () => handlePlaybackSourceChanged(),
   onState: (state) => {
-    logVdsWebInfo(`[vds-web][webcodecs-state] ${state}`);
-    diagnostics.update({ relayProtocolState: state });
+    diagnostics.update({
+      playbackState: state,
+      ...(state === 'stopped' || state === 'waiting-media' ? {
+        videoDecoderState: undefined,
+        audioDecoderState: undefined,
+        playbackFailureReason: undefined
+      } : {})
+    });
+    if (state === 'waiting-media') waitingMessage.classList.remove('hidden');
   },
-  onDecodedFrame: () => {
-    diagnostics.incrementCounter('webDecodedVideoFrames');
-    waitingMessage.classList.add('hidden');
+  video: {
+    onState: (state) => {
+      logVdsWebInfo(`[vds-web][webcodecs-state] ${state}`);
+      diagnostics.update({ videoDecoderState: state });
+    },
+    onDecodedFrame: () => {
+      upstreamRecoveryAttempts = 0;
+      diagnostics.incrementCounter('webDecodedVideoFrames');
+      waitingMessage.classList.add('hidden');
+    },
+    onDroppedFrame: (reason) => {
+      const now = performance.now();
+      if (now - lastVideoDropLogAt >= 250) {
+        lastVideoDropLogAt = now;
+        logVdsWebInfo(`[vds-web][webcodecs-video-drop] ${toConsoleJson({ reason })}`);
+      }
+      diagnostics.incrementCounter('webDroppedVideoFrames');
+      diagnostics.update({ playbackFailureReason: reason });
+    },
+    onPayloadFormat: (format) => diagnostics.update({ h264PayloadFormat: format }),
+    onVideoFrameInfo: (info) => {
+      const snapshot = diagnostics.getSnapshot();
+      logVdsWebInfo(`[vds-web][video-frame] ${toConsoleJson({
+        ...info,
+        mediaManifestVideo: (snapshot.mediaManifest as { video?: unknown } | undefined)?.video,
+        decodedFrames: snapshot.webDecodedVideoFrames,
+        droppedFrames: snapshot.webDroppedVideoFrames,
+        encodedFramesReceived: snapshot.encodedFramesReceived,
+        relayProtocolState: snapshot.relayProtocolState
+      })}`);
+    }
   },
-  onDroppedFrame: (reason) => {
-    logVdsWebInfo(`[vds-web][webcodecs-video-drop] ${toConsoleJson({
-      reason,
-      snapshot: diagnostics.getSnapshot()
-    })}`);
-    diagnostics.incrementCounter('webDroppedVideoFrames');
-    diagnostics.update({ relayFailureReason: reason });
-  },
-  onPayloadFormat: (format) => diagnostics.update({ h264PayloadFormat: format }),
-  onVideoFrameInfo: (info) => {
-    const snapshot = diagnostics.getSnapshot();
-    logVdsWebInfo(`[vds-web][video-frame] ${toConsoleJson({
-      ...info,
-      mediaManifestVideo: (snapshot.mediaManifest as { video?: unknown } | undefined)?.video,
-      decodedFrames: snapshot.webDecodedVideoFrames,
-      droppedFrames: snapshot.webDroppedVideoFrames,
-      encodedFramesReceived: snapshot.encodedFramesReceived,
-      relayProtocolState: snapshot.relayProtocolState
-    })}`);
-  }
-});
-const dataChannelAudioPlayer = new WebCodecsAudioPlayer({
-  onState: (state) => {
-    logVdsWebInfo(`[vds-web][webcodecs-audio-state] ${state}`);
-    diagnostics.update({ relayProtocolState: state });
-  },
-  onDecodedBlock: () => diagnostics.incrementCounter('webDecodedAudioBlocks'),
-  onDroppedBlock: (reason) => {
-    logVdsWebInfo(`[vds-web][webcodecs-audio-drop] ${reason}`);
-    diagnostics.incrementCounter('webDroppedAudioBlocks');
-    diagnostics.update({ relayFailureReason: reason });
+  audio: {
+    onState: (state) => {
+      logVdsWebInfo(`[vds-web][webcodecs-audio-state] ${state}`);
+      diagnostics.update({ audioDecoderState: state });
+    },
+    onDecodedBlock: () => diagnostics.incrementCounter('webDecodedAudioBlocks'),
+    onDroppedBlock: (reason) => {
+      const now = performance.now();
+      if (now - lastAudioDropLogAt >= 250) {
+        lastAudioDropLogAt = now;
+        logVdsWebInfo(`[vds-web][webcodecs-audio-drop] ${reason}`);
+      }
+      diagnostics.incrementCounter('webDroppedAudioBlocks');
+      diagnostics.update({ playbackFailureReason: reason });
+    }
   }
 });
 
 diagnostics.subscribe(renderDiagnostics);
-signaling.onMessage((message) => void handleSignal(message));
+signaling.onMessage((message) => {
+  void handleSignal(message).catch((error) => setError(errorToMessage(error)));
+});
 signaling.onStatus((status) => {
   if (status === 'closed') {
     if (session) {
@@ -258,13 +290,20 @@ async function joinRoom(roomId: string): Promise<void> {
   startJoinAckTimer(joinSeq);
   try {
     setStatus('连接信令中');
-    await dataChannelAudioPlayer.resume();
+    await playback.resumeAudio();
+    if (joinSeq !== joinAttemptSeq || !joinPending) {
+      return;
+    }
     await signaling.connect();
+    if (joinSeq !== joinAttemptSeq || !joinPending) {
+      return;
+    }
     signaling.send({
       type: 'join-room',
       roomId,
       clientId,
       sessionToken: session?.roomId === roomId ? session.sessionToken : undefined,
+      needsMediaReconnect: true,
       webViewer: true,
       encodedRelayRequired: true,
       mediaCapabilities: {
@@ -283,6 +322,9 @@ async function joinRoom(roomId: string): Promise<void> {
     });
     setStatus('等待上游');
   } catch (error) {
+    if (joinSeq !== joinAttemptSeq) {
+      return;
+    }
     clearJoinAckTimer();
     setJoinPending(false);
     restoringStoredSession = false;
@@ -380,7 +422,11 @@ function handleJoined(message: SignalMessage): void {
   setJoinPending(false);
   restoringStoredSession = false;
   viewerReadySent = false;
-  clearPendingVideoDecodeTimers();
+  upstreamRecoveryAttempts = 0;
+  const joinedSession = session;
+  upstreamRecovery.start((reason) => {
+    if (session === joinedSession) requestUpstreamRecovery(null, joinedSession.upstreamPeerId || joinedSession.hostId || '', reason);
+  });
   joinCard.classList.add('hidden');
   leaveButton.classList.remove('hidden');
   viewerRoomId.textContent = session.roomId || '-';
@@ -430,11 +476,17 @@ async function handleOffer(message: SignalMessage): Promise<void> {
   diagnostics.update({ mediaManifest: message.mediaManifest });
 
   const pc = ensureUpstreamPeer(sourceId);
-  pc.ondatachannel = (event) => attachInboundDataChannel(event.channel, sourceId);
+  const currentSession = session;
+  const attemptId = upstreamEdgeAttemptId;
+  const isCurrent = () => session === currentSession && upstreamPc === pc && upstreamEdgeAttemptId === attemptId;
   await pc.setRemoteDescription(sdp);
+  if (!isCurrent()) return;
   const answer = await pc.createAnswer();
+  if (!isCurrent()) return;
   await pc.setLocalDescription(answer);
+  if (!isCurrent()) return;
   await flushPendingIceCandidates(sourceId, pc);
+  if (!isCurrent()) return;
   signaling.send({
     type: 'answer',
     roomId: session.roomId,
@@ -460,8 +512,11 @@ async function handleAnswer(message: SignalMessage): Promise<void> {
     diagnostics.update({ relayFailureReason: 'stale-downstream-answer-ignored' });
     return;
   }
-  await downstreamPc.setRemoteDescription(sdp);
-  await flushPendingIceCandidates(downstreamPeerId, downstreamPc);
+  const pc = downstreamPc;
+  const peerId = downstreamPeerId;
+  await pc.setRemoteDescription(sdp);
+  if (pc !== downstreamPc || peerId !== downstreamPeerId) return;
+  await flushPendingIceCandidates(peerId, pc);
 }
 
 async function handleIceCandidate(message: SignalMessage): Promise<void> {
@@ -471,10 +526,11 @@ async function handleIceCandidate(message: SignalMessage): Promise<void> {
   }
 
   const peerId = String(message.fromClientId || message.sourceId || message.targetId || '');
-  const pc = peerId && peerId === downstreamPeerId ? downstreamPc : upstreamPc;
-  if (!pc) {
+  const isDownstream = Boolean(peerId && peerId === downstreamPeerId);
+  if (!isDownstream && !isCurrentUpstreamPeer(peerId)) {
     return;
   }
+  const pc = isDownstream ? downstreamPc : upstreamPc;
   const remoteAttemptId = getSignalAttemptId(message);
   const expectedAttemptId = peerId && peerId === downstreamPeerId ? downstreamEdgeAttemptId : upstreamEdgeAttemptId;
   if (expectedAttemptId && remoteAttemptId && remoteAttemptId !== expectedAttemptId) {
@@ -483,12 +539,18 @@ async function handleIceCandidate(message: SignalMessage): Promise<void> {
   }
 
   diagnostics.incrementCandidate(peerId || 'unknown', 'remote');
-  if (!pc.remoteDescription) {
-    queuePendingIceCandidate(peerId || 'unknown', candidate);
+  if (!pc || !pc.remoteDescription) {
+    queuePendingIceCandidate(peerId, candidate, remoteAttemptId, pc);
+    return;
+  }
+  if (!isCandidateForRemoteDescription(candidate, pc.remoteDescription)) {
+    diagnostics.update({ relayFailureReason: 'stale-ice-ufrag-ignored' });
     return;
   }
   await pc.addIceCandidate(candidate).catch((error) => {
-    diagnostics.update({ relayFailureReason: `ice-candidate-failed:${errorToMessage(error)}` });
+    if (isCurrentIceCandidatePeer(peerId, pc)) {
+      diagnostics.update({ relayFailureReason: `ice-candidate-failed:${errorToMessage(error)}` });
+    }
   });
 }
 
@@ -523,18 +585,24 @@ async function handleConnectToNext(message: SignalMessage): Promise<void> {
   downstreamDataChannel?.close();
   downstreamDataChannelReady = false;
   downstreamRelayForwarding = false;
+  lastBootstrapFrameId = '';
   downstreamCloseExpected = false;
   clearRelayHelloAckTimer();
   downstreamEdgeAttemptId = ++webEdgeAttemptSeq;
   downstreamPc = new RTCPeerConnection({ iceServers: serverConfig.iceServers });
-  wirePeerEvents(downstreamPc, downstreamPeerId);
-  downstreamDataChannel = downstreamPc.createDataChannel(ENCODED_MEDIA_CHANNEL_LABEL, {
+  const pc = downstreamPc;
+  const peerId = downstreamPeerId;
+  const currentSession = session;
+  wirePeerEvents(pc, peerId);
+  downstreamDataChannel = pc.createDataChannel(ENCODED_MEDIA_CHANNEL_LABEL, {
     ordered: false
   });
   attachOutboundDataChannel(downstreamDataChannel, downstreamPeerId);
 
-  const offer = await downstreamPc.createOffer();
-  await downstreamPc.setLocalDescription(offer);
+  const offer = await pc.createOffer();
+  if (pc !== downstreamPc || session !== currentSession) return;
+  await pc.setLocalDescription(offer);
+  if (pc !== downstreamPc || session !== currentSession) return;
   signaling.send({
     type: 'offer',
     roomId: session.roomId,
@@ -566,6 +634,8 @@ async function handleChainReconnect(message: SignalMessage): Promise<void> {
   }
 
   const previousUpstreamPeerId = session.upstreamPeerId || '';
+  upstreamRecovery.stop();
+  playback.resetMedia();
   upstreamPc?.close();
   upstreamPc = null;
   if (previousUpstreamPeerId) {
@@ -575,8 +645,8 @@ async function handleChainReconnect(message: SignalMessage): Promise<void> {
   pendingIceCandidates.delete(nextUpstreamPeerId);
   viewerReadySent = false;
   lastBootstrapFrameId = '';
+  lastVideoKeyframeForRelay = null;
   upstreamEdgeAttemptId = null;
-  clearPendingVideoDecodeTimers();
   clearError();
 
   session = {
@@ -610,10 +680,18 @@ function ensureUpstreamPeer(peerId: string): RTCPeerConnection {
     return upstreamPc;
   }
 
+  upstreamMediaChannel = null;
+  if (downstreamDataChannel) rotateRelaySourceEpoch();
   upstreamPc = new RTCPeerConnection({ iceServers: serverConfig.iceServers });
-  wirePeerEvents(upstreamPc, peerId);
-  upstreamPc.ondatachannel = (event) => attachInboundDataChannel(event.channel, peerId);
+  playback.start();
+  const pc = upstreamPc;
+  upstreamRecovery.start((reason) => requestUpstreamRecovery(pc, peerId, reason));
+  wirePeerEvents(pc, peerId);
+  pc.ondatachannel = (event) => {
+    if (pc === upstreamPc) attachInboundDataChannel(event.channel, peerId);
+  };
   upstreamPc.ontrack = () => {
+    if (pc !== upstreamPc) return;
     markRelayUnsupported('web-media-track-received-disabled');
   };
 
@@ -622,7 +700,7 @@ function ensureUpstreamPeer(peerId: string): RTCPeerConnection {
 
 function wirePeerEvents(pc: RTCPeerConnection, peerId: string): void {
   pc.onicecandidate = (event) => {
-    if (!session || !event.candidate) {
+    if (!session || !event.candidate || (pc !== upstreamPc && pc !== downstreamPc)) {
       return;
     }
     diagnostics.incrementCandidate(peerId, 'local');
@@ -635,11 +713,46 @@ function wirePeerEvents(pc: RTCPeerConnection, peerId: string): void {
     });
   };
   pc.oniceconnectionstatechange = () => {
+    if (pc !== upstreamPc && pc !== downstreamPc) return;
     diagnostics.updateIce(peerId, pc.iceConnectionState);
+    if (pc === upstreamPc) upstreamRecovery.stateChanged(pc.iceConnectionState);
   };
   pc.onconnectionstatechange = () => {
+    if (pc !== upstreamPc && pc !== downstreamPc) return;
     diagnostics.updateIce(`${peerId}:connection`, pc.connectionState);
+    if (pc === upstreamPc) upstreamRecovery.stateChanged(pc.connectionState);
   };
+}
+
+function requestUpstreamRecovery(pc: RTCPeerConnection | null, peerId: string, reason: string): void {
+  if (!session || pc !== upstreamPc || !isCurrentUpstreamPeer(peerId)) return;
+  upstreamRecovery.stop();
+  upstreamPc = null;
+  pc?.close();
+  upstreamEdgeAttemptId = null;
+  pendingIceCandidates.delete(peerId);
+  viewerReadySent = false;
+  playback.resetMedia();
+  lastVideoKeyframeForRelay = null;
+  lastBootstrapFrameId = '';
+  if (++upstreamRecoveryAttempts > 3) {
+    setError('上游连接恢复失败，请重新加入房间。');
+    return;
+  }
+  diagnostics.update({ relayProtocolState: 'upstream-reconnecting', relayFailureReason: reason });
+  setStatus('上游连接中断，正在重连');
+  try {
+    signaling.send({
+      type: 'viewer-reconnect-ready',
+      roomId: session.roomId,
+      clientId,
+      sessionToken: session.sessionToken,
+      chainPosition: session.chainPosition,
+      failedUpstreamPeerId: peerId === session.hostId ? undefined : peerId
+    });
+  } catch (error) {
+    setError(errorToMessage(error));
+  }
 }
 
 function maybeSendViewerReady(): void {
@@ -668,6 +781,7 @@ function markRelayUnsupported(reason: string): void {
 }
 
 function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): void {
+  rotateRelaySourceEpoch();
   downstreamCloseExpected = false;
   diagnostics.update({ relayProtocolState: 'datachannel-opening' });
   const openTimer = window.setTimeout(() => {
@@ -721,6 +835,10 @@ function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): voi
         sendRelayBootstrapKeyframe();
       } else if (control?.type === 'error') {
         markRelayUnsupported(control.reason || 'datachannel-remote-error');
+      } else if (control?.type === 'keyframe-request') {
+        lastBootstrapFrameId = '';
+        sendRelayBootstrapKeyframe();
+        requestUpstreamKeyframe();
       }
       return;
     }
@@ -753,8 +871,13 @@ function attachInboundDataChannel(channel: RTCDataChannel, peerId: string): void
   }
 
   channel.binaryType = 'arraybuffer';
+  upstreamMediaChannel = channel;
+  const pc = upstreamPc;
   diagnostics.update({ relayProtocolState: 'datachannel-inbound-attached' });
   channel.onmessage = (event) => {
+    if (pc !== upstreamPc || !isCurrentUpstreamPeer(peerId)) {
+      return;
+    }
     if (typeof event.data === 'string') {
       const control = parseControlMessage(event.data);
       if (control?.type === 'hello') {
@@ -780,6 +903,7 @@ function attachInboundDataChannel(channel: RTCDataChannel, peerId: string): void
           return;
         }
         channel.send(JSON.stringify(helloAckMessage(getCurrentManifest())));
+        upstreamRecovery.mediaReady();
         diagnostics.update({ relayProtocolState: 'datachannel-ready' });
         maybeSendViewerReady();
       }
@@ -789,17 +913,44 @@ function attachInboundDataChannel(channel: RTCDataChannel, peerId: string): void
     handleInboundEncodedFrame(event.data, peerId);
   };
   channel.onerror = () => {
-    if (!isCurrentUpstreamPeer(peerId)) {
+    if (pc !== upstreamPc || !isCurrentUpstreamPeer(peerId)) {
       return;
     }
     markRelayUnsupported('datachannel-error');
+    upstreamRecovery.stateChanged('failed');
   };
   channel.onclose = () => {
-    if (!isCurrentUpstreamPeer(peerId)) {
+    if (pc !== upstreamPc || !isCurrentUpstreamPeer(peerId)) {
       return;
     }
     diagnostics.update({ relayProtocolState: 'datachannel-closed' });
+    if (upstreamMediaChannel === channel) upstreamMediaChannel = null;
+    upstreamRecovery.stateChanged('closed');
   };
+}
+
+let lastUpstreamKeyframeRequestMs = -Infinity;
+function requestUpstreamKeyframe(): void {
+  const channel = upstreamMediaChannel;
+  const now = performance.now();
+  if (!upstreamPc || !channel || channel.readyState !== 'open' || now - lastUpstreamKeyframeRequestMs < 500) return;
+  const manifest = getCurrentManifest();
+  if (!manifest || typeof manifest.mediaSessionId !== 'string' || !manifest.mediaSessionId ||
+    typeof manifest.manifestVersion !== 'number' || !Number.isSafeInteger(manifest.manifestVersion) || manifest.manifestVersion < 1) return;
+  lastUpstreamKeyframeRequestMs = now;
+  channel.send(JSON.stringify({ protocol: ENCODED_MEDIA_PROTOCOL, protocolVersion: ENCODED_MEDIA_PROTOCOL_VERSION,
+    type: 'keyframe-request', mediaSessionId: manifest.mediaSessionId, manifestVersion: manifest.manifestVersion }));
+}
+
+function rotateRelaySourceEpoch(): void {
+  const nonce = crypto.getRandomValues(new Uint32Array(4));
+  relaySourceEpoch = `web-${Array.from(nonce, (value) => value.toString(16).padStart(8, '0')).join('')}`;
+  lastBootstrapFrameId = '';
+}
+
+function handlePlaybackSourceChanged(): void {
+  lastVideoKeyframeForRelay = null;
+  rotateRelaySourceEpoch();
 }
 
 function sendRelayBootstrapKeyframe(): void {
@@ -811,7 +962,8 @@ function sendRelayBootstrapKeyframe(): void {
   ) {
     return;
   }
-  const bootstrapFrameId = `${lastVideoKeyframeForRelay.timestampUs}:${lastVideoKeyframeForRelay.sequence}:${lastVideoKeyframeForRelay.payload.byteLength}`;
+  const bootstrapFrameId = JSON.stringify([relaySourceEpoch, lastVideoKeyframeForRelay.timestampUs,
+    lastVideoKeyframeForRelay.sequence, lastVideoKeyframeForRelay.payload.byteLength]);
   if (bootstrapFrameId === lastBootstrapFrameId) {
     return;
   }
@@ -824,7 +976,8 @@ function sendRelayBootstrapKeyframe(): void {
       protocol: ENCODED_MEDIA_PROTOCOL,
       type: 'frame',
       streamType: 'video',
-      codec: getManifestVideoCodec() || 'h264',
+      codec: lastVideoKeyframeForRelay.codec,
+      sourceEpoch: relaySourceEpoch,
       payloadFormat: lastVideoKeyframeForRelay.payloadFormat,
       timestampUs: lastVideoKeyframeForRelay.timestampUs,
       sequence: lastVideoKeyframeForRelay.sequence,
@@ -865,6 +1018,7 @@ function handleViewerLeft(message: SignalMessage): void {
   downstreamDataChannel?.close();
   downstreamPc?.close();
   downstreamDataChannel = null;
+  relaySourceEpoch = '';
   downstreamPc = null;
   downstreamEdgeAttemptId = null;
   downstreamPeerId = '';
@@ -893,10 +1047,43 @@ function handleDownstreamChannelClosed(): void {
   }
 }
 
-function queuePendingIceCandidate(peerId: string, candidate: RTCIceCandidateInit): void {
+function getCandidateIceUfrag(candidate: RTCIceCandidateInit): string {
+  const extensions = String(candidate.candidate || '').trim().split(/\s+/).slice(8).join(' ');
+  const textUfrags = Array.from(extensions.matchAll(/\bufrag\s+([^\s]+)/gi), (match) => match[1]);
+  const objectUfrag = String(candidate.usernameFragment || '');
+  if (new Set([...textUfrags, ...(objectUfrag ? [objectUfrag] : [])]).size > 1) return '!conflicting-ufrag';
+  return objectUfrag || textUfrags[0] || '';
+}
+
+function isCandidateForRemoteDescription(
+  candidate: RTCIceCandidateInit,
+  description: RTCSessionDescriptionInit | null,
+  iceUfrag = getCandidateIceUfrag(candidate)
+): boolean {
+  const extensions = String(candidate.candidate || '').trim().split(/\s+/).slice(8).join(' ');
+  const predicted = /\bvds-predicted\s+1\b/i.test(extensions);
+  if (!iceUfrag) return !predicted;
+  const sdp = String(description?.sdp || '');
+  const ufrags = Array.from(sdp.matchAll(/^a=ice-ufrag:([^\r\n]+)\s*$/gm), (match) => match[1].trim());
+  return ufrags.includes(iceUfrag);
+}
+
+function isCurrentIceCandidatePeer(peerId: string, pc: RTCPeerConnection): boolean {
+  return Boolean(pc === downstreamPc && peerId === downstreamPeerId || pc === upstreamPc && isCurrentUpstreamPeer(peerId));
+}
+
+function queuePendingIceCandidate(
+  peerId: string,
+  candidate: RTCIceCandidateInit,
+  attemptId: number | null = null,
+  pc: RTCPeerConnection | null = null
+): void {
   const existing = pendingIceCandidates.get(peerId) || [];
-  existing.push(candidate);
-  pendingIceCandidates.set(peerId, existing.slice(-32));
+  const iceUfrag = getCandidateIceUfrag(candidate);
+  if (existing.some((entry) => entry.attemptId === attemptId && entry.iceUfrag === iceUfrag &&
+      entry.candidate.candidate === candidate.candidate)) return;
+  existing.push({ candidate, attemptId, iceUfrag, pc });
+  pendingIceCandidates.set(peerId, existing.slice(-128));
 }
 
 function isCurrentUpstreamPeer(peerId: string): boolean {
@@ -922,9 +1109,15 @@ async function flushPendingIceCandidates(peerId: string, pc: RTCPeerConnection):
     return;
   }
   pendingIceCandidates.delete(peerId);
-  for (const candidate of pending) {
-    await pc.addIceCandidate(candidate).catch((error) => {
-      diagnostics.update({ relayFailureReason: `ice-candidate-failed:${errorToMessage(error)}` });
+  for (const entry of pending) {
+    if (!isCurrentIceCandidatePeer(peerId, pc)) return;
+    const expectedAttemptId = peerId === downstreamPeerId ? downstreamEdgeAttemptId : upstreamEdgeAttemptId;
+    if (entry.pc && entry.pc !== pc || entry.attemptId && expectedAttemptId && entry.attemptId !== expectedAttemptId ||
+        !isCandidateForRemoteDescription(entry.candidate, pc.remoteDescription, entry.iceUfrag)) continue;
+    await pc.addIceCandidate(entry.candidate).catch((error) => {
+      if (isCurrentIceCandidatePeer(peerId, pc)) {
+        diagnostics.update({ relayFailureReason: `ice-candidate-failed:${errorToMessage(error)}` });
+      }
     });
   }
 }
@@ -987,6 +1180,7 @@ function leaveCurrentRoom(): void {
 }
 
 function resetLocalViewerSession(): void {
+  upstreamRecovery.stop();
   joinAttemptSeq += 1;
   clearJoinAckTimer();
   clearMobileSuspendTimer();
@@ -995,22 +1189,21 @@ function resetLocalViewerSession(): void {
   downstreamRelayForwarding = false;
   downstreamCloseExpected = true;
   clearRelayHelloAckTimer();
-  clearPendingVideoDecodeTimers();
-  inboundFrameReassembler.clear();
+  playback.close();
   pendingIceCandidates.clear();
-  dataChannelAudioPlayer.close();
-  dataChannelVideoPlayer.close();
   downstreamDataChannel?.close();
   downstreamPc?.close();
   upstreamPc?.close();
   signaling.close();
   downstreamDataChannel = null;
+  relaySourceEpoch = '';
   downstreamPc = null;
   upstreamPc = null;
   downstreamPeerId = '';
   upstreamEdgeAttemptId = null;
   downstreamEdgeAttemptId = null;
   lastBootstrapFrameId = '';
+  lastVideoKeyframeForRelay = null;
   session = null;
   clearStoredSession();
   downstreamCloseExpected = false;
@@ -1028,7 +1221,7 @@ function handleInboundEncodedFrame(data: unknown, peerId: string): void {
   }
 
   try {
-    const decoded = inboundFrameReassembler.push(data);
+    const decoded = playback.acceptMessage(data);
     if (!decoded) {
       diagnostics.incrementCounter('dataChannelChunksReceived');
       return;
@@ -1048,6 +1241,8 @@ function handleInboundEncodedFrame(data: unknown, peerId: string): void {
         })}`);
         diagnostics.incrementCounter('encodedKeyframesReceived');
         lastVideoKeyframeForRelay = {
+          codec: decoded.header.codec,
+          sourceEpoch: decoded.header.sourceEpoch,
           timestampUs: decoded.header.timestampUs,
           sequence: decoded.header.sequence,
           payload: decoded.payload.slice(0),
@@ -1073,57 +1268,17 @@ function handleInboundEncodedFrame(data: unknown, peerId: string): void {
       relayProtocolState: `received-${decoded.header.streamType}-${decoded.header.codec}`
     });
     maybeSendViewerReady();
-    if (decoded.header.streamType === 'audio') {
-      void dataChannelAudioPlayer.pushFrame(decoded.header, decoded.payload);
-    } else {
-      scheduleVideoFrameDecode(decoded.header, decoded.payload);
-    }
-    forwardDecodedDataChannelFrame(decoded.header, decoded.payload);
+    // Forward the encoded frame independently of local decoding success.
+    forwardEncodedFrame(decoded.header, decoded.payload);
   } catch (error) {
     markRelayUnsupported(errorToMessage(error));
   }
 }
 
-function scheduleVideoFrameDecode(header: EncodedFrameHeader, payload: ArrayBuffer): void {
-  trimPendingVideoDecodeTimers(header.keyframe);
-  const timerId = window.setTimeout(() => {
-    pendingVideoDecodeTimers.delete(timerId);
-    void dataChannelVideoPlayer.pushFrame(header, payload);
-  }, VIDEO_DECODE_DELAY_MS);
-  pendingVideoDecodeTimers.set(timerId, {
-    keyframe: Boolean(header.keyframe)
-  });
-}
-
-function trimPendingVideoDecodeTimers(incomingKeyframe: boolean): void {
-  while (pendingVideoDecodeTimers.size >= MAX_PENDING_VIDEO_DECODE_TIMERS) {
-    let dropTimerId: number | null = null;
-    for (const [timerId, entry] of pendingVideoDecodeTimers) {
-      if (!entry.keyframe || incomingKeyframe) {
-        dropTimerId = timerId;
-        break;
-      }
-    }
-    if (dropTimerId === null) {
-      break;
-    }
-    window.clearTimeout(dropTimerId);
-    pendingVideoDecodeTimers.delete(dropTimerId);
-    diagnostics.incrementCounter('webDroppedVideoFrames');
-    diagnostics.update({ relayFailureReason: 'web-video-decode-queue-trimmed' });
-  }
-}
-
-function clearPendingVideoDecodeTimers(): void {
-  for (const timerId of pendingVideoDecodeTimers.keys()) {
-    window.clearTimeout(timerId);
-  }
-  pendingVideoDecodeTimers.clear();
-}
-
-function forwardDecodedDataChannelFrame(header: {
+function forwardEncodedFrame(header: {
   streamType: 'video' | 'audio';
   codec: string;
+  sourceEpoch?: string;
   payloadFormat?: 'annexb' | 'avcc' | 'raw' | 'opus-raw' | 'aac-adts' | 'unknown';
   timestampUs: number;
   sequence: number;
@@ -1143,6 +1298,7 @@ function forwardDecodedDataChannelFrame(header: {
       type: 'frame',
       streamType: header.streamType,
       codec: header.codec,
+      sourceEpoch: relaySourceEpoch,
       payloadFormat: header.payloadFormat || 'unknown',
       timestampUs: header.timestampUs,
       sequence: header.sequence,
@@ -1286,7 +1442,7 @@ function renderCapability(report: CapabilityReport): void {
 }
 
 function unlockAudioFromUserGesture(): void {
-  void dataChannelAudioPlayer.resume().catch(() => {});
+  void playback.resumeAudio().catch(() => {});
 }
 
 function setJoinPending(pending: boolean): void {
@@ -1494,7 +1650,7 @@ function setPlayerVolume(value: number): void {
   const normalized = Math.max(0, Math.min(100, Number.isFinite(value) ? Math.round(value) : 100));
   playerVolumeInput.value = String(normalized);
   playerVolumeValue.textContent = `${normalized}%`;
-  dataChannelAudioPlayer.setVolume(normalized / 100);
+  playback.setVolume(normalized / 100);
   muteButton.setAttribute('aria-label', normalized <= 0 ? '取消静音' : '静音');
   muteButton.setAttribute('title', normalized <= 0 ? '取消静音' : '静音');
 }
@@ -1516,8 +1672,7 @@ function setAudioDelay(value: number): void {
   const normalized = Number.isFinite(value) ? value : 0;
   const delayMs = Math.max(0, Math.min(300, Math.round(normalized / 10) * 10));
   audioDelayInput.value = String(delayMs);
-  dataChannelAudioPlayer.setDelayMs(delayMs);
-  diagnostics.update({ relayProtocolState: `audio-delay-${delayMs}ms` });
+  playback.setDelayMs(delayMs);
 }
 
 function normalizeDescription(message: SignalMessage): RTCSessionDescriptionInit | null {
@@ -1630,17 +1785,17 @@ function applyAudioManifestFormat(mediaManifest: unknown): void {
     return;
   }
   const audio = (mediaManifest as { audio?: { sampleRate?: unknown; channels?: unknown } }).audio;
-  dataChannelAudioPlayer.setFormat(Number(audio?.sampleRate || 48000), Number(audio?.channels || 2));
+  playback.setAudioFormat(Number(audio?.sampleRate || 48000), Number(audio?.channels || 2));
 }
 
 function applyVideoManifestDisplaySize(mediaManifest: unknown): void {
   if (!mediaManifest || typeof mediaManifest !== 'object') {
     return;
   }
-  const video = (mediaManifest as { video?: { width?: unknown; height?: unknown } }).video;
+  const video = (mediaManifest as { video?: { width?: unknown; height?: unknown; frameRate?: unknown; fps?: unknown } }).video;
   const width = Number(video?.width || 0);
   const height = Number(video?.height || 0);
-  dataChannelVideoPlayer.setExpectedDisplaySize(width, height);
+  playback.setVideoDisplaySize(width, height, Number(video?.frameRate || video?.fps || 0));
 }
 
 function getElement<T extends HTMLElement>(id: string): T {

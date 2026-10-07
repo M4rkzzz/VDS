@@ -1,5 +1,128 @@
 # 代码审计问题清单
 
+## 2026-10-07 两种播放器轻量稳帧改造
+
+原生和 Web 的时间戳、背压、呈现与音频输出时钟改造已落地，保持既有后端、编码内容接力和纯 P2P，禁止 TURN。下方连接复兴与历史大表保留原验收范围；当前播放结构以本节和 [播放稳帧改造与验收](PLAYBACK_STABILITY_PLAN.md) 为准。
+
+运行边界按实际输入和输出进度调整：不新增固定帧率、分辨率、换源次数、peer 总数或运行时长上限。正常短突发先等待消费，合法的长音频单元可临时突破软件软目标；内存背压与陈旧数据清理针对持续异常积压，不能用来裁掉正常参考链或尚未到期的音频。
+
+| 编号与级别 | 位置 | 问题与处理结果 |
+| --- | --- | --- |
+| REVIVAL-P1-029 | host clock、sender、audio dispatch、OBS ingest、frame timing | 视频按 peer 重新累计时间、音频独立起点和 OBS 错误 RTP 时间基换算会破坏源时序。已共用房主单调时钟原点，内部与 DataChannel 保留 64 位微秒 PTS、有效零值和内容序号；OBS 以容器公共时基换算，旧 RTP 单独展开回绕。WGC 用捕获 QPC，其他 Annex B/WASAPI 入口仍有时间估计。 |
+| REVIVAL-P1-030 | native video surface、native playback scheduler | 窗口线程解码和固定 8 帧压缩输入会阻塞绘制或切断正常 60 fps 聚包的参考链。已移入独立解码调度 worker；输入容量随源帧率、250 ms 突发窗口与实际音频领先量调整，另计 32 MiB 压缩内存和已经到期 500 ms 的陈旧输入。约 20 ms 缺口等待，真正过载或缺口用配置与随机访问帧恢复。PTS 待呈现通常 2 帧、32 MiB BGRA 软目标，4K 通常 1 帧且合法大画面仍可播放；满时等待呈现。GDI 线程只绘制，迟到尽量在硬件回读和转换前丢弃。 |
+| REVIVAL-P1-031 | Web playback session、policy、video player | 固定延时未计量 codec 内部积压，忽略异步 B 帧输出预留又会把同批输出塞满呈现队列。已按序号短重排，分别计量 decodeQueueSize、待输出和 ready 帧，按真实 B 帧重排量预留位置；已知 B 帧的 IDR flush 独立计量。压缩队列随帧率、250 ms 窗口与音频领先量伸缩，兼容 manifest 的 frameRate/fps。单 rAF 按 PTS 绘制，及时释放 VideoFrame；输出以实际在途任务判断停滞，正常 GPU 等待不按固定短超时直接丢帧。 |
+| REVIVAL-P1-032 | 两端 frame protocol、receiver、relay | 下游连接保留而上游换源后，新源低序号/PTS 会被误判为旧数据；原样复用 A 的代次又会破坏 A → B → A。v1 新增可选 sourceEpoch；每个接力绑定生成独立短输出代次，重绑或上游换代时更新，同一绑定音视频一致。换代清理旧时钟和队列，拒绝退役及新代次后的旧格式降级；退役历史保留到接收会话关闭，不以固定次数停止换源，也不淘汰历史使最旧源重新有效。 |
+| REVIVAL-P1-033 | native audio session、playback、timing、media audio | PCM 无源时序与设备在途积压会破坏同步，11 AAC 聚包或单块多 ADTS 一次解码又会裁掉正常尾部。已在同一 worker 用压缩块游标逐个消费 AAC 单元或短 PCMU 段，PCM 保留源 PTS；waveOut 实际位置映射到源时钟，设备目标 60 ms、总积压目标 120 ms 加用户延迟。合法不可拆长单元按实际时长临时扩大软件预算，消费后恢复，8 kHz AAC 128 ms 不被硬拒绝。500 ms 清理只针对已到期且设备确实未前进的数据；复用 swresample，关闭与 receiver 锁边界隔离旧作业，本轮无完整编码音频重排或新音频线程。 |
+| REVIVAL-P2-034 | Web audio player、diagnostics、main | 旧预约音源可越过换源清理；AAC 解码器输出样本时钟连续、输入源 PTS 有间隙时，严格逐 PTS 配对会永久丢音频。已清理重锚/换代/关闭的预约，并对当前 decoder/generation 核验输入 FIFO 与输出样本时钟，用可信输入 PTS 排程。合法长音频单元的实际时长参与软件预算和等待，普通 48 kHz 目标不变；当前 AAC 对应项目 AAC LC 单 AU/chunk，不宣称通用多 raw-data-block 支持。有效音频输出驱动视频，无音频回退单调时钟。计数与最多 4 Hz JSON/DOM 刷新分离。 |
+| REVIVAL-P1-035 | relay timing、bootstrap、backend runtime | 只缓存旧 IDR 而接上当前 delta，或把 bootstrap 缓存超限当作参考链丢失，会造成错误恢复。已缓存有界连续 GOP，保留 PTS/序号；缓存超限使 warm bootstrap 失效并等待新 IDR，真实输入缺口、发送失败和工作队列过载才触发参考链恢复。绑定代次隔离旧发送完成回调。 |
+| REVIVAL-P1-036 | peer transport、host pipeline、desktop host refresh wakeup | 原生此前只计 PLI 或拒绝 DataChannel keyframe-request，无法真正让当前房主产生恢复帧。已严格解析真实控制消息，核验当前连接和 manifest，TX/RX 以 500 ms 合并节流；relay 传到上游，桌面唤醒现有房主软刷新路径。WGC/FFmpeg 用现有重启生成配置与 IDR，首次 bootstrap 等待期间不反复重启，OBS 等待外部编码器 IDR；刷新待处理 peer 集合无新增固定人数上限。 |
+| REVIVAL-P2-037 | native playback scheduler 配置缓存 | 重排缺口恢复后消费了新配置，再遇后续缺口仍可能取旧缓存覆盖新 SPS/PPS。已同步缓存中的已消费配置并保留未来配置的时序约束；两次缺口与中间新配置的最小复现加入调度回归，当前统一原生 CTest 已通过。 |
+| REVIVAL-P1-038 | Web 视频输出看门狗 | OBS 重连追赶时，视频等待音频期限，codec 正常保留的 B 帧却被当作 500 ms 内部停滞。现仅在已确认 B 帧重排、已产生输出、在途数不超过实际重排深度、decodeQueue 为零且确在等待非空呈现队列时暂停工作计时。原始提交年龄另记，恢复提交后真正 500 ms 无输出仍触发恢复；关闭和错误清理等待及定时器。 |
+| REVIVAL-P1-039 | Web 音频积压恢复 | SRT 重连的实测首 47 AAC 单元约 981 ms 媒体在 446.5 ms 内到达；队列满时只丢新包会永久保留旧积压。现仅在已配置、运行且同 codec 的较新 PTS/序号到达时，取消旧待提交队列并接住当前新包重新锚定，保持已解锁 AudioContext；常规 235 ms 聚包继续完整消费。未声明帧率的视频也用已有帧间隔估计输入容量，避免固定包数误伤正常 60 fps。 |
+| REVIVAL-P2-040 | Web 静音视频时钟 | 用户音量为零时继续用音频时钟，可能在浏览器切换虚拟静音设备后拖慢视频。零音量现在返回无有效音频主钟，视频使用既有单调时钟回退；恢复音量后重新使用当前输出位置，AudioContext、解码器和音源不用重建。真实全零源及长时设备时钟漂移另需验收，本轮未引入斜率监控或变速系统。 |
+
+### 当前验证范围
+
+最终统一 `npm run check` 通过，含 Web 125/125 行为回归、3 个协议/帧/生命周期脚本和 TypeScript，视频 49 项、音频 45 项，桌面 88/88 回归；根与 server 生产依赖审计均为 0。统一原生 Release 与 CTest 15/15 通过，79.65 秒；音频 1420 项、调度 17591 项、源代次 8251 项及实际 DataChannel 关键帧控制 210 项断言通过，原生 NAT 合约与 runtime 完整性检查通过。最终 Electron 42 真解码分别消费 H.264 3 帧、AAC 9 块、Opus 9 块、8 kHz AAC 6 块、带源 PTS 间隙 AAC 9 块，各项无丢弃，画布色彩断言通过。真实隐藏 Win32 窗口 FFmpeg/GDI 覆盖 B 帧、独立配置加同序号 IDR、短突发、同 ID 重开和并发关闭；约 235 ms 的 14 视频加 11 AAC 同批输入，280 帧全部解码、265 帧绘制、220 AAC 全部消费，压缩帧/音频预算丢弃及参考链重置为 0，峰值压缩输入 16 帧、待呈现 2 帧。原生 2048 次及 Web 1024 次换源仍拒绝最旧源，没有换源次数硬限。
+
+实际 SRT → native → Web 的 1080p30 B2、1080p60 B0 八阶段恢复均通过，含同 peer 两次源重启及 Web 二跳恢复，使用同一原生 runtime。30 fps 稳定播放 30.201 秒呈现 901 帧即 29.833 fps，消费 1409 AAC 即 46.654 单元/秒，期间视频和音频无新增丢弃；60 fps 稳定播放 30.146 秒呈现 1781 帧即 59.079 fps，消费 1394 AAC 即 46.242 单元/秒，音频无新增丢弃、视频新增 5 次迟到呈现丢弃。
+
+30/60 fps 每秒采样峰值 ready 3/2 帧、压缩待处理 9/17 帧、decoderQueue 均为 0、BGRA 估算 25,067,520/16,711,680 字节；滚动 128 样本迟到 P95 的最大采样值 13.035/14.518 ms，60 fps 记录最大迟到 42.866 ms，均不宣称采样值是全过程峰值。源重启时追赶新源主动丢旧音频积压，30 fps 两次分别丢 24/24 个 AAC、60 fps 分别丢 48/24 个，恢复阶段不是零丢弃。
+
+用户零音量的实际 1080p30 B2 八阶段恢复通过，持续 30.001 秒呈现 895 帧即 29.832 fps，消费 1397 AAC，期间视频和音频无新增丢弃，audioClockValid=false，确认视频使用既有单调时钟回退。全零源、物理设备和长时漂移边界继续保留。
+
+当前本地 NSIS 构建及一致性通过，`dist/VDS-Setup-1.7.1.exe` 为 239,871,520 字节，SHA256 `5B3255317DA7E000126FF944F403DFEE2A56AA70B1BEBD0744400DE9A6C26154`。35 个源码/静态资源与 ASAR 精确一致，Agent/juice/datachannel 的 build/runtime/package 哈希一致，latest.yml SHA512 与 blockmap 验证通过。实际打包 Electron 42.11.11 通过 preload/native API、四 STUN 含 IPv6、transport 代次与关闭、14 项捕获枚举、音频平台及正常退出，无诊断异常或测试进程残留。未执行安装向导，未签名、未发布，版本保持 1.7.1。
+
+新版使用 offscreen 60 fps、音频图音量 100% 和 webContents 静音；浏览器静音仍可能使用软件虚拟输出，不证明物理设备实际听到的音画偏差。旧隐藏窗口即时绘制基线约 29.9/59.8 fps，环境不同，不以该对比宣称 CPU 或内存下降。32 MiB 不代表总内存，GDI/Canvas 计数不代表物理 Vsync。10 分钟调度对照、30 分钟真实声音音画偏差和 100 次完整停启仍是验收目标；实际移动宽带与联通宽带互通、WGC/GPU、手机和长时真实音画仍需实机验收。双方 UDP 无法通过或 NAT 任意随机分配时仍可能失败，当前结果不能证明与 UU 相同的跨网成功率。
+
+## 2026-10-07：连接播放与纯 P2P 恢复
+
+用户补充主要故障为跨运营商连通和播放，明确禁止 TURN，并要求自行实现端口预测和多端口打洞。本轮保留纯 P2P，修复关键恢复路径，增强原生 ICE；下方首轮“后续关键项”已在本轮处理，当前状态以本节为准。
+
+| 编号/级别 | 位置 | 问题与处理结果 |
+| --- | --- | --- |
+| REVIVAL-P1-011 | `room-client.js`、`app.js`、`native-room-message-controller.js` | 旧 socket close 覆写新连接；取消加入后迟到异步结果/房间确认恢复旧房间。已增加 socket 身份、加入 generation、确认前及清理 await 后校验。真实 Electron 中取消确认基线失败，修后正常；正常自动重连保持可用。 |
+| REVIVAL-P1-012 | `native-surface-controller.js` | 同 ID 旧 attach 回包拆新窗口；pending attach/recovery 在 stop 后重新挂载；丢失 surface 的更新错误被吞导致永久无画面。已按 ID 排队、记录期望状态与代次、取消旧操作并安全重挂丢失窗口。 |
+| REVIVAL-P1-013 | `server-core.js` | 重连遗漏下游容量配置；ready relay 信令重绑未唤醒等待者；换上游未先通知观看者。已透传配置、唤醒下游，上游变化先 `chain-reconnect` 并等待确认后沿已选上游握手，防止选回失败 relay 或双 offer。12 项真实 WS 回归通过。 |
+| REVIVAL-P1-014 | `main.ts`、`server-core.js` | 真 E2E 复现浏览器刷新后媒体为 0：新页面重绑保留旧 ready 状态。Web 新加入/页面恢复明确 `needsMediaReconnect`；server 清旧状态并重新握手，刷新恢复已通过真解码。 |
+| REVIVAL-P1-015 | `main.ts`、`upstream-recovery.ts` | Web 上游失败或 DataChannel 关闭只更新诊断，不能触发重选。已增加初始/握手 30 秒等待、短断 3 秒宽限、单 peer 请求去重、取消旧计时器和连续失败上限；初始预算留出 native 端口映射时间。 |
+| REVIVAL-P1-016 | `datachannel-protocol.ts` | 完整帧绕过 2 MiB 上限，截断分片被补零接受。已核验完整帧上限、分片数量、精确实际长度和帧元数据一致性。 |
+| REVIVAL-P1-017 | `webcodecs-player.ts`、`webcodecs-audio-player.ts` | close 期间支持探测回包复活/空引用，并发帧重复配置；closed decoder 被永久复用。已隔离 generation/输出/错误、有界顺序处理、释放并恢复失效 decoder。真实 H264 closed 恢复基线失败，修后通过；初始并发音频配置由 7 次降到 1 次。 |
+| REVIVAL-P1-018 | `media_audio.cpp` | compact buffer 未按 FFmpeg 输入契约填充，空包把 AAC/Opus decoder 永久 flush。已使用拥有缓冲的零填充 packet，空 transport 包直接忽略；真实 encode/decode/empty/restart 回归通过。 |
+| REVIVAL-P1-019 | `viewer_audio_playback.cpp` | 延迟上限只统计软件队列，waveOut 在途音频无界积压。已共同计量并限制设备提交、丢弃过旧待播块、stop 清空；真实静音压力峰从 48000 帧约 1 秒降至 5760 帧即 120 ms。 |
+| REVIVAL-P1-020 | `stun-server-selector.js`、`main.js`、`native-peer-controller.js`、native STUN 配置 | server STUN 配置未传到 native；libjuice 打乱多服务器列表后只选一个。本机 Cloudflare 超时而 Linphone 可达，存在随机失效。已透传纯 STUN 池、并行探测首选可达服务并短期共享结果；native 严格接受指定 STUN、拒 TURN 等非法值，暴露 `selectedStunServer`。真实 Electron IPC 测试成功选择第二个响应节点；后续增强 ICE 保留首选顺序并使用最多四个服务，见 024。 |
+| REVIVAL-P1-021 | `main.js`、`pcp-packet.js`、`native-peer-controller.js` | PCP Client IP 为全零、缺响应关联校验；按 port 去重与默认网关不匹配多网卡，串行等待超过前端预算；旧 NAT 映射回包可污染新 peer。已从已连接 UDP socket 取源地址、核验 nonce/UDP/内部端口、按地址和端口去重并匹配网关、有界并发请求，旧 handle 的结果与错误不能影响替代 peer。合规 router fixture、真实 loopback UDP 接线和迟到结果回归通过，未修改真实路由器。 |
+| REVIVAL-P2-022 | `server-core.js` | 非法 JSON/结构绕过消息计数。已统一计入限流，超限关闭 1008；服务保持可用。 |
+| REVIVAL-P2-023 | Web `main.ts`、`playback-session.ts`、`diagnostics.ts` | 播放调度/重组/两个 decoder 的清理分散在连接事件中，解码状态和错误覆盖 relay 诊断。已新增 `EncodedMediaPlaybackSession`，统一 start/close、帧重组、调度和播放器参数；代次取消旧任务，保留用户手势解锁音频，本地解码错误不阻断原编码帧转发。播放、decoder、连接和 relay 分别记录，视频成功不抹掉音频异常；本节记录的是连接复兴时的初版，后续自适应队列与 PTS 调度以顶部 031/034 为准。 |
+| REVIVAL-P1-024 | `nat_port_prediction.h`、`peer_stun_config.*`、libjuice/libdatachannel 补丁 | 只选一个 STUN 无法观察不同目的端点的映射规律；独立 Electron 探测 socket 也不能代表媒体端口。修改意见：在实际 ICE socket 上采样并做有限预测检查。处理结果：保留首选顺序并使用最多四个 STUN，校验响应来源和事务、记录实际首次发送顺序；同一 IPv4 地址至少三个连续有效样本、稳定非零步长且绝对值不超过 16 才线性预测。不稳定样本仅尝试已验证端口 ±1、±2 邻域，每 peer 最多 16 个低优先级推测候选，由实际 ICE 检查验证。选中可用候选对后停止其他推测检查，关闭时释放。未移植 UU 代码，未新增 TURN。 |
+| REVIVAL-P1-025 | `peer_transport.*`、`peer_session_controller.cpp`、`native-peer-controller.js`、Web `main.ts` | 同 ID peer 替换时，迟到候选、状态、SDP 或 close 请求可能作用于新 transport；预测候选更依赖当前采样和凭据。修改意见：明确 transport 归属并在应用排队候选时复核。处理结果：原生事件和 createPeer 结果提供 `transportGeneration`，当前控制链路携带预期代次；预测候选必须携带当前 ICE `ufrag`，旧代次和凭据被拒绝。排队候选关联当前 handle/PC 与尝试身份，应用前重新校验。预测候选限定 UDP IPv4、已确认地址和有限数量；普通 IPv6、prflx、TCP、mDNS 候选保留原交换路径，普通 RPC/候选仍兼容缺少身份字段的旧格式。 |
+| REVIVAL-P2-026 | `third_party/ice-patches/`、`VdsEnhancedIce.cmake`、`build-vds-ice.ps1`、`build-media-agent.ps1` | 本机依赖缓存修改难复现，打包混用旧 ICE DLL 会让源码与实际行为不一致。修改意见：保存依赖补丁并统一构建/复制。处理结果：固定 libjuice 1.7.0 与 libdatachannel 0.24.1 源包 SHA512，仓库保存补丁；构建校验补丁和算法版本标记，CMake 优先选择增强依赖，runtime 使用对应 `juice.dll`、`datachannel.dll`。新增纯算法、虚拟 NAT 真实 DataChannel 与原生 RPC 合约验证入口。 |
+| REVIVAL-P1-027 | libjuice `agent_bookkeeping`、libdatachannel `processRemoteCandidate` 的仓库补丁 | 采样暂停检查却未移动发送时限，可能零超时忙轮询；上层忽略 ICE 后端拒绝结果，把被拒绝的推测候选加入去重描述，导致假接受和后续无法重试。修改意见：保持调度时限一致，并按后端结果更新候选状态。处理结果：暂停同时更新下一次发送时限；推测候选只有后端接受后才加入远端描述，拒绝明确抛错；普通候选保持原兼容路径。 |
+| REVIVAL-P1-028 | `peer_stun_config.*`、`peer_transport.cpp` | 原生 RPC 实际使用标准 `params` 对象，STUN 解析只读顶层而忽略配置；合法 `stun:[::1]:3478` 通过校验后又被上游 URI 构造器按首个冒号错切，导致 createPeer 失败。修改意见：严格选择参数作用域，并从已验证配置分离 host/port。处理结果：正确读取标准 `params`，兼容直接参数，拒绝重复 params、无效对象与混合顶层配置；IPv6 去除方括号后使用 STUN host/port 构造器，保留显式端口与默认 3478。54 条真实 RPC 生命周期序列及 Manager 合约通过。 |
+
+### 连接复兴阶段的验证结果
+
+- `npm run check` 通过，Desktop 75/75，Web 行为回归 17/17；播放生命周期 13 组、播放会话 7 项、上游恢复 4 项、服务端重连 12 项回归通过。最终原生 Release 与 CTest 6/6 分两组执行通过，包含 8160 个算法断言、正式 STUN 两场景、严格 NAT、音频及 54 条真实 RPC 生命周期序列；`npm run verify:nat` 通过。
+- 本机严格虚拟 NAT 的 8 个场景通过，隐藏 host 候选并禁止 TURN。标准候选基线不能连通；四 STUN 预测、100 ms 分批 trickle、双方按远端地址端口分别映射及精确过滤的场景均建立真实 ICE/DTLS/SCTP DataChannel，双向传输 4096 字节。成功场景步长为 1，每侧实际检查 5 个推测端口。单 STUN 未知映射实际检查 4 个邻域端口、非线性分配实际检查 12 个端口但均未连通，非线性步长保持 0；预算外不扩张尝试，关闭后停止发包。这些结果仅覆盖 fixture 的映射与过滤规则。
+- 直接 SDK 验证第 17 个推测候选被 ICE 后端拒绝，重试仍被拒绝，远端描述未记录被拒绝候选。`natProbeObservations` 改从底层 `vds-probe-count` 获取有效 IPv4 映射样本数，重复映射的有效响应不再因候选合并而漏计。
+- `npm run verify:playback` 通过：真实 Electron 42 WebCodecs H264/AAC/Opus 解码、closed/reopen 恢复和画布色彩断言；合成 H264/AAC → 本机 SRT → native libdatachannel → 实际房间服务 → 实际 Web 页面，覆盖持续播放、退出重进、刷新、Web 二跳、关闭 relay 后重接房主。
+- 最终增强 runtime 的六阶段真实 E2E 通过，均达到独立 `playbackState=playing`，decoder 诊断不再覆盖 relay；退出为 stopped。初播视频/音频为 15/22，持续播放为 163/483，重进为 175/514，刷新为 15/22，Web 接力为 13/33，relay 离线恢复为 25/55。约 10 秒持续观察新增 148 视频帧和 461 音频块，无停滞、没有新增丢帧；刷新时裁剪丢弃 2 个视频帧后恢复。音频为静音测试，未验证听感。
+- 原生 Manager 合约通过代次、重复 ufrag、过期 detach、嵌入 SDP 的纯 P2P/推测候选预算与 IPv6 池检查；build 与 runtime 中的最终 Agent、juice、datachannel 哈希一致。Agent SHA256 为 `1FA852976EA1FEF0271F66CF87387306C220D4A9C435551FB2A28DD89C67E708`。
+- STUN 本机当前网络实际选优返回 Linphone，约 232 ms；PCP 报文字段与本机 UDP 接线通过，匹配候选接口的网关只读查询通过。尚未实测移动宽带 ↔ 联通宽带。
+- 连接复兴阶段的增强 ICE 版本 Windows NSIS 重包通过，239,818,844 字节；包内 34 个源码/静态文件与当时工作区一致，安装包 SHA512 与 manifest 一致；Agent、juice、datachannel 三文件在 build/runtime/package 间 SHA256 一致。实际打包 Electron 42.11.11 验证增强 NAT 启用、四 STUN 含 IPv6、transport 代次返回及关闭，枚举 12 个捕获项；正常退出、无诊断异常、无残留进程。这是稳帧改造前的本地未签名 1.7.1 验证记录，不代表当前播放代码的最终安装包。
+
+### 剩余连通性边界
+
+- 当前 libjuice 只提供 TCP active，两个 native 端无法组成 TCP 直连候选对。未宣称已提供 TCP 备用通道。
+- 已自行实现线性端口预测和有限邻域多端口检查。它依赖有效样本和有限端口预算，不能保证任意随机分配 NAT 或被阻断的 UDP 可以直连。UU 本机 `streamer.dll` 的静态诊断标记只显示存在相关路径，未移植其代码或还原算法。
+- 同房间快速重新加入缺少协议 request ID，无法精确区分同 room 的旧确认；当前保守避免清理新会话。
+- 真实跨运营商、手机、WGC 捕获、GPU/跨屏 surface、长时音画同步仍需验证；IPv6/TCP/prflx/mDNS 候选没有被普通交换逻辑统一过滤。保持禁止 TURN。
+
+UDP 端口预测条件见 [RFC 5128](https://www.rfc-editor.org/rfc/rfc5128.html)，ICE 连通检查见 [RFC 8445](https://www.rfc-editor.org/rfc/rfc8445.html)。PCP 契约见 [RFC 6887](https://www.rfc-editor.org/rfc/rfc6887.html#section-16.4)，TCP active 能力见 [libjuice 1.7.0 源码](https://github.com/paullouisageneau/libjuice/blob/v1.7.0/src/agent.c)。
+
+## 2026-10-07：小范围复兴与关键模块检查
+
+按用户要求，本轮聚焦媒体生命周期、观看/重连、服务端权限和依赖；保留现有目录与协议，不做全项目重构。下方 2026-06-19 内容为历史记录；当前状态以本节为准。
+
+### 已处理问题
+
+| 编号/级别 | 位置 | 问题与影响 | 修改意见与处理结果 |
+| --- | --- | --- | --- |
+| REVIVAL-P1-001 | `server/server-core.js` WebSocket connection | 超过 maxPayload 的消息触发未监听的 socket error，整个服务进程退出。已用独立子进程复现。 | 已监听每条连接的 error；超限连接关闭 1009，HTTP 与新连接继续可用。 |
+| REVIVAL-P2-002 | `server/server-core.js::finalizeViewerDisconnect` | viewer 主动退出后保留 socket 绑定，进入其他房间被拒绝。 | 已清除原 socket 元数据、旧 viewer token 与 ws 引用；同连接换房及旧 leave 消息隔离回归通过。 |
+| REVIVAL-P1-003 | `server/server-core.js`、`server/public/admin.html`、`server/docker-compose.yml` | 两个管理数据 API 无鉴权暴露私有房间与拓扑；主端口后台请求路径不正确。 | 已统一 Bearer `ADMIN_TOKEN` 鉴权，空配置 503、无效令牌 401、响应 no-store；修正后台路径，管理端口/宿主映射默认仅本机。 |
+| REVIVAL-P1-004 | `desktop/media-agent-manager.js` | stop 或 RPC 超时后启动新进程，旧进程退出/stream 回调可清除新进程与请求。并发 start 也未共享完整握手。 | 已协调停启并共享握手，通过 child 身份隔离旧回调；5 项行为回归通过。 |
+| REVIVAL-P1-005 | `media-agent/src/session_owner_activation.cpp`、`agent_rpc_router.cpp` | 活动 OBS owner A 被直接切换到 B，A worker 未 join；EOF 实测退出码 -1073740791。 | 已在创建 registry 条目或改 active id 前预检全部 owner；冲突返回 `MEDIA_SESSION_ACTIVE`，原会话保持正常。新增单元及真实 RPC 生命周期回归。 |
+| REVIVAL-P1-006 | `server/public/native/native-session-controller.js` | 旧 capture start 在预览/信令 await 后继续 fallback、建房或 stop，可能干扰用户刚重启的新 host。 | 已在异步边界检查 generation；过期流程停止后续动作，不清理新会话/新 UI。正常预览失败仍可重试。 |
+| REVIVAL-P1-007 | `native-session-controller.js::teardownObsHostRoom`、`app-native-overrides.js` | OBS 断流清理缺少房间身份，leave 抛错；清理失败阻断本地状态重置，媒体 id 被清空影响再次推流。 | 已从当前 snapshot 补齐身份，finally 保证本地清理，保留监听 session id 并捕获异步错误。与 host start 合计 8 项回归通过。 |
+| REVIVAL-P1-008 | `vds_web/src/signaling.ts`、`main.ts` | 并发 connect 重复创建 socket，提前关闭 Promise 悬挂；旧连接/peer 的异步结果和帧可污染当前会话。 | 已共享待连接 Promise、结算取消/关闭、隔离旧 socket/peer、阻止过期 join、清理跨房间/下游关键帧缓存。行为回归在旧源码失败、修复后通过。 |
+| REVIVAL-P1-009 | `vds_web/src/webcodecs-player.ts::splitAnnexBNalUnits` | Annex B 转 AVCC 混入下一 NAL 的起始码，SPS/PPS 长度错误，影响对应解码路径。 | 已修正结束边界；精确验证 SPS/PPS/IDR 字节与长度 6/4/3。 |
+| REVIVAL-P2-010 | `package*.json`、`server/package*.json`、`scripts/test-vds-web-protocol.js`、检查入口 | 基线生产依赖告警 7/4 项（根/server），全量根审计 36 项含 high/critical；Web 测试耦合已翻译的 README 英文 prose。 | 已更新依赖与锁文件、替换废弃 rebuild 包；移除非契约措辞断言，保留实际命令/协议验证。新增 `npm run check`、`test:desktop`、`test:server-revival` 与生产依赖检查，发布门禁接入新增回归。 |
+
+### 验证结果与边界
+
+- 架构五项、日志、Web 类型/协议/移动诊断、原服务端测试、新服务端回归均通过；桌面回归 13/13。
+- 原生 Release 构建、CTest 2/2（单元 + 真实 RPC 生命周期）、transport-ready smoke 通过；libdatachannel 0.24.1。
+- Electron 42.11.11 开发启动与实际 `dist/win-unpacked/VDS.exe` 隐藏运行均通过；包内 preload/native entry、窗口 IPC、agent/capabilities/stats、捕获枚举和音频模块 smoke 正常，同版本更新检查正常，诊断无异常。应用正常退出，无测试进程残留；未创建房间或启动共享。
+- Windows NSIS 本地打包通过；包内 32 个源码/静态文件与工作区一致，原生 exe SHA256 一致，installer SHA512 与 latest.yml 一致。版本仍为 1.7.1 开发验证产物，未进行公开发布。
+- 根与 server 的生产依赖审计均为 0。根全量审计剩 8 个 moderate，来自 builder 的 `@electron/get -> global-agent -> roarr -> sprintf-js` 链（同一上游问题的依赖传播）；无 high/critical。未使用 `audit fix --force` 降级或未经兼容验证的 override。
+- 未验证真实双端音画、持续 OBS 推流、手机浏览器或 native surface 停止后立即重启；自动通过不代表这些场景已完成验收。
+
+### 后续关键项（本轮未修改）
+
+| 优先级 | 位置 | 证据与下一步 |
+| --- | --- | --- |
+| P1 | `media-agent/src/media_audio.cpp:164` | compact encoded buffer 直接传入 FFmpeg，缺少 API 要求的尾部零 padding；代码/SDK 契约确认，尚无 ASan/坏包运行复现。后续补 padding 与坏包回归。 |
+| P1 | `server/public/native/native-surface-controller.js:436`、`:473`、`:509` | 延迟 Promise VM 已复现 attach/recover 在 stop/restart 后继续附着或拆除同 id 的新 surface。后续统一 surface generation 与取消边界，并做真实预览验收。 |
+| P2 | `server/public/room-client.js:344`、`app.js:1845` | VM 已复现普通 renderer 旧 socket close 覆写新连接状态；取消加入后音频偏好 await 仍继续 join。后续按 Web 端同类模式隔离。 |
+| P2 | `vds_web/src/datachannel-protocol.ts:180`、`:264` | 已复现超过 2 MiB 的完整帧被接受，以及声明 10 字节/实际 3 字节分片补零。后续补接收上限和分片实际长度校验。 |
+| P2 | `vds_web/src/webcodecs-audio-player.ts:146`、`webcodecs-player.ts:178` | 支持探测等待期间 close，随后可能重新创建 audio decoder 或访问空 video decoder。后续对探测结果加生命周期校验。 |
+| P2 | `server/server-core.js:230`、`:393`、`:540` | 非法 JSON 绕过速率计数已复现；部分重连调用回退默认下游上限 2，未独立复现配置偏差。后续统一入口计数和配置透传。 |
+
+---
+
+## 历史记录（2026-06-19 起）
+
 生成日期：2026-06-19
 
 用途：本文档汇总当前代码审计发现的问题。每个问题后预留“修改意见”，用于后续人工填写处理方案、取舍、负责人或排期。

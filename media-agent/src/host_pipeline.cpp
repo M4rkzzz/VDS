@@ -108,6 +108,18 @@ void append_video_encoder_runtime_flags(std::ostringstream& command, const HostP
 
   if (encoder == "libopenh264") {
     command << " -rc_mode bitrate -bf 0";
+    return;
+  }
+
+  // These backends use FFmpeg's generic max_b_frames setting. Keep capture
+  // input order equal to Annex-B picture order for the source timestamp FIFO.
+  // Leave unrecognised/manual encoders to their existing capability probe.
+  if (encoder == "h264_qsv" || encoder == "hevc_qsv" ||
+      encoder == "h264_mf" || encoder == "hevc_mf" ||
+      encoder == "h264_d3d12va" || encoder == "hevc_d3d12va" ||
+      encoder == "h264_vaapi" || encoder == "hevc_vaapi" ||
+      encoder == "h264_vulkan" || encoder == "hevc_vulkan") {
+    command << " -bf 0";
   }
 }
 

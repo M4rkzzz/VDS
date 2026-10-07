@@ -11,12 +11,14 @@
 #include "surface_attachment_runtime.h"
 #include "time_utils.h"
 #include "video_access_unit.h"
+#include "video_bootstrap_helpers.h"
 
 bool submit_scheduled_video_unit_to_surface(
   const std::string& peer_id,
   PeerVideoReceiverRuntime& runtime,
   const std::vector<std::uint8_t>& frame,
   const std::string& codec_path,
+  const MediaFrameTiming& timing,
   std::string* warning_message) {
   std::shared_ptr<NativeVideoSurface> surface;
   {
@@ -40,7 +42,6 @@ bool submit_scheduled_video_unit_to_surface(
       runtime.running = false;
       runtime.decoder_ready = false;
       runtime.pending_video_annexb_bytes.clear();
-      runtime.startup_video_decoder_config_au.clear();
       runtime.startup_waiting_for_random_access = true;
       runtime.reason = "peer-video-surface-decoder-recovering";
       runtime.last_error = snapshot.last_error;
@@ -64,7 +65,7 @@ bool submit_scheduled_video_unit_to_surface(
   }
 
   std::string submit_error;
-  if (surface->submit_encoded_frame(frame, codec_path, &submit_error)) {
+  if (surface->submit_encoded_frame(frame, codec_path, timing, &submit_error)) {
     return true;
   }
 
@@ -92,7 +93,7 @@ bool submit_scheduled_video_unit_to_surface(
         runtime.last_error.clear();
       }
 
-      if (restarted_surface && restarted_surface->submit_encoded_frame(frame, codec_path, &submit_error)) {
+      if (restarted_surface && restarted_surface->submit_encoded_frame(frame, codec_path, timing, &submit_error)) {
         return true;
       }
     }
@@ -107,7 +108,6 @@ bool submit_scheduled_video_unit_to_surface(
     runtime.running = false;
     runtime.decoder_ready = false;
     runtime.pending_video_annexb_bytes.clear();
-    runtime.startup_video_decoder_config_au.clear();
     runtime.startup_waiting_for_random_access = true;
     runtime.reason = "peer-video-surface-submit-failed";
     runtime.last_error = submit_error;
@@ -130,7 +130,8 @@ void consume_remote_peer_video_frame(
   const std::shared_ptr<PeerTransportSession>& transport_session,
   const std::vector<std::uint8_t>& frame,
   const std::string& codec,
-  std::uint32_t rtp_timestamp) {
+  std::uint32_t rtp_timestamp,
+  const MediaFrameTiming& incoming_timing) {
   if (!runtime_ptr) {
     return;
   }
@@ -142,17 +143,51 @@ void consume_remote_peer_video_frame(
   }
 
   auto& runtime = *runtime_ptr;
+  MediaFrameTiming timing = incoming_timing;
   std::string codec_path;
   std::vector<std::vector<std::uint8_t>> decode_units;
   std::vector<std::vector<std::uint8_t>> relay_decode_units;
+  std::shared_ptr<NativeVideoSurface> surface;
+  {
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    surface = runtime.surface;
+  }
+  const NativeVideoSurfaceSnapshot surface_snapshot = surface ? surface->snapshot() : NativeVideoSurfaceSnapshot{};
 
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
     if (runtime.closing) {
       return;
     }
+    const auto previous_codec = runtime.codec_path;
     runtime.codec_path = vds::media_agent::normalize_video_codec(codec);
     codec_path = runtime.codec_path;
+    if (!timing.timestamp_valid) {
+      if (runtime.video_rtp_codec != codec_path) {
+        runtime.video_rtp_codec = codec_path;
+        runtime.video_rtp_timestamps.reset();
+      }
+      timing.timestamp_us = vds::media_agent::media_clock_ticks_to_us(
+        runtime.video_rtp_timestamps.unwrap(rtp_timestamp), 90000);
+      timing.timestamp_valid = true;
+      // A bare RTP clock has no shared AV epoch. Keep it separate from the
+      // DataChannel source that has an explicit common 64-bit timeline.
+      timing.source_id = peer_id + "/" + runtime.source_generation + "/rtp-video";
+    }
+    if (timing.source_id.empty()) timing.source_id = peer_id + "/" + runtime.source_generation;
+    if (runtime.active_video_source_id != timing.source_id || previous_codec != codec_path) {
+      runtime.active_video_source_id = timing.source_id;
+      runtime.pending_video_annexb_bytes.clear();
+      runtime.startup_video_decoder_config_au.clear();
+      runtime.startup_waiting_for_random_access = true;
+    }
+    if (surface_snapshot.needs_keyframe &&
+        (!runtime.surface_keyframe_wait_observed ||
+         surface_snapshot.reference_chain_resets != runtime.surface_reference_chain_resets_observed)) {
+      runtime.startup_waiting_for_random_access = true;
+    }
+    runtime.surface_keyframe_wait_observed = surface_snapshot.needs_keyframe;
+    runtime.surface_reference_chain_resets_observed = surface_snapshot.reference_chain_resets;
 
     if (codec_path == "h264" || codec_path == "h265") {
       const bool frame_has_annexb_start_code =
@@ -187,11 +222,15 @@ void consume_remote_peer_video_frame(
       if (runtime.closing) {
         return;
       }
+      for (const auto& decode_unit : decode_units) {
+        auto config = vds::media_agent::extract_video_decoder_config_nals(codec_path, decode_unit);
+        if (!config.empty()) {
+          runtime.startup_video_decoder_config_au = vds::media_agent::merge_video_decoder_config(
+            codec_path, runtime.startup_video_decoder_config_au, config);
+        }
+      }
       if (runtime.startup_waiting_for_random_access) {
         for (const auto& decode_unit : decode_units) {
-          if (vds::media_agent::video_access_unit_has_decoder_config_nal(codec_path, decode_unit)) {
-            runtime.startup_video_decoder_config_au = decode_unit;
-          }
           if (!vds::media_agent::video_access_unit_has_random_access_nal(codec_path, decode_unit)) {
             continue;
           }
@@ -203,12 +242,8 @@ void consume_remote_peer_video_frame(
           }
 
           runtime.startup_waiting_for_random_access = false;
-          if (!runtime.startup_video_decoder_config_au.empty()) {
-            startup_units.push_back(runtime.startup_video_decoder_config_au);
-          }
-          if (startup_units.empty() || startup_units.back() != decode_unit) {
-            startup_units.push_back(decode_unit);
-          }
+          startup_units.push_back(vds::media_agent::prepend_config_if_needed(
+            codec_path, runtime.startup_video_decoder_config_au, decode_unit));
           runtime.reason = "peer-video-bootstrap-random-access";
           break;
         }
@@ -225,7 +260,7 @@ void consume_remote_peer_video_frame(
     }
 
     if (waiting_for_random_access) {
-      relay_hub().publish_video_units(peer_id, codec_path, relay_decode_units, rtp_timestamp);
+      relay_hub().publish_video_units(peer_id, codec_path, relay_decode_units, rtp_timestamp, timing);
       refresh_peer_video_receiver_runtime(runtime);
       update_peer_decoder_state_from_runtime(runtime_ptr, transport_session);
       return;
@@ -236,7 +271,7 @@ void consume_remote_peer_video_frame(
     }
   }
 
-  relay_hub().publish_video_units(peer_id, codec_path, relay_decode_units, rtp_timestamp);
+  relay_hub().publish_video_units(peer_id, codec_path, relay_decode_units, rtp_timestamp, timing);
   bool local_playback_enabled = false;
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
@@ -253,12 +288,16 @@ void consume_remote_peer_video_frame(
   }
 
   for (const auto& decode_unit : decode_units) {
+    MediaFrameTiming unit_timing = timing;
+    unit_timing.keyframe = vds::media_agent::video_access_unit_has_random_access_nal(codec_path, decode_unit);
+    unit_timing.config = vds::media_agent::video_access_unit_has_decoder_config_nal(codec_path, decode_unit);
     std::string warning_message;
     const bool submitted = submit_scheduled_video_unit_to_surface(
       peer_id,
       runtime,
       decode_unit,
       codec_path,
+      unit_timing,
       &warning_message
     );
     std::lock_guard<std::mutex> lock(runtime.mutex);

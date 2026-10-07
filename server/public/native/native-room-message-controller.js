@@ -90,6 +90,55 @@
       return false;
     }
 
+    function normalizeRoomId(roomId) {
+      return String(roomId || '').trim().toUpperCase();
+    }
+
+    function getViewerAckSnapshot() {
+      return {
+        generation: getOptionValue('getViewerJoinGeneration', null),
+        sessionToken: String(getOptionValue('getCurrentSessionToken', '') || '')
+      };
+    }
+
+    function isCurrentViewerAck(data, snapshot, resuming = false) {
+      const roomId = normalizeRoomId(data && data.roomId);
+      const ackToken = String((data && data.sessionToken) || '');
+      if (!roomId || getOptionValue('getSessionRole', null) !== 'viewer' ||
+          normalizeRoomId(getOptionValue('getCurrentRoomId', '')) !== roomId ||
+          getOptionValue('getViewerJoinGeneration', null) !== snapshot.generation ||
+          String(getOptionValue('getCurrentSessionToken', '') || '') !== snapshot.sessionToken) {
+        return false;
+      }
+      if (resuming) {
+        return Boolean(snapshot.sessionToken) && (!ackToken || ackToken === snapshot.sessionToken);
+      }
+      return getBooleanOption('isViewerJoinPending', false) && Boolean(ackToken) &&
+        (!snapshot.sessionToken || ackToken === snapshot.sessionToken);
+    }
+
+    function ignoreStaleViewerAck(data, phase) {
+      const roomId = normalizeRoomId(data && data.roomId);
+      const currentRoomId = normalizeRoomId(getOptionValue('getCurrentRoomId', ''));
+      logNativeStep('viewer-room-ack:stale-ignored', {
+        phase,
+        roomId,
+        currentRoomId,
+        role: getOptionValue('getSessionRole', null),
+        generation: getOptionValue('getViewerJoinGeneration', null)
+      }, 'connection');
+
+      const ackToken = String((data && data.sessionToken) || '');
+      const currentToken = String(getOptionValue('getCurrentSessionToken', '') || '');
+      const clientId = getOptionValue('getClientId', '');
+      // Without a request ID, a same-room acknowledgement may belong to a new join.
+      // Never release that room or substitute its current token for an obsolete token.
+      if (!roomId || !ackToken || !clientId || roomId === currentRoomId || ackToken === currentToken) {
+        return;
+      }
+      sendLeaveRoom({ roomId, clientId, sessionToken: ackToken, sendOptions: { queueIfDisconnected: false } });
+    }
+
     function isObsIngestHostBackend() {
       return typeof options.isObsIngestHostBackend === 'function' ? Boolean(options.isObsIngestHostBackend()) : false;
     }
@@ -144,11 +193,20 @@
     }
 
     async function handleRoomJoinedMessage(data) {
+      const snapshot = getViewerAckSnapshot();
+      if (!isCurrentViewerAck(data, snapshot)) {
+        ignoreStaleViewerAck(data, 'room-joined:before-peer-cleanup');
+        return;
+      }
       callOptional('clearAllRelayOfferRetries');
-      callOptional('rememberMediaManifest', data && data.mediaManifest);
       if (typeof options.clearAllPeerConnections === 'function') {
         await options.clearAllPeerConnections({ clearRetryState: true });
       }
+      if (!isCurrentViewerAck(data, snapshot)) {
+        ignoreStaleViewerAck(data, 'room-joined:after-peer-cleanup');
+        return;
+      }
+      callOptional('rememberMediaManifest', data && data.mediaManifest);
       callOptional('resetViewerFpsIndicator');
       const roomId = data && data.roomId;
       const sessionToken = data && data.sessionToken ? data.sessionToken : '';
@@ -253,18 +311,21 @@
       const role = data && data.role;
       const roomId = data && data.roomId;
       const sessionToken = (data && data.sessionToken) || getOptionValue('getCurrentSessionToken', '') || '';
-      callOptional('setSessionRoomState', { roomId, role, sessionToken });
-      callOptional('rememberMediaManifest', data && data.mediaManifest);
-      syncRendererAppState('session-resumed', {
-        role,
-        roomId,
-        sessionToken,
-        hostId: role === 'host' ? null : getOptionValue('getHostId', null),
-        upstreamPeerId: role === 'host' ? null : getOptionValue('getUpstreamPeerId', null),
-        chainPosition: role === 'host' ? -1 : getOptionValue('getChainPosition', -1),
-        viewerCount: Math.max(0, Number(data && data.viewerCount) || 0)
-      });
+      const commitSessionState = () => {
+        callOptional('setSessionRoomState', { roomId, role, sessionToken });
+        callOptional('rememberMediaManifest', data && data.mediaManifest);
+        syncRendererAppState('session-resumed', {
+          role,
+          roomId,
+          sessionToken,
+          hostId: role === 'host' ? null : getOptionValue('getHostId', null),
+          upstreamPeerId: role === 'host' ? null : getOptionValue('getUpstreamPeerId', null),
+          chainPosition: role === 'host' ? -1 : getOptionValue('getChainPosition', -1),
+          viewerCount: Math.max(0, Number(data && data.viewerCount) || 0)
+        });
+      };
       if (role === 'host') {
+        commitSessionState();
         setObsRoomCreatePending(false);
         if (nativeSessionState && typeof nativeSessionState.setObsIngestStreamActive === 'function') {
           nativeSessionState.setObsIngestStreamActive(isObsIngestHostBackend() ? true : getObsIngestStreamActive());
@@ -287,11 +348,21 @@
         return;
       }
 
-      callOptional('setIsHost', false);
+      const snapshot = getViewerAckSnapshot();
+      if (role !== 'viewer' || !isCurrentViewerAck(data, snapshot, true)) {
+        ignoreStaleViewerAck(data, 'session-resumed:before-peer-cleanup');
+        return;
+      }
       callOptional('clearAllRelayOfferRetries');
       if (typeof options.clearAllPeerConnections === 'function') {
         await options.clearAllPeerConnections({ clearRetryState: true });
       }
+      if (!isCurrentViewerAck(data, snapshot, true)) {
+        ignoreStaleViewerAck(data, 'session-resumed:after-peer-cleanup');
+        return;
+      }
+      commitSessionState();
+      callOptional('setIsHost', false);
       callOptional('resetViewerFpsIndicator');
       const hostId = (data && data.hostId) || getOptionValue('getHostId', null);
       const upstreamPeerId = (data && data.upstreamPeerId) || hostId;

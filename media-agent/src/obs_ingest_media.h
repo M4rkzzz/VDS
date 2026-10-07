@@ -25,3 +25,7 @@ std::uint32_t packet_timestamp_at_clock_rate(
   const AVStream* stream,
   const AVPacket* packet,
   int clock_rate);
+bool packet_presentation_timestamp_us(
+  const AVPacket* packet,
+  AVRational time_base,
+  std::int64_t* timestamp_us);

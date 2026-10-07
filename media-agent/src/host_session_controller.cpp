@@ -4,6 +4,7 @@
 
 #include "agent_diagnostics.h"
 #include "host_session_state.h"
+#include "host_media_clock.h"
 #include "host_session_runtime.h"
 #include "host_session_start_pipeline.h"
 #include "host_session_stop_pipeline.h"
@@ -23,6 +24,7 @@ HostSessionCommandResult start_host_session_from_request(
   const HostSessionControllerCallbacks& callbacks) {
   emit_host_session_breadcrumb("startHostSession:begin");
   vds::media_agent::drain_running_host_session(state, session, obs_ingest, callbacks, "host-session-restart");
+  vds::media_agent::reset_shared_host_media_clock();
 
   const int requested_obs_port = vds::media_agent::apply_host_session_start_request(session, request_json);
   emit_host_session_breadcrumb(

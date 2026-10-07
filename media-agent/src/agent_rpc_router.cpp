@@ -42,6 +42,13 @@ void write_command_result(int id, const CommandResult& result) {
   write_json_line(build_result_payload(id, result.result_json));
 }
 
+void write_owner_busy_error(int id) {
+  write_json_line(build_error_payload(
+    id,
+    "MEDIA_SESSION_ACTIVE",
+    "Stop the active media session before selecting a different mediaSessionId"));
+}
+
 }  // namespace
 
 void run_agent_rpc_loop(AgentRuntimeState& runtime_state) {
@@ -82,28 +89,40 @@ void run_agent_rpc_loop(AgentRuntimeState& runtime_state) {
     }
 
     if (method == "startAudioSession") {
-      vds::media_agent::activate_audio_owner_session_from_request(runtime_state, line);
+      if (!vds::media_agent::activate_audio_owner_session_from_request(runtime_state, line)) {
+        write_owner_busy_error(id);
+        continue;
+      }
       HostAudioDispatchSession host_audio_dispatch = bind_active_host_audio_dispatch(runtime_state, peer_sessions);
       write_command_result(id, host_audio_dispatch.start_from_request(line));
       continue;
     }
 
     if (method == "prepareObsIngest") {
-      vds::media_agent::activate_media_owner_sessions_from_request(runtime_state, line);
+      if (!vds::media_agent::activate_media_owner_sessions_from_request(runtime_state, line)) {
+        write_owner_busy_error(id);
+        continue;
+      }
       ObsIngestSession obs_ingest = bind_active_obs_ingest_session(runtime_state);
       write_command_result(id, obs_ingest.prepare_from_request(line));
       continue;
     }
 
     if (method == "stopAudioSession") {
-      vds::media_agent::activate_audio_owner_session_from_request(runtime_state, line);
+      if (!vds::media_agent::activate_audio_owner_session_from_request(runtime_state, line)) {
+        write_owner_busy_error(id);
+        continue;
+      }
       HostAudioDispatchSession host_audio_dispatch = bind_active_host_audio_dispatch(runtime_state, peer_sessions);
       write_command_result(id, host_audio_dispatch.stop_from_request());
       continue;
     }
 
     if (method == "startHostSession") {
-      vds::media_agent::activate_media_owner_sessions_from_request(runtime_state, line);
+      if (!vds::media_agent::activate_media_owner_sessions_from_request(runtime_state, line)) {
+        write_owner_busy_error(id);
+        continue;
+      }
       HostSessionController host_sessions(runtime_state);
       HostSessionControllerCallbacks callbacks = make_start_host_session_callbacks(runtime_state);
       write_command_result(id, host_sessions.start_from_request(line, callbacks));
@@ -111,7 +130,10 @@ void run_agent_rpc_loop(AgentRuntimeState& runtime_state) {
     }
 
     if (method == "stopHostSession") {
-      vds::media_agent::activate_media_owner_sessions_from_request(runtime_state, line);
+      if (!vds::media_agent::activate_media_owner_sessions_from_request(runtime_state, line)) {
+        write_owner_busy_error(id);
+        continue;
+      }
       HostSessionController host_sessions(runtime_state);
       HostSessionControllerCallbacks callbacks = make_stop_host_session_callbacks(runtime_state);
       write_command_result(id, host_sessions.stop(callbacks));

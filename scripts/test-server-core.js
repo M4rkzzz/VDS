@@ -52,6 +52,17 @@ function onceMessage(ws) {
   });
 }
 
+async function acknowledgeChainReconnect(ws, session, clientId, expectedUpstreamId) {
+  const reconnect = await onceMessage(ws);
+  assert.strictEqual(reconnect.type, 'chain-reconnect');
+  assert.strictEqual(reconnect.upstreamPeerId, expectedUpstreamId);
+  ws.send(JSON.stringify({
+    type: 'viewer-reconnect-ready', roomId: session.roomId, clientId,
+    sessionToken: session.sessionToken, chainPosition: reconnect.newChainPosition,
+    upstreamPeerId: reconnect.upstreamPeerId
+  }));
+}
+
 function collectMessages(ws, durationMs) {
   return new Promise((resolve) => {
     const messages = [];
@@ -1588,6 +1599,7 @@ async function testViewerReconnectReselectsUpstreamWithFanoutLimit() {
       upstreamPeerId: 'viewer-fanout-b',
       failedUpstreamPeerId: 'viewer-fanout-b'
     }));
+    await acknowledgeChainReconnect(viewerC, joinedC, 'viewer-fanout-c', 'host-fanout');
     const hostReconnect = await onceMessage(host);
     assert.strictEqual(hostReconnect.type, 'viewer-joined');
     assert.strictEqual(hostReconnect.viewerId, 'viewer-fanout-c');
@@ -1639,6 +1651,7 @@ async function testStaleViewerReconnectReadyDoesNotReselectCurrentUpstream() {
       upstreamPeerId: 'viewer-stale-reconnect-b',
       failedUpstreamPeerId: 'viewer-stale-reconnect-b'
     }));
+    await acknowledgeChainReconnect(viewerC, joinedC, 'viewer-stale-reconnect-c', 'host-stale-reconnect');
     const firstReconnect = await onceMessage(host);
     assert.strictEqual(firstReconnect.type, 'viewer-joined');
     assert.strictEqual(firstReconnect.viewerId, 'viewer-stale-reconnect-c');
@@ -1772,6 +1785,7 @@ async function testViewerCapabilityLimitsDirectDownstreams() {
       upstreamPeerId: 'viewer-capability-b',
       failedUpstreamPeerId: 'viewer-capability-b'
     }));
+    await acknowledgeChainReconnect(viewerC, joinedC, 'viewer-capability-c', 'host-capability');
     const hostReconnect = await onceMessage(host);
     assert.strictEqual(hostReconnect.type, 'viewer-joined');
     assert.strictEqual(hostReconnect.viewerId, 'viewer-capability-c');
@@ -1791,6 +1805,7 @@ async function testViewerCapabilityLimitsDirectDownstreams() {
       upstreamPeerId: 'viewer-capability-c',
       failedUpstreamPeerId: 'viewer-capability-c'
     }));
+    await acknowledgeChainReconnect(viewerD, joinedD, 'viewer-capability-d', 'viewer-capability-b');
     const fallbackToB = await onceMessage(viewerB);
     assert.strictEqual(fallbackToB.type, 'connect-to-next');
     assert.strictEqual(fallbackToB.nextViewerId, 'viewer-capability-d');

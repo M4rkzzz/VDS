@@ -1,6 +1,8 @@
 import type { CapabilityReport } from './capabilities';
+import type { WebPlaybackMetrics } from './playback-session';
 
 const DIAGNOSTICS_SCHEMA_VERSION = 2;
+const DIAGNOSTICS_NOTIFICATION_INTERVAL_MS = 250;
 
 type IceCounters = {
   local: number;
@@ -33,6 +35,11 @@ type DiagnosticsSnapshot = {
   webDroppedAudioBlocks: number;
   relayProtocol: string;
   relayProtocolState: string;
+  playbackState: string;
+  videoDecoderState?: string;
+  audioDecoderState?: string;
+  playbackFailureReason?: string;
+  webPlaybackMetrics?: WebPlaybackMetrics;
   h264PayloadFormat: string;
   reencodePathUsed: boolean;
   relayFailureReason?: string;
@@ -59,6 +66,8 @@ type ObservedMediaManifest = {
 export class DiagnosticsStore {
   private snapshot: DiagnosticsSnapshot;
   private listeners = new Set<() => void>();
+  private notificationTimer: number | null = null;
+  private notificationPending = false;
 
   constructor(capability: CapabilityReport, clientId: string) {
     this.snapshot = {
@@ -81,6 +90,7 @@ export class DiagnosticsStore {
       webDroppedAudioBlocks: 0,
       relayProtocol: 'vds-media-encoded-v1',
       relayProtocolState: 'idle',
+      playbackState: 'stopped',
       h264PayloadFormat: 'unknown',
       reencodePathUsed: false,
       observedMediaManifests: [],
@@ -90,10 +100,20 @@ export class DiagnosticsStore {
 
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+    this.scheduleNotification();
+    return () => {
+      this.listeners.delete(listener);
+      if (!this.listeners.size && this.notificationTimer !== null) {
+        window.clearTimeout(this.notificationTimer);
+        this.notificationTimer = null;
+      }
+    };
   }
 
   update(partial: Partial<DiagnosticsSnapshot>): void {
+    if (!partial.mediaManifest && Object.entries(partial).every(([name, value]) => (
+      this.snapshot[name as keyof DiagnosticsSnapshot] === value
+    ))) return;
     const observedMediaManifests = partial.mediaManifest
       ? recordObservedMediaManifest(this.snapshot.observedMediaManifests, partial.mediaManifest)
       : this.snapshot.observedMediaManifests;
@@ -102,6 +122,7 @@ export class DiagnosticsStore {
   }
 
   updateIce(peerId: string, state: string): void {
+    if (this.snapshot.iceState[peerId] === state) return;
     this.snapshot.iceState = { ...this.snapshot.iceState, [peerId]: state };
     this.emit();
   }
@@ -132,6 +153,7 @@ export class DiagnosticsStore {
       | 'webDroppedAudioBlocks',
     amount = 1
   ): void {
+    if (amount === 0) return;
     const observedMediaManifests = incrementObservedMediaCounter(
       this.snapshot.observedMediaManifests,
       this.snapshot.mediaManifest,
@@ -192,9 +214,21 @@ export class DiagnosticsStore {
   }
 
   private emit(): void {
-    for (const listener of this.listeners) {
-      listener();
-    }
+    this.notificationPending = true;
+    this.scheduleNotification();
+  }
+
+  private scheduleNotification(): void {
+    if (!this.notificationPending || !this.listeners.size || this.notificationTimer !== null) return;
+    this.notificationTimer = window.setTimeout(() => {
+      this.notificationTimer = null;
+      if (!this.listeners.size || !this.notificationPending) return;
+      // Clear before notifying so a listener's update schedules the next batch.
+      this.notificationPending = false;
+      for (const listener of [...this.listeners]) {
+        if (this.listeners.has(listener)) listener();
+      }
+    }, DIAGNOSTICS_NOTIFICATION_INTERVAL_MS);
   }
 }
 

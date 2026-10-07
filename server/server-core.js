@@ -87,6 +87,8 @@ function startServer(options = {}) {
   const maxMessagesPerWindow = normalizePositiveInt(options.maxMessagesPerWindow || process.env.WS_MAX_MESSAGES_PER_WINDOW, DEFAULT_MAX_MESSAGES_PER_WINDOW);
   const messageRateWindowMs = normalizePositiveInt(options.messageRateWindowMs || process.env.WS_MESSAGE_RATE_WINDOW_MS, DEFAULT_MESSAGE_RATE_WINDOW_MS);
   const adminPort = options.adminPort === undefined ? 0 : normalizePositiveInt(options.adminPort, 0);
+  const adminHost = String(options.adminHost || process.env.ADMIN_HOST || '127.0.0.1');
+  const adminToken = String(options.adminToken ?? process.env.ADMIN_TOKEN ?? '').trim();
   const appVersion = resolveAppVersion(baseDir);
   const iceServers = buildIceServers();
   const publicDir = resolveExistingPath([
@@ -124,7 +126,7 @@ function startServer(options = {}) {
   });
 
   app.use((req, res, next) => {
-    if (req.path.startsWith('/api/')) {
+    if (req.path.startsWith('/api/') && !/^\/api\/admin(?:\/|$)/i.test(req.path)) {
       res.header('Access-Control-Allow-Origin', '*');
       res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
       res.header('Access-Control-Allow-Headers', 'Content-Type');
@@ -196,21 +198,37 @@ function startServer(options = {}) {
     });
   });
 
-  app.get('/api/admin/rooms', (_req, res) => {
-    res.json({
-      generatedAt: Date.now(),
-      activeConnections,
-      limits: {
-        maxRooms,
-        maxViewersPerRoom,
-        maxDownstreamsPerUpstream,
-        maxConnections
-      },
-      rooms: buildAdminRoomSnapshotList(rooms, maxDownstreamsPerUpstream)
-    });
-  });
+  function authorizeAdmin(req, res, next) {
+    res.set('Cache-Control', 'no-store');
+    if (!adminToken) {
+      res.status(503).json({ code: 'admin-disabled', message: 'Configure ADMIN_TOKEN to enable the dashboard' });
+      return;
+    }
+    const match = /^Bearer (.+)$/i.exec(String(req.headers.authorization || ''));
+    if (!match || !isValidSessionToken(adminToken, match[1])) {
+      res.set('WWW-Authenticate', 'Bearer realm="VDS admin"');
+      res.status(401).json({ code: 'admin-unauthorized', message: 'Admin token is required' });
+      return;
+    }
+    next();
+  }
+
+  function sendAdminSnapshot(_req, res) {
+    res.json(buildAdminSnapshot(rooms, maxDownstreamsPerUpstream, activeConnections, {
+      maxRooms,
+      maxViewersPerRoom,
+      maxDownstreamsPerUpstream,
+      maxConnections
+    }));
+  }
+
+  app.get('/api/admin/rooms', authorizeAdmin, sendAdminSnapshot);
 
   wss.on('connection', (ws, req) => {
+    // Protocol errors (including maxPayload) belong to this connection, not the process.
+    ws.on('error', (error) => {
+      logServerWarning('ws-connection-error', 'WebSocket connection error:', error);
+    });
     if (activeConnections >= maxConnections) {
       sendJson(ws, {
         type: 'error',
@@ -228,14 +246,25 @@ function startServer(options = {}) {
     logServerDebug('New WebSocket connection');
 
     ws.on('message', (message) => {
+      if (!isSocketOpen(ws)) {
+        return;
+      }
+      let data;
       try {
-        const data = JSON.parse(message);
+        data = JSON.parse(message);
+      } catch (error) {
+        // Malformed JSON still consumes this connection's message allowance.
+        validateInboundMessage(ws, null, maxMessagesPerWindow, messageRateWindowMs);
+        logServerWarning('ws-message-parse', 'Error parsing message:', error);
+        return;
+      }
+      try {
         if (!validateInboundMessage(ws, data, maxMessagesPerWindow, messageRateWindowMs)) {
           return;
         }
         handleMessage(ws, data);
       } catch (error) {
-        logServerWarning('ws-message-parse', 'Error parsing message:', error);
+        logServerWarning('ws-message-handler', 'Error handling message:', error);
       }
     });
 
@@ -372,6 +401,10 @@ function startServer(options = {}) {
       clearDisconnectTimer(existingViewer);
       existingViewer.ws = ws;
       existingViewer.mediaCapabilities = sanitizeMediaCapabilities(data.mediaCapabilities, ws.__vdsUserAgent) || existingViewer.mediaCapabilities;
+      if (data.needsMediaReconnect === true) {
+        existingViewer.mediaReady = false;
+        existingViewer.relayEstablished = false;
+      }
       attachSocketMetadata(ws, roomId, clientId, 'viewer');
       retireSocket(previousWs, 'viewer-rebound', ws);
 
@@ -390,7 +423,9 @@ function startServer(options = {}) {
         });
 
         if (!existingViewer.mediaReady || !existingViewer.relayEstablished) {
-          requestViewerReconnect(room, existingViewer);
+          requestViewerReconnect(room, existingViewer, maxDownstreamsPerUpstream);
+        } else {
+          notifyPendingDownstreams(room, existingViewer);
         }
       }
       return;
@@ -537,8 +572,9 @@ function startServer(options = {}) {
     });
 
     if (data.needsMediaReconnect) {
-      requestViewerReconnect(room, viewer);
+      requestViewerReconnect(room, viewer, maxDownstreamsPerUpstream);
     }
+    notifyPendingDownstreams(room, viewer);
   }
 
   function handleViewerReady(ws, data) {
@@ -568,6 +604,7 @@ function startServer(options = {}) {
     viewer.mediaReady = true;
     viewer.relayEstablished = true;
     viewer.connectRequestPending = false;
+    viewer.upstreamChangePending = false;
 
     notifyPendingDownstreams(room, viewer);
   }
@@ -593,6 +630,18 @@ function startServer(options = {}) {
     }
     const failedUpstreamId = String(data.failedUpstreamPeerId || '');
     if (failedUpstreamId && failedUpstreamId !== getViewerUpstreamId(room, viewer)) {
+      return;
+    }
+
+    if (viewer.upstreamChangePending && !failedUpstreamId) {
+      if (data.upstreamPeerId && data.upstreamPeerId !== getViewerUpstreamId(room, viewer)) {
+        return;
+      }
+      viewer.upstreamChangePending = false;
+      viewer.mediaReady = false;
+      viewer.relayEstablished = false;
+      viewer.connectRequestPending = false;
+      notifyViewerCurrentUpstream(room, viewer, true);
       return;
     }
 
@@ -792,6 +841,9 @@ function startServer(options = {}) {
 
     const [viewer] = room.viewers.splice(viewerIndex, 1);
     clearDisconnectTimer(viewer);
+    clearSocketMetadata(viewer.ws);
+    viewer.sessionToken = null;
+    viewer.ws = null;
     notifyHostViewerCount(room);
 
     const leftPosition = viewer.chainPosition;
@@ -869,16 +921,10 @@ function startServer(options = {}) {
 
   if (adminPort > 0) {
     const adminApp = express();
-    adminApp.get('/api/rooms', (_req, res) => {
-      res.json(buildAdminSnapshot(rooms, maxDownstreamsPerUpstream, activeConnections, {
-        maxRooms,
-        maxViewersPerRoom,
-        maxDownstreamsPerUpstream,
-        maxConnections
-      }));
-    });
+    adminApp.get('/api/rooms', authorizeAdmin, sendAdminSnapshot);
     if (publicDir) {
       adminApp.get('/', (_req, res, next) => {
+        res.set('Cache-Control', 'no-store');
         const adminEntry = path.join(publicDir, 'admin.html');
         if (fs.existsSync(adminEntry)) {
           res.sendFile(adminEntry);
@@ -892,10 +938,10 @@ function startServer(options = {}) {
     });
     adminServer = http.createServer(adminApp);
     adminServer.on('error', handleListenError);
-    adminServer.listen(adminPort, () => {
+    adminServer.listen(adminPort, adminHost, () => {
       const address = adminServer.address();
       const actualPort = address && typeof address === 'object' ? address.port : adminPort;
-      logServerInfo(`Admin dashboard running on http://localhost:${actualPort}`);
+      logServerInfo(`Admin dashboard running on http://${adminHost}:${actualPort} (${adminToken ? 'token required' : 'disabled: configure ADMIN_TOKEN'})`);
     });
   }
 
@@ -928,9 +974,12 @@ function requestViewerReconnect(room, viewer, maxDownstreamsPerUpstream = DEFAUL
     return;
   }
 
+  const previousUpstreamId = getViewerUpstreamId(room, viewer);
   viewer.mediaReady = false;
   viewer.relayEstablished = false;
   viewer.connectRequestPending = false;
+  viewer.upstreamChangePending = false;
+  viewer.needsChainReconnect = false;
   const upstreamPeerId = selectViewerUpstream(room, viewer.chainPosition, maxDownstreamsPerUpstream, viewer.clientId, failedUpstreamId);
   viewer.upstreamPeerId = upstreamPeerId;
   if (!upstreamPeerId) {
@@ -942,6 +991,11 @@ function requestViewerReconnect(room, viewer, maxDownstreamsPerUpstream = DEFAUL
         message: 'No upstream peer is currently available for reconnect'
       });
     }
+    return;
+  }
+  if (upstreamPeerId !== previousUpstreamId) {
+    viewer.needsChainReconnect = true;
+    notifyReconnectTargets(room);
     return;
   }
   notifyViewerCurrentUpstream(room, viewer, true);
@@ -1613,15 +1667,6 @@ function codecListIncludes(values, target) {
 }
 
 function validateInboundMessage(ws, data, maxMessagesPerWindow, messageRateWindowMs) {
-  if (!data || typeof data !== 'object' || typeof data.type !== 'string' || data.type.length > 64) {
-    sendJson(ws, {
-      type: 'error',
-      code: 'invalid-message',
-      message: 'Invalid message'
-    });
-    return false;
-  }
-
   const now = Date.now();
   if (!ws.__vdsRateWindowStartedAt || now - ws.__vdsRateWindowStartedAt > messageRateWindowMs) {
     ws.__vdsRateWindowStartedAt = now;
@@ -1635,6 +1680,15 @@ function validateInboundMessage(ws, data, maxMessagesPerWindow, messageRateWindo
       message: 'Too many messages'
     });
     ws.close(1008, 'message-rate-limit');
+    return false;
+  }
+
+  if (!data || typeof data !== 'object' || typeof data.type !== 'string' || data.type.length > 64) {
+    sendJson(ws, {
+      type: 'error',
+      code: 'invalid-message',
+      message: 'Invalid message'
+    });
     return false;
   }
 
@@ -1957,6 +2011,7 @@ function markViewerForReconnect(viewer, upstreamPeerId) {
   viewer.mediaReady = false;
   viewer.relayEstablished = false;
   viewer.connectRequestPending = false;
+  viewer.upstreamChangePending = false;
   viewer.needsChainReconnect = true;
 }
 
@@ -2018,8 +2073,9 @@ function notifyReconnectTargets(room) {
     if (!upstreamPeerId) {
       return;
     }
-    viewer.needsChainReconnect = false;
     if (isSocketOpen(viewer.ws)) {
+      viewer.needsChainReconnect = false;
+      viewer.upstreamChangePending = true;
       sendJson(viewer.ws, {
         type: 'chain-reconnect',
         newChainPosition: viewer.chainPosition,

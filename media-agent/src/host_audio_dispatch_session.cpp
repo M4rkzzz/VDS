@@ -17,6 +17,7 @@
 #include "audio_session_state.h"
 #include "audio_transport_config.h"
 #include "json_protocol.h"
+#include "host_media_clock.h"
 #include "peer_session_controller.h"
 #include "peer_transport.h"
 #include "wasapi_backend.h"
@@ -77,13 +78,24 @@ struct HostAudioDispatchState {
     unsigned int bits_per_sample = 0;
     unsigned int block_align = 0;
     bool silent = false;
+    std::uint64_t first_sample_us = 0;
+    std::uint64_t clock_generation = 0;
+    std::string source_epoch;
+    std::uint64_t capture_sequence = 0;
   };
 
   std::mutex mutex;
   std::condition_variable cv;
   std::vector<std::weak_ptr<PeerTransportSession>> sessions;
   std::deque<QueuedCapturePacket> capture_queue;
-  unsigned long long next_timestamp_samples = 0;
+  std::uint64_t next_timestamp_samples = 0;
+  std::uint64_t next_audio_sequence = 0;
+  std::uint64_t next_capture_sequence = 0;
+  std::uint64_t last_capture_sequence = 0;
+  std::uint64_t clock_generation = 0;
+  std::string source_epoch;
+  bool source_clock_valid = false;
+  std::deque<std::int64_t> encoder_frame_pts;
   std::deque<std::int16_t> pending_pcm;
   AVCodecContext* encoder_context = nullptr;
   AVPacket* encoder_packet = nullptr;
@@ -193,6 +205,8 @@ bool ensure_host_audio_encoder_locked(HostAudioDispatchState& state, std::string
 
 void reset_host_audio_encoder_locked(HostAudioDispatchState& state) {
   state.pending_pcm.clear();
+  state.encoder_frame_pts.clear();
+  state.source_clock_valid = false;
   state.last_error.clear();
   if (state.encoder_packet) {
     av_packet_free(&state.encoder_packet);
@@ -256,8 +270,8 @@ bool send_host_audio_opus_frame_locked(
     state.pending_pcm.pop_front();
   }
 
-  const std::uint64_t timestamp_us =
-    (state.next_timestamp_samples * 1000000ull) / kTransportAudioSampleRate;
+  const auto frame_pts = static_cast<std::int64_t>(state.next_timestamp_samples);
+  frame->pts = frame_pts;
   const int send_result = avcodec_send_frame(state.encoder_context, frame);
   av_frame_free(&frame);
   if (send_result < 0) {
@@ -266,8 +280,10 @@ bool send_host_audio_opus_frame_locked(
     }
     return false;
   }
+  state.encoder_frame_pts.push_back(frame_pts);
+  // Advance for every accepted input frame, including encoder delay/EAGAIN.
+  state.next_timestamp_samples += static_cast<std::uint64_t>(state.encoder_frame_size);
 
-  bool emitted_packet = false;
   while (true) {
     const int receive_result = avcodec_receive_packet(state.encoder_context, state.encoder_packet);
     if (receive_result == AVERROR(EAGAIN) || receive_result == AVERROR_EOF) {
@@ -284,6 +300,16 @@ bool send_host_audio_opus_frame_locked(
       state.encoder_packet->data,
       state.encoder_packet->data + state.encoder_packet->size
     );
+    const auto fallback_pts = state.encoder_frame_pts.empty()
+      ? frame_pts : state.encoder_frame_pts.front();
+    const auto packet_pts = state.encoder_packet->pts == AV_NOPTS_VALUE
+      ? fallback_pts : state.encoder_packet->pts + state.encoder_context->initial_padding;
+    const auto timestamp_us = vds::media_agent::host_media_samples_to_us(
+      static_cast<std::uint64_t>(std::max<std::int64_t>(0, packet_pts)), kTransportAudioSampleRate);
+    const auto packet_sequence = state.next_audio_sequence++;
+    if (!state.encoder_frame_pts.empty()) {
+      state.encoder_frame_pts.pop_front();
+    }
     std::string send_error;
     for (const auto& session : sessions) {
       const PeerTransportSnapshot snapshot = get_peer_transport_snapshot(session);
@@ -299,7 +325,8 @@ bool send_host_audio_opus_frame_locked(
         encoded_frame.codec = "opus";
         encoded_frame.payload_format = "opus-raw";
         encoded_frame.timestamp_us = timestamp_us;
-        encoded_frame.sequence = state.next_timestamp_samples;
+        encoded_frame.sequence = packet_sequence;
+        encoded_frame.source_epoch = state.source_epoch;
         encoded_frame.payload = encoded;
         send_peer_transport_encoded_media_frame(session, encoded_frame, &send_error);
       } else {
@@ -307,11 +334,6 @@ bool send_host_audio_opus_frame_locked(
       }
     }
     av_packet_unref(state.encoder_packet);
-    emitted_packet = true;
-  }
-
-  if (emitted_packet) {
-    state.next_timestamp_samples += static_cast<unsigned long long>(state.encoder_frame_size);
   }
 
   return true;
@@ -344,8 +366,33 @@ void process_host_audio_capture_packet(
   }
 
   if (sessions.empty()) {
+    reset_host_audio_encoder_locked(state);
     return;
   }
+
+  const auto clock = vds::media_agent::host_media_clock_snapshot();
+  const auto source_now_us = vds::media_agent::host_media_now_us(clock);
+  if (packet.clock_generation != clock.generation ||
+      (source_now_us > packet.first_sample_us && source_now_us - packet.first_sample_us > 250000)) {
+    reset_host_audio_encoder_locked(state);
+    return;
+  }
+
+  const auto pending_frames = state.pending_pcm.size() / kTransportAudioChannelCount;
+  const auto expected_sample_us = vds::media_agent::host_media_samples_to_us(
+    state.next_timestamp_samples + pending_frames, kTransportAudioSampleRate);
+  const auto capture_gap_us = packet.first_sample_us > expected_sample_us
+    ? packet.first_sample_us - expected_sample_us : expected_sample_us - packet.first_sample_us;
+  if (!state.source_clock_valid || state.clock_generation != packet.clock_generation ||
+      packet.capture_sequence != state.last_capture_sequence + 1 || capture_gap_us > 100000) {
+    reset_host_audio_encoder_locked(state);
+    state.next_timestamp_samples = vds::media_agent::host_media_us_to_samples(
+      packet.first_sample_us, kTransportAudioSampleRate);
+    state.clock_generation = packet.clock_generation;
+    state.source_epoch = packet.source_epoch;
+    state.source_clock_valid = true;
+  }
+  state.last_capture_sequence = packet.capture_sequence;
 
   std::string encoder_error;
   if (!ensure_host_audio_encoder_locked(state, &encoder_error)) {
@@ -368,6 +415,7 @@ void process_host_audio_capture_packet(
   while (state.pending_pcm.size() >= static_cast<std::size_t>(state.encoder_frame_size) * kTransportAudioChannelCount) {
     std::string send_error;
     if (!send_host_audio_opus_frame_locked(state, sessions, &send_error)) {
+      reset_host_audio_encoder_locked(state);
       state.last_error = send_error;
       break;
     }
@@ -538,7 +586,17 @@ void HostAudioDispatchSession::attach_wasapi_callbacks() const {
 }
 
 void HostAudioDispatchSession::set_capture_active(bool active) const {
-  g_host_audio_capture_active.store(active, std::memory_order_release);
+  const bool previous = g_host_audio_capture_active.exchange(active, std::memory_order_acq_rel);
+  if (previous != active) {
+    auto& state = host_audio_dispatch_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    // A capture restart is a source discontinuity even if it is shorter than
+    // the queue's age limit. Do not concatenate old partial PCM with new input.
+    ++state.next_capture_sequence;
+    if (!active) {
+      state.capture_queue.clear();
+    }
+  }
 }
 
 void HostAudioDispatchSession::register_transport_session(
@@ -585,6 +643,8 @@ void HostAudioDispatchSession::reset_transport_sessions() const {
     state.sessions.clear();
     state.capture_queue.clear();
     state.next_timestamp_samples = 0;
+    state.next_audio_sequence = 0;
+    state.next_capture_sequence = 0;
   }
   reset_host_audio_encoder_locked(state);
 }
@@ -600,7 +660,7 @@ void HostAudioDispatchSession::dispatch_capture_packet(
 
   auto& state = host_audio_dispatch_state();
 
-  if (!silent && (!data || frames == 0 || status.block_align == 0)) {
+  if (frames == 0 || status.sample_rate == 0 || (!silent && (!data || status.block_align == 0))) {
     return;
   }
 
@@ -611,6 +671,11 @@ void HostAudioDispatchSession::dispatch_capture_packet(
   packet.bits_per_sample = status.bits_per_sample;
   packet.block_align = status.block_align;
   packet.silent = silent;
+  const auto clock = vds::media_agent::host_media_clock_snapshot();
+  packet.clock_generation = clock.generation;
+  packet.source_epoch = clock.source_epoch;
+  packet.first_sample_us = vds::media_agent::host_media_packet_first_sample_us(
+    vds::media_agent::host_media_now_us(clock), frames, status.sample_rate);
   if (!silent) {
     const std::size_t byte_count = static_cast<std::size_t>(frames) * status.block_align;
     packet.bytes.assign(data, data + byte_count);
@@ -618,11 +683,15 @@ void HostAudioDispatchSession::dispatch_capture_packet(
 
   {
     std::lock_guard<std::mutex> lock(state.mutex);
+    packet.capture_sequence = state.next_capture_sequence++;
     if (state.sessions.empty()) {
       return;
     }
     ensure_host_audio_dispatch_worker_running_locked(state);
-    if (state.capture_queue.size() >= kMaxQueuedHostAudioCapturePackets) {
+    while (!state.capture_queue.empty() &&
+           (state.capture_queue.size() >= kMaxQueuedHostAudioCapturePackets ||
+            (packet.first_sample_us > state.capture_queue.front().first_sample_us &&
+             packet.first_sample_us - state.capture_queue.front().first_sample_us > 250000))) {
       state.capture_queue.pop_front();
     }
     state.capture_queue.push_back(std::move(packet));

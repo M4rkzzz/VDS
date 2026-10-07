@@ -276,6 +276,12 @@
       return !Boolean(optionsForCheck.stopInFlight);
     }
 
+    function assertHostStartCurrent(generation) {
+      if (!isHostStartCurrent(generation, { stopInFlight: getStopShareInFlight() })) {
+        throw new Error('native-host-start-superseded');
+      }
+    }
+
     function setNativeHostSessionRunning(running) {
       callOptional('setNativeHostSessionRunning', Boolean(running));
     }
@@ -705,9 +711,12 @@
       try {
         applyEffects(buildHostStartBeginEffects({ backend: 'native' }));
         await callOptional('ensureNativeUiReady');
+        assertHostStartCurrent(startGeneration);
         const parsedSource = prepareNativeCaptureHostStart(sourceId);
         await callOptional('ensureMediaEngineStarted');
+        assertHostStartCurrent(startGeneration);
         await callOptional('waitForHostUiReady');
+        assertHostStartCurrent(startGeneration);
         callOptional('refreshQualitySettingsUi');
         const previewStartState = buildNativePreviewStartState({ nativeHostPreviewEnabled: context.nativeHostPreviewEnabled });
         const preferredPreview = Boolean(previewStartState.preferredPreview);
@@ -717,12 +726,10 @@
         for (let attempt = 0; attempt < 2; attempt += 1) {
           let sessionStarted = false;
           try {
+            assertHostStartCurrent(startGeneration);
             const session = await startHostSession(parsedSource);
             callOptional('logNativeDebug', 'video', '[media-engine] host session result:', JSON.stringify(session));
-            if (!isHostStartCurrent(startGeneration, { stopInFlight: getStopShareInFlight() })) {
-              await stopHostSession({}).catch(() => {});
-              throw new Error('native-host-start-superseded');
-            }
+            assertHostStartCurrent(startGeneration);
             const validation = validateHostStartResult({ backend: 'native', session });
             if (!validation.ok) {
               if (validation.shouldStop) {
@@ -747,12 +754,10 @@
 
             if (allowPreviewForAttempt) {
               await callOptional('waitForHostUiReady');
+              assertHostStartCurrent(startGeneration);
               await callOptional('attachHostPreviewSurface');
             }
-            if (!isHostStartCurrent(startGeneration, { stopInFlight: getStopShareInFlight() })) {
-              await cleanupFailedHostStart();
-              throw new Error('native-host-start-superseded');
-            }
+            assertHostStartCurrent(startGeneration);
 
             if (shouldShowPreviewFallbackNotice({ allowPreviewForAttempt, preferredPreview, previewFallbackNoticeShown })) {
               previewFallbackNoticeShown = true;
@@ -762,15 +767,21 @@
             await createNativeCaptureHostRoom({
               session,
               effectiveCodec,
+              startGeneration,
               clientId: context.clientId || '',
               timeoutMs: 5000
             });
+            assertHostStartCurrent(startGeneration);
             return { started: true, session, effectiveCodec };
           } catch (error) {
+            // A cancelled attempt no longer owns the running host or its UI.
+            assertHostStartCurrent(startGeneration);
             if (sessionStarted) {
               await stopHostSession({}).catch(() => {});
+              assertHostStartCurrent(startGeneration);
             }
             await cleanupFailedHostStart();
+            assertHostStartCurrent(startGeneration);
             if (shouldRetryNativeStartWithoutPreview({ attempt, allowPreviewForAttempt, error })) {
               callOptional('logNativeStep', 'startHostSession:retry-without-preview', {
                 message: error && error.message ? error.message : String(error),
@@ -785,7 +796,9 @@
         }
         return { started: false, reason: 'native-host-start-exhausted' };
       } finally {
-        finishHostStart();
+        if (isHostStartCurrent(startGeneration, { stopInFlight: getStopShareInFlight() })) {
+          finishHostStart();
+        }
       }
     }
 
@@ -823,6 +836,9 @@
       const message = buildHostCreateRoomOptions(context);
       if (typeof options.sendHostCreateRoom === 'function') {
         await callOptional('waitForWsConnected', message.timeoutMs);
+        if (typeof context.startGeneration === 'number') {
+          assertHostStartCurrent(context.startGeneration);
+        }
         const waitForAck = typeof options.waitForHostRoomCreated === 'function'
           ? options.waitForHostRoomCreated({
             mediaSessionId: message.mediaManifest && message.mediaManifest.mediaSessionId,
@@ -936,18 +952,26 @@
 
     async function teardownObsHostRoom(context = {}) {
       const reason = context.reason || 'host-room-ended';
-      if (typeof options.sendLeaveRoom === 'function') {
-        await Promise.resolve(options.sendLeaveRoom({
-          roomId: context.roomId || '',
-          clientId: context.clientId || '',
-          sessionToken: context.sessionToken || '',
-          reason,
-          sendOptions: { queueIfDisconnected: false }
-        }));
+      const roomSnapshot = callOptional('getRoomSnapshot') || {};
+      const roomId = context.roomId || roomSnapshot.roomId || '';
+      const clientId = context.clientId || roomSnapshot.clientId || '';
+      const sessionToken = context.sessionToken || roomSnapshot.sessionToken || '';
+      try {
+        if (roomId && clientId && typeof options.sendLeaveRoom === 'function') {
+          await options.sendLeaveRoom({
+            roomId,
+            clientId,
+            sessionToken,
+            reason,
+            sendOptions: { queueIfDisconnected: false }
+          });
+        }
+      } finally {
+        // OBS can reconnect to the same native listening session.
+        clearRoomState(reason, { clearObsFlags: true });
+        resetPlaybackState();
+        resetObsRoomUiWaitingForStream();
       }
-      clearRoomState(reason, { resetMediaSessionId: true, clearObsFlags: true });
-      resetPlaybackState();
-      resetObsRoomUiWaitingForStream();
     }
 
     async function cleanupFailedHostStart() {

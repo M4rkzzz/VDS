@@ -19,7 +19,8 @@ RelayHub::RelayHub() : backend_(std::make_unique<Backend>()) {
       batch.upstream_peer_id,
       batch.codec,
       batch.payloads,
-      batch.rtp_timestamp
+      batch.rtp_timestamp,
+      batch.timing
     );
   });
   frame_bus_.set_audio_handler([this](const EncodedFrame& frame) {
@@ -30,7 +31,8 @@ RelayHub::RelayHub() : backend_(std::make_unique<Backend>()) {
       frame.upstream_peer_id,
       frame.payload,
       frame.codec,
-      frame.rtp_timestamp
+      frame.rtp_timestamp,
+      frame.timing
     );
   });
 }
@@ -99,7 +101,8 @@ void RelayHub::publish_video_units(
   const std::string& upstream_peer_id,
   const std::string& codec,
   const std::vector<std::vector<std::uint8_t>>& access_units,
-  std::uint32_t rtp_timestamp) const {
+  std::uint32_t rtp_timestamp,
+  const MediaFrameTiming& timing) const {
   if (upstream_peer_id.empty() || access_units.empty()) {
     return;
   }
@@ -109,6 +112,8 @@ void RelayHub::publish_video_units(
   batch.stream_type = "video";
   batch.codec = codec;
   batch.rtp_timestamp = rtp_timestamp;
+  batch.timestamp_us = timing.timestamp_us;
+  batch.timing = timing;
   batch.payloads = access_units;
   frame_bus_.publish_video(batch);
 }
@@ -117,7 +122,8 @@ void RelayHub::publish_audio_frame(
   const std::string& upstream_peer_id,
   const std::vector<std::uint8_t>& frame,
   const std::string& codec,
-  std::uint32_t rtp_timestamp) const {
+  std::uint32_t rtp_timestamp,
+  const MediaFrameTiming& timing) const {
   if (upstream_peer_id.empty() || frame.empty()) {
     return;
   }
@@ -127,6 +133,10 @@ void RelayHub::publish_audio_frame(
   encoded_frame.stream_type = "audio";
   encoded_frame.codec = codec;
   encoded_frame.rtp_timestamp = rtp_timestamp;
+  encoded_frame.timestamp_us = timing.timestamp_us;
+  encoded_frame.keyframe = timing.keyframe;
+  encoded_frame.config = timing.config;
+  encoded_frame.timing = timing;
   encoded_frame.payload = frame;
   frame_bus_.publish_audio(encoded_frame);
 }

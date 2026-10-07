@@ -8,8 +8,10 @@
 #include "host_pipeline.h"
 #include "obs_ingest_state.h"
 #include "platform_utils.h"
+#include "peer_stun_config.h"
 #include "runtime_registry.h"
 #include "session_registries.h"
+#include "session_owner_activation.h"
 #include "surface_target.h"
 #include "video_access_unit.h"
 
@@ -185,6 +187,145 @@ void test_session_registries() {
   expect_eq(vds::media_agent::active_host_session_id(runtime_state), "media-session-unit", "runtime failed host activation keeps active id");
 }
 
+void test_peer_stun_config() {
+  using namespace vds::media_agent;
+  for (const std::string& server : {
+      "stun:stun.linphone.org:3478", "stun:stun.cloudflare.com", "stun:127.0.0.1:1",
+      "stun:[2001:db8::1]:65535", "stun:[::1]", "stun:[::ffff:127.0.0.1]:3478"}) {
+    expect_true(is_valid_peer_stun_server(server), "valid STUN URI is accepted: " + server);
+  }
+  for (const std::string& server : {
+      "", "stun:", "turn:relay.example.com:3478", "turns:relay.example.com:5349",
+      "relay:relay.example.com:3478", "stun://example.com:3478", "stun:user@example.com",
+      "stun:example.com/path", "stun:example.com?transport=tcp", "stun:example.com#relay",
+      "stun:example.com:0", "stun:example.com:65536", "stun:example.com:abc",
+      "stun:example.com:", "stun:bad..example.com", "stun:-bad.example.com",
+      "stun:example.com\n", "stun:[:::]:3478", "stun:2001:db8::1"}) {
+    expect_true(!is_valid_peer_stun_server(server), "invalid/relay STUN URI is rejected: " + server);
+  }
+  expect_true(!is_valid_peer_stun_server("stun:" + std::string(252, 'a')), "oversized STUN URI is rejected");
+  std::string server;
+  expect_true(parse_peer_stun_server_request("{}", &server) && server.empty(), "absent STUN option preserves defaults");
+  expect_true(parse_peer_stun_server_request(R"json({"stunServer":"stun:stun.linphone.org:3478"})json", &server) &&
+    server == "stun:stun.linphone.org:3478", "request preserves the selected STUN server");
+  expect_true(!parse_peer_stun_server_request(R"json({"stunServer":""})json", &server), "explicit empty STUN option is rejected");
+  expect_true(!parse_peer_stun_server_request(R"json({"stunServer":null})json", &server), "non-string STUN option is rejected");
+  expect_true(parse_peer_stun_server_request(R"json({"metadata":{"stunServer":"turn:ignored.example:3478"}})json", &server) &&
+    server.empty(), "nested STUN fields cannot configure the transport");
+  expect_true(!parse_peer_stun_server_request(R"json({"stunServer":"stun:one.example","stunServer":"stun:two.example"})json", &server),
+    "duplicate top-level STUN option is rejected");
+  std::vector<std::string> servers;
+  const std::string rpc_pool = R"json({"id":1,"method":"createPeer","params":{"peerId":"rpc-peer","stunServer":"stun:127.0.0.1:3478","stunServers":["stun:127.0.0.1:3478","stun:[::1]:3478"]}})json";
+  expect_true(parse_peer_stun_server_request(rpc_pool, &server) && server == "stun:127.0.0.1:3478",
+    "real JSON-RPC params preserves the selected single STUN server");
+  expect_true(parse_peer_stun_servers_request(rpc_pool, &servers) &&
+    servers == std::vector<std::string>({"stun:127.0.0.1:3478", "stun:[::1]:3478"}),
+    "real JSON-RPC params preserves the STUN pool and IPv6 brackets");
+  expect_true(parse_peer_stun_server_request(R"json({"params":{"metadata":{"stunServer":"turn:ignored.example"}}})json", &server) && server.empty(),
+    "params does not recursively read arbitrary nested single STUN fields");
+  expect_true(parse_peer_stun_servers_request(R"json({"params":{"metadata":{"stunServers":["turn:ignored.example"]}}})json", &servers) && servers.empty(),
+    "params does not recursively read arbitrary nested STUN pools");
+  expect_true(parse_peer_stun_server_request(R"json({"params":{}})json", &server) && server.empty(), "empty params keeps single STUN defaults");
+  expect_true(parse_peer_stun_servers_request(R"json({"params":{}})json", &servers) && servers.empty(), "empty params keeps STUN pool defaults");
+  for (const std::string& request : {
+      R"json({"params":null})json", R"json({"params":[]})json", R"json({"params":true})json", R"json({"params":"{}"})json",
+      R"json({"params":{},"params":{}})json", R"json({"params":{},"stunServer":"stun:one.example"})json",
+      R"json({"params":{},"stunServers":[]})json",
+      R"json({"params":{"stunServer":"stun:one.example"},"stunServer":"stun:one.example"})json",
+      R"json({"params":{"stunServers":["stun:one.example"]},"stunServers":["stun:one.example"]})json"}) {
+    server = "stun:unchanged.example";
+    servers = {"stun:unchanged.example"};
+    expect_true(!parse_peer_stun_server_request(request, &server) && server.empty(), "invalid or ambiguous params cannot select single STUN: " + request);
+    expect_true(!parse_peer_stun_servers_request(request, &servers) && servers.empty(), "invalid or ambiguous params cannot select STUN pool: " + request);
+  }
+  for (const std::string& request : {
+      R"json({"params":{"stunServer":"turn:relay.example"}})json", R"json({"params":{"stunServer":null}})json",
+      R"json({"params":{"stunServer":3478}})json", R"json({"params":{"stunServer":""}})json",
+      R"json({"params":{"stunServer":"stun:one.example","stunServer":"stun:one.example"}})json"}) {
+    expect_true(!parse_peer_stun_server_request(request, &server) && server.empty(), "invalid single STUN in params is rejected: " + request);
+  }
+  expect_true(parse_peer_stun_servers_request("{}", &servers) && servers.empty(), "absent STUN pool preserves defaults");
+  expect_true(parse_peer_stun_servers_request(R"json({"stunServers":[]})json", &servers) && servers.empty(), "empty STUN pool is valid");
+  expect_true(parse_peer_stun_servers_request(R"json({"stunServer":"stun:one.example","stunServers":[]})json", &servers),
+    "single STUN option remains compatible with an empty pool");
+  expect_true(parse_peer_stun_servers_request(R"json({"stunServers":["stun:[2001:db8::1]:3478","stun:[::1]","stun:three.example","stun:four.example:65535"]})json", &servers) &&
+    servers == std::vector<std::string>({"stun:[2001:db8::1]:3478", "stun:[::1]", "stun:three.example", "stun:four.example:65535"}),
+    "four-entry STUN pool preserves IPv6 brackets and order");
+  expect_true(parse_peer_stun_servers_request(R"json({"stunServers":["stun:one.example","stun:one.example","stun:two.example"]})json", &servers) &&
+    servers == std::vector<std::string>({"stun:one.example", "stun:two.example"}), "STUN pool deduplicates after validating raw count");
+  expect_true(parse_peer_stun_servers_request(R"json({"stunServers":["stun:\u005b::1\u005d:3478"],"nested":{"stunServers":["turn:ignored.example"]}})json", &servers) &&
+    servers == std::vector<std::string>({"stun:[::1]:3478"}), "JSON escaped IPv6 brackets are decoded correctly");
+  expect_true(parse_peer_stun_servers_request(R"json({"nested":{"stunServers":["turn:ignored.example"]}})json", &servers) && servers.empty(),
+    "nested STUN pools cannot configure the transport");
+  for (const std::string& request : {
+      R"json({"stunServers":null})json", R"json({"stunServers":"stun:one.example"})json",
+      R"json({"stunServers":[1]})json", R"json({"stunServers":[false]})json", R"json({"stunServers":[null]})json",
+      R"json({"stunServers":[{}]})json", R"json({"stunServers":[[]]})json", R"json({"stunServers":[""]})json",
+      R"json({"stunServers":["turn:relay.example:3478"]})json", R"json({"stunServers":["turns:relay.example:5349"]})json",
+      R"json({"stunServers":["stun:example:65536"]})json", R"json({"stunServers":["stun:example:0"]})json",
+      R"json({"stunServers":["stun:[:::]:3478"]})json", R"json({"stunServers":["stun:one.example",]})json",
+      R"json({"stunServers":["stun:one.example"] garbage})json", R"json({"stunServers":["stun:one.example"})json",
+      R"json({"stunServers":["stun:one.example" "stun:two.example"]})json",
+      R"json({"stunServers":["stun:one.example"],"stunServers":[]})json",
+      R"json({"stunServers":["stun:one.example","stun:one.example","stun:one.example","stun:one.example","stun:one.example"]})json",
+      R"json({"stunServers":["stun:one.example"]} trailing)json",
+      R"json([{"stunServers":["stun:one.example"]}])json"}) {
+    servers = {"stun:unchanged.example"};
+    expect_true(!parse_peer_stun_servers_request(request, &servers) && servers.empty(), "invalid STUN pool is rejected without partial output: " + request);
+    const std::string rpc = "{\"id\":1,\"method\":\"createPeer\",\"params\":" + request + "}";
+    servers = {"stun:unchanged.example"};
+    expect_true(!parse_peer_stun_servers_request(rpc, &servers) && servers.empty(), "invalid STUN pool in JSON-RPC params is rejected without partial output: " + request);
+  }
+  expect_true(!parse_peer_stun_servers_request("{\"stunServers\":[\"stun:" + std::string(252, 'a') + "\"]}", &servers),
+    "oversized STUN pool entry is rejected");
+}
+
+void test_session_owner_activation() {
+  using namespace vds::media_agent;
+  AgentRuntimeState state;
+  const std::string owner_a = R"json({"mediaSessionId":"owner-a"})json";
+  const std::string owner_b = R"json({"sessionId":"owner-b"})json";
+  expect_true(activate_media_owner_sessions_from_request(state, owner_a), "inactive owners can select a session");
+  expect_true(activate_media_owner_sessions_from_request(state, "{}"), "legacy requests retain the active owner");
+
+  auto expect_owner_a_unchanged = [&state]() {
+    expect_eq(active_host_session_id(state), "owner-a", "rejected switch preserves host owner");
+    expect_eq(active_audio_session_id(state), "owner-a", "rejected switch preserves audio owner");
+    expect_eq(active_obs_ingest_session_id(state), "owner-a", "rejected switch preserves OBS owner");
+    expect_eq_int(static_cast<int>(host_session_count(state)), 2, "rejected switch creates no host registry entry");
+    expect_eq_int(static_cast<int>(audio_session_count(state)), 2, "rejected switch creates no audio registry entry");
+    expect_eq_int(static_cast<int>(obs_ingest_session_count(state)), 2, "rejected switch creates no OBS registry entry");
+  };
+
+  active_host_session(state).running = true;
+  expect_true(!activate_media_owner_sessions_from_request(state, owner_b), "running host prevents media owner switch");
+  expect_true(!activate_audio_owner_session_from_request(state, owner_b), "running host prevents audio owner switch");
+  expect_true(activate_media_owner_sessions_from_request(state, owner_a), "same host owner remains selectable for stop and restart");
+  expect_true(active_host_session(state).running, "rejected switch does not stop the active host");
+  expect_owner_a_unchanged();
+  active_host_session(state).running = false;
+
+  active_audio_session(state).capture_active = true;
+  expect_true(!activate_media_owner_sessions_from_request(state, owner_b), "capturing audio prevents media owner switch");
+  expect_true(!activate_audio_owner_session_from_request(state, owner_b), "capturing audio prevents audio owner switch");
+  expect_true(activate_audio_owner_session_from_request(state, owner_a), "same audio owner remains selectable for stop");
+  expect_owner_a_unchanged();
+  active_audio_session(state).capture_active = false;
+
+  // A finished but unjoined worker must also keep its owner selected until stop.
+  active_obs_ingest_session(state).worker = std::thread([]() {});
+  expect_true(!activate_media_owner_sessions_from_request(state, owner_b), "joinable OBS worker prevents media owner switch");
+  expect_true(!activate_audio_owner_session_from_request(state, owner_b), "joinable OBS worker prevents audio owner switch");
+  expect_true(activate_media_owner_sessions_from_request(state, owner_a), "same OBS owner remains selectable for stop");
+  expect_owner_a_unchanged();
+  active_obs_ingest_session(state).worker.join();
+
+  expect_true(activate_media_owner_sessions_from_request(state, owner_b), "stopped owners can switch to the next session");
+  expect_eq(active_host_session_id(state), "owner-b", "successful switch updates host owner");
+  expect_eq(active_audio_session_id(state), "owner-b", "successful switch updates audio owner");
+  expect_eq(active_obs_ingest_session_id(state), "owner-b", "successful switch updates OBS owner");
+}
+
 void test_video_access_unit() {
   using namespace vds::media_agent;
 
@@ -233,6 +374,8 @@ int main() {
   test_host_pipeline_selection();
   test_surface_target();
   test_session_registries();
+  test_session_owner_activation();
+  test_peer_stun_config();
   test_video_access_unit();
 
   if (g_failed_assertions != 0) {

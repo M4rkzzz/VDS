@@ -5,10 +5,10 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node ../scripts/test-server-core.js"
+    "test": "node ../scripts/test-server-core.js && node ../scripts/test-server-revival.js"
   },
   "dependencies": {
-    "express": "^4.22.2",
-    "ws": "^8.21.0"
+    "express": "^4.22.3",
+    "ws": "^8.22.0"
   }
 }

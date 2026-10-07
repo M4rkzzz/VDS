@@ -1,10 +1,12 @@
 #include "native_video_surface.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cctype>
 #include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -19,6 +21,10 @@
 #include <vector>
 
 #include "time_utils.h"
+#include "native_playback_scheduler.h"
+#include "video_access_unit.h"
+#include "video_bootstrap_helpers.h"
+#include "viewer_audio_playback.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -595,6 +601,8 @@ class NativeVideoSurface::Impl {
  public:
   explicit Impl(NativeVideoSurfaceConfig config)
       : config_(std::move(config)) {
+    cadence_frame_rate_ = config_.frame_rate ? config_.frame_rate : 60u;
+    frame_queue_.set_capacity(native_playback_detail::encoded_capacity_for_frame_rate(config_.frame_rate));
     snapshot_.codec_path = to_lower_ascii(config_.codec.empty() ? "h264" : config_.codec);
     snapshot_.window_title = config_.window_title;
   }
@@ -610,6 +618,8 @@ class NativeVideoSurface::Impl {
     }
 
     stop_requested_ = false;
+    decoder_start_complete_ = false;
+    decoder_start_succeeded_ = false;
     start_complete_ = false;
     start_succeeded_ = false;
     start_error_.clear();
@@ -637,12 +647,24 @@ class NativeVideoSurface::Impl {
   }
 
   bool submit_encoded_frame(const std::vector<std::uint8_t>& frame, const std::string& codec, std::string* error) {
+    return submit_encoded_frame(frame, codec, MediaFrameTiming{}, error);
+  }
+
+  bool submit_encoded_frame(const std::vector<std::uint8_t>& frame, const std::string& codec,
+      const MediaFrameTiming& timing, std::string* error) {
     if (frame.empty()) {
       if (error) {
         *error = "remote-video-frame-is-empty";
       }
       return false;
     }
+    constexpr std::uint64_t kProtocolSafeInteger = 9007199254740991ull;
+    if ((timing.timestamp_valid && timing.timestamp_us > kProtocolSafeInteger) ||
+        (timing.sequence_valid && timing.sequence > kProtocolSafeInteger)) {
+      if (error) *error = "native-video-frame-timing-out-of-range";
+      return false;
+    }
+    const auto audio_clock = get_viewer_audio_playback_clock_snapshot();
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -653,25 +675,66 @@ class NativeVideoSurface::Impl {
         return false;
       }
 
+      if (frame.size() > 2u * 1024u * 1024u) {
+        if (error) *error = "native-video-frame-too-large";
+        return false;
+      }
       EncodedFrame queued_frame;
       queued_frame.codec = to_lower_ascii(codec.empty() ? snapshot_.codec_path : codec);
-      queued_frame.bytes.resize(frame.size() + AV_INPUT_BUFFER_PADDING_SIZE, 0);
-      std::memcpy(queued_frame.bytes.data(), frame.data(), frame.size());
-
-      if (frame_queue_.size() >= kMaxQueuedFrames) {
-        frame_queue_.pop_front();
-        snapshot_.reason = "native-frame-queue-trimmed";
+      queued_frame.bytes = std::make_shared<std::vector<std::uint8_t>>(
+        frame.size() + AV_INPUT_BUFFER_PADDING_SIZE, std::uint8_t{0});
+      std::memcpy(queued_frame.bytes->data(), frame.data(), frame.size());
+      MediaFrameTiming normalized_timing = timing;
+      normalized_timing.keyframe = normalized_timing.keyframe ||
+        vds::media_agent::video_access_unit_has_random_access_nal(queued_frame.codec, frame);
+      normalized_timing.config = normalized_timing.config ||
+        vds::media_agent::video_access_unit_has_decoder_config_nal(queued_frame.codec, frame);
+      const bool config_only = is_configuration_only(frame, queued_frame.codec);
+      // Unknown or changing sources can reveal a faster cadence before the
+      // first SPS reaches the decoder. Learn from positive source-PTS steps;
+      // B-frame backwards steps cannot shrink a valid reference backlog.
+      if (!config_only && timing.timestamp_valid) {
+        if (timing.source_id != cadence_source_id_) {
+          cadence_source_id_ = timing.source_id;
+          previous_input_pts_us_.reset();
+          highest_input_pts_us_.reset();
+          coded_audio_lead_us_ = 0;
+          cadence_frame_rate_ = config_.frame_rate ? config_.frame_rate : 60u;
+        }
+        if (previous_input_pts_us_ && timing.timestamp_us > *previous_input_pts_us_) {
+          const auto interval = timing.timestamp_us - *previous_input_pts_us_;
+          const auto observed_fps = static_cast<unsigned int>(std::min<std::uint64_t>(
+            (1000000u + interval / 2u) / interval, std::numeric_limits<unsigned int>::max()));
+          cadence_frame_rate_ = std::max(cadence_frame_rate_, observed_fps);
+        }
+        // The next ordinary PES arrives while the previous batch can still
+        // be following waveOut's real device position. Account for that live
+        // backlog instead of breaking a valid reference chain at 17 AUs.
+        if (highest_input_pts_us_ && audio_clock.valid && audio_clock.source_id == timing.source_id) {
+          const auto heard_pts = native_playback_detail::add_saturated(audio_clock.timestamp_us,
+            static_cast<std::uint64_t>(audio_clock.delay_ms) * 1000u);
+          coded_audio_lead_us_ = *highest_input_pts_us_ > heard_pts
+            ? std::min<std::uint64_t>(*highest_input_pts_us_ - heard_pts, 500000u) : 0;
+        }
+        const auto extra_frames = (static_cast<std::uint64_t>(cadence_frame_rate_) * coded_audio_lead_us_ + 999999u) / 1000000u;
+        frame_queue_.set_capacity(native_playback_detail::encoded_capacity_for_frame_rate(cadence_frame_rate_) +
+          static_cast<std::size_t>(extra_frames));
+        previous_input_pts_us_ = timing.timestamp_us;
+        highest_input_pts_us_ = std::max(highest_input_pts_us_.value_or(0), timing.timestamp_us);
       }
-
-      frame_queue_.push_back(std::move(queued_frame));
+      const auto result = frame_queue_.push(std::move(queued_frame), normalized_timing,
+        static_cast<std::uint64_t>(current_time_micros_steady()), config_only, frame.size());
+      snapshot_.dropped_encoded_frames += result.dropped_frames;
+      snapshot_.pending_encoded_frames = static_cast<unsigned int>(frame_queue_.size());
+      snapshot_.needs_keyframe = frame_queue_.needs_keyframe();
+      input_generation_ += 1;
+      if (result.reset_required) snapshot_.reason = "native-reference-chain-recovering";
     }
 
     if (error) {
       error->clear();
     }
-#ifdef _WIN32
-    request_frame_drain();
-#endif
+    frame_available_.notify_one();
     return true;
   }
 
@@ -743,10 +806,41 @@ class NativeVideoSurface::Impl {
  private:
   struct EncodedFrame {
     std::string codec;
-    std::vector<std::uint8_t> bytes;
+    std::shared_ptr<std::vector<std::uint8_t>> bytes;
   };
 
-  static constexpr std::size_t kMaxQueuedFrames = 8;
+  struct FrameDeleter {
+    void operator()(AVFrame* value) const { av_frame_free(&value); }
+  };
+  struct PendingFrame {
+    std::unique_ptr<AVFrame, FrameDeleter> frame;
+    MediaFrameTiming timing;
+  };
+  struct RenderedImage {
+    std::vector<std::uint8_t> bytes;
+    int width = 0;
+    int height = 0;
+    AVRational sample_aspect_ratio{1, 1};
+    std::uint64_t serial = 0;
+    std::int64_t due_us = 0;
+  };
+
+  static constexpr std::size_t kMaxEncodedBytes = 32u * 1024u * 1024u;
+  static constexpr std::size_t kReadyMemoryBudgetBytes = 32u * 1024u * 1024u;
+  static bool is_configuration_only(const std::vector<std::uint8_t>& bytes, const std::string& codec) {
+    bool saw_nal = false;
+    std::size_t offset = 0;
+    while ((offset = vds::media_agent::find_next_annexb_start_code(bytes, offset)) != std::string::npos) {
+      const std::size_t prefix = offset + 3 < bytes.size() && bytes[offset + 2] == 0 ? 4 : 3;
+      if (offset + prefix >= bytes.size()) break;
+      saw_nal = true;
+      const unsigned int type = codec == "h265" || codec == "hevc"
+        ? (bytes[offset + prefix] >> 1) & 0x3fu : bytes[offset + prefix] & 0x1fu;
+      if ((codec == "h265" || codec == "hevc") ? type <= 31 : type >= 1 && type <= 5) return false;
+      offset += prefix + 1;
+    }
+    return saw_nal;
+  }
 #ifdef _WIN32
   static constexpr UINT kFrameAvailableMessage = WM_APP + 1;
   static constexpr UINT kRefreshOwnerMoveHookMessage = WM_APP + 2;
@@ -771,6 +865,8 @@ class NativeVideoSurface::Impl {
     if (stop_reason_.empty() && !stop_requested_) {
       stop_reason_ = "surface-window-closed";
     }
+    stop_requested_ = true;
+    frame_available_.notify_all();
   }
 
   static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param) {
@@ -802,7 +898,8 @@ class NativeVideoSurface::Impl {
         activate_owner_window_for_popup(hwnd);
         return 0;
       case kFrameAvailableMessage:
-        self->drain_queued_frames();
+        self->frame_drain_pending_.store(false, std::memory_order_release);
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       case kRefreshOwnerMoveHookMessage:
         self->refresh_owner_move_hook();
@@ -845,8 +942,18 @@ class NativeVideoSurface::Impl {
       return;
     }
 
-    if (!open_decoder(initial_codec)) {
-      return;
+    decode_worker_ = std::thread([this, initial_codec]() { decode_thread_main(initial_codec); });
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      started_condition_.wait(lock, [this]() { return decoder_start_complete_ || stop_requested_; });
+      if (!decoder_start_succeeded_ || stop_requested_) {
+        stop_requested_ = true;
+        lock.unlock();
+        frame_available_.notify_all();
+        if (decode_worker_.joinable()) decode_worker_.join();
+        destroy_window();
+        return;
+      }
     }
 
     {
@@ -860,6 +967,7 @@ class NativeVideoSurface::Impl {
       start_succeeded_ = true;
     }
     started_condition_.notify_all();
+    frame_available_.notify_all();
 
     bool should_stop = false;
     MSG msg{};
@@ -876,7 +984,14 @@ class NativeVideoSurface::Impl {
       should_stop = stop_requested_;
     }
 
-    cleanup_decoder();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_requested_ = true;
+    }
+    frame_available_.notify_all();
+    if (decode_worker_.joinable()) decode_worker_.join();
+    cleanup_back_buffer();
+    image_pool_ = {};
     destroy_window();
 
     {
@@ -884,6 +999,11 @@ class NativeVideoSurface::Impl {
       snapshot_.attached = false;
       snapshot_.running = false;
       snapshot_.decoder_ready = false;
+      latest_image_.reset();
+      frame_queue_.reset();
+      snapshot_.pending_decoded_frames = 0;
+      snapshot_.pending_encoded_frames = 0;
+      snapshot_.needs_keyframe = false;
       snapshot_.reason = stop_reason_.empty() ? "native-surface-stopped" : stop_reason_;
     }
     return;
@@ -1313,28 +1433,33 @@ class NativeVideoSurface::Impl {
     }
   }
 
-  void drain_queued_frames() {
-    frame_drain_pending_.store(false, std::memory_order_release);
-
-    while (true) {
-      EncodedFrame frame;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (stop_requested_ || frame_queue_.empty()) {
-          return;
-        }
-
-        frame = std::move(frame_queue_.front());
-        frame_queue_.pop_front();
-      }
-
-      if (!frame.bytes.empty()) {
-        if (!frame.codec.empty() && frame.codec != active_codec_) {
-          open_decoder(frame.codec);
-        }
-        decode_and_present(frame);
-      }
+  void cleanup_back_buffer() {
+    if (back_buffer_dc_ && previous_back_buffer_bitmap_) {
+      SelectObject(back_buffer_dc_, previous_back_buffer_bitmap_);
     }
+    if (back_buffer_bitmap_) DeleteObject(back_buffer_bitmap_);
+    if (back_buffer_dc_) DeleteDC(back_buffer_dc_);
+    back_buffer_dc_ = nullptr;
+    back_buffer_bitmap_ = nullptr;
+    previous_back_buffer_bitmap_ = nullptr;
+    back_buffer_width_ = 0;
+    back_buffer_height_ = 0;
+  }
+
+  void ensure_back_buffer(HDC hdc, int width, int height) {
+    if (back_buffer_dc_ && width == back_buffer_width_ && height == back_buffer_height_) return;
+    cleanup_back_buffer();
+    if (width <= 0 || height <= 0) return;
+    back_buffer_dc_ = CreateCompatibleDC(hdc);
+    if (!back_buffer_dc_) return;
+    back_buffer_bitmap_ = CreateCompatibleBitmap(hdc, width, height);
+    if (!back_buffer_bitmap_) {
+      cleanup_back_buffer();
+      return;
+    }
+    previous_back_buffer_bitmap_ = SelectObject(back_buffer_dc_, back_buffer_bitmap_);
+    back_buffer_width_ = width;
+    back_buffer_height_ = height;
   }
 
   void paint() {
@@ -1349,30 +1474,19 @@ class NativeVideoSurface::Impl {
 
     const int client_width = client_rect.right - client_rect.left;
     const int client_height = client_rect.bottom - client_rect.top;
-    HDC back_buffer_dc = CreateCompatibleDC(hdc);
-    HBITMAP back_buffer_bitmap = nullptr;
-    HGDIOBJ previous_bitmap = nullptr;
-    if (back_buffer_dc && client_width > 0 && client_height > 0) {
-      back_buffer_bitmap = CreateCompatibleBitmap(hdc, client_width, client_height);
-      if (back_buffer_bitmap) {
-        previous_bitmap = SelectObject(back_buffer_dc, back_buffer_bitmap);
-      }
-    }
-
-    HDC target_dc = back_buffer_dc && back_buffer_bitmap ? back_buffer_dc : hdc;
+    ensure_back_buffer(hdc, client_width, client_height);
+    HDC target_dc = back_buffer_dc_ && back_buffer_bitmap_ ? back_buffer_dc_ : hdc;
     FillRect(target_dc, &client_rect, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
 
-    std::vector<std::uint8_t> local_bgra;
-    int local_width = 0;
-    int local_height = 0;
+    std::shared_ptr<const RenderedImage> image;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      local_bgra = bgra_buffer_;
-      local_width = frame_width_;
-      local_height = frame_height_;
+      image = latest_image_;
     }
-
-    if (!local_bgra.empty() && local_width > 0 && local_height > 0 && client_width > 0 && client_height > 0) {
+    const int local_width = image ? image->width : 0;
+    const int local_height = image ? image->height : 0;
+    bool drew_image = false;
+    if (image && !image->bytes.empty() && local_width > 0 && local_height > 0 && client_width > 0 && client_height > 0) {
       BITMAPINFO bitmap_info{};
       bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
       bitmap_info.bmiHeader.biWidth = local_width;
@@ -1386,23 +1500,15 @@ class NativeVideoSurface::Impl {
 
       int display_aspect_width = local_width;
       int display_aspect_height = local_height;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        get_display_aspect_dimensions(
-          frame_width_,
-          frame_height_,
-          frame_sample_aspect_ratio_,
-          &display_aspect_width,
-          &display_aspect_height
-        );
-      }
+      get_display_aspect_dimensions(local_width, local_height, image->sample_aspect_ratio,
+        &display_aspect_width, &display_aspect_height);
       const RECT draw_rect = fit_rect_with_aspect(
         display_aspect_width,
         display_aspect_height,
         client_width,
         client_height
       );
-      StretchDIBits(
+      const int drawn_lines = StretchDIBits(
         target_dc,
         draw_rect.left,
         draw_rect.top,
@@ -1412,30 +1518,223 @@ class NativeVideoSurface::Impl {
         0,
         local_width,
         local_height,
-        local_bgra.data(),
+        image->bytes.data(),
         &bitmap_info,
         DIB_RGB_COLORS,
         SRCCOPY
       );
+      drew_image = drawn_lines != 0 && drawn_lines != static_cast<int>(GDI_ERROR);
     }
 
-    if (back_buffer_dc && back_buffer_bitmap) {
-      BitBlt(hdc, 0, 0, client_width, client_height, back_buffer_dc, 0, 0, SRCCOPY);
-    }
-
-    if (previous_bitmap) {
-      SelectObject(back_buffer_dc, previous_bitmap);
-    }
-    if (back_buffer_bitmap) {
-      DeleteObject(back_buffer_bitmap);
-    }
-    if (back_buffer_dc) {
-      DeleteDC(back_buffer_dc);
+    if (back_buffer_dc_ && back_buffer_bitmap_) {
+      drew_image = BitBlt(hdc, 0, 0, client_width, client_height, back_buffer_dc_, 0, 0, SRCCOPY) != FALSE && drew_image;
     }
 
     EndPaint(hwnd, &paint_struct);
+    if (drew_image && image && image->serial != last_painted_serial_) {
+      last_painted_serial_ = image->serial;
+      const auto now_us = current_time_micros_steady();
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot_.painted_frames += 1;
+      snapshot_.decoded_frames_rendered = snapshot_.painted_frames;
+      const auto lateness_us = std::max<std::int64_t>(0, now_us - image->due_us);
+      if (lateness_us > 2000) snapshot_.presentation_late_frames += 1;
+      snapshot_.max_presentation_lateness_ms = std::max(snapshot_.max_presentation_lateness_ms,
+        static_cast<double>(lateness_us) / 1000.0);
+      if (last_frame_present_at_steady_us_ > 0 && now_us > last_frame_present_at_steady_us_) {
+        const double interval_us = static_cast<double>(now_us - last_frame_present_at_steady_us_);
+        frame_interval_sample_count_ += 1;
+        const double delta = interval_us - frame_interval_mean_us_;
+        frame_interval_mean_us_ += delta / static_cast<double>(frame_interval_sample_count_);
+        frame_interval_m2_us_ += delta * (interval_us - frame_interval_mean_us_);
+        snapshot_.frame_interval_stddev_ms = frame_interval_sample_count_ > 1
+          ? std::sqrt(frame_interval_m2_us_ / static_cast<double>(frame_interval_sample_count_ - 1)) / 1000.0 : 0.0;
+      }
+      last_frame_present_at_steady_us_ = now_us;
+      snapshot_.reason = "native-frame-rendered";
+    }
   }
 #endif
+
+  std::optional<std::uint64_t> active_audio_time(const std::string& source_id) const {
+    const auto clock = get_viewer_audio_playback_clock_snapshot();
+    if (!clock.valid || source_id.empty() || source_id != active_source_id_ || clock.source_id != source_id) return std::nullopt;
+    return native_playback_detail::add_saturated(clock.timestamp_us,
+      static_cast<std::uint64_t>(clock.delay_ms) * 1000u);
+  }
+
+  void reset_decoded_reference_chain() {
+    pending_frames_.clear();
+    pending_nonvcl_prefix_.clear();
+    if (codec_context_) avcodec_flush_buffers(codec_context_);
+    playback_scheduler_.reset();
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_.reference_chain_resets += 1;
+    snapshot_.pending_decoded_frames = 0;
+    snapshot_.needs_keyframe = frame_queue_.needs_keyframe();
+    snapshot_.reason = "native-reference-chain-recovering";
+  }
+
+  void decode_thread_main(const std::string& initial_codec) {
+    const bool opened = open_decoder(initial_codec);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      decoder_start_succeeded_ = opened;
+      decoder_start_complete_ = true;
+    }
+    started_condition_.notify_all();
+    if (!opened) {
+      cleanup_decoder();
+      return;
+    }
+
+    using FrameQueue = NativeEncodedFrameQueue<EncodedFrame>;
+    std::uint64_t next_keyframe_request_us = 0;
+    while (true) {
+      bool reset_pending = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stop_requested_) break;
+        reset_pending = frame_queue_.reset_pending();
+      }
+      auto presentation_wake = reset_pending ? std::optional<std::uint64_t>{} : present_pending_frames();
+      typename FrameQueue::Entry entry;
+      typename FrameQueue::PopState state;
+      const auto now_us = static_cast<std::uint64_t>(current_time_micros_steady());
+      bool needs_keyframe = false;
+      std::uint64_t input_generation = 0;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stop_requested_) break;
+        std::size_t discarded = 0;
+        // Encoded AUs carry the bounded jitter backlog. A full decoded queue
+        // must preserve its earliest deadline instead of replacing it with
+        // a newer future frame on every network arrival.
+        state = pending_frames_.size() >= ready_capacity_ && !frame_queue_.reset_pending()
+          ? FrameQueue::PopState::Empty : frame_queue_.pop(now_us, entry, &discarded);
+        snapshot_.dropped_encoded_frames += discarded;
+        snapshot_.pending_encoded_frames = static_cast<unsigned int>(frame_queue_.size());
+        snapshot_.needs_keyframe = needs_keyframe = frame_queue_.needs_keyframe();
+        input_generation = input_generation_;
+      }
+      if (state == FrameQueue::PopState::Reset) {
+        reset_decoded_reference_chain();
+        next_keyframe_request_us = 0;
+      }
+      if (needs_keyframe && now_us >= next_keyframe_request_us) {
+        next_keyframe_request_us = native_playback_detail::add_saturated(now_us, 500000);
+        if (config_.on_keyframe_needed) {
+          try { config_.on_keyframe_needed("reference-chain-recovery"); }
+          catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            snapshot_.last_error = "native-keyframe-request-callback-failed";
+          }
+        }
+      }
+      if (state == FrameQueue::PopState::Frame) {
+        if (!entry.timing.source_id.empty() && entry.timing.source_id != active_source_id_) {
+          pending_frames_.clear();
+          if (codec_context_) avcodec_flush_buffers(codec_context_);
+          playback_scheduler_.reset();
+          cached_decoder_config_.clear();
+          pending_nonvcl_prefix_.clear();
+          active_source_id_ = entry.timing.source_id;
+        }
+        if (!entry.frame.codec.empty() && entry.frame.codec != active_codec_) {
+          pending_frames_.clear();
+          playback_scheduler_.reset();
+          cached_decoder_config_.clear();
+          pending_nonvcl_prefix_.clear();
+          if (!open_decoder(entry.frame.codec)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            frame_queue_.reset();
+            snapshot_.needs_keyframe = true;
+          }
+        }
+        if (entry.timing.timestamp_valid && !entry.config_only) {
+          playback_scheduler_.observe(entry.timing.timestamp_us, entry.arrival_us);
+        }
+        decode_and_queue(entry);
+      }
+      presentation_wake = present_pending_frames();
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (stop_requested_) break;
+        snapshot_.pending_decoded_frames = static_cast<unsigned int>(pending_frames_.size());
+        snapshot_.buffer_delay_ms = static_cast<unsigned int>(playback_scheduler_.buffer_delay_us() / 1000u);
+        if (state == FrameQueue::PopState::Frame || state == FrameQueue::PopState::Reset) continue;
+        if (input_generation != input_generation_) continue;
+        auto wake = presentation_wake;
+        if (const auto gap = frame_queue_.next_deadline_us(); gap && (!wake || *gap < *wake)) wake = gap;
+        if (frame_queue_.needs_keyframe() && (!wake || next_keyframe_request_us < *wake)) {
+          wake = next_keyframe_request_us;
+        }
+        if (wake) {
+          const auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+          frame_available_.wait_until(lock, std::chrono::steady_clock::time_point(
+            std::chrono::microseconds(static_cast<std::int64_t>(std::min(*wake, limit)))));
+        } else {
+          frame_available_.wait(lock);
+        }
+      }
+    }
+    pending_frames_.clear();
+    cached_decoder_config_.clear();
+    pending_nonvcl_prefix_.clear();
+    cleanup_decoder();
+  }
+
+  std::optional<std::uint64_t> present_pending_frames() {
+    std::optional<std::uint64_t> wake;
+    std::optional<PendingFrame> selected;
+    auto now_us = static_cast<std::uint64_t>(current_time_micros_steady());
+    std::uint64_t dropped = 0;
+    std::int64_t selected_due_us = static_cast<std::int64_t>(now_us);
+    while (!pending_frames_.empty()) {
+      auto& front = pending_frames_.front();
+      const auto audio_time = active_audio_time(front.timing.source_id);
+      const auto decision = playback_scheduler_.decision(front.timing.timestamp_us, now_us,
+        front.timing.timestamp_valid ? audio_time : std::nullopt);
+      if (front.timing.timestamp_valid && decision.action == NativePlaybackScheduler::Action::Wait) {
+        wake = decision.due_us;
+        // Audio output positions may stop or be adjusted without a video input.
+        if (audio_time) wake = std::min(*wake, native_playback_detail::add_saturated(now_us, 20000));
+        break;
+      }
+      if (front.timing.timestamp_valid && decision.action == NativePlaybackScheduler::Action::Drop) {
+        pending_frames_.pop_front();
+        dropped += 1;
+        continue;
+      }
+      if (selected) dropped += 1;
+      selected = std::move(front);
+      selected_due_us = static_cast<std::int64_t>(std::min(decision.due_us,
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())));
+      pending_frames_.pop_front();
+    }
+    if (dropped != 0) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot_.dropped_decoded_frames += dropped;
+    }
+    if (selected) {
+      AVFrame* frame_to_present = selected->frame.get();
+      if (hw_pixel_format_ != AV_PIX_FMT_NONE && frame_to_present->format == hw_pixel_format_) {
+        av_frame_unref(transfer_frame_);
+        const int result = av_hwframe_transfer_data(transfer_frame_, frame_to_present, 0);
+        if (result < 0) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          snapshot_.last_error = ffmpeg_error_string(result);
+          snapshot_.reason = "native-decoder-transfer-failed";
+          return wake;
+        }
+        transfer_frame_->sample_aspect_ratio = frame_to_present->sample_aspect_ratio;
+        frame_to_present = transfer_frame_;
+      }
+      present_frame(frame_to_present, selected_due_us);
+      av_frame_unref(transfer_frame_);
+    }
+    return wake;
+  }
 
   static AVPixelFormat ffmpeg_get_format(AVCodecContext* codec_context, const AVPixelFormat* pixel_formats) {
     const auto* self = static_cast<const NativeVideoSurface::Impl*>(codec_context->opaque);
@@ -1485,8 +1784,11 @@ class NativeVideoSurface::Impl {
 
     codec_context_ = context;
     codec_context_->opaque = this;
-    codec_context_->thread_count = 0;
-    codec_context_->thread_type = FF_THREAD_FRAME;
+    // Frame threading can hold several whole frames before output. Prefer
+    // slice parallelism, which does not add a frame-order playback backlog.
+    codec_context_->thread_count = (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS) != 0 ? 2 : 1;
+    codec_context_->thread_type = (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS) != 0 ? FF_THREAD_SLICE : 0;
+    codec_context_->pkt_timebase = AVRational{1, 1000000};
 
     hw_pixel_format_ = AV_PIX_FMT_NONE;
 
@@ -1511,6 +1813,7 @@ class NativeVideoSurface::Impl {
       av_buffer_unref(&device_ref);
       codec_context_->get_format = &NativeVideoSurface::Impl::ffmpeg_get_format;
       hw_pixel_format_ = hw_pixel_format;
+      codec_context_->thread_count = 1;
       break;
     }
 
@@ -1561,10 +1864,6 @@ class NativeVideoSurface::Impl {
     if (codec_context_) {
       avcodec_free_context(&codec_context_);
     }
-    bgra_buffer_.clear();
-    frame_width_ = 0;
-    frame_height_ = 0;
-    frame_sample_aspect_ratio_ = AVRational{1, 1};
     active_codec_.clear();
     hw_pixel_format_ = AV_PIX_FMT_NONE;
   }
@@ -1583,23 +1882,56 @@ class NativeVideoSurface::Impl {
     }
   }
 
-  void decode_and_present(const EncodedFrame& frame) {
+  void decode_and_queue(const NativeEncodedFrameQueue<EncodedFrame>::Entry& entry) {
+    const auto& frame = entry.frame;
     if (!codec_context_) {
       return;
     }
+    if (!frame.bytes || frame.bytes->size() <= AV_INPUT_BUFFER_PADDING_SIZE) return;
+
+    const auto payload_size = frame.bytes->size() - AV_INPUT_BUFFER_PADDING_SIZE;
+    if (entry.timing.config) {
+      const std::vector<std::uint8_t> payload(frame.bytes->begin(), frame.bytes->begin() +
+        static_cast<std::ptrdiff_t>(payload_size));
+      const auto config = vds::media_agent::extract_video_decoder_config(frame.codec, payload);
+      auto merged = vds::media_agent::merge_video_decoder_config(frame.codec, cached_decoder_config_, config);
+      if (merged.size() <= 256u * 1024u) cached_decoder_config_ = std::move(merged);
+    }
+    if (entry.config_only) {
+      const std::vector<std::uint8_t> payload(frame.bytes->begin(), frame.bytes->begin() +
+        static_cast<std::ptrdiff_t>(payload_size));
+      if (pending_nonvcl_prefix_.size() + payload_size <= 2u * 1024u * 1024u) {
+        pending_nonvcl_prefix_.insert(pending_nonvcl_prefix_.end(), payload.begin(), payload.end());
+      }
+      return;
+    }
+
+    std::vector<std::uint8_t> prefixed;
+    if (!pending_nonvcl_prefix_.empty() || (entry.timing.keyframe && !cached_decoder_config_.empty())) {
+      prefixed = std::move(pending_nonvcl_prefix_);
+      pending_nonvcl_prefix_.clear();
+      prefixed.insert(prefixed.end(), frame.bytes->begin(), frame.bytes->begin() + static_cast<std::ptrdiff_t>(payload_size));
+      if (entry.timing.keyframe) {
+        prefixed = vds::media_agent::prepend_config_if_needed(frame.codec, cached_decoder_config_, prefixed);
+      }
+      prefixed.resize(prefixed.size() + AV_INPUT_BUFFER_PADDING_SIZE, 0);
+    }
 
     AVPacket packet{};
-    packet.data = const_cast<std::uint8_t*>(frame.bytes.data());
-    packet.size = static_cast<int>(frame.bytes.size() - AV_INPUT_BUFFER_PADDING_SIZE);
+    packet.data = prefixed.empty() ? frame.bytes->data() : prefixed.data();
+    packet.size = static_cast<int>((prefixed.empty() ? frame.bytes->size() : prefixed.size()) - AV_INPUT_BUFFER_PADDING_SIZE);
+    packet.pts = entry.timing.timestamp_valid && entry.timing.timestamp_us <=
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
+      ? static_cast<std::int64_t>(entry.timing.timestamp_us) : AV_NOPTS_VALUE;
+    packet.dts = AV_NOPTS_VALUE;
 
     const int send_result = avcodec_send_packet(codec_context_, &packet);
     if (send_result < 0) {
-      const std::string active_codec = active_codec_;
-      cleanup_decoder();
-      if (!active_codec.empty()) {
-        open_decoder(active_codec);
-      }
+      pending_frames_.clear();
+      avcodec_flush_buffers(codec_context_);
       std::lock_guard<std::mutex> lock(mutex_);
+      frame_queue_.reset();
+      snapshot_.needs_keyframe = true;
       snapshot_.last_error = ffmpeg_error_string(send_result);
       snapshot_.reason = "native-decoder-send-failed";
       return;
@@ -1617,27 +1949,84 @@ class NativeVideoSurface::Impl {
         return;
       }
 
-      AVFrame* frame_to_present = decoded_frame_;
-      if (hw_pixel_format_ != AV_PIX_FMT_NONE && decoded_frame_->format == hw_pixel_format_) {
-        av_frame_unref(transfer_frame_);
-        const int transfer_result = av_hwframe_transfer_data(transfer_frame_, decoded_frame_, 0);
-        if (transfer_result < 0) {
-          std::lock_guard<std::mutex> lock(mutex_);
-          snapshot_.last_error = ffmpeg_error_string(transfer_result);
-          snapshot_.reason = "native-decoder-transfer-failed";
-          av_frame_unref(decoded_frame_);
-          return;
-        }
-        frame_to_present = transfer_frame_;
+      PendingFrame output;
+      output.timing = entry.timing;
+      const auto frame_pts = decoded_frame_->best_effort_timestamp != AV_NOPTS_VALUE
+        ? decoded_frame_->best_effort_timestamp : decoded_frame_->pts;
+      output.timing.timestamp_valid = frame_pts != AV_NOPTS_VALUE && frame_pts >= 0;
+      if (codec_context_->framerate.num > 0 && codec_context_->framerate.den > 0) {
+        const auto fps = static_cast<unsigned int>(std::min<std::uint64_t>(
+          (static_cast<std::uint64_t>(codec_context_->framerate.num) + codec_context_->framerate.den - 1u) /
+            static_cast<unsigned int>(codec_context_->framerate.den), std::numeric_limits<unsigned int>::max()));
+        std::lock_guard<std::mutex> lock(mutex_);
+        cadence_frame_rate_ = std::max(cadence_frame_rate_, fps);
+        frame_queue_.set_capacity(std::max(frame_queue_.capacity(),
+          native_playback_detail::encoded_capacity_for_frame_rate(fps)));
       }
-
-      present_frame(frame_to_present);
+      if (output.timing.timestamp_valid) output.timing.timestamp_us = static_cast<std::uint64_t>(frame_pts);
+      const auto now_us = static_cast<std::uint64_t>(current_time_micros_steady());
+      const auto audio_time = output.timing.timestamp_valid ? active_audio_time(output.timing.source_id) : std::nullopt;
+      if (output.timing.timestamp_valid) {
+        playback_scheduler_.observe_output(output.timing.timestamp_us, now_us, audio_time.has_value());
+      }
+      const auto decision = playback_scheduler_.decision(output.timing.timestamp_us, now_us, audio_time);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_.decoded_frames += 1;
+        if (output.timing.timestamp_valid && decision.lateness_us > 2000) snapshot_.decode_late_frames += 1;
+        snapshot_.max_decode_lateness_ms = std::max(snapshot_.max_decode_lateness_ms,
+          static_cast<double>(std::max<std::int64_t>(0, decision.lateness_us)) / 1000.0);
+      }
+      if (output.timing.timestamp_valid && decision.action == NativePlaybackScheduler::Action::Drop) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_.dropped_decoded_frames += 1;
+        av_frame_unref(decoded_frame_);
+        continue;
+      }
+      const int estimate = av_image_get_buffer_size(AV_PIX_FMT_BGRA,
+        decoded_frame_->width, decoded_frame_->height, 1);
+      ready_capacity_ = estimate > 0 && static_cast<std::size_t>(estimate) > kReadyMemoryBudgetBytes / 2 ? 1 : 2;
+      std::uint64_t dropped = 0;
+      while (pending_frames_.size() > ready_capacity_) {
+        pending_frames_.pop_back();
+        dropped += 1;
+      }
+      // A decoder can emit several outputs for one packet. Keep the earliest
+      // display slot; the second slot, if available, tracks the newest output.
+      bool keep_output = true;
+      if (pending_frames_.size() == ready_capacity_) {
+        if (output.timing.timestamp_us < pending_frames_.front().timing.timestamp_us) {
+          pending_frames_.pop_front();
+        } else if (ready_capacity_ > 1 && output.timing.timestamp_us > pending_frames_.back().timing.timestamp_us) {
+          pending_frames_.pop_back();
+        } else {
+          keep_output = false;
+        }
+        dropped += 1;
+      }
+      if (!keep_output) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_.dropped_decoded_frames += dropped;
+        av_frame_unref(decoded_frame_);
+        continue;
+      }
+      output.frame.reset(av_frame_clone(decoded_frame_));
+      if (output.frame) {
+        const auto position = std::upper_bound(pending_frames_.begin(), pending_frames_.end(), output.timing.timestamp_us,
+          [](std::uint64_t timestamp, const PendingFrame& item) { return timestamp < item.timing.timestamp_us; });
+        pending_frames_.insert(position, std::move(output));
+      } else {
+        dropped += 1;
+      }
+      if (dropped != 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_.dropped_decoded_frames += dropped;
+      }
       av_frame_unref(decoded_frame_);
-      av_frame_unref(transfer_frame_);
     }
   }
 
-  void present_frame(AVFrame* frame) {
+  void present_frame(AVFrame* frame, std::int64_t due_us) {
     if (!frame || frame->width <= 0 || frame->height <= 0) {
       return;
     }
@@ -1650,14 +2039,27 @@ class NativeVideoSurface::Impl {
       return;
     }
 
-    render_buffer_.resize(static_cast<std::size_t>(buffer_size));
+    std::shared_ptr<RenderedImage> image;
+    for (auto& pooled : image_pool_) {
+      if (!pooled) pooled = std::make_shared<RenderedImage>();
+      if (pooled.use_count() == 1) {
+        image = pooled;
+        break;
+      }
+    }
+    if (!image) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot_.dropped_decoded_frames += 1;
+      return;
+    }
+    image->bytes.resize(static_cast<std::size_t>(buffer_size));
 
     std::uint8_t* destination_data[4] = { nullptr, nullptr, nullptr, nullptr };
     int destination_linesize[4] = { 0, 0, 0, 0 };
     const int fill_result = av_image_fill_arrays(
       destination_data,
       destination_linesize,
-      render_buffer_.data(),
+      image->bytes.data(),
       AV_PIX_FMT_BGRA,
       frame->width,
       frame->height,
@@ -1700,39 +2102,22 @@ class NativeVideoSurface::Impl {
       destination_linesize
     );
 
-    const long long now_steady_us = current_time_micros_steady();
+    image->width = frame->width;
+    image->height = frame->height;
+    image->sample_aspect_ratio = frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0
+      ? frame->sample_aspect_ratio : codec_context_->sample_aspect_ratio;
+    image->serial = ++render_serial_;
+    image->due_us = due_us;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      frame_width_ = frame->width;
-      frame_height_ = frame->height;
-      frame_sample_aspect_ratio_ =
-        (frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0)
-          ? frame->sample_aspect_ratio
-          : codec_context_->sample_aspect_ratio;
-      bgra_buffer_.swap(render_buffer_);
-      if (last_frame_present_at_steady_us_ > 0 && now_steady_us > last_frame_present_at_steady_us_) {
-        const double interval_us = static_cast<double>(now_steady_us - last_frame_present_at_steady_us_);
-        frame_interval_sample_count_ += 1;
-        const double delta = interval_us - frame_interval_mean_us_;
-        frame_interval_mean_us_ += delta / static_cast<double>(frame_interval_sample_count_);
-        const double delta2 = interval_us - frame_interval_mean_us_;
-        frame_interval_m2_us_ += delta * delta2;
-        snapshot_.frame_interval_stddev_ms = frame_interval_sample_count_ > 1
-          ? std::sqrt(frame_interval_m2_us_ / static_cast<double>(frame_interval_sample_count_ - 1)) / 1000.0
-          : 0.0;
-      }
-      last_frame_present_at_steady_us_ = now_steady_us;
-      snapshot_.decoded_frames_rendered += 1;
+      latest_image_ = std::move(image);
       snapshot_.decoder_ready = true;
       snapshot_.last_error.clear();
-      snapshot_.reason = "native-frame-rendered";
+      snapshot_.reason = "native-frame-ready-for-paint";
     }
 
 #ifdef _WIN32
-    const HWND hwnd = window_handle_.load();
-    if (hwnd) {
-      InvalidateRect(hwnd, nullptr, FALSE);
-    }
+    request_frame_drain();
 #endif
   }
 
@@ -1740,8 +2125,18 @@ class NativeVideoSurface::Impl {
   mutable std::mutex mutex_;
   std::condition_variable frame_available_;
   std::condition_variable started_condition_;
-  std::deque<EncodedFrame> frame_queue_;
+  NativeEncodedFrameQueue<EncodedFrame> frame_queue_{
+    native_playback_detail::encoded_capacity_for_frame_rate(0), 20000, kMaxEncodedBytes, 500000};
+  std::string cadence_source_id_;
+  std::optional<std::uint64_t> previous_input_pts_us_;
+  std::optional<std::uint64_t> highest_input_pts_us_;
+  unsigned int cadence_frame_rate_ = 60;
+  std::uint64_t coded_audio_lead_us_ = 0;
+  std::uint64_t input_generation_ = 0;
   std::thread worker_;
+  std::thread decode_worker_;
+  bool decoder_start_complete_ = false;
+  bool decoder_start_succeeded_ = false;
   bool stop_requested_ = false;
   bool start_complete_ = false;
   bool start_succeeded_ = false;
@@ -1757,6 +2152,12 @@ class NativeVideoSurface::Impl {
   HWND owner_move_hook_owner_ = nullptr;
   static std::mutex owner_move_hook_registry_mutex_;
   static std::unordered_map<HWINEVENTHOOK, Impl*> owner_move_hook_registry_;
+  HDC back_buffer_dc_ = nullptr;
+  HBITMAP back_buffer_bitmap_ = nullptr;
+  HGDIOBJ previous_back_buffer_bitmap_ = nullptr;
+  int back_buffer_width_ = 0;
+  int back_buffer_height_ = 0;
+  std::uint64_t last_painted_serial_ = 0;
 #endif
 
   AVCodecContext* codec_context_ = nullptr;
@@ -1765,11 +2166,15 @@ class NativeVideoSurface::Impl {
   SwsContext* sws_context_ = nullptr;
   AVPixelFormat hw_pixel_format_ = AV_PIX_FMT_NONE;
   std::string active_codec_;
-  int frame_width_ = 0;
-  int frame_height_ = 0;
-  AVRational frame_sample_aspect_ratio_ { 1, 1 };
-  std::vector<std::uint8_t> bgra_buffer_;
-  std::vector<std::uint8_t> render_buffer_;
+  NativePlaybackScheduler playback_scheduler_;
+  std::deque<PendingFrame> pending_frames_;
+  std::size_t ready_capacity_ = 2;
+  std::string active_source_id_;
+  std::vector<std::uint8_t> cached_decoder_config_;
+  std::vector<std::uint8_t> pending_nonvcl_prefix_;
+  std::shared_ptr<const RenderedImage> latest_image_;
+  std::array<std::shared_ptr<RenderedImage>, 2> image_pool_;
+  std::uint64_t render_serial_ = 0;
   long long last_frame_present_at_steady_us_ = -1;
   std::uint64_t frame_interval_sample_count_ = 0;
   double frame_interval_mean_us_ = 0.0;
@@ -1792,6 +2197,11 @@ bool NativeVideoSurface::submit_encoded_frame(
   std::string* error
 ) {
   return impl_->submit_encoded_frame(frame, codec, error);
+}
+
+bool NativeVideoSurface::submit_encoded_frame(const std::vector<std::uint8_t>& frame,
+  const std::string& codec, const MediaFrameTiming& timing, std::string* error) {
+  return impl_->submit_encoded_frame(frame, codec, timing, error);
 }
 
 NativeVideoSurfaceSnapshot NativeVideoSurface::snapshot() const {

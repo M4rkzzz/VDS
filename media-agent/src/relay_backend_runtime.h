@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "relay_subscriber_state.h"
+#include "media_frame_timing.h"
 
 class PeerTransportSession;
 
@@ -40,13 +41,15 @@ class Runtime {
     const std::string& upstream_peer_id,
     const std::string& codec,
     const std::vector<std::vector<std::uint8_t>>& access_units,
-    std::uint32_t rtp_timestamp);
+    std::uint32_t rtp_timestamp,
+    const MediaFrameTiming& timing = {});
 
   void fanout_audio_frame(
     const std::string& upstream_peer_id,
     const std::vector<std::uint8_t>& frame,
     const std::string& codec,
-    std::uint32_t rtp_timestamp);
+    std::uint32_t rtp_timestamp,
+    const MediaFrameTiming& timing = {});
 
  private:
   friend State& relay_backend_state(Runtime& runtime);

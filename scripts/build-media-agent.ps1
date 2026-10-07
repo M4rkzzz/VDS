@@ -183,6 +183,14 @@ if ($enableLibDataChannel) {
   Write-Warning 'vcpkg toolchain not found; -AllowNoLibDataChannel was provided, building media-agent without libdatachannel backend.'
 }
 
+if ($enableLibDataChannel) {
+  # Configure the existing manifest first so a fresh checkout has OpenSSL/SRTP/SCTP.
+  cmake @cmakeArgs '-DVDS_MEDIA_AGENT_ENHANCED_ICE=OFF' | Out-Host
+  if ($LASTEXITCODE -ne 0) { throw "Dependency bootstrap failed with exit code $LASTEXITCODE" }
+  & (Join-Path $PSScriptRoot 'build-vds-ice.ps1') -Configuration $Configuration -VcpkgRoot $vcpkgRoot -SkipRuntimeCopy
+  $cmakeArgs += '-DVDS_MEDIA_AGENT_ENHANCED_ICE=ON'
+}
+
 cmake @cmakeArgs | Out-Host
 if ($LASTEXITCODE -ne 0) {
   throw "cmake configure failed with exit code $LASTEXITCODE"
@@ -203,9 +211,6 @@ if (-not $builtBinary) {
   throw "Unable to locate built vds-media-agent.exe under $buildDir"
 }
 
-if (Test-Path $runtimeDir) {
-  Remove-Item $runtimeDir -Recurse -Force
-}
 New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
 $runtimeBinary = Join-Path $runtimeDir 'vds-media-agent.exe'
 Copy-Item $builtBinary $runtimeBinary -Force
@@ -222,6 +227,7 @@ if ($enableLibDataChannel) {
   )
   foreach ($runtimeLibName in $runtimeLibNames) {
     $runtimeLibSource = @(
+      (Join-Path $sourceDir "build\vds-ice\installed\bin\$runtimeLibName"),
       (Join-Path $buildDir "vcpkg_installed\x64-windows\bin\$runtimeLibName"),
       (Join-Path $vcpkgRoot "installed\x64-windows\bin\$runtimeLibName")
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1

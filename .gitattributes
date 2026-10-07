@@ -1,0 +1,2 @@
+# Unified-diff context whitespace and bytes must stay intact for upstream patches.
+media-agent/third_party/ice-patches/*.patch -text -whitespace

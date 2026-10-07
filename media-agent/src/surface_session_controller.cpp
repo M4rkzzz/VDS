@@ -15,6 +15,7 @@
 #include "surface_attachment_state.h"
 #include "surface_state_json.h"
 #include "surface_target.h"
+#include "viewer_audio_playback.h"
 
 namespace {
 
@@ -108,6 +109,7 @@ SurfaceControlCommandResult SurfaceSessionController::attach_from_request(const 
     attachment.peer_runtime = peer->receiver_runtime;
     {
       std::lock_guard<std::mutex> lock(peer->receiver_runtime->mutex);
+      peer->receiver_runtime->local_playback_enabled = peer->role == "viewer-upstream";
       peer->receiver_runtime->surface_id = surface;
       peer->receiver_runtime->target = target;
       peer->receiver_runtime->surface_layout = layout;
@@ -243,6 +245,14 @@ SurfaceControlCommandResult SurfaceSessionController::detach_from_request(const 
     attachment->phase = SessionPhase::Draining;
     attachment->phase_reason = "surface-detaching";
     if (attachment->peer_runtime) {
+      std::string source_id;
+      {
+        std::lock_guard<std::mutex> lock(attachment->peer_runtime->mutex);
+        attachment->peer_runtime->local_playback_enabled = false;
+        source_id = attachment->peer_runtime->peer_id + "/" + attachment->peer_runtime->source_generation;
+      }
+      stop_viewer_audio_playback_source(source_id);
+      stop_viewer_audio_playback_source(source_id + "/rtp-audio");
       stop_peer_video_surface_attachment(*attachment->peer_runtime, "surface-detached");
       PeerState* peer = find_peer(runtime_state_, attachment->peer_id);
       if (peer) {

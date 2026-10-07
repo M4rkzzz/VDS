@@ -48,6 +48,7 @@ export type EncodedFrameHeader = {
   payloadFormat?: 'annexb' | 'avcc' | 'raw' | 'opus-raw' | 'aac-adts' | 'unknown';
   timestampUs: number;
   sequence: number;
+  sourceEpoch?: string;
   keyframe: boolean;
   config: boolean;
   frameId?: string;
@@ -107,6 +108,9 @@ export function helloAckMessage(manifest?: { mediaSessionId?: unknown; manifestV
 }
 
 export function encodeFrameMessage(header: EncodedFrameHeader, payload: ArrayBuffer): ArrayBuffer {
+  if (!isValidSourceEpoch(header.sourceEpoch)) {
+    throw new Error('datachannel-frame-invalid-header');
+  }
   if (payload.byteLength > MAX_ENCODED_FRAME_BYTES) {
     throw new Error('datachannel-frame-too-large');
   }
@@ -135,7 +139,9 @@ export function encodeFrameMessages(header: EncodedFrameHeader, payload: ArrayBu
     throw new Error('datachannel-frame-too-large');
   }
 
-  const frameId = `${header.streamType}:${header.timestampUs}:${header.sequence}:${payload.byteLength}`;
+  const frameId = header.sourceEpoch === undefined
+    ? `${header.streamType}:${header.timestampUs}:${header.sequence}:${payload.byteLength}`
+    : JSON.stringify([header.sourceEpoch, header.streamType, header.timestampUs, header.sequence, payload.byteLength]);
   const chunks: ArrayBuffer[] = [];
   const bytes = new Uint8Array(payload);
   const chunkCount = Math.ceil(bytes.byteLength / DATA_CHANNEL_CHUNK_PAYLOAD_BYTES);
@@ -168,6 +174,9 @@ export function decodeFrameMessage(buffer: ArrayBuffer): { header: EncodedFrameH
   const headerLength = view.getUint32(4, false);
   if (headerLength <= 0 || headerLength > HEADER_LIMIT_BYTES || 8 + headerLength > buffer.byteLength) {
     throw new Error('datachannel-frame-invalid-header');
+  }
+  if (buffer.byteLength - 8 - headerLength > MAX_ENCODED_FRAME_BYTES) {
+    throw new Error('datachannel-frame-too-large');
   }
 
   const header = JSON.parse(textDecoder.decode(new Uint8Array(buffer, 8, headerLength))) as EncodedFrameHeader;
@@ -218,8 +227,8 @@ export class EncodedFrameReassembler {
       payloadBytes <= 0 ||
       payloadBytes > MAX_ENCODED_FRAME_BYTES ||
       chunkCount > Math.ceil(MAX_ENCODED_FRAME_BYTES / DATA_CHANNEL_CHUNK_PAYLOAD_BYTES) ||
-      decoded.payload.byteLength > DATA_CHANNEL_CHUNK_PAYLOAD_BYTES ||
-      (chunkIndex < chunkCount - 1 && decoded.payload.byteLength !== DATA_CHANNEL_CHUNK_PAYLOAD_BYTES)
+      chunkCount !== Math.ceil(payloadBytes / DATA_CHANNEL_CHUNK_PAYLOAD_BYTES) ||
+      decoded.payload.byteLength !== Math.min(DATA_CHANNEL_CHUNK_PAYLOAD_BYTES, payloadBytes - chunkIndex * DATA_CHANNEL_CHUNK_PAYLOAD_BYTES)
     ) {
       throw new Error('datachannel-chunk-invalid-header');
     }
@@ -232,6 +241,16 @@ export class EncodedFrameReassembler {
     }
 
     let entry = this.pending.get(frameId);
+    if (entry && (
+      entry.payloadBytes !== payloadBytes || entry.chunks.length !== chunkCount ||
+      entry.header.streamType !== decoded.header.streamType || entry.header.codec !== decoded.header.codec ||
+      entry.header.payloadFormat !== decoded.header.payloadFormat || entry.header.timestampUs !== decoded.header.timestampUs ||
+      entry.header.sequence !== decoded.header.sequence || entry.header.keyframe !== decoded.header.keyframe ||
+      entry.header.config !== decoded.header.config || entry.header.sourceEpoch !== decoded.header.sourceEpoch
+    )) {
+      this.pending.delete(frameId);
+      throw new Error('datachannel-chunk-header-mismatch');
+    }
     if (!entry) {
       entry = {
         header: { ...decoded.header, type: 'frame' },
@@ -337,6 +356,7 @@ function isFrameHeader(value: EncodedFrameHeader): boolean {
     typeof value.codec === 'string' &&
     typeof value.timestampUs === 'number' &&
     typeof value.sequence === 'number' &&
+    isValidSourceEpoch(value.sourceEpoch) &&
     typeof value.keyframe === 'boolean' &&
     typeof value.config === 'boolean' &&
     (
@@ -349,4 +369,8 @@ function isFrameHeader(value: EncodedFrameHeader): boolean {
       )
     )
   );
+}
+
+function isValidSourceEpoch(value: unknown): boolean {
+  return value === undefined || typeof value === 'string' && value.length > 0 && value.length <= 128;
 }

@@ -19,6 +19,9 @@ extern "C" {
 #include "agent_events.h"
 #include "host_session_state.h"
 #include "host_session_runtime.h"
+#include "host_media_clock.h"
+#include "media_frame_timing.h"
+#include "media_timestamp_helpers.h"
 #include "json_protocol.h"
 #include "obs_ingest_constants.h"
 #include "obs_ingest_media.h"
@@ -280,6 +283,9 @@ void ObsIngestSession::run_worker(ObsIngestState* session_ptr, ObsIngestSessionR
   }
 
   ObsIngestState& session = *session_ptr;
+  std::uint64_t video_sequence = 0;
+  std::uint64_t audio_sequence = 0;
+  std::uint64_t ingest_generation = 0;
   while (!session.stop_requested.load()) {
     {
       std::lock_guard<std::mutex> lock(session.mutex);
@@ -419,6 +425,45 @@ void ObsIngestSession::run_worker(ObsIngestState* session_ptr, ObsIngestSessionR
       access.peer_transport_ready(),
       session));
 
+    const auto source_clock = vds::media_agent::host_media_clock_snapshot();
+    vds::media_agent::MediaSourceTimeline source_timeline;
+    source_timeline.source_offset_us = vds::media_agent::host_media_now_us(source_clock);
+    if (format_context->start_time != AV_NOPTS_VALUE) {
+      source_timeline.origin_valid = true;
+      source_timeline.origin_us = format_context->start_time;
+    } else {
+      // Stream start times share the demuxer's source clock. Select their common
+      // earliest origin instead of rebasing video and audio independently.
+      for (const int index : {video_stream_index, audio_stream_index}) {
+        if (index < 0) continue;
+        const AVStream* stream = format_context->streams[index];
+        if (stream->start_time == AV_NOPTS_VALUE) continue;
+        const auto start_us = av_rescale_q(stream->start_time, stream->time_base, AVRational{1, 1000000});
+        if (!source_timeline.origin_valid || start_us < source_timeline.origin_us) {
+          source_timeline.origin_valid = true;
+          source_timeline.origin_us = start_us;
+        }
+      }
+    }
+    const std::string source_id = std::string(kObsIngestVirtualUpstreamPeerId) + "/" +
+      std::to_string(source_clock.generation) + "/" + std::to_string(++ingest_generation);
+    const std::string source_epoch = source_clock.source_epoch + "/obs=" + std::to_string(ingest_generation);
+    const auto make_packet_timing = [&](const AVPacket& source_packet, AVRational time_base,
+                                        std::uint64_t sequence) {
+      MediaFrameTiming timing;
+      std::int64_t presentation_us = 0;
+      timing.timestamp_us = packet_presentation_timestamp_us(&source_packet, time_base, &presentation_us)
+        ? source_timeline.map(presentation_us)
+        : vds::media_agent::host_media_now_us(source_clock);
+      timing.timestamp_valid = true;
+      timing.sequence = sequence;
+      timing.sequence_valid = true;
+      timing.keyframe = (source_packet.flags & AV_PKT_FLAG_KEY) != 0;
+      timing.source_id = source_id;
+      timing.source_epoch = source_epoch;
+      return timing;
+    };
+
     AVPacket packet;
     av_init_packet(&packet);
     bool stream_running_emitted = false;
@@ -455,12 +500,16 @@ void ObsIngestSession::run_worker(ObsIngestState* session_ptr, ObsIngestSessionR
           if (units.empty()) {
             return;
           }
-          const std::uint32_t rtp_timestamp = packet_timestamp_at_clock_rate(
-            format_context->streams[video_stream_index],
-            &ready_packet,
-            static_cast<int>(kVideoRtpClockRate)
-          );
-          relay_hub().publish_video_units(kObsIngestVirtualUpstreamPeerId, video_codec, units, rtp_timestamp);
+          const AVRational video_time_base = video_bsf && video_bsf->time_base_out.num > 0
+            ? video_bsf->time_base_out : format_context->streams[video_stream_index]->time_base;
+          auto timing = make_packet_timing(ready_packet, video_time_base, video_sequence++);
+          for (const auto& unit : units) {
+            timing.keyframe = timing.keyframe || vds::media_agent::video_access_unit_has_random_access_nal(video_codec, unit);
+            timing.config = timing.config || vds::media_agent::video_access_unit_has_decoder_config_nal(video_codec, unit);
+          }
+          const auto rtp_timestamp = vds::media_agent::media_timestamp_us_to_rtp(
+            timing.timestamp_us, static_cast<std::uint32_t>(kVideoRtpClockRate));
+          relay_hub().publish_video_units(kObsIngestVirtualUpstreamPeerId, video_codec, units, rtp_timestamp, timing);
           {
             std::lock_guard<std::mutex> lock(session.mutex);
             session.stream_running = true;
@@ -500,12 +549,10 @@ void ObsIngestSession::run_worker(ObsIngestState* session_ptr, ObsIngestSessionR
       } else if (audio_stream_index >= 0 && packet.stream_index == audio_stream_index) {
         auto framed = build_adts_framed_aac(packet.data, static_cast<std::size_t>(packet.size), aac_config);
         if (!framed.empty()) {
-          const std::uint32_t rtp_timestamp = packet_timestamp_at_clock_rate(
-            format_context->streams[audio_stream_index],
-            &packet,
-            48000
-          );
-          relay_hub().publish_audio_frame(kObsIngestVirtualUpstreamPeerId, framed, "aac", rtp_timestamp);
+          const auto timing = make_packet_timing(
+            packet, format_context->streams[audio_stream_index]->time_base, audio_sequence++);
+          const auto rtp_timestamp = vds::media_agent::media_timestamp_us_to_rtp(timing.timestamp_us, 48000);
+          relay_hub().publish_audio_frame(kObsIngestVirtualUpstreamPeerId, framed, "aac", rtp_timestamp, timing);
         }
       }
 

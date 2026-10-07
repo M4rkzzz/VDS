@@ -7,6 +7,11 @@ const repoRoot = path.resolve(__dirname, '..');
 
 function loadTsModule(relativePath, globals = {}) {
   const absolutePath = path.join(repoRoot, relativePath);
+  const windowLike = globals.window || global.window;
+  if (windowLike) {
+    windowLike.setTimeout ||= setTimeout;
+    windowLike.clearTimeout ||= clearTimeout;
+  }
   const source = fs.readFileSync(absolutePath, 'utf8');
   const transpiled = ts.transpileModule(source, {
     compilerOptions: {
@@ -29,7 +34,9 @@ function loadTsModule(relativePath, globals = {}) {
   return fn(
     module,
     module.exports,
-    require,
+    (request) => request.startsWith('.')
+      ? loadTsModule(path.relative(repoRoot, path.resolve(path.dirname(absolutePath), `${request}.ts`)), globals)
+      : require(request),
     ...Object.values(globals)
   );
 }
@@ -636,11 +643,127 @@ function testMobileViewportAndSafeAreaStylesArePresent() {
 }
 
 function testRelayKeepsLocalPlaybackWhileForwarding() {
-  const source = fs.readFileSync(path.join(repoRoot, 'vds_web/src/main.ts'), 'utf8');
-  const inboundFrameHandler = /function handleInboundEncodedFrame\([\s\S]*?\n}\n\nfunction scheduleVideoFrameDecode/.exec(source);
-  assert.ok(inboundFrameHandler, 'handleInboundEncodedFrame block should be present');
-  assert.match(inboundFrameHandler[0], /if \(decoded\.header\.streamType === 'audio'\) \{\s*void dataChannelAudioPlayer\.pushFrame\(decoded\.header, decoded\.payload\);\s*\} else \{\s*scheduleVideoFrameDecode\(decoded\.header, decoded\.payload\);\s*\}\s*forwardDecodedDataChannelFrame\(decoded\.header, decoded\.payload\);/);
-  assert.doesNotMatch(source, /forward-only audio|skipLocalAudio|suppressLocalAudio|relayOnlyAudio/);
+  const payload = new Uint8Array([1, 2, 3]).buffer;
+  const frame = { header: { streamType: 'audio', codec: 'opus' }, payload };
+  const calls = [];
+  let failValidation = false;
+  const handler = loadMainHandlers(['handleInboundEncodedFrame'], '', 'handleInboundEncodedFrame', {
+    playback: { acceptMessage(data) {
+      calls.push(['playback', data]);
+      if (failValidation) throw new Error('invalid-frame');
+      return frame;
+    } },
+    diagnostics: { incrementCounter() {}, update() {}, getSnapshot: () => ({}) },
+    maybeSendViewerReady() {},
+    forwardEncodedFrame: (header, forwarded) => calls.push(['forward', header, forwarded]),
+    markRelayUnsupported: (reason) => calls.push(['invalid', reason]),
+    errorToMessage: (error) => error.message
+  });
+  handler(payload, 'upstream');
+  assert.deepStrictEqual(calls, [['playback', payload], ['forward', frame.header, payload]],
+    'the validated encoded frame must be forwarded without awaiting local decoder output');
+  calls.length = 0;
+  failValidation = true;
+  handler(payload, 'upstream');
+  assert.deepStrictEqual(calls, [['playback', payload], ['invalid', 'invalid-frame']],
+    'invalid transport frames must not be forwarded');
+}
+
+function testNormalizedManifestKeepsVideoFrameRateThroughWebRelay() {
+  const calls = [];
+  const apply = loadMainHandlers(['applyVideoManifestDisplaySize'], '', 'applyVideoManifestDisplaySize', {
+    playback: { setVideoDisplaySize: (...args) => calls.push(args) }
+  });
+  apply({ video: { width: 1920, height: 1080, fps: 60 } });
+  apply({ video: { width: 1920, height: 1080, frameRate: 30 } });
+  apply({ video: { width: 3840, height: 2160 } });
+  assert.deepStrictEqual(calls, [[1920, 1080, 60], [1920, 1080, 30], [3840, 2160, 0]],
+    'server-normalized fps and native frameRate both reach encoded queue and B-frame timing policy');
+}
+
+function testKeyframeRequestUsesFlatManifestIdentity() {
+  const protocol = loadTsModule('vds_web/src/datachannel-protocol.ts');
+  const sent = [];
+  let now = 1000;
+  let manifest;
+  const request = loadMainHandlers(['requestUpstreamKeyframe'], `
+    let lastUpstreamKeyframeRequestMs = -Infinity;
+    const upstreamPc = {};
+    const upstreamMediaChannel = channel;
+  `, 'requestUpstreamKeyframe', {
+    channel: { readyState: 'open', send: (message) => sent.push(JSON.parse(message)) },
+    performance: { now: () => now }, getCurrentManifest: () => manifest,
+    ENCODED_MEDIA_PROTOCOL: protocol.ENCODED_MEDIA_PROTOCOL,
+    ENCODED_MEDIA_PROTOCOL_VERSION: protocol.ENCODED_MEDIA_PROTOCOL_VERSION
+  });
+  request(); assert.strictEqual(sent.length, 0, 'an identified request waits for the negotiated manifest');
+  manifest = { mediaSessionId: 'media-current', manifestVersion: 4,
+    video: { codec: 'h264', width: 1920 }, audio: { codec: 'aac', sampleRate: 48000 } };
+  request();
+  assert.deepStrictEqual(sent, [{ protocol: protocol.ENCODED_MEDIA_PROTOCOL,
+    protocolVersion: protocol.ENCODED_MEDIA_PROTOCOL_VERSION, type: 'keyframe-request',
+    mediaSessionId: 'media-current', manifestVersion: 4 }]);
+  request(); assert.strictEqual(sent.length, 1, 'missing manifest does not consume the rate limit, and repeated recovery requests are bounded');
+  now += 500; request(); assert.strictEqual(sent.length, 2);
+}
+
+function testRelayPreservesSourceEpoch() {
+  const protocol = loadTsModule('vds_web/src/datachannel-protocol.ts');
+  const { SourceEpochGate } = loadTsModule('vds_web/src/playback-policy.ts');
+  const sent = [];
+  let nonce = 0;
+  const cache = { codec: 'h265', sourceEpoch: 'source/new:0', timestampUs: 0, sequence: 0,
+    payloadFormat: 'annexb', payload: makeHevcFramePayload() };
+  const harness = loadMainHandlers(['forwardEncodedFrame', 'sendRelayBootstrapKeyframe', 'rotateRelaySourceEpoch',
+    'handlePlaybackSourceChanged', 'attachOutboundDataChannel', 'isCurrentDownstreamChannel'], `
+    let lastVideoKeyframeForRelay = cache;
+    let lastBootstrapFrameId = '';
+    let relaySourceEpoch = '';
+    let downstreamDataChannel = null;
+    let downstreamPeerId = 'same-peer';
+    let downstreamCloseExpected = false;
+    const DATA_CHANNEL_MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
+  `, `{ forwardEncodedFrame, sendRelayBootstrapKeyframe, epoch: () => relaySourceEpoch, cache: () => lastVideoKeyframeForRelay,
+    bind: (channel) => { downstreamDataChannel = channel; attachOutboundDataChannel(channel, downstreamPeerId); },
+    sourceChanged: (next) => { handlePlaybackSourceChanged(); lastVideoKeyframeForRelay = next; } }`, {
+    cache,
+    crypto: { getRandomValues: (values) => { values.fill(++nonce); return values; } },
+    window: { setTimeout: () => 1, clearTimeout() {} },
+    DATA_CHANNEL_OPEN_TIMEOUT_MS: 3000,
+    ENCODED_MEDIA_PROTOCOL: protocol.ENCODED_MEDIA_PROTOCOL,
+    encodeFrameMessages: protocol.encodeFrameMessages,
+    isDataChannelRelayReady: () => true,
+    canSendDataChannelMessage: () => true,
+    markDownstreamRelayForwarding() {},
+    diagnostics: { incrementCounter() {}, update() {} },
+    markRelayUnsupported: (reason) => assert.fail(reason), errorToMessage: (error) => error.message
+  });
+  const channel = () => ({ readyState: 'open', bufferedAmount: 0, send: (message) => sent.push(message) });
+  harness.bind(channel());
+  const initialEpoch = harness.epoch();
+  harness.forwardEncodedFrame({ streamType: 'audio', codec: 'opus', payloadFormat: 'opus-raw',
+    sourceEpoch: cache.sourceEpoch, timestampUs: 0, sequence: 0, keyframe: true, config: false }, new Uint8Array([1]).buffer);
+  harness.sendRelayBootstrapKeyframe();
+  const decoded = sent.map((message) => protocol.decodeFrameMessage(message));
+  assert.deepStrictEqual(decoded.map((frame) => frame.header.sourceEpoch), [initialEpoch, initialEpoch]);
+  assert.notStrictEqual(initialEpoch, cache.sourceEpoch, 'one subscriber gets a short independent output epoch');
+  assert.strictEqual(decoded[1].header.codec, 'h265', 'bootstrap retains the actual source codec');
+  assert.strictEqual(decoded[1].header.sequence, 0);
+  harness.sendRelayBootstrapKeyframe(); assert.strictEqual(sent.length, 2, 'the same epoch bootstrap is still deduplicated');
+  const epochs = [initialEpoch];
+  for (const origin of ['source-B', cache.sourceEpoch]) {
+    harness.sourceChanged({ ...cache, sourceEpoch: origin });
+    epochs.push(harness.epoch()); harness.sendRelayBootstrapKeyframe();
+  }
+  harness.bind(channel()); epochs.push(harness.epoch()); harness.sendRelayBootstrapKeyframe();
+  assert.strictEqual(new Set(epochs).size, 4, 'A to B to A and same-peer rebinding each create a fresh output epoch');
+  const downstreamGate = new SourceEpochGate();
+  for (const epoch of epochs) {
+    assert.ok(epoch.length <= 40);
+    assert.strictEqual(downstreamGate.accept(epoch).accepted, true);
+  }
+  assert.strictEqual(downstreamGate.accept(initialEpoch).reason, 'retired', 'late media from the old binding cannot switch back');
+  harness.sourceChanged(null); assert.strictEqual(harness.cache(), null, 'changing source clears the old bootstrap before audio can forward');
 }
 
 function testDiagnosticsReportIncludesMobileEnvironmentSummary() {
@@ -807,7 +930,6 @@ function testDiagnosticsReportIncludesMobileEnvironmentSummary() {
   assert.match(fs.readFileSync(path.join(repoRoot, 'scripts/release-check.js'), 'utf8'), /Release \$\{mode\} check failed/);
   const readme = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
   assert.match(readme, /npm run build:release/);
-  assert.match(readme, /manual QA evidence/);
   assert.match(readme, /check:web-mobile-code/);
   assert.strictEqual(report.encodedAudioFramesForwarded, 16);
   assert.match(fs.readFileSync(path.join(repoRoot, 'vds_web/src/main.ts'), 'utf8'), /incrementCounter\('encodedAudioFramesForwarded'\)/);
@@ -1007,6 +1129,154 @@ function testDataChannelFrameChunking() {
   assert.deepStrictEqual(Array.from(new Uint8Array(decoded.payload)), Array.from(payload));
 }
 
+async function testSignalingConnectionLifecycle() {
+  const sockets = [];
+  class FakeWebSocket {
+    static OPEN = 1;
+    readyState = 0;
+    handlers = new Map();
+    sent = [];
+    constructor() { sockets.push(this); }
+    addEventListener(type, handler) {
+      const handlers = this.handlers.get(type) || [];
+      handlers.push(handler);
+      this.handlers.set(type, handlers);
+    }
+    emit(type, event = {}) {
+      if (type === 'open') this.readyState = FakeWebSocket.OPEN;
+      if (type === 'close') this.readyState = 3;
+      for (const handler of this.handlers.get(type) || []) handler(event);
+    }
+    close() { this.readyState = 3; }
+    send(payload) { this.sent.push(JSON.parse(payload)); }
+  }
+  const { VdsWebSignaling } = loadTsModule('vds_web/src/signaling.ts', {
+    WebSocket: FakeWebSocket,
+    location: { protocol: 'https:', host: 'test.example' }
+  });
+  const signaling = new VdsWebSignaling();
+  const statuses = [];
+  const messages = [];
+  signaling.onStatus((status) => statuses.push(status));
+  signaling.onMessage((message) => messages.push(message));
+
+  const first = signaling.connect();
+  assert.strictEqual(signaling.connect(), first, 'parallel callers must share the pending socket');
+  assert.strictEqual(sockets.length, 1);
+  sockets[0].emit('close');
+  await assert.rejects(first, /closed before connection completed/);
+
+  const cancelled = signaling.connect();
+  signaling.close();
+  await assert.rejects(cancelled, /cancelled/);
+  const current = signaling.connect();
+  sockets[2].emit('open');
+  await current;
+  const currentStatuses = statuses.slice();
+  sockets[1].emit('open');
+  sockets[1].emit('close');
+  sockets[1].emit('error');
+  sockets[1].emit('message', { data: JSON.stringify({ type: 'host-disconnected' }) });
+  assert.deepStrictEqual(statuses, currentStatuses, 'events from superseded sockets must be ignored');
+  assert.deepStrictEqual(messages, []);
+  sockets[2].emit('message', { data: JSON.stringify({ type: 'room-joined' }) });
+  assert.deepStrictEqual(messages, [{ type: 'room-joined' }]);
+  signaling.send({ type: 'viewer-ready' });
+  assert.deepStrictEqual(sockets[2].sent, [{ type: 'viewer-ready' }]);
+  sockets[2].emit('close');
+  assert.strictEqual(statuses.at(-1), 'closed');
+  const failed = signaling.connect();
+  sockets.at(-1).emit('error');
+  await assert.rejects(failed, /connection failed/);
+  assert.deepStrictEqual(statuses.slice(-2), ['error', 'closed']);
+}
+
+// Evaluate selected production handlers without starting the page or depending on a DOM implementation.
+function loadMainHandlers(names, prelude, returned, globals) {
+  const filename = path.join(repoRoot, 'vds_web/src/main.ts');
+  const source = ts.createSourceFile(filename, fs.readFileSync(filename, 'utf8'), ts.ScriptTarget.ES2022, true);
+  const declarations = source.statements.filter((statement) =>
+    ts.isFunctionDeclaration(statement) && names.includes(statement.name?.text)
+  );
+  assert.strictEqual(declarations.length, names.length);
+  const transpiled = ts.transpileModule(`${prelude}\n${declarations.map((statement) => statement.getText(source)).join('\n')}`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
+  });
+  return new Function(...Object.keys(globals), `${transpiled.outputText}\nreturn ${returned};`)(...Object.values(globals));
+}
+
+async function testSupersededDownstreamOfferIsIgnored() {
+  const peers = [];
+  const sent = [];
+  class FakePeer {
+    localDescriptions = [];
+    constructor() { peers.push(this); }
+    close() {}
+    createDataChannel() { return { close() {} }; }
+    createOffer() { return new Promise((resolve) => { this.finishOffer = resolve; }); }
+    async setLocalDescription(offer) { this.localDescriptions.push(offer); this.localDescription = offer; }
+  }
+  const harness = loadMainHandlers(['handleConnectToNext'], `
+    let session = { roomId: 'ROOM' };
+    const capability = { relayCapable: true };
+    const serverConfig = { iceServers: [] };
+    let downstreamPc = null, downstreamDataChannel = null, downstreamPeerId = '';
+    let downstreamDataChannelReady = false, downstreamRelayForwarding = false, downstreamCloseExpected = false;
+    let lastBootstrapFrameId = '', downstreamEdgeAttemptId = null, webEdgeAttemptSeq = 0;
+  `, '{ handleConnectToNext }', {
+    RTCPeerConnection: FakePeer,
+    diagnostics: { update() {} },
+    getManifestCompatibilityFailure: () => '',
+    setStatus() {}, setError() {}, clearRelayHelloAckTimer() {}, wirePeerEvents() {}, attachOutboundDataChannel() {},
+    ENCODED_MEDIA_CHANNEL_LABEL: 'vds-media-encoded',
+    signaling: { send: (message) => sent.push(message) },
+    getWebEncodedMediaCapabilities: () => ({})
+  });
+  const stale = harness.handleConnectToNext({ nextViewerId: 'old-peer' });
+  const current = harness.handleConnectToNext({ nextViewerId: 'new-peer' });
+  peers[0].finishOffer({ type: 'offer', sdp: 'old' });
+  await stale;
+  assert.deepStrictEqual(peers[0].localDescriptions, [], 'superseded offer must stop after createOffer');
+  assert.deepStrictEqual(peers[1].localDescriptions, [], 'old offer must not configure the replacement peer');
+  assert.deepStrictEqual(sent, []);
+  peers[1].finishOffer({ type: 'offer', sdp: 'current' });
+  await current;
+  assert.strictEqual(sent.length, 1);
+  assert.strictEqual(sent[0].targetId, 'new-peer');
+  assert.strictEqual(sent[0].sdp.sdp, 'current');
+}
+
+function testSupersededUpstreamFramesAreIgnored() {
+  const frames = [];
+  const updates = [];
+  const harness = loadMainHandlers(['attachInboundDataChannel'], `
+    let upstreamPc = {};
+    let upstreamMediaChannel = null;
+    const ENCODED_MEDIA_CHANNEL_LABEL = 'vds-media-encoded';
+  `, '{ attachInboundDataChannel, currentChannel: () => upstreamMediaChannel, replacePeer: () => { upstreamPc = {}; upstreamMediaChannel = null; } }', {
+    diagnostics: { update: (update) => updates.push(update) },
+    isCurrentUpstreamPeer: () => true,
+    markRelayUnsupported: (reason) => updates.push({ reason }),
+    handleInboundEncodedFrame: (payload) => frames.push(payload)
+  });
+  const oldChannel = { label: 'vds-media-encoded' };
+  harness.attachInboundDataChannel(oldChannel, 'host');
+  assert.strictEqual(harness.currentChannel(), oldChannel);
+  const payload = new ArrayBuffer(1);
+  oldChannel.onmessage({ data: payload });
+  assert.deepStrictEqual(frames, [payload]);
+  harness.replacePeer();
+  const replacementChannel = { label: 'vds-media-encoded' };
+  harness.attachInboundDataChannel(replacementChannel, 'host');
+  oldChannel.onmessage({ data: new ArrayBuffer(2) });
+  assert.deepStrictEqual(frames, [payload], 'old channels must not deliver frames after upstream replacement');
+  const currentUpdates = updates.slice();
+  oldChannel.onerror();
+  oldChannel.onclose();
+  assert.deepStrictEqual(updates, currentUpdates, 'old channel lifecycle events must not affect the current viewer');
+  assert.strictEqual(harness.currentChannel(), replacementChannel, 'old channel close cannot clear its replacement');
+}
+
 async function testWebCodecsPlayerDecodePath() {
   const decodedChunks = [];
   const renderedFrames = [];
@@ -1183,7 +1453,12 @@ async function testWebCodecsVideoAvccFallbackPath() {
     assert.ok(formats.includes('annexb:avcc'));
     const outputBytes = new Uint8Array(decodedChunks[0].data);
     const firstUnitLength = new DataView(outputBytes.buffer, outputBytes.byteOffset, outputBytes.byteLength).getUint32(0, false);
-    assert.ok(firstUnitLength > 0);
+    assert.strictEqual(firstUnitLength, 6);
+    assert.deepStrictEqual(Array.from(outputBytes), [
+      0, 0, 0, 6, 0x67, 0x42, 0xe0, 0x1f, 0x89, 0x8b,
+      0, 0, 0, 4, 0x68, 0xce, 0x3c, 0x80,
+      0, 0, 0, 3, 0x65, 0x88, 0x84
+    ], 'AVCC NAL units must exclude subsequent Annex B start codes');
     assert.notDeepStrictEqual(Array.from(outputBytes.slice(0, 4)), [0, 0, 0, 1]);
     assert.deepStrictEqual(drops, []);
   } finally {
@@ -1586,8 +1861,9 @@ async function testWebCodecsAudioDecodePath() {
       decodedChunks.push(chunk.init);
       this.init.output({
         sampleRate: 48000,
+        timestamp: chunk.init.timestamp,
         numberOfChannels: 2,
-        numberOfFrames: 2,
+        numberOfFrames: 960,
         copyTo: (target) => {
           target[0] = 0;
           target[1] = 0;
@@ -1611,7 +1887,7 @@ async function testWebCodecsAudioDecodePath() {
 
     createBuffer(channels, frames, sampleRate) {
       assert.strictEqual(channels, 2);
-      assert.strictEqual(frames, 2);
+      assert.strictEqual(frames, 960);
       assert.strictEqual(sampleRate, 48000);
       return {
         duration: frames / sampleRate,
@@ -1680,8 +1956,8 @@ async function testWebCodecsAudioDecodePath() {
     assert.strictEqual(decodedChunks[0].timestamp, 20000);
     assert.ok(states.includes('webcodecs-audio-configured-opus'));
     assert.ok(decodedBlocks.includes('decoded'));
-    assert.strictEqual(starts[0], 10.12);
-    assert.strictEqual(starts[1], 10.12 + (2 / 48000));
+    assert.ok(Math.abs(starts[0] - 10.14) < 1e-9, 'manual delay plus the bounded initial buffer is retained');
+    assert.ok(Math.abs(starts[1] - 10.16) < 1e-9, 'source PTS spaces subsequent 20 ms Opus blocks');
     assert.deepStrictEqual(drops, []);
   } finally {
     global.window = previousWindow;
@@ -1724,6 +2000,7 @@ async function testWebCodecsAacAdtsDecodePath() {
     decode(chunk) {
       decodedChunks.push(chunk.init);
       this.init.output({
+        timestamp: chunk.init.timestamp,
         sampleRate: 44100,
         numberOfChannels: 2,
         numberOfFrames: 2,
@@ -1834,8 +2111,9 @@ async function testWebCodecsAacDescriptionChangeReconfiguresDecoder() {
       this.state = 'configured';
     }
 
-    decode() {
+    decode(chunk) {
       this.init.output({
+        timestamp: chunk.init.timestamp,
         sampleRate: 44100,
         numberOfChannels: 2,
         numberOfFrames: 1,
@@ -1915,12 +2193,18 @@ async function testWebCodecsAacDescriptionChangeReconfiguresDecoder() {
 }
 
 async function main() {
+  await testSignalingConnectionLifecycle();
+  await testSupersededDownstreamOfferIsIgnored();
+  testSupersededUpstreamFramesAreIgnored();
   await testMobileCapabilityPolicies();
   await testAacCapabilityProbeUsesAudioSpecificConfig();
   testEncodedMediaCapabilitiesRequireDetectedCodecTargets();
   testWebJoinPayloadIncludesMobileRelayCapabilities();
   testMobileViewportAndSafeAreaStylesArePresent();
   testRelayKeepsLocalPlaybackWhileForwarding();
+  testNormalizedManifestKeepsVideoFrameRateThroughWebRelay();
+  testKeyframeRequestUsesFlatManifestIdentity();
+  testRelayPreservesSourceEpoch();
   testDiagnosticsReportIncludesMobileEnvironmentSummary();
   testNativeOfferChecksWebCodecCompatibilityBeforeSignaling();
   testNativeTransportEnforcesAdvertisedEncodedFrameLimit();

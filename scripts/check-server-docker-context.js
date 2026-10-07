@@ -29,7 +29,7 @@ if (!/\bEXPOSE\s+3000(?:\s+3010|\s.*\b3010\b)/.test(dockerfileText)) {
 
 const composePath = path.join(projectRoot, 'server/docker-compose.yml');
 const composeText = fs.readFileSync(composePath, 'utf8');
-for (const expectedText of ['"3000:3000"', '"3010:3010"', 'ADMIN_PORT: 3010']) {
+for (const expectedText of ['"3000:3000"', '"127.0.0.1:3010:3010"', 'ADMIN_PORT: 3010', 'ADMIN_HOST: 0.0.0.0', 'ADMIN_TOKEN: ${ADMIN_TOKEN:-}']) {
   if (!composeText.includes(expectedText)) {
     throw new Error(`docker-compose.yml missing required admin/signaling setting: ${expectedText}`);
   }

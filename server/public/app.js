@@ -34,6 +34,7 @@ let myChainPosition = -1; // 观众在链中的位置
 let hostId = null; // Host的clientId
 let viewerJoinMode = 'lobby';
 let viewerJoinPending = false;
+let viewerJoinGeneration = 0;
 let viewerPendingJoinSource = null;
 let viewerJoinPendingTimer = null;
 const VIEWER_JOIN_PENDING_TIMEOUT_MS = 10000;
@@ -277,11 +278,12 @@ function setViewerJoinPending(pending, { source = null } = {}) {
   viewerJoinPending = Boolean(pending);
   viewerPendingJoinSource = viewerJoinPending ? source : null;
   if (viewerJoinPending) {
+    const joinGeneration = viewerJoinGeneration;
     viewerJoinPendingTimer = setTimeout(() => {
-      viewerJoinPendingTimer = null;
-      if (!viewerJoinPending) {
+      if (joinGeneration !== viewerJoinGeneration || !viewerJoinPending) {
         return;
       }
+      viewerJoinPendingTimer = null;
       handleViewerJoinFailure('加入房间超时，请检查信令服务器连接后重试。').catch((error) => {
         setViewerJoinPending(false);
         showError(error && error.message ? error.message : '加入房间超时');
@@ -292,6 +294,7 @@ function setViewerJoinPending(pending, { source = null } = {}) {
 }
 
 function cancelPendingViewerJoin() {
+  viewerJoinGeneration += 1;
   setViewerJoinPending(false);
   removePendingMessages((entry) => Boolean(
     entry &&
@@ -1833,6 +1836,7 @@ async function joinRoomById(roomId, { source = 'direct' } = {}) {
     return;
   }
 
+  const joinGeneration = ++viewerJoinGeneration;
   setViewerJoinPending(true, {
     source
   });
@@ -1844,7 +1848,14 @@ async function joinRoomById(roomId, { source = 'direct' } = {}) {
   try {
     await applyNativeViewerPlaybackPrefs();
   } catch (error) {
+    if (joinGeneration !== viewerJoinGeneration || !viewerJoinPending) {
+      return;
+    }
     debugLog('audio', '[media-engine] apply viewer playback prefs before join failed:', error && error.message ? error.message : String(error));
+  }
+
+  if (joinGeneration !== viewerJoinGeneration || !viewerJoinPending) {
+    return;
   }
 
   currentRoomId = normalizedRoomId;

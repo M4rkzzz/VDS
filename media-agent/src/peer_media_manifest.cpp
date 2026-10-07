@@ -87,9 +87,11 @@ void apply_media_manifest_to_peer(PeerState& peer, const std::string& request_js
   const std::string audio_json = extract_object_slice(manifest_json, "audio");
   peer.expected_video_codec = normalize_manifest_codec_impl(extract_string_value(video_json, "codec"));
   peer.expected_audio_codec = normalize_manifest_codec_impl(extract_string_value(audio_json, "codec"));
-  if (peer.receiver_runtime && !peer.expected_video_codec.empty()) {
+  if (peer.receiver_runtime) {
     std::lock_guard<std::mutex> lock(peer.receiver_runtime->mutex);
-    peer.receiver_runtime->codec_path = peer.expected_video_codec;
+    const int frame_rate = extract_int_value(video_json, "frameRate", 0);
+    peer.receiver_runtime->expected_video_frame_rate = frame_rate > 0 ? static_cast<unsigned int>(frame_rate) : 0;
+    if (!peer.expected_video_codec.empty()) peer.receiver_runtime->codec_path = peer.expected_video_codec;
     peer.receiver_runtime->reason = "media-manifest-applied";
   }
   if (!peer.expected_video_codec.empty()) {

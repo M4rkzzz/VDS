@@ -10,6 +10,7 @@
 #include "relay_hub.h"
 #include "viewer_audio_playback.h"
 #include "wasapi_backend.h"
+#include "time_utils.h"
 
 ViewerAudioCommandResult ViewerAudioSession::set_volume_from_request(const std::string& request_json) {
   const int pid = vds::media_agent::extract_int_value(request_json, "pid", 0);
@@ -85,7 +86,9 @@ void ViewerAudioSession::consume_remote_peer_frame(
   const std::shared_ptr<PeerVideoReceiverRuntime>& runtime_ptr,
   const std::vector<std::uint8_t>& frame,
   const std::string& codec,
-  std::uint32_t rtp_timestamp) {
+  std::uint32_t rtp_timestamp,
+  const MediaFrameTiming& timing) {
+  const auto ingress_us = vds::media_agent::current_time_micros_steady();
   if (!runtime_ptr) {
     return;
   }
@@ -103,7 +106,7 @@ void ViewerAudioSession::consume_remote_peer_frame(
   std::transform(lowered_codec.begin(), lowered_codec.end(), lowered_codec.begin(), [](unsigned char ch) {
     return static_cast<char>(std::tolower(ch));
   });
-  relay_hub().publish_audio_frame(peer_id, frame, lowered_codec, rtp_timestamp);
+  relay_hub().publish_audio_frame(peer_id, frame, lowered_codec, rtp_timestamp, timing);
   if (!local_playback_enabled) {
     return;
   }
@@ -111,16 +114,9 @@ void ViewerAudioSession::consume_remote_peer_frame(
     return;
   }
 
-  auto pcm = lowered_codec == "pcmu"
-    ? decode_pcmu_to_pcm16(frame)
-    : decode_audio_to_pcm16(runtime_ptr, frame, lowered_codec, nullptr);
-  if (pcm.empty()) {
-    return;
-  }
-
   {
     std::lock_guard<std::mutex> lock(runtime_ptr->mutex);
-    if (runtime_ptr->closing) {
+    if (runtime_ptr->closing || !runtime_ptr->local_playback_enabled) {
       return;
     }
     if (runtime_ptr->startup_waiting_for_random_access) {
@@ -128,8 +124,14 @@ void ViewerAudioSession::consume_remote_peer_frame(
       runtime_ptr->reason = "peer-audio-waiting-for-random-access";
       return;
     }
-    runtime_ptr->dispatched_audio_blocks += 1;
-    runtime_ptr->reason = "peer-audio-passthrough-dispatched";
+    // Close/detach marks this receiver first and then stops its audio source.
+    // Submitting under that same lock prevents a late callback reopening it
+    // after stop_source has already completed.
+    if (queue_viewer_audio_encoded_frame(runtime_ptr, frame, lowered_codec, timing, ingress_us)) {
+      runtime_ptr->reason = "peer-audio-encoded-deferred";
+    } else {
+      ++runtime_ptr->dropped_audio_blocks;
+      runtime_ptr->reason = "peer-audio-encoded-rejected";
+    }
   }
-  queue_viewer_audio_pcm_block(std::move(pcm));
 }

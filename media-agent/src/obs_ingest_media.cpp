@@ -109,6 +109,17 @@ std::uint32_t packet_timestamp_at_clock_rate(
   if (best_ts == AV_NOPTS_VALUE) {
     return 0;
   }
-  const std::int64_t scaled = av_rescale_q(best_ts, stream->time_base, AVRational{ clock_rate, 1 });
+  const std::int64_t scaled = av_rescale_q(best_ts, stream->time_base, AVRational{ 1, clock_rate });
   return static_cast<std::uint32_t>(scaled & 0xFFFFFFFFu);
+}
+
+bool packet_presentation_timestamp_us(
+  const AVPacket* packet,
+  AVRational time_base,
+  std::int64_t* timestamp_us) {
+  if (!packet || !timestamp_us || time_base.num <= 0 || time_base.den <= 0) return false;
+  const std::int64_t timestamp = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+  if (timestamp == AV_NOPTS_VALUE) return false;
+  *timestamp_us = av_rescale_q(timestamp, time_base, AVRational{1, 1000000});
+  return true;
 }

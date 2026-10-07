@@ -24,6 +24,11 @@ struct PeerTransportSnapshot {
   bool encoded_media_data_channel_open = false;
   bool encoded_media_data_channel_ready = false;
   int remote_candidate_count = 0;
+  int nat_probe_observations = 0;
+  int nat_port_step = 0;
+  int predicted_local_candidates = 0;
+  int predicted_remote_candidates = 0;
+  bool nat_traversal_enabled = false;
   std::uint64_t video_frames_sent = 0;
   std::uint64_t audio_frames_sent = 0;
   std::uint64_t remote_video_frames_received = 0;
@@ -35,6 +40,9 @@ struct PeerTransportSnapshot {
   std::uint64_t nack_retransmissions = 0;
   std::uint64_t pli_requests_received = 0;
   std::uint64_t keyframe_requests_sent = 0;
+  std::uint64_t keyframe_requests_received = 0;
+  std::uint64_t keyframe_requests_throttled = 0;
+  std::string keyframe_request_action = "keyframe-producer-unavailable";
   std::uint64_t decoder_recovery_count = 0;
   std::uint64_t dropped_video_units = 0;
   std::int64_t round_trip_time_ms = -1;
@@ -50,6 +58,9 @@ struct PeerTransportSnapshot {
   std::string codec_path = "h264";
   std::string selected_local_candidate;
   std::string selected_remote_candidate;
+  std::string selected_stun_server;
+  std::vector<std::string> stun_servers;
+  std::string transport_generation;
   std::string reason = "peer-not-created";
   std::string last_error;
 };
@@ -78,6 +89,7 @@ struct PeerEncodedMediaDataChannelFrame {
   std::string stream_type;
   std::string codec;
   std::string payload_format;
+  std::string source_epoch;
   std::uint64_t timestamp_us = 0;
   std::uint64_t sequence = 0;
   bool keyframe = false;
@@ -89,9 +101,12 @@ struct PeerEncodedMediaDataChannelFrame {
   std::vector<std::uint8_t> payload;
 };
 
+using PeerKeyframeRequestHandler = std::function<std::string(const std::string&)>;
+
 struct PeerTransportCallbacks {
-  std::function<void(const std::string& type, const std::string& sdp)> on_local_description;
-  std::function<void(const std::string& candidate, const std::string& sdp_mid)> on_local_candidate;
+  PeerKeyframeRequestHandler on_keyframe_requested;
+  std::function<void(const std::string& type, const std::string& sdp, const std::string& generation)> on_local_description;
+  std::function<void(const std::string& candidate, const std::string& sdp_mid, const std::string& generation)> on_local_candidate;
   std::function<void(const PeerTransportSnapshot& snapshot, const std::string& logical_state)> on_state_change;
   std::function<void(const std::vector<std::uint8_t>& frame, const std::string& codec, std::uint32_t rtp_timestamp)> on_remote_video_frame;
   std::function<void(const std::vector<std::uint8_t>& frame, const std::string& codec, std::uint32_t rtp_timestamp)> on_remote_audio_frame;
@@ -101,6 +116,10 @@ struct PeerTransportCallbacks {
 
 class PeerTransportSession;
 
+void set_peer_transport_keyframe_request_handler(
+  const std::shared_ptr<PeerTransportSession>& session,
+  PeerKeyframeRequestHandler handler);
+
 PeerTransportBackendInfo get_peer_transport_backend_info();
 
 std::shared_ptr<PeerTransportSession> create_peer_transport_session(
@@ -108,6 +127,8 @@ std::shared_ptr<PeerTransportSession> create_peer_transport_session(
   bool initiator,
   const PeerTransportCallbacks& callbacks,
   bool encoded_media_data_channel,
+  const std::string& stun_server,
+  const std::vector<std::string>& stun_servers,
   std::string* error
 );
 

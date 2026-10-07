@@ -25,6 +25,8 @@ type StatusHandler = (status: 'connecting' | 'open' | 'closed' | 'error') => voi
 
 export class VdsWebSignaling {
   private ws: WebSocket | null = null;
+  private connectPromise: Promise<void> | null = null;
+  private rejectConnect: ((reason: Error) => void) | null = null;
   private messageHandlers = new Set<MessageHandler>();
   private statusHandlers = new Set<StatusHandler>();
 
@@ -32,24 +34,55 @@ export class VdsWebSignaling {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       return Promise.resolve();
     }
+    if (this.connectPromise) {
+      return this.connectPromise;
+    }
 
     this.emitStatus('connecting');
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${protocol}//${location.host}`);
     this.ws = ws;
 
-    return new Promise((resolve, reject) => {
+    this.connectPromise = new Promise((resolve, reject) => {
+      this.rejectConnect = reject;
       ws.addEventListener('open', () => {
+        if (this.ws !== ws) {
+          return;
+        }
+        this.connectPromise = null;
+        this.rejectConnect = null;
         this.emitStatus('open');
         resolve();
       }, { once: true });
       ws.addEventListener('error', () => {
+        if (this.ws !== ws) {
+          return;
+        }
+        this.ws = null;
+        this.connectPromise = null;
+        this.rejectConnect = null;
+        ws.close();
         this.emitStatus('error');
         reject(new Error('WebSocket connection failed'));
+        this.emitStatus('closed');
       }, { once: true });
-      ws.addEventListener('close', () => this.emitStatus('closed'));
-      ws.addEventListener('message', (event) => this.handleMessage(event.data));
+      ws.addEventListener('close', () => {
+        if (this.ws !== ws) {
+          return;
+        }
+        this.ws = null;
+        this.connectPromise = null;
+        this.rejectConnect = null;
+        reject(new Error('WebSocket closed before connection completed'));
+        this.emitStatus('closed');
+      });
+      ws.addEventListener('message', (event) => {
+        if (this.ws === ws) {
+          this.handleMessage(event.data);
+        }
+      });
     });
+    return this.connectPromise;
   }
 
   onMessage(handler: MessageHandler): () => void {
@@ -70,8 +103,13 @@ export class VdsWebSignaling {
   }
 
   close(): void {
-    this.ws?.close();
+    const ws = this.ws;
     this.ws = null;
+    const rejectConnect = this.rejectConnect;
+    this.connectPromise = null;
+    this.rejectConnect = null;
+    rejectConnect?.(new Error('WebSocket connection cancelled'));
+    ws?.close();
   }
 
   private handleMessage(raw: unknown): void {

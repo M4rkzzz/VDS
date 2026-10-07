@@ -34,13 +34,15 @@ class RelayHub {
     const std::string& upstream_peer_id,
     const std::string& codec,
     const std::vector<std::vector<std::uint8_t>>& access_units,
-    std::uint32_t rtp_timestamp) const;
+    std::uint32_t rtp_timestamp,
+    const MediaFrameTiming& timing = {}) const;
 
   void publish_audio_frame(
     const std::string& upstream_peer_id,
     const std::vector<std::uint8_t>& frame,
     const std::string& codec,
-    std::uint32_t rtp_timestamp) const;
+    std::uint32_t rtp_timestamp,
+    const MediaFrameTiming& timing = {}) const;
 
  private:
   struct Backend;

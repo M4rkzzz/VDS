@@ -315,6 +315,10 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
       logNativeStep: (event, payload, category) => nativeDiagnostics.logNativeStep(event, payload, category),
       getClientId: () => clientId,
       getCurrentSessionToken: () => currentSessionToken,
+      getSessionRole: () => sessionRole,
+      getCurrentRoomId: () => currentRoomId,
+      getViewerJoinGeneration: () => viewerJoinGeneration,
+      isViewerJoinPending: () => viewerJoinPending,
       isObsIngestHostBackend: () => isObsIngestHostBackend(),
       setHostRoomState: (state) => nativeRendererState.setHostRoomState(state),
       setHostRoomActiveUi: (state) => nativeRendererState.setHostRoomActiveUi(state),
@@ -350,6 +354,7 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
     });
   const nativePeerController = nativeEntry.createRequired('nativePeer', 'createController', 'native-peer-controller-unavailable', {
       mediaEngine,
+      getIceServers: () => config.iceServers,
       surfaceController: nativeSurfaceController,
       roomClient,
       logNativeStep: (scope, payload, category) => nativeDiagnostics.logNativeStep(scope, payload, category),
@@ -507,7 +512,14 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
         nativeSessionState.setObsRoomCreatePending(false);
         showError(error && error.message ? error.message : 'websocket-timeout');
       }),
-      teardownObsHostRoom: (reason) => nativeSessionController.teardownObsHostRoom({ reason: reason || 'host-room-ended' }),
+      teardownObsHostRoom: (reason) => nativeSessionController.teardownObsHostRoom({ reason: reason || 'host-room-ended' }).catch((error) => {
+        nativeDiagnostics.logRecoverableNativeWarning('obs-host-room:teardown-failed', error, {
+          key: 'obs-host-room-teardown',
+          category: 'connection',
+          channel: 'nativeSteps',
+          fallbackLabel: '[media-engine] OBS room teardown failed:'
+        });
+      }),
       logRecoverableNativeWarning: (scope, error, warningOptions) => nativeDiagnostics.logRecoverableNativeWarning(scope, error, warningOptions),
       stopHostStatsPolling: () => nativeStatsController.stopHostStatsPolling(),
       stopViewerStatsPolling: () => nativeStatsController.stopViewerStatsPolling(),

@@ -1,5 +1,6 @@
 #include "peer_create_request_config.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <utility>
@@ -7,6 +8,7 @@
 #include "agent_diagnostics.h"
 #include "json_protocol.h"
 #include "peer_media_manifest.h"
+#include "peer_stun_config.h"
 #include "peer_video_receiver_state.h"
 #include "peer_transport.h"
 
@@ -43,6 +45,27 @@ PeerCreateRequestConfig configure_peer_create_request(
   if (config.peer.peer_id.empty()) {
     config.error = error_peer_control_result("BAD_REQUEST", "peerId is required");
     return config;
+  }
+  if (!parse_peer_stun_server_request(request_json, &config.stun_server)) {
+    config.error = error_peer_control_result(
+      "BAD_REQUEST", "stunServer must be a stun:host[:port] URL of at most 256 characters; relay servers are not supported");
+    return config;
+  }
+
+  if (!parse_peer_stun_servers_request(request_json, &config.stun_servers)) {
+    config.error = error_peer_control_result(
+      "BAD_REQUEST", "stunServers must contain at most four distinct pure STUN URLs");
+    return config;
+  }
+  if (!config.stun_server.empty()) {
+    config.stun_servers.erase(
+      std::remove(config.stun_servers.begin(), config.stun_servers.end(), config.stun_server),
+      config.stun_servers.end());
+    config.stun_servers.insert(config.stun_servers.begin(), config.stun_server);
+    if (config.stun_servers.size() > 4) {
+      config.error = error_peer_control_result("BAD_REQUEST", "The selected STUN and STUN pool exceed four endpoints");
+      return config;
+    }
   }
 
   config.peer.phase = SessionPhase::Configured;

@@ -185,6 +185,29 @@
       return String(candidate.candidate || '');
     }
 
+    function getCandidateIceUfrag(candidate) {
+      const extensions = getIceCandidateText(candidate).trim().split(/\s+/).slice(8).join(' ');
+      const textUfrags = Array.from(extensions.matchAll(/\bufrag\s+([^\s]+)/gi), (match) => match[1]);
+      const objectUfrag = candidate && typeof candidate === 'object'
+        ? String(candidate.usernameFragment || '') : '';
+      const uniqueUfrags = new Set([...textUfrags, ...(objectUfrag ? [objectUfrag] : [])]);
+      if (uniqueUfrags.size > 1) {
+        return '!conflicting-ufrag';
+      }
+      return objectUfrag || textUfrags[0] || '';
+    }
+
+    function isCandidateForRemoteDescription(candidate, description, iceUfrag = getCandidateIceUfrag(candidate)) {
+      const extensions = getIceCandidateText(candidate).trim().split(/\s+/).slice(8).join(' ');
+      const predicted = /\bvds-predicted\s+1\b/i.test(extensions);
+      if (!iceUfrag) {
+        return !predicted;
+      }
+      const sdp = String(description && description.sdp || '');
+      const ufrags = Array.from(sdp.matchAll(/^a=ice-ufrag:([^\r\n]+)\s*$/gm), (match) => match[1].trim());
+      return ufrags.includes(iceUfrag);
+    }
+
     function isAllowedPureP2pCandidate(candidate) {
       const candidateText = getIceCandidateText(candidate);
       if (!candidateText) {
@@ -214,12 +237,12 @@
         meta.remoteCandidateKeys = new Set();
       }
       meta.remoteCandidateKeys.add(candidateKey);
-      if (meta.remoteCandidateKeys.size > 64) {
-        meta.remoteCandidateKeys = new Set(Array.from(meta.remoteCandidateKeys).slice(-48));
+      if (meta.remoteCandidateKeys.size > 256) {
+        meta.remoteCandidateKeys = new Set(Array.from(meta.remoteCandidateKeys).slice(-192));
       }
     }
 
-    function queuePendingRemoteCandidate(peerId, candidate) {
+    function queuePendingRemoteCandidate(peerId, candidate, attemptId = null) {
       if (!peerId || !candidate) {
         return false;
       }
@@ -228,12 +251,14 @@
       }
       const queued = pendingRemoteCandidates.get(peerId);
       const candidateKey = buildRemoteCandidateKey(candidate);
-      const duplicate = queued.some((entry) => buildRemoteCandidateKey(entry) === candidateKey);
+      const iceUfrag = getCandidateIceUfrag(candidate);
+      const duplicate = queued.some((entry) => entry.attemptId === attemptId && entry.iceUfrag === iceUfrag &&
+        buildRemoteCandidateKey(entry.candidate) === candidateKey);
       if (duplicate) {
         return false;
       }
-      queued.push(candidate);
-      while (queued.length > 32) {
+      queued.push({ candidate, attemptId, iceUfrag, handle: getPeerHandle(peerId) });
+      while (queued.length > 128) {
         queued.shift();
       }
       return true;
@@ -718,6 +743,9 @@
       if (!handle.remoteDescription || !handle.remoteDescription.type) {
         return { action: 'queue', peerId, handle, reason: 'missing-remote-description' };
       }
+      if (!isCandidateForRemoteDescription(candidate, handle.remoteDescription)) {
+        return { action: 'ignore', peerId, handle, attemptId, reason: 'stale-ice-ufrag' };
+      }
       return { action: 'apply', peerId, handle };
     }
 
@@ -789,12 +817,24 @@
       }, peerId);
     }
 
+    function isCurrentNativeSignal(params) {
+      const generation = params && params.transportGeneration;
+      if (!generation) {
+        return true;
+      }
+      const handle = getPeerHandle(getSignalPeerId(params));
+      return Boolean(handle && !handle.closed && handle.transportGeneration === generation);
+    }
+
     function prepareLocalIceCandidateSignal(params, messageOptions = {}) {
       if (!params || !params.type) {
         return { action: 'ignore', reason: 'missing-type' };
       }
       if (params.type !== 'candidate') {
         return { action: 'ignore', reason: 'unsupported-type', signalType: params.type };
+      }
+      if (!isCurrentNativeSignal(params)) {
+        return { action: 'ignore', reason: 'stale-transport-generation' };
       }
 
       const targetId = params.targetId || params.peerId || params.remotePeerId;
@@ -830,6 +870,15 @@
 
     function handleLocalSignalEvent(params, messageOptions = {}) {
       const peerId = getSignalPeerId(params);
+      const handle = getPeerHandle(peerId);
+      if (params && params.transportGeneration && handle && !handle.closed && handle.__readyResolved === false) {
+        handle.__pendingLocalSignals.push({ params, messageOptions });
+        if (handle.__pendingLocalSignals.length > 128) handle.__pendingLocalSignals.shift();
+        return { peerId, decision: { action: 'ignore', reason: 'pending-transport-generation' } };
+      }
+      if (!isCurrentNativeSignal(params)) {
+        return { peerId, decision: { action: 'ignore', reason: 'stale-transport-generation' } };
+      }
       if (peerId) {
         updateSignalState(peerId, params);
         enqueueSignal(params);
@@ -1166,6 +1215,8 @@
     }
 
     async function attemptLastChanceNatMapping(peerId, reason, natOptions = {}) {
+      const mappingHandle = getPeerHandle(peerId);
+      const isCurrentMapping = () => getPeerHandle(peerId) === mappingHandle && mappingHandle && !mappingHandle.closed;
       const mediaEngine = options.mediaEngine || null;
       if (!mediaEngine || typeof mediaEngine.openNatMapping !== 'function') {
         return false;
@@ -1196,6 +1247,10 @@
       const setTimer = typeof window !== 'undefined' && typeof window.setTimeout === 'function'
         ? window.setTimeout.bind(window)
         : setTimeout;
+      const clearTimer = typeof window !== 'undefined' && typeof window.clearTimeout === 'function'
+        ? window.clearTimeout.bind(window)
+        : clearTimeout;
+      let timeoutId = null;
 
       try {
         const result = await Promise.race([
@@ -1205,9 +1260,10 @@
             lifetimeSeconds: 180
           }),
           new Promise((_, reject) => {
-            setTimer(() => reject(new Error('nat-mapping-timeout')), timeoutMs);
+            timeoutId = setTimer(() => reject(new Error('nat-mapping-timeout')), timeoutMs);
           })
         ]);
+        if (!isCurrentMapping()) return false;
         logNativeStep('peer-nat-mapping:result', {
           peerId,
           ok: Boolean(result && result.ok),
@@ -1222,6 +1278,7 @@
         sendNatMappedCandidatesAndArmWait(peerId, result.candidates, { roomId: natOptions.roomId });
         return true;
       } catch (error) {
+        if (!isCurrentMapping()) return false;
         applyNatMappingError(peerId, error);
         logNativeStep('peer-nat-mapping:failed', {
           peerId,
@@ -1229,7 +1286,8 @@
         }, 'p2p');
         return false;
       } finally {
-        finishNatMappingAttempt(peerId);
+        if (timeoutId !== null) clearTimer(timeoutId);
+        if (isCurrentMapping()) finishNatMappingAttempt(peerId);
         if (typeof options.renderP2pDiagnosticReport === 'function') {
           options.renderP2pDiagnosticReport();
         }
@@ -1245,6 +1303,9 @@
       const fallbackStarted = await attemptLastChanceNatMapping(peerId, reason, {
         roomId: failureOptions.roomId
       });
+      if (getPeerHandle(peerId) !== prepared.handle || prepared.handle.closed || prepared.meta.hasConnected) {
+        return { finalized: false, peerId, reason: 'superseded-or-connected' };
+      }
       if (fallbackStarted) {
         return { finalized: false, fallbackStarted: true, peerId, reason, source };
       }
@@ -1314,6 +1375,9 @@
       const handle = getPeerHandle(peerId);
       if (!handle) {
         return { handled: false, reason: 'missing-handle' };
+      }
+      if (params.transportGeneration && (handle.__readyResolved === false || !isCurrentNativeSignal(params))) {
+        return { handled: false, peerId, reason: 'stale-transport-generation' };
       }
       const meta = getPeerMeta(peerId);
       const state = String(params.state || '');
@@ -1496,15 +1560,30 @@
         localDescription: null,
         remoteDescription: null,
         closed: false,
-        __readyPromise: options.mediaEngine.createPeer({
+        transportGeneration: '',
+        __readyResolved: false,
+        __pendingLocalSignals: [],
+        __readyPromise: null
+      };
+      setPeerHandle(peerId, handle);
+      handle.__readyPromise = Promise.resolve(options.mediaEngine.createPeer({
           peerId,
           role,
           initiator,
           encodedMediaDataChannel,
+          iceServers: typeof options.getIceServers === 'function' ? options.getIceServers() : [],
           mediaManifest: params.mediaManifest || null
-        })
-      };
-      setPeerHandle(peerId, handle);
+        })).then((result) => {
+          handle.transportGeneration = String(result && (
+            result.transportGeneration || result.peerTransport && result.peerTransport.transportGeneration ||
+            result.peer && result.peer.peerTransport && result.peer.peerTransport.transportGeneration
+          ) || '');
+          handle.__readyResolved = true;
+          if (handle.closed || getPeerHandle(peerId) !== handle) return result;
+          const queued = handle.__pendingLocalSignals.splice(0);
+          for (const entry of queued) handleLocalSignalEventAndSend(entry.params, entry.messageOptions);
+          return result;
+        });
       return handle;
     }
 
@@ -1660,8 +1739,10 @@
         peerId,
         type: description.type,
         sdp: description.sdp,
-        mediaManifest: mediaManifest || null
+        mediaManifest: mediaManifest || null,
+        ...(handle.transportGeneration ? { transportGeneration: handle.transportGeneration } : {})
       });
+      if (handle.closed || getPeerHandle(peerId) !== handle) throw new Error(`native-peer-stale:${peerId}`);
       logNativeStep('setRemoteDescription:applied', {
         peerId,
         type: description.type
@@ -1803,7 +1884,8 @@
       await ensurePeerReady(peerId, handle);
       await options.mediaEngine.addRemoteIceCandidate({
         peerId,
-        candidate
+        candidate,
+        ...(handle.transportGeneration ? { transportGeneration: handle.transportGeneration } : {})
       });
       logNativeStep('addRemoteIceCandidate:applied', { peerId });
     }
@@ -1815,6 +1897,12 @@
       if (!isAllowedPureP2pCandidate(candidate)) {
         return { action: 'block', peerId, handle, reason: 'relay-candidate' };
       }
+      if (handle.closed || getPeerHandle(peerId) !== handle) {
+        return { action: 'ignore', peerId, handle, reason: 'stale-peer' };
+      }
+      if (!isCandidateForRemoteDescription(candidate, handle.remoteDescription)) {
+        return { action: 'ignore', peerId, handle, reason: 'stale-ice-ufrag' };
+      }
 
       const candidateKey = buildRemoteCandidateKey(candidate);
       if (hasRemoteCandidate(peerId, candidateKey)) {
@@ -1822,6 +1910,9 @@
       }
 
       await addRemoteIceCandidate(peerId, handle, candidate);
+      if (handle.closed || getPeerHandle(peerId) !== handle) {
+        return { action: 'ignore', peerId, handle, reason: 'stale-peer' };
+      }
       rememberRemoteCandidate(peerId, candidateKey);
       return { action: 'apply', peerId, handle, candidateKey, uiState: 'checking' };
     }
@@ -1832,7 +1923,7 @@
         return decision;
       }
       if (decision.action === 'queue') {
-        queuePendingRemoteCandidate(peerId, candidate);
+        queuePendingRemoteCandidate(peerId, candidate, attemptId);
         return { ...decision, queued: true };
       }
       if (decision.action === 'apply') {
@@ -1901,8 +1992,17 @@
       }
 
       const results = [];
-      for (const candidate of queued) {
-        results.push(await applyRemoteIceCandidate(peerId, handle, candidate));
+      for (const entry of queued) {
+        if (handle.closed || getPeerHandle(peerId) !== handle) break;
+        if ((entry.handle && entry.handle !== handle) || !isCurrentPeerAttempt(peerId, entry.attemptId)) {
+          results.push({ action: 'ignore', peerId, reason: 'stale-attempt' });
+          continue;
+        }
+        if (!isCandidateForRemoteDescription(entry.candidate, handle.remoteDescription, entry.iceUfrag)) {
+          results.push({ action: 'ignore', peerId, reason: 'stale-ice-ufrag' });
+          continue;
+        }
+        results.push(await applyRemoteIceCandidate(peerId, handle, entry.candidate));
       }
       return {
         action: 'flush',
@@ -1923,13 +2023,16 @@
         throw new Error(`unexpected-renderer-peer-handle:${peerId}`);
       }
       currentHandle.closed = true;
+      if (currentHandle.__readyPromise) await currentHandle.__readyPromise.catch(() => {});
+      const identity = currentHandle.transportGeneration ? { transportGeneration: currentHandle.transportGeneration } : {};
+      if (getPeerHandle(peerId) !== currentHandle) return null;
       if (options.mediaEngine && typeof options.mediaEngine.detachPeerMediaSource === 'function') {
-        await options.mediaEngine.detachPeerMediaSource({ peerId }).catch(() => {});
+        await options.mediaEngine.detachPeerMediaSource({ peerId, ...identity }).catch(() => {});
       }
       if (options.mediaEngine && typeof options.mediaEngine.closePeer === 'function') {
-        await options.mediaEngine.closePeer({ peerId }).catch(() => {});
+        await options.mediaEngine.closePeer({ peerId, ...identity }).catch(() => {});
       }
-      deletePeerHandle(peerId);
+      if (getPeerHandle(peerId) === currentHandle) deletePeerHandle(peerId);
       return null;
     }
 
@@ -1960,7 +2063,9 @@
         }
         await closePeer(peerId, handle);
       } finally {
-        applyPeerCloseCleanupEffects(peerId, closeCleanupDecision);
+        if (!getPeerHandle(peerId) || getPeerHandle(peerId) === handle) {
+          applyPeerCloseCleanupEffects(peerId, closeCleanupDecision);
+        }
       }
       return null;
     }

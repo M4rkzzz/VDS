@@ -1,0 +1,562 @@
+--- a/include/juice/juice.h
++++ b/include/juice/juice.h
+@@ -48,7 +48,14 @@
+ 
+ #define JUICE_MAX_ADDRESS_STRING_LEN 64
+ #define JUICE_MAX_CANDIDATE_SDP_STRING_LEN 256
+-#define JUICE_MAX_SDP_STRING_LEN 4096
++#define JUICE_MAX_SDP_STRING_LEN 32768
++
++#define JUICE_VDS_ENHANCED_ICE 1
++#define JUICE_VDS_MAX_STUN_SERVERS 4
++typedef struct juice_stun_server {
++	const char *host;
++	uint16_t port;
++} juice_stun_server_t;
+ 
+ typedef struct juice_agent juice_agent_t;
+ 
+@@ -115,6 +122,11 @@
+ 	juice_cb_recv_t cb_recv;
+ 
+ 	void *user_ptr;
++
++	// VDS extension: copied at creation; probes use the actual ICE UDP socket.
++	juice_stun_server_t stun_servers[JUICE_VDS_MAX_STUN_SERVERS];
++	int stun_servers_count;
++	bool enable_port_prediction;
+ 
+ } juice_config_t;
+ 
+--- a/src/agent.h
++++ b/src/agent.h
+@@ -18,6 +18,7 @@
+ #include "thread.h"
+ #include "timestamp.h"
+ #include "turn.h"
++#include "nat_port_prediction.h"
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
+@@ -61,7 +62,7 @@
+ #define TURN_REFRESH_PERIOD (TURN_LIFETIME - 60000) // msecs (lifetime - 1 min)
+ 
+ // Max STUN and TURN server entries
+-#define MAX_SERVER_ENTRIES_COUNT 2 // max STUN server entries
++#define MAX_SERVER_ENTRIES_COUNT 8 // Four STUN targets, up to IPv4/IPv6 per target
+ #define MAX_RELAY_ENTRIES_COUNT 2  // max TURN server entries
+ 
+ // Max TURN redirections for ALTERNATE-SERVER mechanism
+@@ -116,6 +117,8 @@
+ 	timediff_t retransmission_timeout;
+ 	int retransmissions;
+ 	bool transaction_id_expired;
++	uint32_t vds_first_send_sequence;
++	bool vds_mapping_observed;
+ 
+ 	// TURN
+ 	agent_turn_state_t *turn;
+@@ -146,6 +149,13 @@
+ 	timestamp_t pac_timestamp; // Patiently Awaiting Connectivity timer
+ 	timestamp_t nomination_timestamp;
+ 	bool gathering_done;
++	uint32_t vds_send_sequence;
++	uint32_t vds_current_probe_index;
++	vds_nat_port_observation vds_observations[VDS_NAT_MAX_OBSERVATIONS];
++	size_t vds_observation_count;
++	timestamp_t vds_prediction_deadline;
++	timestamp_t vds_remote_sampling_grace_until;
++	bool vds_prediction_emitted;
+ 
+ 	conn_registry_t *registry;
+ 	int conn_index;
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -38,6 +38,110 @@
+ #define BUFFER_SIZE 4096
+ #define DEFAULT_MAX_RECORDS_COUNT 8
+ 
++
++// Runs under the existing connection lock; never creates another socket/thread.
++static bool vds_is_public_destination(const addr_record_t *record) {
++	if (record->addr.ss_family != AF_INET) return false;
++	uint32_t ip = ntohl(((const struct sockaddr_in *)&record->addr)->sin_addr.s_addr);
++	return (ip >> 24) != 10 && (ip >> 24) != 127 && (ip >> 16) != 0xa9fe &&
++	       (ip >> 20) != 0xac1 && (ip >> 16) != 0xc0a8;
++}
++
++static bool vds_server_requests_pending(const juice_agent_t *agent) {
++	for (int i = 0; i < agent->entries_count; ++i)
++		if (agent->entries[i].type == AGENT_STUN_ENTRY_TYPE_SERVER &&
++		    agent->entries[i].state == AGENT_STUN_ENTRY_STATE_PENDING) return true;
++	return false;
++}
++
++static void vds_flush_reflexive_candidates(juice_agent_t *agent) {
++	for (int i = 0; i < agent->local.candidates_count; ++i) {
++		ice_candidate_t *candidate = agent->local.candidates + i;
++		if (candidate->type != ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE || candidate->vds_emitted) continue;
++		char buffer[BUFFER_SIZE];
++		int length = ice_generate_candidate_sdp(candidate, buffer, sizeof(buffer));
++		if (length < 0) continue;
++		int extra = snprintf(buffer + length, sizeof(buffer) - length, " vds-probe-count %u",
++		                     (unsigned int)agent->vds_observation_count);
++		if (extra < 0 || (size_t)extra >= sizeof(buffer) - length) continue;
++		candidate->vds_emitted = true;
++		if (agent->config.cb_candidate)
++			agent->config.cb_candidate(agent, buffer, agent->config.user_ptr);
++	}
++}
++
++static bool vds_confirmed_sequential_remote(const juice_agent_t *agent, const ice_candidate_t *remote) {
++	if (!remote->vds_predicted || remote->transport != ICE_CANDIDATE_TRANSPORT_UDP ||
++	    remote->resolved.addr.ss_family != AF_INET || !remote->vds_nat_step ||
++	    remote->vds_nat_step < -16 || remote->vds_nat_step > 16 ||
++	    !*remote->vds_ufrag || strcmp(remote->vds_ufrag, agent->remote.ice_ufrag)) return false;
++	for (int i = 0; i < agent->remote.candidates_count; ++i) {
++		const ice_candidate_t *candidate = agent->remote.candidates + i;
++		if (!candidate->vds_predicted && candidate->type == ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE &&
++		    candidate->resolved.addr.ss_family == AF_INET &&
++		    addr_record_is_equal(&candidate->resolved, &remote->resolved, false)) return true;
++	}
++	return false;
++}
++
++static void vds_emit_predictions(juice_agent_t *agent, bool deadline) {
++	if (!agent->config.enable_port_prediction || agent->vds_prediction_emitted) return;
++	if (!deadline && vds_server_requests_pending(agent)) return;
++	// Address confirmation is delivered first. Checks wait in a bounded single grace window.
++	vds_flush_reflexive_candidates(agent);
++	if (agent->selected_pair || !agent->vds_observation_count) {
++		agent->vds_prediction_emitted = true;
++		return;
++	}
++	uint16_t ports[VDS_NAT_MAX_PREDICTED_PORTS];
++	int step = 0;
++	size_t count = vds_nat_predict_ports(agent->vds_observations, agent->vds_observation_count,
++	                                   ports, VDS_NAT_MAX_PREDICTED_PORTS, &step);
++	if (!count)
++		count = vds_nat_neighbor_ports(agent->vds_observations, agent->vds_observation_count,
++		                               ports, VDS_NAT_MAX_PREDICTED_PORTS);
++	agent->vds_prediction_emitted = true;
++	if (!count) return;
++	uint32_t address = 0;
++	uint32_t last_sequence = 0;
++	for (size_t i = 0; i < agent->vds_observation_count; ++i) {
++		const vds_nat_port_observation *observation = agent->vds_observations + i;
++		if (observation->valid && observation->sequence > last_sequence) {
++			address = observation->address;
++			last_sequence = observation->sequence;
++		}
++	}
++	for (size_t i = 0; i < count; ++i) {
++		// Leave ample capacity for subsequently discovered genuine/prflx candidates.
++		if (agent->local.candidates_count >= ICE_MAX_CANDIDATES_COUNT - 32) break;
++		addr_record_t record;
++		memset(&record, 0, sizeof(record));
++		struct sockaddr_in *sa = (struct sockaddr_in *)&record.addr;
++		sa->sin_family = AF_INET;
++		sa->sin_addr.s_addr = address;
++		sa->sin_port = htons(ports[i]);
++		record.len = sizeof(*sa);
++		record.socktype = SOCK_DGRAM;
++		if (ice_find_candidate_from_addr(&agent->local, &record, ICE_CANDIDATE_TYPE_UNKNOWN)) continue;
++		ice_candidate_t candidate;
++		if (ice_create_local_candidate(ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE, 1,
++		                               agent->local.candidates_count, &record, &candidate,
++		                               ICE_CANDIDATE_TRANSPORT_UDP)) continue;
++		candidate.vds_predicted = true;
++		candidate.vds_emitted = true;
++		candidate.vds_nat_step = step;
++		candidate.vds_probe_index = last_sequence;
++		strcpy(candidate.vds_ufrag, agent->local.ice_ufrag);
++		// Real srflx is type preference 100; hypotheses are always lower priority.
++		candidate.priority = (80U << 24) | ((uint32_t)(65535 - i) << 8) | 255;
++		if (ice_add_candidate(&candidate, &agent->local)) continue;
++		char buffer[BUFFER_SIZE];
++		if (ice_generate_candidate_sdp(&candidate, buffer, sizeof(buffer)) < 0) continue;
++		if (agent->config.cb_candidate)
++			agent->config.cb_candidate(agent, buffer, agent->config.user_ptr);
++	}
++}
++
+ static char *alloc_string_copy(const char *orig, bool *alloc_failed) {
+ 	if (!orig)
+ 		return NULL;
+@@ -96,6 +200,14 @@
+ 	agent->config.concurrency_mode = config->concurrency_mode;
+ 	agent->config.stun_server_host = alloc_string_copy(config->stun_server_host, &alloc_failed);
+ 	agent->config.stun_server_port = config->stun_server_port;
++	if (config->stun_servers_count < 0 || config->stun_servers_count > JUICE_VDS_MAX_STUN_SERVERS)
++		goto error;
++	agent->config.stun_servers_count = config->stun_servers_count;
++	agent->config.enable_port_prediction = config->enable_port_prediction;
++	for (int i = 0; i < config->stun_servers_count; ++i) {
++		agent->config.stun_servers[i].host = alloc_string_copy(config->stun_servers[i].host, &alloc_failed);
++		agent->config.stun_servers[i].port = config->stun_servers[i].port;
++	}
+ 	agent->config.bind_address = alloc_string_copy(config->bind_address, &alloc_failed);
+ 	agent->config.local_port_range_begin = config->local_port_range_begin;
+ 	agent->config.local_port_range_end = config->local_port_range_end;
+@@ -176,6 +288,8 @@
+ 
+ 	// Free strings in config
+ 	free((void *)agent->config.stun_server_host);
++	for (int i = 0; i < agent->config.stun_servers_count; ++i)
++		free((void *)agent->config.stun_servers[i].host);
+ 	for (int i = 0; i < agent->config.turn_servers_count; ++i) {
+ 		juice_turn_server_t *turn_server = agent->config.turn_servers + i;
+ 		free((void *)turn_server->host);
+@@ -196,6 +310,10 @@
+ static bool has_nonnumeric_server_hostnames(const juice_config_t *config) {
+ 	if (config->stun_server_host && !addr_is_numeric_hostname(config->stun_server_host))
+ 		return true;
++
++	for (int i = 0; i < config->stun_servers_count; ++i)
++		if (config->stun_servers[i].host && !addr_is_numeric_hostname(config->stun_servers[i].host))
++			return true;
+ 
+ 	for (int i = 0; i < config->turn_servers_count; ++i) {
+ 		juice_turn_server_t *turn_server = config->turn_servers + i;
+@@ -293,6 +411,8 @@
+ 		}
+ 	}
+ 
++	for (int i = 0; i < agent->local.candidates_count; ++i)
++		strcpy(agent->local.candidates[i].vds_ufrag, agent->local.ice_ufrag);
+ 	ice_sort_candidates(&agent->local);
+ 
+ 	for (int i = 0; i < agent->entries_count; ++i)
+@@ -440,50 +560,39 @@
+ 		}
+ 	}
+ 
+-	// STUN server resolution
+-	// The entry is added after so the TURN server address will be matched in priority
+-	if (agent->config.stun_server_host) {
+-		if (!agent->config.stun_server_port)
+-			agent->config.stun_server_port = 3478; // default STUN port
+-
+-		char hostname[256];
+-		char service[8];
+-		snprintf(hostname, 256, "%s", agent->config.stun_server_host);
+-		snprintf(service, 8, "%hu", agent->config.stun_server_port);
+-
++	// Resolve at most four configured STUN targets, keeping the selected primary first.
++	int configured_count = agent->config.stun_servers_count;
++	int server_count = configured_count ? configured_count : (agent->config.stun_server_host ? 1 : 0);
++	int registered_count = 0;
++	for (int server_index = 0; server_index < server_count; ++server_index) {
++		const char *host = configured_count ? agent->config.stun_servers[server_index].host : agent->config.stun_server_host;
++		uint16_t port = configured_count ? agent->config.stun_servers[server_index].port : agent->config.stun_server_port;
++		if (!host || !*host) continue;
++		if (!port) port = 3478;
++		char hostname[256], service[8];
++		snprintf(hostname, sizeof(hostname), "%s", host);
++		snprintf(service, sizeof(service), "%hu", port);
+ 		conn_unlock(agent);
+-
+-		addr_record_t records[MAX_STUN_SERVER_RECORDS_COUNT];
+-		int records_count =
+-		    addr_resolve(hostname, service, SOCK_DGRAM, records, MAX_STUN_SERVER_RECORDS_COUNT);
+-
++		addr_record_t records[2];
++		int records_count = addr_resolve(hostname, service, SOCK_DGRAM, records, 2);
+ 		conn_lock(agent);
+-
+-		if (records_count > 0) {
+-			if (records_count > MAX_STUN_SERVER_RECORDS_COUNT)
+-				records_count = MAX_STUN_SERVER_RECORDS_COUNT;
+-
+-			JLOG_INFO("Using STUN server %s:%s", agent->config.stun_server_host, service);
+-
+-			for (int i = 0; i < records_count; ++i) {
+-				if (i >= MAX_SERVER_ENTRIES_COUNT)
+-					break;
+-				JLOG_VERBOSE("Registering STUN entry %d for server request", agent->entries_count);
+-				agent_stun_entry_t *entry = agent->entries + agent->entries_count;
+-				entry->type = AGENT_STUN_ENTRY_TYPE_SERVER;
+-				entry->state = AGENT_STUN_ENTRY_STATE_PENDING;
+-				entry->pair = NULL;
+-				entry->record = records[i];
+-				juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
+-				entry->transaction_id_expired = false;
+-				++agent->entries_count;
+-
+-				agent_arm_transmission(agent, entry, STUN_PACING_TIME * i);
+-			}
+-		} else {
+-			JLOG_ERROR("STUN server address resolution failed");
+-		}
+-	}
++		for (int i = 0; i < records_count && i < 2 && registered_count < MAX_SERVER_ENTRIES_COUNT; ++i) {
++			bool duplicate = false;
++			for (int j = 0; j < agent->entries_count; ++j)
++				if (agent->entries[j].type == AGENT_STUN_ENTRY_TYPE_SERVER &&
++				    addr_record_is_equal(&agent->entries[j].record, records + i, true)) duplicate = true;
++			if (duplicate || agent->entries_count >= MAX_STUN_ENTRIES_COUNT) continue;
++			agent_stun_entry_t *entry = agent->entries + agent->entries_count++;
++			entry->type = AGENT_STUN_ENTRY_TYPE_SERVER;
++			entry->state = AGENT_STUN_ENTRY_STATE_PENDING;
++			entry->record = records[i];
++			juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
++			entry->transaction_id_expired = false;
++			agent_arm_transmission(agent, entry, STUN_PACING_TIME * registered_count++);
++		}
++	}
++	if (agent->config.enable_port_prediction && registered_count)
++		agent->vds_prediction_deadline = current_timestamp() + 2000;
+ 
+ 	agent_update_gathering_done(agent);
+ 	conn_unlock(agent);
+@@ -909,9 +1018,32 @@
+ 	if (agent->state == JUICE_STATE_DISCONNECTED || agent->state == JUICE_STATE_GATHERING)
+ 		return 0;
+ 
++	if (agent->vds_prediction_deadline && now >= agent->vds_prediction_deadline)
++		vds_emit_predictions(agent, true);
++	if (agent->vds_prediction_deadline && !agent->vds_prediction_emitted &&
++	    now < agent->vds_prediction_deadline && *next_timestamp > agent->vds_prediction_deadline)
++		*next_timestamp = agent->vds_prediction_deadline;
+ 	for (int i = 0; i < agent->entries_count; ++i) {
+ 		agent_stun_entry_t *entry = agent->entries + i;
+ 
++		timestamp_t pause_until = 0;
++		if (entry->state == AGENT_STUN_ENTRY_STATE_PENDING &&
++		    entry->type == AGENT_STUN_ENTRY_TYPE_CHECK && !agent->vds_prediction_emitted &&
++		    agent->vds_prediction_deadline > now && vds_is_public_destination(&entry->record))
++			pause_until = agent->vds_prediction_deadline;
++		if (entry->state == AGENT_STUN_ENTRY_STATE_PENDING &&
++		    entry->type == AGENT_STUN_ENTRY_TYPE_CHECK && entry->pair &&
++		    !entry->vds_first_send_sequence && !entry->pair->remote->vds_predicted &&
++		    entry->pair->remote->type == ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE &&
++		    entry->pair->remote->resolved.addr.ss_family == AF_INET &&
++		    agent->vds_remote_sampling_grace_until > now &&
++		    agent->vds_remote_sampling_grace_until > pause_until)
++			pause_until = agent->vds_remote_sampling_grace_until;
++		if (pause_until > now) {
++			// Move the deadline too, avoiding zero-timeout busy polling while paused.
++			entry->next_transmission = pause_until;
++			continue;
++		}
+ 		if (entry->state == AGENT_STUN_ENTRY_STATE_PENDING) { // STUN transmission or retransmission
+ 			if (entry->next_transmission > now)
+ 				continue;
+@@ -1104,6 +1236,14 @@
+ 		pending_count = 0;
+ 	}
+ 
++	// Both ICE roles stop non-selected speculative checks once a real pair works.
++	if (selected_pair) {
++		for (int i = 0; i < agent->candidate_pairs_count; ++i) {
++			ice_candidate_pair_t *pair = agent->candidate_pairs + i;
++			if (pair != selected_pair && pair->remote->vds_predicted)
++				pair->state = ICE_CANDIDATE_PAIR_STATE_FROZEN;
++		}
++	}
+ 	// Cancel entries of frozen pairs
+ 	for (int i = 0; i < agent->entries_count; ++i) {
+ 		agent_stun_entry_t *entry = agent->entries + i;
+@@ -1386,6 +1526,14 @@
+ 			JLOG_WARN("Missing integrity in STUN Binding message from remote peer, ignoring");
+ 			return -1;
+ 		}
++		if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER && STUN_IS_RESPONSE(msg->msg_class)) {
++			if (relayed || !addr_record_is_equal(src, &entry->record, true) ||
++			    entry->state == AGENT_STUN_ENTRY_STATE_FAILED ||
++			    entry->state == AGENT_STUN_ENTRY_STATE_CANCELLED) return -1;
++			if (msg->msg_class == STUN_CLASS_RESP_SUCCESS &&
++			    (!msg->mapped.len || addr_is_any((const struct sockaddr *)&msg->mapped.addr) ||
++			     !addr_get_port((const struct sockaddr *)&msg->mapped.addr))) return -1;
++		}
+ 		return agent_process_stun_binding(agent, msg, entry, src, relayed);
+ 
+ 	case STUN_METHOD_ALLOCATE:
+@@ -1546,6 +1694,17 @@
+ 			ice_candidate_type_t type = (entry->type == AGENT_STUN_ENTRY_TYPE_CHECK)
+ 			                                ? ICE_CANDIDATE_TYPE_PEER_REFLEXIVE
+ 			                                : ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE;
++			agent->vds_current_probe_index = entry->type == AGENT_STUN_ENTRY_TYPE_SERVER ? entry->vds_first_send_sequence : 0;
++			if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER && !entry->vds_mapping_observed &&
++			    msg->mapped.addr.ss_family == AF_INET && agent->vds_observation_count < VDS_NAT_MAX_OBSERVATIONS) {
++				const struct sockaddr_in *sa = (const struct sockaddr_in *)&msg->mapped.addr;
++				vds_nat_port_observation *observation = agent->vds_observations + agent->vds_observation_count++;
++				observation->address = sa->sin_addr.s_addr;
++				observation->port = ntohs(sa->sin_port);
++				observation->sequence = entry->vds_first_send_sequence;
++				observation->valid = true;
++				entry->vds_mapping_observed = true;
++			}
+ 			if (agent_add_local_reflexive_candidate(agent, type, &msg->mapped)) {
+ 				JLOG_WARN("Failed to add local peer reflexive candidate from STUN mapped address");
+ 			}
+@@ -1592,6 +1751,8 @@
+ 				pair->nominated = true;
+ 			}
+ 		} else if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER) {
++			agent->vds_current_probe_index = 0;
++			vds_emit_predictions(agent, false);
+ 			agent_update_gathering_done(agent);
+ 		}
+ 		break;
+@@ -1775,6 +1936,10 @@
+ 
+ 	// Direct send
+ 	int ret = agent_direct_send(agent, &entry->record, buffer, size, 0);
++	// IPv6 does not consume an IPv4 NAT mapping. Commit only successful IPv4 sends.
++	if (ret >= 0 && entry->record.addr.ss_family == AF_INET &&
++	    !entry->vds_first_send_sequence)
++		entry->vds_first_send_sequence = ++agent->vds_send_sequence;
+ 	if (ret < 0) {
+ 		if (ret == -SENETUNREACH)
+ 			JLOG_INFO("STUN binding failed: Network unreachable");
+@@ -2315,6 +2480,8 @@
+ 		JLOG_ERROR("Failed to create reflexive candidate");
+ 		return -1;
+ 	}
++	candidate.vds_probe_index = type == ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE ? agent->vds_current_probe_index : 0;
++	strcpy(candidate.vds_ufrag, agent->local.ice_ufrag);
+ 	if (candidate.type == ICE_CANDIDATE_TYPE_PEER_REFLEXIVE &&
+ 	    ice_candidates_count(&agent->local, ICE_CANDIDATE_TYPE_PEER_REFLEXIVE) >=
+ 	        MAX_PEER_REFLEXIVE_CANDIDATES_COUNT) {
+@@ -2334,8 +2501,12 @@
+ 	}
+ 	JLOG_DEBUG("Gathered reflexive candidate: %s", buffer);
+ 
+-	if (type != ICE_CANDIDATE_TYPE_PEER_REFLEXIVE && agent->config.cb_candidate)
++	if (type != ICE_CANDIDATE_TYPE_PEER_REFLEXIVE && agent->config.cb_candidate) {
++		if (agent->config.enable_port_prediction && !agent->vds_prediction_emitted &&
++		    agent->vds_prediction_deadline) return 0;
++		agent->local.candidates[agent->local.candidates_count - 1].vds_emitted = true;
+ 		agent->config.cb_candidate(agent, buffer, agent->config.user_ptr);
++	}
+ 
+ 	return 0;
+ }
+@@ -2484,6 +2655,14 @@
+ }
+ 
+ int agent_add_candidate_pairs_for_remote(juice_agent_t *agent, ice_candidate_t *remote) {
++	// One short grace window, never extended by subsequent remote metadata.
++	if (!agent->vds_remote_sampling_grace_until && agent->config.enable_port_prediction &&
++	    remote->transport == ICE_CANDIDATE_TRANSPORT_UDP && remote->resolved.addr.ss_family == AF_INET &&
++	    ((!remote->vds_predicted && remote->type == ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE &&
++	      remote->vds_probe_index && *remote->vds_ufrag &&
++	      !strcmp(remote->vds_ufrag, agent->remote.ice_ufrag)) || vds_confirmed_sequential_remote(agent, remote)))
++		agent->vds_remote_sampling_grace_until = current_timestamp() + 400;
++
+ 	// Here is the trick: local non-relayed candidates are undifferentiated for sending.
+ 	// Therefore, we don't need to match remote candidates with local ones.
+ 	if (agent_add_candidate_pair(agent, NULL, remote))
+@@ -2608,6 +2787,7 @@
+ 			return;
+ 		}
+ 	}
++	vds_emit_predictions(agent, false);
+ 	if (!agent->gathering_done) {
+ 		JLOG_INFO("Candidate gathering done");
+ 		agent->local.finished = true;
+--- a/src/ice.h
++++ b/src/ice.h
+@@ -17,7 +17,7 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+-#define ICE_MAX_CANDIDATES_COUNT 20 // ~ 500B * 20 = 10KB
++#define ICE_MAX_CANDIDATES_COUNT 128 // Bounded VDS enhanced ICE candidate capacity
+ 
+ #define ICE_CANDIDATE_PENALTY_TCP 50
+ 
+@@ -52,6 +52,11 @@
+ 	char hostname[256 + 1];
+ 	char service[32 + 1];
+ 	addr_record_t resolved;
++	bool vds_predicted;
++	bool vds_emitted;
++	int vds_nat_step;
++	uint32_t vds_probe_index;
++	char vds_ufrag[257];
+ } ice_candidate_t;
+ 
+ typedef struct ice_description {
+--- a/src/ice.c
++++ b/src/ice.c
+@@ -111,6 +111,18 @@
+ 		return ICE_PARSE_IGNORED;
+ 	}
+ 
++	const char *ext = strstr(line, " vds-predicted ");
++	if (ext) {
++		unsigned int predicted = 0;
++		if (sscanf(ext, " vds-predicted %u", &predicted) == 1 && predicted == 1)
++			candidate->vds_predicted = true;
++	}
++	ext = strstr(line, " vds-probe-index ");
++	if (ext) sscanf(ext, " vds-probe-index %u", &candidate->vds_probe_index);
++	ext = strstr(line, " vds-nat-step ");
++	if (ext) sscanf(ext, " vds-nat-step %d", &candidate->vds_nat_step);
++	ext = strstr(line, " ufrag ");
++	if (ext) sscanf(ext, " ufrag %256s", candidate->vds_ufrag);
+ 	return 0;
+ }
+ 
+@@ -238,6 +250,13 @@
+ 	if (candidate->type == ICE_CANDIDATE_TYPE_UNKNOWN)
+ 		return -1;
+ 
++	if (candidate->vds_predicted) {
++		int predicted_count = 0;
++		for (int i = 0; i < description->candidates_count; ++i)
++			if (description->candidates[i].vds_predicted) ++predicted_count;
++		if (predicted_count >= 16 || description->candidates_count >= ICE_MAX_CANDIDATES_COUNT - 32)
++			return -1;
++	}
+ 	if (description->candidates_count >= ICE_MAX_CANDIDATES_COUNT) {
+ 		JLOG_WARN("Description already has the maximum number of candidates");
+ 		return -1;
+@@ -370,10 +389,27 @@
+ 			return -1;
+ 	}
+ 
+-	return snprintf(buffer, size, "a=candidate:%s %u %s %u %s %s typ %s%s%s",
+-	                candidate->foundation, candidate->component, transport, candidate->priority,
+-	                candidate->hostname, candidate->service, type, suffix ? " " : "",
+-	                suffix ? suffix : "");
++	int len = snprintf(buffer, size, "a=candidate:%s %u %s %u %s %s typ %s%s%s",
++	                   candidate->foundation, candidate->component, transport, candidate->priority,
++	                   candidate->hostname, candidate->service, type, suffix ? " " : "",
++	                   suffix ? suffix : "");
++	if (len < 0 || (size_t)len >= size) return -1;
++	if (candidate->vds_predicted) {
++		int n = snprintf(buffer + len, size - len, " vds-predicted 1 vds-nat-step %d", candidate->vds_nat_step);
++		if (n < 0 || (size_t)n >= size - len) return -1;
++		len += n;
++	}
++	if (candidate->vds_probe_index) {
++		int n = snprintf(buffer + len, size - len, " vds-probe-index %u", candidate->vds_probe_index);
++		if (n < 0 || (size_t)n >= size - len) return -1;
++		len += n;
++	}
++	if (*candidate->vds_ufrag) {
++		int n = snprintf(buffer + len, size - len, " ufrag %s", candidate->vds_ufrag);
++		if (n < 0 || (size_t)n >= size - len) return -1;
++		len += n;
++	}
++	return len;
+ }
+ 
+ int ice_create_candidate_pair(ice_candidate_t *local, ice_candidate_t *remote, bool is_controlling,
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -17,6 +17,11 @@
+ option(ENABLE_LOCALHOST_ADDRESS "List localhost addresses in candidates" OFF)
+ option(ENABLE_LOCAL_ADDRESS_TRANSLATION "Translate local addresses to localhost" OFF)
+ 
++set(VDS_NAT_PREDICTION_INCLUDE_DIR "" CACHE PATH "VDS header-only NAT predictor directory")
++if(NOT EXISTS "${VDS_NAT_PREDICTION_INCLUDE_DIR}/nat_port_prediction.h")
++  message(FATAL_ERROR "VDS NAT prediction header is required")
++endif()
++include_directories("${VDS_NAT_PREDICTION_INCLUDE_DIR}")
+ set(CMAKE_C_STANDARD 11)
+ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+ set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)

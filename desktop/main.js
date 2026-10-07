@@ -5,6 +5,11 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { MediaAgentManager } = require('./media-agent-manager');
+const { HostVideoRefreshWakeup } = require('./host-video-refresh-wakeup');
+const { StunServerSelector, getStunServerPool } = require('./stun-server-selector');
+const { buildPcpMapRequest, parsePcpMapResponse } = require('./pcp-packet');
+const crypto = require('node:crypto');
+const nativeStunSelector = new StunServerSelector();
 
 const SERVER_URL = normalizeBaseUrl(process.env.SERVER_URL || 'https://boshan.s.3q.hair');
 const DISCONNECT_GRACE_MS = Number(process.env.DISCONNECT_GRACE_MS || 30000);
@@ -42,6 +47,14 @@ let updateInstallInProgress = false;
 let updateCheckInProgressPromise = null;
 let updateDownloadInProgress = false;
 let audioCapture = undefined;
+const hostVideoRefreshWakeup = new HostVideoRefreshWakeup({
+  isRunning: isHostVideoRefreshAgentRunning,
+  invokeStats: () => {
+    if (!isHostVideoRefreshAgentRunning()) return;
+    return mediaAgentManager.invoke('getStats', {});
+  },
+  onError: (error) => logMainProcessDebug('video', '[media-agent] host video refresh wakeup failed:', error.message || String(error))
+});
 let emulatedFullscreenState = {
   active: false,
   bounds: null,
@@ -203,7 +216,13 @@ ipcMain.handle('media-engine-stop-host-session', async (_event, options) => invo
 ipcMain.handle('media-engine-prepare-obs-ingest', async (_event, options) => invokeMediaEngine('prepareObsIngest', options || {}));
 ipcMain.handle('media-engine-start-audio-session', async (_event, options) => invokeMediaEngine('startAudioSession', options || {}));
 ipcMain.handle('media-engine-stop-audio-session', async (_event, options) => invokeMediaEngine('stopAudioSession', options || {}));
-ipcMain.handle('media-engine-create-peer', async (_event, options) => invokeMediaEngine('createPeer', options || {}));
+ipcMain.handle('media-engine-create-peer', async (_event, options) => {
+  const { iceServers, ...peerOptions } = options || {};
+  const selection = await nativeStunSelector.select(iceServers);
+  const stunServers = [selection.url, ...getStunServerPool(iceServers).filter((url) => url !== selection.url)].slice(0, 4);
+  logMainProcessDebug('p2p', '[p2p-stun] selected:', selection.url, 'reachable:', selection.reachable);
+  return invokeMediaEngine('createPeer', { ...peerOptions, stunServer: selection.url, stunServers });
+});
 ipcMain.handle('media-engine-close-peer', async (_event, options) => invokeMediaEngine('closePeer', options || {}));
 ipcMain.handle('media-engine-set-remote-description', async (_event, options) => invokeMediaEngine('setRemoteDescription', options || {}));
 ipcMain.handle('media-engine-add-remote-ice-candidate', async (_event, options) => invokeMediaEngine('addRemoteIceCandidate', options || {}));
@@ -699,6 +718,7 @@ function requestAppQuit() {
     return;
   }
   quitInProgress = true;
+  hostVideoRefreshWakeup.dispose();
 
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.hide();
@@ -948,16 +968,20 @@ function execFilePromise(file, args, options = {}) {
   });
 }
 
-async function resolveDefaultGatewayIpv4() {
+async function resolveDefaultGatewayIpv4(localAddress = '') {
+  if (localAddress && !isValidIpv4(localAddress)) return '';
   if (process.platform === 'win32') {
     try {
+      const interfaceFilter = localAddress
+        ? `-InterfaceIndex (Get-NetIPAddress -AddressFamily IPv4 -IPAddress '${localAddress}' -ErrorAction Stop | Select-Object -First 1 -ExpandProperty InterfaceIndex)`
+        : '';
       const output = await execFilePromise('powershell.exe', [
         '-NoProfile',
         '-ExecutionPolicy',
         'Bypass',
         '-Command',
-        "(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1 -ExpandProperty NextHop)"
-      ]);
+        `(Get-NetRoute -AddressFamily IPv4 ${interfaceFilter} -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.NextHop -ne '0.0.0.0' } | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1 -ExpandProperty NextHop)`
+      ], { timeout: 2500 });
       const gateway = output.split(/\r?\n/).map((line) => line.trim()).find(isValidIpv4);
       if (gateway) {
         return gateway;
@@ -966,6 +990,9 @@ async function resolveDefaultGatewayIpv4() {
       logMainProcessDebug('p2p', '[p2p-nat] Get-NetRoute failed:', error && error.message ? error.message : String(error));
     }
   }
+
+  // Never map a candidate through another interface's default gateway.
+  if (localAddress) return '';
 
   try {
     const command = process.platform === 'win32' ? 'route' : 'ip';
@@ -982,7 +1009,7 @@ async function resolveDefaultGatewayIpv4() {
   return '';
 }
 
-function udpRequest(address, port, payload, timeoutMs = 1200) {
+function udpRequest(address, port, payload, timeoutMs = 1200, localAddress = '') {
   return new Promise((resolve, reject) => {
     const socket = dgram.createSocket('udp4');
     let settled = false;
@@ -1015,34 +1042,47 @@ function udpRequest(address, port, payload, timeoutMs = 1200) {
       resolve(message);
     });
 
-    socket.send(payload, port, address, (error) => {
-      if (error && !settled) {
+    const connect = () => socket.connect(port, address, () => {
+      if (settled) return;
+      try {
+        const request = typeof payload === 'function' ? payload(socket.address().address) : payload;
+        socket.send(request, (error) => {
+          if (error && !settled) {
+            settled = true;
+            clearTimeout(timer);
+            socket.close();
+            reject(error);
+          }
+        });
+      } catch (error) {
         settled = true;
         clearTimeout(timer);
         socket.close();
         reject(error);
       }
     });
+    if (localAddress) socket.bind(0, localAddress, connect);
+    else connect();
   });
 }
 
-async function requestNatPmpExternalAddress(gateway) {
-  const response = await udpRequest(gateway, 5351, Buffer.from([0, 0]), 1200);
+async function requestNatPmpExternalAddress(gateway, localAddress = '') {
+  const response = await udpRequest(gateway, 5351, Buffer.from([0, 0]), 1200, localAddress);
   if (response.length < 12 || response[0] !== 0 || response[1] !== 128 || response.readUInt16BE(2) !== 0) {
     throw new Error('nat-pmp-public-address-failed');
   }
   return bufferToIpv4(response, 8);
 }
 
-async function requestNatPmpUdpMapping(gateway, internalPort, lifetimeSeconds) {
+async function requestNatPmpUdpMapping(gateway, internalPort, lifetimeSeconds, localAddress = '') {
   const request = Buffer.alloc(12);
   request[0] = 0;
   request[1] = 1;
   request.writeUInt16BE(internalPort, 4);
   request.writeUInt16BE(internalPort, 6);
   request.writeUInt32BE(lifetimeSeconds, 8);
-  const response = await udpRequest(gateway, 5351, request, 1200);
-  if (response.length < 16 || response[0] !== 0 || response[1] !== 129 || response.readUInt16BE(2) !== 0) {
+  const response = await udpRequest(gateway, 5351, request, 1200, localAddress);
+  if (response.length < 16 || response[0] !== 0 || response[1] !== 129 || response.readUInt16BE(2) !== 0 || response.readUInt16BE(8) !== internalPort) {
     throw new Error('nat-pmp-map-udp-failed');
   }
   return {
@@ -1053,34 +1093,12 @@ async function requestNatPmpUdpMapping(gateway, internalPort, lifetimeSeconds) {
   };
 }
 
-async function requestPcpUdpMapping(gateway, internalPort, lifetimeSeconds) {
-  const nonce = Buffer.alloc(12);
-  for (let index = 0; index < nonce.length; index += 1) {
-    nonce[index] = Math.floor(Math.random() * 256);
-  }
-  const request = Buffer.alloc(60);
-  request[0] = 2;
-  request[1] = 1;
-  request.writeUInt32BE(lifetimeSeconds, 4);
-  nonce.copy(request, 24);
-  request[36] = 17;
-  request.writeUInt16BE(internalPort, 40);
-  request.writeUInt16BE(internalPort, 42);
-  const response = await udpRequest(gateway, 5351, request, 1500);
-  if (response.length < 60 || response[0] !== 2 || response[1] !== 129 || response[3] !== 0) {
-    throw new Error('pcp-map-udp-failed');
-  }
-  const externalAddress = ipv6MappedIpv4FromBuffer(response, 44);
-  if (!externalAddress) {
-    throw new Error('pcp-external-ipv4-unavailable');
-  }
-  return {
-    protocol: 'pcp',
-    internalPort: response.readUInt16BE(40),
-    externalPort: response.readUInt16BE(42),
-    externalAddress,
-    lifetimeSeconds: response.readUInt32BE(4)
-  };
+async function requestPcpUdpMapping(gateway, internalPort, lifetimeSeconds, localAddress = '') {
+  const nonce = crypto.randomBytes(12);
+  const response = await udpRequest(gateway, 5351, (clientAddress) => buildPcpMapRequest({
+    clientAddress, internalPort, externalPort: internalPort, lifetimeSeconds, nonce
+  }), 1500, localAddress);
+  return parsePcpMapResponse(response, { nonce, internalPort });
 }
 
 function buildMappedIceCandidate(candidate, mapping, externalAddress) {
@@ -1102,8 +1120,9 @@ async function openP2PNatMappings(options = {}) {
   const candidates = rawCandidates.map(parseIceCandidateForMapping).filter(Boolean);
   const uniqueByPort = new Map();
   for (const candidate of candidates) {
-    if (!uniqueByPort.has(candidate.port)) {
-      uniqueByPort.set(candidate.port, candidate);
+    const key = `${candidate.address}:${candidate.port}`;
+    if (!uniqueByPort.has(key) && uniqueByPort.size < 4) {
+      uniqueByPort.set(key, candidate);
     }
   }
 
@@ -1115,51 +1134,47 @@ async function openP2PNatMappings(options = {}) {
     };
   }
 
-  const gateway = await resolveDefaultGatewayIpv4();
-  if (!gateway) {
-    return {
-      ok: false,
-      reason: 'default-gateway-not-found',
-      candidates: []
-    };
-  }
-
-  let publicAddress = '';
-  try {
-    publicAddress = await requestNatPmpExternalAddress(gateway);
-  } catch (error) {
-    logMainProcessDebug('p2p', '[p2p-nat] NAT-PMP public address failed:', error && error.message ? error.message : String(error));
-  }
-
   const mappedCandidates = [];
   const errors = [];
-  for (const candidate of uniqueByPort.values()) {
+  const gatewayQueries = new Map();
+  const publicAddressQueries = new Map();
+  const gateways = new Set();
+  await Promise.all([...uniqueByPort.values()].map(async (candidate) => {
     try {
+      if (!gatewayQueries.has(candidate.address)) gatewayQueries.set(candidate.address, resolveDefaultGatewayIpv4(candidate.address));
+      const gateway = await gatewayQueries.get(candidate.address);
+      if (!gateway) throw new Error('candidate-gateway-not-found');
+      gateways.add(gateway);
+      const key = `${candidate.address}:${gateway}`;
+      if (!publicAddressQueries.has(key)) publicAddressQueries.set(key, requestNatPmpExternalAddress(gateway, candidate.address).catch(() => ''));
       let mapping;
       try {
-        mapping = await requestNatPmpUdpMapping(gateway, candidate.port, lifetimeSeconds);
+        const [publicAddress, natPmpMapping] = await Promise.all([
+          publicAddressQueries.get(key), requestNatPmpUdpMapping(gateway, candidate.port, lifetimeSeconds, candidate.address)
+        ]);
         if (!publicAddress) {
           throw new Error('nat-pmp-public-address-unavailable');
         }
+        mapping = natPmpMapping;
         mapping.externalAddress = publicAddress;
       } catch (natPmpError) {
-        mapping = await requestPcpUdpMapping(gateway, candidate.port, lifetimeSeconds);
+        mapping = await requestPcpUdpMapping(gateway, candidate.port, lifetimeSeconds, candidate.address);
         errors.push(`nat-pmp:${candidate.port}:${natPmpError && natPmpError.message ? natPmpError.message : String(natPmpError)}`);
       }
 
-      const mappedCandidate = buildMappedIceCandidate(candidate, mapping, publicAddress);
+      const mappedCandidate = buildMappedIceCandidate(candidate, mapping, mapping.externalAddress);
       if (mappedCandidate) {
         mappedCandidates.push(mappedCandidate);
       }
     } catch (error) {
       errors.push(`${candidate.port}:${error && error.message ? error.message : String(error)}`);
     }
-  }
+  }));
 
   return {
     ok: mappedCandidates.length > 0,
     protocol: mappedCandidates.length > 0 ? 'nat-pmp/pcp' : '',
-    gateway,
+    gateway: [...gateways][0] || '',
     candidates: mappedCandidates,
     errors,
     reason: mappedCandidates.length > 0 ? 'nat-mapping-ready' : 'nat-mapping-failed'
@@ -1782,9 +1797,11 @@ function getMediaAgentManager() {
       }
     });
     mediaAgentManager.on('status', (status) => {
+      hostVideoRefreshWakeup.handleAgentStatus(status);
       sendToRenderer('media-engine-status', status);
     });
     mediaAgentManager.on('event', (event) => {
+      hostVideoRefreshWakeup.handleEvent(event);
       sendToRenderer('media-engine-event', event);
     });
   }
@@ -1793,17 +1810,22 @@ function getMediaAgentManager() {
 }
 
 async function invokeMediaEngine(method, params) {
+  const wakeupTicket = method === 'createPeer' ? hostVideoRefreshWakeup.beginCreate(params || {}) : null;
+  if (method === 'closePeer') hostVideoRefreshWakeup.closePeer(params || {});
+  if (method === 'stopHostSession') hostVideoRefreshWakeup.cancelPending();
   const debugCategory = getMediaEngineDebugCategory(method);
   if (shouldLogMediaInvoke(method, debugCategory)) {
     logMainProcessDebug(debugCategory, `[media-agent invoke] ${method} request:`, JSON.stringify(summarizeMediaEnginePayload(params)));
   }
   try {
     const result = await getMediaAgentManager().invoke(method, params);
+    if (method === 'createPeer') hostVideoRefreshWakeup.completeCreate(wakeupTicket, result);
     if (shouldLogMediaInvoke(method, debugCategory)) {
       logMainProcessDebug(debugCategory, `[media-agent invoke] ${method} result:`, JSON.stringify(summarizeMediaEnginePayload(result)));
     }
     return result;
   } catch (error) {
+    if (method === 'createPeer') hostVideoRefreshWakeup.failCreate(wakeupTicket);
     const message = error && error.message ? error.message : String(error);
     if (method === 'getViewerVolume' && message.includes('No active render audio session was found')) {
       throw error;
@@ -1827,6 +1849,12 @@ async function invokeMediaEngine(method, params) {
   }
 }
 
+function isHostVideoRefreshAgentRunning() {
+  const child = mediaAgentManager && mediaAgentManager.child;
+  return Boolean(!quitInProgress && !app.isQuitting && mediaAgentManager && !mediaAgentManager.stopPromise &&
+    child && !child.killed && child.exitCode === null && child.signalCode === null);
+}
+
 async function invokeMediaEngineHostSessionBridge(method, params) {
   if (!ENABLE_NATIVE_HOST_SESSION_BRIDGE) {
     return {
@@ -1842,6 +1870,7 @@ async function invokeMediaEngineHostSessionBridge(method, params) {
     if (method === 'stopHostSession') {
       const manager = getMediaAgentManager();
       try {
+        hostVideoRefreshWakeup.reset();
         await manager.stop();
       } catch (restartStopError) {
         const rate = shouldEmitMainDebugLog('host-session-bridge:recovery-shutdown-failed', 5000);

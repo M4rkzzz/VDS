@@ -13,6 +13,7 @@ std::string build_peer_state_json(const PeerState& peer, const std::string& stat
   payload
     << "{\"peerId\":\"" << vds::media_agent::json_escape(peer.peer_id) << "\""
     << ",\"state\":\"" << vds::media_agent::json_escape(state) << "\""
+    << ",\"transportGeneration\":\"" << vds::media_agent::json_escape(peer.transport.transport_generation) << "\""
     << ",\"sessionPhase\":\"" << vds::media_agent::session_phase_to_string(peer.phase) << "\""
     << ",\"phaseReason\":\"" << vds::media_agent::json_escape(peer.phase_reason) << "\""
     << "}";
@@ -26,6 +27,7 @@ std::string build_peer_result_json(const PeerState& peer) {
     << ",\"sessionPhase\":\"" << vds::media_agent::session_phase_to_string(peer.phase) << "\""
     << ",\"phaseReason\":\"" << vds::media_agent::json_escape(peer.phase_reason) << "\""
     << ",\"transportReady\":" << (peer.transport.transport_ready ? "true" : "false")
+    << ",\"transportGeneration\":\"" << vds::media_agent::json_escape(peer.transport.transport_generation) << "\""
     << "}";
   return payload.str();
 }

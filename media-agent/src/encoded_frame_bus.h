@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "media_frame_timing.h"
+
 struct EncodedFrame {
   std::string upstream_peer_id;
   std::string stream_type;
@@ -13,6 +15,7 @@ struct EncodedFrame {
   std::uint64_t timestamp_us = 0;
   bool keyframe = false;
   bool config = false;
+  MediaFrameTiming timing;
   std::vector<std::uint8_t> payload;
 };
 
@@ -22,6 +25,7 @@ struct EncodedFrameBatch {
   std::string codec;
   std::uint32_t rtp_timestamp = 0;
   std::uint64_t timestamp_us = 0;
+  MediaFrameTiming timing;
   std::vector<std::vector<std::uint8_t>> payloads;
 };
 
