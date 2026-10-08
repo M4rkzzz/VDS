@@ -14,11 +14,11 @@ VDS 是一套为“把画面稳定地给很多人看”而做的屏幕共享工�
 
 ## 快速入口
 
-- 下载最新版：[VDS 1.7.1 Release](https://github.com/M4rkzzz/VDS/releases/tag/v1.7.1)
+- 下载最新版：[VDS 1.7.2 Release](https://github.com/M4rkzzz/VDS/releases/tag/v1.7.2)
 - 适合人群：需要比普通聊天软件更可控的屏幕共享、OBS 分发、局域网观看或多人 relay 的用户。
 - 如果这个项目刚好解决了你的屏幕分享痛点，可以给仓库点一个 Star，后续更新和排障记录都会继续公开在这里。
 
-本轮连接、播放和增强 ICE 改动尚未公开发布；上方 GitHub 1.7.1 下载属于既有 release。本轮源码与本地验证产物的状态见 [项目现状报告](docs/PROJECT_STATUS.md)。
+1.7.2 已包含本轮连接、播放和增强 ICE 改动，GitHub Release 与默认公网自动更新源均已同步。安装包约 229 MiB，未签名。验证范围与剩余实机验收项见 [项目现状报告](docs/PROJECT_STATUS.md)。
 
 ## 为什么值得试试
 
@@ -45,21 +45,18 @@ VDS 是一套为“把画面稳定地给很多人看”而做的屏幕共享工�
 - 提供 3010 后台查看实时房间、拓扑、节点状态和媒体 manifest。
 - 提供诊断面板，方便定位 P2P、采集、编码、解码、relay 和浏览器能力问题。
 
-## 1.7.1 版本概览
+## 1.7.2 版本概览
 
-`1.7.1` 重点完善了 renderer/native authority 拆分后的稳定性、media-agent session ownership、native/OBS 生命周期、Web/native relay 拓扑，以及移动浏览器 Web 观看端能力检测。
+`1.7.2` 集中恢复纯 P2P 连接与播放，更新至 Electron 42，并恢复自部署服务与自动更新源。
 
 主要变化：
 
-- Renderer 侧拆分为 app state、room client、调试面板、源选择、画质设置、更新 UI、native session、peer、surface、diagnostics 和 P2P 状态机等职责模块。
-- media-agent 收紧 Host、Peer、Surface、Relay、Audio、OBS ingest 的 session/controller ownership，减少共享大状态带来的时序风险。
-- 修复 native/OBS 开播、停止共享、重复开播、房间创建、房间号显示、公开房间发现和 stale manifest 清理问题。
-- 修复 OBS ingest 音频与 AAC manifest，OBS 推流后可正确向下游播放和 relay。
-- 源缩略图改为异步加载，改进 WGC 预览时序和诊断，降低源选择、预览黑屏和预览异常对主流程的影响。
-- 强化链式 relay 拓扑：默认优先链式，上游不可达时由服务端重新选择上游，并限制单上游下游容量。
-- Web 观看端增强 iOS Safari、Android Chrome 和其它 Android 浏览器的能力检测、诊断导出、codec/payload format 判断和 LAN HTTP 测试路径。
-- 3010 信令后台支持实时房间、拓扑、节点状态、边状态、容量和 manifest 可视化。
-- 完整发布流程包含 renderer、server、Web、logging、media-agent、打包产物和 GitHub Release 校验。
+- 实际 ICE UDP socket 多 STUN 采样、端口预测和有限多端口检查，继续禁止 TURN。
+- Web 播放会话集中管理，原生解码与呈现分离；缓冲随源帧率、短突发和实际音频进度调整。
+- 共享源 PTS 与媒体代次隔离，使用实际音频输出时钟，改善换源、关键帧恢复、重连追赶和零音量播放。
+- 修复旧 socket、取消加入、surface 恢复、上游重选及 native/OBS 生命周期问题。
+- Electron 42.11.11，增强 ICE 源包和补丁固定，发布门禁核验 EXE 与配套 DLL 一致性。
+- Docker 信令、FRP HTTPS/WSS 与证书续期恢复，管理后台免管理令牌；GitHub 与公网自动更新源同步。
 
 ## 当前媒体路径
 
