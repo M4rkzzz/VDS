@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.7.2
+
+### 中文
+
+- 增强纯 P2P 连接：从实际 ICE UDP socket 获取多个 STUN 映射样本，按稳定步长预测端口，并进行有限邻域多端口连通性检查；自行实现 libjuice/libdatachannel 补丁，继续禁止 TURN。
+- 整理 Web 播放会话，原生端分离解码与呈现；两种播放器按源帧率、短突发和实际音频进度调整缓冲，保留合法长音频单元，不增加固定帧率、分辨率或运行时长限制。
+- 统一共享源 PTS 与 `sourceEpoch` 媒体代次，隔离换源后的旧数据；使用 waveOut/Web Audio 输出位置驱动视频，无音频或零音量时回退单调时钟，并改善关键帧恢复和重连后的实时追赶。
+- 修复过期 socket、取消或迟到的加入确认、surface 恢复、上游重选、media-agent 停启和 OBS 断流清理，补充连接、播放与生命周期回归。
+- 更新至 Electron 42.11.11，整理依赖和原生构建完整性检查，固定增强 ICE 的源包及补丁。
+- 恢复 Docker 信令与后台、FRP HTTPS/WSS 入口和 DNS 验证证书续期；管理后台按要求免管理令牌访问，保留房间会话身份隔离。
+- Windows 构建未签名。跨运营商实机连通与长时间物理音画同步仍待验收；本地回归与虚拟 NAT 结果不代表实际网络连接率或性能提升。
+
+### English
+
+- Enhanced pure P2P connectivity with mapping samples from multiple STUN services on the actual ICE UDP socket, stable-step port prediction, and bounded connectivity checks on neighboring ports. Kept TURN disabled and implemented the libjuice/libdatachannel patches within this project.
+- Consolidated the Web playback session and separated native decoding from presentation. Both players adapt buffering to source frame rate, short bursts, and actual audio progress while preserving valid long audio units, without adding fixed frame-rate, resolution, or runtime limits.
+- Added shared source PTS and `sourceEpoch` isolation for source changes. Video follows waveOut/Web Audio output progress, falls back to a monotonic clock when audio is absent or muted, and benefits from improved keyframe recovery and reconnect catch-up.
+- Fixed stale sockets, canceled or late join acknowledgments, surface recovery, upstream reselection, media-agent restart, and OBS disconnect cleanup, with connection, playback, and lifecycle regressions.
+- Updated to Electron 42.11.11, refreshed dependencies and native runtime integrity checks, and pinned the enhanced ICE sources and patches.
+- Restored the Docker signaling service and dashboard, FRP HTTPS/WSS access, and DNS certificate renewal. Removed dashboard management tokens as requested while retaining room session identity isolation.
+- Windows builds are unsigned. Connectivity between different ISPs and long-running physical audio/video synchronization still require real-device validation; local regressions and virtual NAT results do not establish a real-world connection rate or performance gain.
+
 ## 1.7.1
 
 ### 中文

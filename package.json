@@ -1,6 +1,6 @@
 {
   "name": "screenshare-relay",
-  "version": "1.7.1",
+  "version": "1.7.2",
   "description": "Multi-viewer screen sharing with cascade relay (蜈蚣法) - Electron Edition",
   "main": "desktop/main.js",
   "engines": {
@@ -51,7 +51,7 @@
     "release:github": "node scripts/publish-github-release.js",
     "release:precheck": "node scripts/release-check.js --prebuild",
     "release:check": "node scripts/release-check.js --postbuild",
-    "build:release": "npm run release:precheck && npm run build && npm run prepare-server-release && npm run release:check && npm run release:github"
+    "build:release": "npm run release:precheck && npm run build -- --publish never && npm run prepare-server-release && npm run release:check && npm run release:github"
   },
   "dependencies": {
     "electron-updater": "^6.8.9",
