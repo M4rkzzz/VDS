@@ -1052,6 +1052,8 @@ class NativeLivePreview::Impl {
     auto next_source_retry_at = source_
       ? std::chrono::steady_clock::time_point {}
       : std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    WgcFrameCpuBuffer frame;
+    std::string frame_error;
     while (!stop_requested_.load(std::memory_order_acquire)) {
       if (placeholder_mode_active) {
         const WindowCaptureAvailability availability =
@@ -1119,8 +1121,6 @@ class NativeLivePreview::Impl {
         placeholder_mode_active = false;
       }
 
-      WgcFrameCpuBuffer frame;
-      std::string frame_error;
       if (!source_->wait_for_frame_bgra(250, &frame, &frame_error)) {
         if (stop_requested_.load(std::memory_order_acquire)) {
           break;

@@ -1,4 +1,5 @@
 const express = require('express');
+const compression = require('compression');
 const http = require('http');
 const https = require('https');
 const WebSocket = require('ws');
@@ -15,8 +16,36 @@ const DEFAULT_MAX_VIEWERS_PER_ROOM = 16;
 const DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM = 2;
 const DEFAULT_MAX_MESSAGES_PER_WINDOW = 120;
 const DEFAULT_MESSAGE_RATE_WINDOW_MS = 10000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 30000;
 const MAX_ID_LENGTH = 128;
 const MAX_SIGNAL_FIELD_LENGTH = 65536;
+
+function shouldCompressHttpResponse(req, res) {
+  // Use the full URL because Express temporarily strips mounted route prefixes.
+  const pathname = req.originalUrl.split('?')[0];
+  if (/^\/updates(?:\/|$)/i.test(pathname) || /\.(?:exe|blockmap)$/i.test(pathname) ||
+      req.headers.range || res.statusCode === 206 || res.getHeader('Content-Range') ||
+      /^text\/event-stream(?:;|$)/i.test(res.getHeader('Content-Type') || '')) {
+    return false;
+  }
+  return compression.filter(req, res);
+}
+
+function setPublicStaticHeaders(publicDir, res, filePath) {
+  // send removes Content-Type on 304. Set Vary before that, using the same MIME
+  // lookup as Express, so cached compressed representations revalidate safely.
+  res.type(path.extname(filePath));
+  if (compression.filter(res.req, res)) res.vary('Accept-Encoding');
+  if (/\.html?$/i.test(filePath)) {
+    res.set('Cache-Control', 'no-store');
+    return;
+  }
+  const relativePath = path.relative(publicDir, filePath).split(path.sep).join('/');
+  if (relativePath.startsWith('vds_web/assets/') &&
+      /-[A-Za-z0-9_-]{8}\.[A-Za-z0-9]+$/.test(path.basename(filePath))) {
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  }
+}
 
 function logServerDebug(...args) {
   if (VERBOSE_SERVER_LOGS) {
@@ -86,6 +115,7 @@ function startServer(options = {}) {
   const maxDownstreamsPerUpstream = normalizePositiveInt(options.maxDownstreamsPerUpstream || process.env.MAX_DOWNSTREAMS_PER_UPSTREAM, DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM);
   const maxMessagesPerWindow = normalizePositiveInt(options.maxMessagesPerWindow || process.env.WS_MAX_MESSAGES_PER_WINDOW, DEFAULT_MAX_MESSAGES_PER_WINDOW);
   const messageRateWindowMs = normalizePositiveInt(options.messageRateWindowMs || process.env.WS_MESSAGE_RATE_WINDOW_MS, DEFAULT_MESSAGE_RATE_WINDOW_MS);
+  const heartbeatIntervalMs = normalizePositiveInt(options.heartbeatIntervalMs || process.env.WS_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_INTERVAL_MS);
   const adminPort = options.adminPort === undefined ? 0 : normalizePositiveInt(options.adminPort, 0);
   const adminHost = String(options.adminHost || process.env.ADMIN_HOST || '127.0.0.1');
   const appVersion = resolveAppVersion(baseDir);
@@ -104,6 +134,8 @@ function startServer(options = {}) {
   const serverProtocol = httpsOptions ? 'https' : 'http';
 
   const app = express();
+  const compressHttpResponse = compression({ level: 4, threshold: 1024, filter: shouldCompressHttpResponse });
+  app.use(compressHttpResponse);
   const server = httpsOptions ? https.createServer(httpsOptions, app) : http.createServer(app);
   const wss = new WebSocket.Server({ server, maxPayload });
   let adminServer = null;
@@ -142,6 +174,7 @@ function startServer(options = {}) {
       const webEntry = path.join(publicDir, 'vds_web', 'index.html');
       if (!isElectronUserAgent(req) && fs.existsSync(webEntry)) {
         res.set('Cache-Control', 'no-store');
+        res.vary('Accept-Encoding');
         res.sendFile(webEntry);
         return;
       }
@@ -151,6 +184,7 @@ function startServer(options = {}) {
       const webEntry = path.join(publicDir, 'vds_web', 'index.html');
       if (fs.existsSync(webEntry)) {
         res.set('Cache-Control', 'no-store');
+        res.vary('Accept-Encoding');
         res.sendFile(webEntry);
         return;
       }
@@ -160,16 +194,23 @@ function startServer(options = {}) {
       const adminEntry = path.join(publicDir, 'admin.html');
       if (fs.existsSync(adminEntry)) {
         res.set('Cache-Control', 'no-store');
+        res.vary('Accept-Encoding');
         res.sendFile(adminEntry);
         return;
       }
       next();
     });
-    app.use(express.static(publicDir));
+    app.use(express.static(publicDir, {
+      setHeaders: (res, filePath) => setPublicStaticHeaders(publicDir, res, filePath)
+    }));
   }
 
   if (updatesDir) {
-    app.use('/updates', express.static(updatesDir));
+    app.use('/updates', express.static(updatesDir, {
+      setHeaders: (res, filePath) => {
+        if (/\.ya?ml(?:\.sig)?$/i.test(filePath)) res.set('Cache-Control', 'no-store');
+      }
+    }));
   }
 
   app.get('/api/config', (_req, res) => {
@@ -197,17 +238,43 @@ function startServer(options = {}) {
     });
   });
 
-  function sendAdminSnapshot(_req, res) {
+  function sendAdminSnapshot(_req, res, publicOnly = false) {
     res.set('Cache-Control', 'no-store');
-    res.json(buildAdminSnapshot(rooms, maxDownstreamsPerUpstream, activeConnections, {
+    const visibleRooms = publicOnly
+      ? new Map(Array.from(rooms).filter(([, room]) => room.publicListing === true))
+      : rooms;
+    res.json({ ...buildAdminSnapshot(visibleRooms, maxDownstreamsPerUpstream, activeConnections, {
       maxRooms,
       maxViewersPerRoom,
       maxDownstreamsPerUpstream,
       maxConnections
-    }));
+    }), scope: publicOnly ? 'public-rooms' : 'all-rooms' });
   }
 
-  app.get('/api/admin/rooms', sendAdminSnapshot);
+  app.get('/api/admin/rooms', (req, res) => sendAdminSnapshot(req, res, true));
+
+  const heartbeatTimer = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (!ws.__vdsHeartbeatAlive) {
+        ws.terminate();
+        continue;
+      }
+      ws.__vdsHeartbeatAlive = false;
+      if (isSocketOpen(ws)) {
+        try { ws.ping(); } catch { ws.terminate(); }
+      }
+    }
+  }, heartbeatIntervalMs);
+  heartbeatTimer.unref();
+  function clearServerTimers() {
+    clearInterval(heartbeatTimer);
+    for (const room of rooms.values()) {
+      clearDisconnectTimer(room.host);
+      for (const viewer of room.viewers) clearDisconnectTimer(viewer);
+    }
+  }
+  wss.once('close', clearServerTimers);
+  server.once('close', clearServerTimers);
 
   wss.on('connection', (ws, req) => {
     // Protocol errors (including maxPayload) belong to this connection, not the process.
@@ -225,6 +292,8 @@ function startServer(options = {}) {
     }
 
     activeConnections += 1;
+    ws.__vdsHeartbeatAlive = true;
+    ws.on('pong', () => { ws.__vdsHeartbeatAlive = true; });
     ws.__vdsUserAgent = String((req && req.headers && req.headers['user-agent']) || '');
     ws.__vdsRateWindowStartedAt = Date.now();
     ws.__vdsRateWindowCount = 0;
@@ -354,6 +423,14 @@ function startServer(options = {}) {
         type: 'error',
         code: 'room-not-found',
         message: '该房间已不存在'
+      });
+      return;
+    }
+    if (!clientId.trim() || clientId.trim().toLowerCase() === 'host' || clientId === room.host.clientId) {
+      sendJson(ws, {
+        type: 'error',
+        code: 'client-id-unavailable',
+        message: 'Client ID is reserved or already belongs to the host'
       });
       return;
     }
@@ -708,12 +785,10 @@ function startServer(options = {}) {
       return;
     }
 
-    data.fromClientId = ws.clientId;
-    if (!data.mediaManifest && room.mediaManifest) {
-      data.mediaManifest = room.mediaManifest;
-    }
-
-    sendJson(targetWs, data);
+    const participant = ws.role === 'host'
+      ? room.host
+      : room.viewers.find((viewer) => viewer.clientId === ws.clientId);
+    sendJson(targetWs, buildForwardedSignal(data, ws, targetWs, room, participant));
   }
 
   function handleHostMediaManifest(ws, data) {
@@ -906,10 +981,12 @@ function startServer(options = {}) {
 
   if (adminPort > 0) {
     const adminApp = express();
-    adminApp.get('/api/rooms', sendAdminSnapshot);
+    adminApp.use(compressHttpResponse);
+    adminApp.get('/api/rooms', (req, res) => sendAdminSnapshot(req, res));
     if (publicDir) {
       adminApp.get('/', (_req, res, next) => {
         res.set('Cache-Control', 'no-store');
+        res.vary('Accept-Encoding');
         const adminEntry = path.join(publicDir, 'admin.html');
         if (fs.existsSync(adminEntry)) {
           res.sendFile(adminEntry);
@@ -1446,6 +1523,40 @@ function normalizePayloadFormat(value, fallback) {
   return normalized || fallback;
 }
 
+function buildForwardedSignal(data, ws, targetWs, room, participant) {
+  const result = {
+    type: data.type,
+    roomId: room.id,
+    fromClientId: ws.clientId,
+    targetId: targetWs.clientId,
+    mediaManifest: room.mediaManifest
+  };
+  if (participant && participant.mediaCapabilities) result.mediaCapabilities = participant.mediaCapabilities;
+  if (Number.isSafeInteger(data.attemptId) && data.attemptId > 0) result.attemptId = data.attemptId;
+  const isDescription = data.type === 'offer' || data.type === 'answer';
+  if (typeof data.sdp === 'string') result.sdp = data.sdp;
+  else if (data.sdp && typeof data.sdp.sdp === 'string') {
+    result.sdp = { type: isDescription ? data.type : String(data.sdp.type || '').slice(0, 32), sdp: data.sdp.sdp };
+  }
+  if (!isDescription && data.candidate != null) {
+    if (typeof data.candidate === 'string') result.candidate = data.candidate;
+    else if (typeof data.candidate === 'object' && !Array.isArray(data.candidate) && typeof data.candidate.candidate === 'string') {
+      result.candidate = { candidate: data.candidate.candidate };
+      for (const key of ['sdpMid', 'usernameFragment']) {
+        if (typeof data.candidate[key] === 'string') result.candidate[key] = data.candidate[key].slice(0, MAX_ID_LENGTH);
+        else if (data.candidate[key] === null) result.candidate[key] = null;
+      }
+      if (Number.isSafeInteger(data.candidate.sdpMLineIndex) && data.candidate.sdpMLineIndex >= 0) {
+        result.candidate.sdpMLineIndex = data.candidate.sdpMLineIndex;
+      } else if (data.candidate.sdpMLineIndex === null) result.candidate.sdpMLineIndex = null;
+    }
+  }
+  for (const key of isDescription ? ['isRelay', 'reconnect', 'iceRestart'] : ['isRelay', 'reconnect', 'iceRestart', 'trickle', 'natMapping']) {
+    if (data[key] === true) result[key] = true;
+  }
+  return result;
+}
+
 function sanitizeCodecConfig(value, codec) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return {};
@@ -1915,10 +2026,6 @@ function normalizeCapabilityCodecName(value) {
   return normalized;
 }
 
-function normalizePayloadFormat(value, fallback) {
-  return String(value || fallback || '').trim().toLowerCase();
-}
-
 function wouldCreateUpstreamCycle(room, viewerId, upstreamPeerId) {
   let currentId = upstreamPeerId;
   const visited = new Set([viewerId]);
@@ -2082,7 +2189,7 @@ function notifyPendingDownstreams(room, upstreamViewer) {
 
 function generateRoomId(existingRooms) {
   for (let attempt = 0; attempt < 32; attempt += 1) {
-    const roomId = crypto.randomBytes(3).toString('hex').toUpperCase();
+    const roomId = crypto.randomBytes(6).toString('hex').toUpperCase();
     if (!existingRooms || !existingRooms.has(roomId)) {
       return roomId;
     }

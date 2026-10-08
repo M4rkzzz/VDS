@@ -36,6 +36,12 @@ struct PeerTransportSnapshot {
   std::uint64_t encoded_media_data_channel_frames_sent = 0;
   std::uint64_t encoded_media_data_channel_frames_received = 0;
   std::uint64_t encoded_media_data_channel_invalid_frames = 0;
+  std::uint64_t encoded_media_data_channel_chunks_received = 0;
+  std::uint64_t encoded_media_data_channel_incomplete_frames_dropped = 0;
+  std::uint64_t encoded_media_data_channel_backpressure_drops = 0;
+  std::uint64_t encoded_media_data_channel_pending_frames = 0;
+  std::uint64_t encoded_media_data_channel_pending_bytes = 0;
+  std::uint64_t encoded_media_data_channel_buffered_bytes = 0;
   std::uint64_t decoded_frames_rendered = 0;
   std::uint64_t nack_retransmissions = 0;
   std::uint64_t pli_requests_received = 0;
@@ -63,6 +69,15 @@ struct PeerTransportSnapshot {
   std::string transport_generation;
   std::string reason = "peer-not-created";
   std::string last_error;
+};
+
+// A readiness hint for media producers. This carries no diagnostic strings,
+// does not query RTT/candidates, and never replaces actual send admission.
+struct PeerTransportMediaReadiness {
+  bool connected = false;
+  bool use_encoded_data_channel = false;
+  bool video_ready = false;
+  bool audio_ready = false;
 };
 
 struct PeerVideoTrackConfig {
@@ -104,6 +119,9 @@ struct PeerEncodedMediaDataChannelFrame {
 using PeerKeyframeRequestHandler = std::function<std::string(const std::string&)>;
 
 struct PeerTransportCallbacks {
+  // Downstream media bindings still accept hello/keyframe control, but cannot
+  // feed media back into a host or relay receiver.
+  bool allow_remote_media = true;
   PeerKeyframeRequestHandler on_keyframe_requested;
   std::function<void(const std::string& type, const std::string& sdp, const std::string& generation)> on_local_description;
   std::function<void(const std::string& candidate, const std::string& sdp_mid, const std::string& generation)> on_local_candidate;
@@ -221,5 +239,8 @@ void add_peer_transport_dropped_video_units(
 void close_peer_transport_session(const std::shared_ptr<PeerTransportSession>& session);
 
 PeerTransportSnapshot get_peer_transport_snapshot(const std::shared_ptr<PeerTransportSession>& session);
+
+PeerTransportMediaReadiness get_peer_transport_media_readiness(
+  const std::shared_ptr<PeerTransportSession>& session);
 
 std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot);

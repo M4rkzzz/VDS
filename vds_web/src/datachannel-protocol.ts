@@ -6,6 +6,29 @@ export const DATA_CHANNEL_HELLO_ACK_TIMEOUT_MS = 3000;
 export const MAX_ENCODED_FRAME_BYTES = 2 * 1024 * 1024;
 export const DATA_CHANNEL_CHUNK_PAYLOAD_BYTES = 12 * 1024;
 const MAX_PENDING_CHUNKED_FRAMES = 64;
+export const MAX_PENDING_CHUNKED_BYTES = 16 * MAX_ENCODED_FRAME_BYTES;
+const MAX_CHUNKED_FRAME_AGE_MS = 10000;
+
+type ReassemblyClock = {
+  now: () => number;
+  setTimeout: (callback: () => void, delayMs: number) => unknown;
+  clearTimeout: (timer: unknown) => void;
+};
+
+const reassemblyClock: ReassemblyClock = {
+  now: () => typeof performance === 'undefined' ? Date.now() : performance.now(),
+  setTimeout: (callback, delayMs) => {
+    if (typeof window !== 'undefined') return window.setTimeout(callback, delayMs);
+    const timer = setTimeout(callback, delayMs);
+    // CLI protocol checks must not be kept alive by an unfinished test frame.
+    (timer as unknown as { unref?: () => void }).unref?.();
+    return timer;
+  },
+  clearTimeout: (timer) => {
+    if (typeof window !== 'undefined') window.clearTimeout(timer as number);
+    else clearTimeout(timer as ReturnType<typeof setTimeout>);
+  }
+};
 
 const MAGIC = 'VDS1';
 const HEADER_LIMIT_BYTES = 16 * 1024;
@@ -195,12 +218,52 @@ export class EncodedFrameReassembler {
     header: EncodedFrameHeader;
     chunks: Array<ArrayBuffer | undefined>;
     received: number;
+    receivedBytes: number;
     payloadBytes: number;
     createdAt: number;
   }>();
+  private pendingByteCount = 0;
+  private expiryTimer: unknown = null;
+
+  constructor(private readonly clock: ReassemblyClock = reassemblyClock) {}
+
+  get pendingBytes(): number { return this.pendingByteCount; }
+  get pendingFrameCount(): number { return this.pending.size; }
 
   clear(): void {
     this.pending.clear();
+    this.pendingByteCount = 0;
+    if (this.expiryTimer !== null) this.clock.clearTimeout(this.expiryTimer);
+    this.expiryTimer = null;
+  }
+
+  private removePending(frameId: string): void {
+    const entry = this.pending.get(frameId);
+    if (!entry) return;
+    this.pendingByteCount -= entry.receivedBytes;
+    this.pending.delete(frameId);
+    if (this.pending.size === 0 && this.expiryTimer !== null) {
+      this.clock.clearTimeout(this.expiryTimer);
+      this.expiryTimer = null;
+    }
+  }
+
+  private pruneExpired(now: number): void {
+    for (const [id, entry] of this.pending) {
+      if (now - entry.createdAt < MAX_CHUNKED_FRAME_AGE_MS) break;
+      this.removePending(id);
+    }
+  }
+
+  private armExpiry(): void {
+    if (this.expiryTimer !== null || this.pending.size === 0) return;
+    const oldest = this.pending.values().next().value;
+    if (!oldest) return;
+    this.expiryTimer = this.clock.setTimeout(() => {
+      this.expiryTimer = null;
+      this.pruneExpired(this.clock.now());
+      this.armExpiry();
+    }, Math.max(1, oldest.createdAt + MAX_CHUNKED_FRAME_AGE_MS - this.clock.now()));
   }
 
   push(buffer: ArrayBuffer): { header: EncodedFrameHeader; payload: ArrayBuffer } | null {
@@ -233,12 +296,8 @@ export class EncodedFrameReassembler {
       throw new Error('datachannel-chunk-invalid-header');
     }
 
-    const now = Date.now();
-    for (const [id, entry] of this.pending) {
-      if (now - entry.createdAt > 10000) {
-        this.pending.delete(id);
-      }
-    }
+    const now = this.clock.now();
+    this.pruneExpired(now);
 
     let entry = this.pending.get(frameId);
     if (entry && (
@@ -248,7 +307,7 @@ export class EncodedFrameReassembler {
       entry.header.sequence !== decoded.header.sequence || entry.header.keyframe !== decoded.header.keyframe ||
       entry.header.config !== decoded.header.config || entry.header.sourceEpoch !== decoded.header.sourceEpoch
     )) {
-      this.pending.delete(frameId);
+      this.removePending(frameId);
       throw new Error('datachannel-chunk-header-mismatch');
     }
     if (!entry) {
@@ -256,6 +315,7 @@ export class EncodedFrameReassembler {
         header: { ...decoded.header, type: 'frame' },
         chunks: new Array(chunkCount),
         received: 0,
+        receivedBytes: 0,
         payloadBytes,
         createdAt: now
       };
@@ -267,15 +327,26 @@ export class EncodedFrameReassembler {
       if (this.pending.size > MAX_PENDING_CHUNKED_FRAMES) {
         const oldest = this.pending.keys().next().value;
         if (oldest) {
-          this.pending.delete(oldest);
+          this.removePending(oldest);
         }
       }
     }
 
     if (!entry.chunks[chunkIndex]) {
+      // Budget bytes actually retained, so a 60 fps burst of valid frames is
+      // independent of its frame rate or duration. Duplicates consume nothing.
+      while (this.pendingByteCount + decoded.payload.byteLength > MAX_PENDING_CHUNKED_BYTES) {
+        const oldest = this.pending.keys().next().value;
+        if (!oldest) break;
+        this.removePending(oldest);
+      }
+      if (!this.pending.has(frameId)) return null;
       entry.chunks[chunkIndex] = decoded.payload;
       entry.received += 1;
+      entry.receivedBytes += decoded.payload.byteLength;
+      this.pendingByteCount += decoded.payload.byteLength;
     }
+    this.armExpiry();
     if (entry.received !== entry.chunks.length) {
       return null;
     }
@@ -288,13 +359,13 @@ export class EncodedFrameReassembler {
       }
       const chunkBytes = new Uint8Array(chunk);
       if (offset + chunkBytes.byteLength > output.byteLength) {
-        this.pending.delete(frameId);
+        this.removePending(frameId);
         throw new Error('datachannel-chunk-payload-overflow');
       }
       output.set(chunkBytes, offset);
       offset += chunkBytes.byteLength;
     }
-    this.pending.delete(frameId);
+    this.removePending(frameId);
     return {
       header: entry.header,
       payload: output.buffer

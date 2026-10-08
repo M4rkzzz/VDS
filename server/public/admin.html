@@ -232,6 +232,7 @@
     </div>
   </header>
   <main>
+    <p id="snapshotScope" hidden></p>
     <section class="summary" id="summary"></section>
     <section class="rooms" id="rooms"></section>
   </main>
@@ -493,6 +494,9 @@
     }
 
     function render(snapshot) {
+      const scope = document.getElementById('snapshotScope');
+      scope.hidden = snapshot.scope !== 'public-rooms';
+      scope.textContent = '公网视图仅展示公开房间；未公开房间的完整拓扑请在服务器内网 3010 后台查看。';
       renderSummary(snapshot);
       const rooms = Array.isArray(snapshot.rooms) ? snapshot.rooms : [];
       roomsEl.innerHTML = rooms.length ? rooms.map(renderRoom).join('') : '<div class="empty">当前没有房间</div>';

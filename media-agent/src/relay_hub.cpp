@@ -38,7 +38,7 @@ RelayHub::RelayHub() : backend_(std::make_unique<Backend>()) {
 }
 
 RelayHub::~RelayHub() {
-  shutdown_runtime();
+  close_runtime();
 }
 
 EncodedFrameBus& RelayHub::frame_bus() {
@@ -95,6 +95,13 @@ void RelayHub::shutdown_runtime() const {
     return;
   }
   backend_->runtime->shutdown_dispatch();
+}
+
+void RelayHub::close_runtime() const {
+  if (!backend_ || !backend_->runtime) {
+    return;
+  }
+  backend_->runtime->close();
 }
 
 void RelayHub::publish_video_units(

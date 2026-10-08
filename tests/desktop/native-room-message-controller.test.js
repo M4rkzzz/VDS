@@ -12,43 +12,83 @@ function deferred() {
   return { promise, resolve };
 }
 
-function createHarness(initialState = {}, cleanup = async () => {}) {
+function createHarness(initialState = {}, cleanup = async () => {}, extraOptions = {}) {
   const context = { window: { VDS: {} } };
   for (const file of ['room-client.js', 'native/native-room-message-controller.js']) {
     vm.runInNewContext(fs.readFileSync(path.join(publicPath, file), 'utf8'), context, { filename: file });
   }
-  const state = { role: 'viewer', roomId: 'ROOM1', sessionToken: null, generation: 1, pending: true, ...initialState };
-  const calls = { leaves: [], manifest: [], patches: [], joinedUi: [], cleanup: 0, joined: 0, armed: [], hostUi: [] };
+  const state = {
+    role: 'viewer', roomId: 'ROOM1', sessionToken: null, generation: 1, pending: true,
+    hostGeneration: 1, hostRunning: initialState.role === 'host', hostStopping: false,
+    mediaSessionId: 'media1', mediaManifest: { mediaSessionId: 'media1', video: { codec: 'h264' } },
+    publicListing: false, obsBackend: false, obsActive: false, obsPending: false,
+    ...initialState
+  };
+  const calls = { leaves: [], creates: [], queueClears: [], manifest: [], patches: [], joinedUi: [], cleanup: 0,
+    joined: 0, armed: [], hostUi: [], hostStatus: [], viewerStatus: [], errors: [], hidden: [], viewerReset: 0,
+    relayRetryClears: 0, timerClears: 0 };
   const controller = context.window.VDS.nativeRoomMessages.createController({
     roomClient: {
+      createRoom: request => { calls.creates.push(request); return true; },
+      clearPendingSignalingQueues: reason => calls.queueClears.push(reason),
       leaveRoom: request => {
         calls.leaves.push({ ...context.window.VDS.roomClient.buildLeaveRoomMessage(request), sendOptions: request.sendOptions });
         return true;
       }
     },
-    p2pStateMachine: { armViewerUpstreamOfferWaitTimer: peerId => calls.armed.push(peerId) },
+    p2pStateMachine: {
+      armViewerUpstreamOfferWaitTimer: peerId => calls.armed.push(peerId),
+      clearViewerUpstreamOfferWaitTimer: () => { calls.timerClears += 1; },
+      clearViewerMediaWaitTimer: () => { calls.timerClears += 1; }
+    },
+    nativeSessionState: {
+      setObsRoomCreatePending: pending => { state.obsPending = pending; },
+      getObsIngestStreamActive: () => state.obsActive,
+      setObsIngestStreamActive: active => { state.obsActive = active; }
+    },
     getClientId: () => 'viewer-test',
     getSessionRole: () => state.role,
     getCurrentRoomId: () => state.roomId,
     getCurrentSessionToken: () => state.sessionToken,
+    getCurrentHostMediaSessionId: () => state.mediaSessionId,
+    getCurrentMediaManifest: () => state.mediaManifest,
+    getHostStartGeneration: () => state.hostGeneration,
+    isNativeHostSessionRunning: () => state.hostRunning,
+    isHostStopping: () => state.hostStopping,
+    getPublicRoomEnabled: () => state.publicListing,
+    isObsIngestHostBackend: () => state.obsBackend,
     getViewerJoinGeneration: () => state.generation,
     isViewerJoinPending: () => state.pending,
     getHostId: () => state.hostId,
     getUpstreamPeerId: () => state.upstreamPeerId,
     getChainPosition: () => state.chainPosition,
     clearAllPeerConnections: () => { calls.cleanup += 1; return cleanup(); },
+    clearAllRelayOfferRetries: () => { calls.relayRetryClears += 1; },
+    resetViewerState: () => {
+      calls.viewerReset += 1;
+      Object.assign(state, { role: null, roomId: null, sessionToken: null, pending: false, generation: state.generation + 1 });
+      return cleanup();
+    },
     rememberMediaManifest: manifest => calls.manifest.push(manifest),
     setViewerRoomState: value => Object.assign(state, { ...value, role: 'viewer' }),
+    setHostRoomState: value => Object.assign(state, { ...value, role: 'host' }),
     setSessionRoomState: value => Object.assign(state, value),
     setViewerResumeState: value => Object.assign(state, value),
     syncRendererAppState: (reason, patch) => calls.patches.push({ reason, patch }),
     handleViewerJoinSucceeded: () => { state.pending = false; calls.joined += 1; },
     setViewerJoinedUi: value => calls.joinedUi.push(value),
-    setHostRoomActiveUi: value => calls.hostUi.push(value)
+    setHostRoomActiveUi: value => calls.hostUi.push(value),
+    setViewerCount: count => { state.viewerCount = count; },
+    setRoomInfoHidden: hidden => calls.hidden.push(hidden),
+    setHostStatus: (text, waiting) => calls.hostStatus.push({ text, waiting }),
+    setViewerConnectionState: text => calls.viewerStatus.push(text),
+    showError: message => calls.errors.push(message),
+    ...extraOptions
   });
   return {
-    controller, state, calls,
-    cancel: () => Object.assign(state, { role: null, roomId: null, sessionToken: null, pending: false, generation: state.generation + 1 })
+    controller, state, calls, context,
+    cancel: () => Object.assign(state, { role: null, roomId: null, sessionToken: null, pending: false,
+      generation: state.generation + 1, hostGeneration: state.hostGeneration + 1, hostRunning: false })
   };
 }
 
@@ -196,4 +236,188 @@ test('normal host session resume still restores the host room UI', async () => {
   assert.equal(calls.hostUi.length, 1);
   assert.equal(calls.cleanup, 0);
   assert.equal(calls.leaves.length, 0);
+});
+
+test('expired host session recreates one real room using the existing capture manifest and public setting', async () => {
+  const cleanup = deferred();
+  const { controller, state, calls } = createHarness({ role: 'host', sessionToken: 'old-host-token',
+    pending: false, publicListing: true, viewerCount: 7 }, () => cleanup.promise);
+  const manifest = state.mediaManifest;
+  const first = controller.handleErrorMessage({ code: 'session-not-found' });
+  const duplicate = controller.handleErrorMessage({ code: 'room-not-found' });
+  assert.equal(state.roomId, null);
+  assert.equal(state.sessionToken, '');
+  assert.equal(state.hostRunning, true);
+  assert.equal(state.mediaSessionId, 'media1');
+  assert.equal(state.mediaManifest, manifest);
+  assert.equal(state.viewerCount, 0);
+  assert.deepEqual(calls.hidden, [true]);
+  assert.equal(calls.cleanup, 1);
+  assert.equal(calls.relayRetryClears, 1);
+  assert.equal(calls.creates.length, 0);
+  cleanup.resolve();
+  await Promise.all([first, duplicate]);
+  assert.equal(calls.creates.length, 1);
+  assert.equal(calls.creates[0].mediaManifest, manifest);
+  assert.equal(calls.creates[0].publicListing, true);
+  assert.equal(calls.creates[0].clientId, 'viewer-test');
+  assert.equal(state.obsPending, true);
+  await controller.handleErrorMessage({ code: 'session-not-found' });
+  assert.equal(calls.creates.length, 1, 'duplicate errors before the create acknowledgement must not create another room');
+  await controller.handleRoomCreatedMessage(ack({ roomId: 'AABBCC112233', sessionToken: 'new-host-token' }));
+  assert.equal(state.roomId, 'AABBCC112233');
+  assert.equal(state.sessionToken, 'new-host-token');
+  assert.equal(state.role, 'host');
+  assert.equal(state.hostRunning, true);
+  assert.equal(state.obsPending, false);
+  assert.equal(calls.hostUi.at(-1).roomId, 'AABBCC112233');
+  assert.equal(calls.hostUi.at(-1).viewerCount, 0);
+  assert.equal(calls.leaves.length, 0);
+  assert.deepEqual(calls.queueClears, ['host-session-expired']);
+});
+
+for (const change of ['stop', 'generation', 'media-session']) {
+  test(`host recovery cancelled by ${change} during old-peer cleanup cannot recreate a room`, async () => {
+    const cleanup = deferred();
+    const { controller, state, calls } = createHarness({ role: 'host', sessionToken: 'old-token', pending: false }, () => cleanup.promise);
+    const recovery = controller.handleErrorMessage({ code: 'session-not-found' });
+    if (change === 'stop') {
+      state.hostStopping = true;
+      controller.cancelRoomRecovery('host-stopping');
+    } else if (change === 'generation') {
+      state.hostGeneration += 1;
+    } else {
+      state.mediaSessionId = 'new-media-session';
+    }
+    cleanup.resolve();
+    await recovery;
+    assert.equal(calls.creates.length, 0);
+    assert.equal(calls.hostUi.length, 0);
+    assert.equal(calls.errors.length, 0);
+    assert.equal(state.obsPending, false);
+  });
+}
+
+test('stopping an already-requested recovery releases a late room-created acknowledgement', async () => {
+  const harness = createHarness({ role: 'host', sessionToken: 'old-token', pending: false });
+  await harness.controller.handleErrorMessage({ code: 'session-not-found' });
+  assert.equal(harness.calls.creates.length, 1);
+  harness.controller.cancelRoomRecovery('host-stopping');
+  harness.state.hostStopping = true;
+  await harness.controller.handleRoomCreatedMessage(ack({ roomId: 'AABBCC112233', sessionToken: 'late-host-token' }));
+  assert.equal(harness.state.roomId, null);
+  assert.equal(harness.calls.hostUi.length, 0);
+  assert.equal(harness.calls.leaves.length, 1);
+  assert.equal(harness.calls.leaves[0].roomId, 'AABBCC112233');
+  assert.equal(harness.calls.leaves[0].sessionToken, 'late-host-token');
+  assert.equal(harness.calls.leaves[0].sendOptions.queueIfDisconnected, false);
+  assert.deepEqual(harness.calls.queueClears, ['host-session-expired', 'host-stopping']);
+});
+
+test('a recovery room acknowledgement cannot revive a superseded host generation', async () => {
+  const { controller, state, calls } = createHarness({ role: 'host', sessionToken: 'old-token', pending: false });
+  await controller.handleErrorMessage({ code: 'session-not-found' });
+  state.hostGeneration += 1;
+  await controller.handleRoomCreatedMessage(ack({ roomId: 'AABBCC112233', sessionToken: 'late-token' }));
+  assert.equal(state.roomId, null);
+  assert.equal(calls.hostUi.length, 0);
+  assert.equal(calls.leaves[0].sessionToken, 'late-token');
+});
+
+test('OBS recovery retains the active ingest and does not create a room while its source is inactive', async () => {
+  for (const active of [true, false]) {
+    const { controller, state, calls } = createHarness({ role: 'host', sessionToken: 'old-token', pending: false,
+      obsBackend: true, obsActive: active });
+    await controller.handleErrorMessage({ code: 'session-not-found' });
+    assert.equal(state.obsActive, active);
+    assert.equal(state.hostRunning, true);
+    assert.equal(calls.creates.length, active ? 1 : 0);
+    assert.equal(state.obsPending, active);
+    if (!active) assert.equal(calls.hostStatus.at(-1).text, '等待 OBS 推流...');
+  }
+});
+
+test('missing host manifest fails visibly without restarting or stopping the capture', async () => {
+  const { controller, state, calls } = createHarness({ role: 'host', sessionToken: 'old-token', pending: false, mediaManifest: null });
+  await controller.handleErrorMessage({ code: 'session-not-found' });
+  assert.equal(calls.creates.length, 0);
+  assert.equal(state.roomId, null);
+  assert.equal(state.hostRunning, true);
+  assert.equal(state.obsPending, false);
+  assert.match(calls.errors[0], /重新开始/);
+});
+
+test('stale room acknowledgements cannot unlock a pending OBS recovery', async () => {
+  const { controller, state, calls } = createHarness({ role: 'host', sessionToken: 'old-token', pending: false,
+    obsBackend: true, obsActive: true });
+  await controller.handleErrorMessage({ code: 'session-not-found' });
+  await controller.handleRoomCreatedMessage(ack({ roomId: 'STALE', mediaManifest: { mediaSessionId: 'old-media' } }));
+  assert.equal(state.roomId, null);
+  assert.equal(state.obsPending, true);
+  assert.equal(calls.creates.length, 1);
+  assert.equal(calls.leaves.length, 1);
+  await controller.handleRoomCreatedMessage(ack({ roomId: 'AABBCC112233', sessionToken: 'new-token' }));
+  assert.equal(state.roomId, 'AABBCC112233');
+  assert.equal(state.obsPending, false);
+});
+
+test('recovery creation errors clear pending retries and leave a persistent failure state', async () => {
+  const { controller, state, calls } = createHarness({ role: 'host', sessionToken: 'old-token', pending: false });
+  await controller.handleErrorMessage({ code: 'session-not-found' });
+  await controller.handleErrorMessage({ code: 'room-limit-reached', message: 'Server room limit reached' });
+  assert.equal(state.hostRunning, true);
+  assert.equal(state.roomId, null);
+  assert.equal(state.obsPending, false);
+  assert.equal(calls.creates.length, 1);
+  assert.deepEqual(calls.queueClears, ['host-session-expired', 'host-room-create-failed']);
+  assert.match(calls.hostStatus.at(-1).text, /恢复失败/);
+  assert.equal(calls.errors.at(-1), 'Server room limit reached');
+});
+
+for (const code of ['session-not-found', 'room-not-found', 'session-token-invalid']) {
+  test(`viewer ${code} clears the expired session and asks for an explicit new join`, async () => {
+    const { controller, state, calls } = createHarness({ sessionToken: 'old-viewer-token', pending: false });
+    await controller.handleErrorMessage({ code });
+    assert.equal(state.role, null);
+    assert.equal(state.roomId, null);
+    assert.equal(state.sessionToken, null);
+    assert.equal(calls.viewerReset, 1);
+    assert.equal(calls.creates.length, 0);
+    assert.equal(calls.timerClears, 2);
+    assert.deepEqual(calls.queueClears, ['viewer-session-expired']);
+    assert.match(calls.viewerStatus[0], /重新加入/);
+    assert.match(calls.errors[0], /新的房间号/);
+    await controller.handleErrorMessage({ code });
+    assert.equal(calls.viewerReset, 1, 'expired sessions must not retry or reset indefinitely');
+  });
+}
+
+test('viewer recovery cleanup cannot overwrite a newly selected room', async () => {
+  const cleanup = deferred();
+  const { controller, state, calls } = createHarness({ sessionToken: 'old-token', pending: false }, () => cleanup.promise);
+  const reset = controller.handleErrorMessage({ code: 'session-not-found' });
+  Object.assign(state, { role: 'viewer', roomId: 'NEWROOM', generation: state.generation + 1, pending: true });
+  cleanup.resolve();
+  await reset;
+  assert.equal(state.roomId, 'NEWROOM');
+  assert.equal(calls.viewerStatus.length, 0);
+  assert.equal(calls.errors.length, 0);
+});
+
+test('late host resume acknowledgements cannot restore a stopped, replaced or recovering room', async () => {
+  for (const change of ['stop', 'room', 'token', 'media-session', 'recovery']) {
+    const { controller, state, calls } = createHarness({ role: 'host', sessionToken: 'host-token', pending: false });
+    if (change === 'stop') state.hostStopping = true;
+    if (change === 'room') state.roomId = 'NEWROOM';
+    if (change === 'token') state.sessionToken = 'new-token';
+    if (change === 'media-session') state.mediaSessionId = 'new-media-session';
+    if (change === 'recovery') await controller.handleErrorMessage({ code: 'session-not-found' });
+    const expectedRoomId = state.roomId;
+    const expectedToken = state.sessionToken;
+    await controller.handleSessionResumedMessage(ack({ role: 'host', sessionToken: 'host-token' }));
+    assert.equal(state.roomId, expectedRoomId, change);
+    assert.equal(state.sessionToken, expectedToken, change);
+    assert.equal(calls.hostUi.length, 0, change);
+    assert.equal(calls.patches.filter(entry => entry.reason === 'session-resumed').length, 0, change);
+  }
 });

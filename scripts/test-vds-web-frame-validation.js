@@ -33,6 +33,10 @@ const reassembler = new protocol.EncodedFrameReassembler();
 const chunkHeader = { ...header, type: 'chunk', frameId: 'short-frame', chunkIndex: 0, chunkCount: 1, framePayloadBytes: 10 };
 assert.throws(() => reassembler.push(envelope(chunkHeader, new Uint8Array([1, 2, 3]))), /chunk-invalid-header/);
 assert.throws(() => reassembler.push(envelope({ ...chunkHeader, chunkCount: 2 }, new Uint8Array(10))), /chunk-invalid-header/);
+assert.throws(() => reassembler.push(envelope({
+  ...chunkHeader, chunkCount: Number.MAX_SAFE_INTEGER, framePayloadBytes: protocol.MAX_ENCODED_FRAME_BYTES
+}, new Uint8Array(protocol.DATA_CHANNEL_CHUNK_PAYLOAD_BYTES))), /chunk-invalid-header/);
+assert.strictEqual(reassembler.pendingBytes, 0, 'rejected headers cannot reserve pending payload');
 
 const bytes = new Uint8Array(protocol.DATA_CHANNEL_CHUNK_PAYLOAD_BYTES + 5);
 for (let index = 0; index < bytes.length; index++) bytes[index] = index % 251;
@@ -55,4 +59,6 @@ const epochMessages = protocol.encodeFrameMessages({ ...header, sourceEpoch: 'so
 const epochChunk = protocol.decodeFrameMessage(epochMessages[1]);
 assert.strictEqual(reassembler.push(epochMessages[0]), null);
 assert.throws(() => reassembler.push(envelope({ ...epochChunk.header, sourceEpoch: 'source-epoch-b' }, new Uint8Array(epochChunk.payload))), /chunk-header-mismatch/);
+assert.strictEqual(reassembler.pendingBytes, 0, 'header mismatch releases the partial frame');
+reassembler.clear();
 console.log('vds-web receiving frame validation passed');

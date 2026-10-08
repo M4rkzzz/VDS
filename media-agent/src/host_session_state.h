@@ -68,6 +68,7 @@ struct HostCaptureProcessState {
   std::string last_error;
   std::string command_line;
 #ifdef _WIN32
+  HANDLE process_job_handle = nullptr;
   HANDLE process_handle = nullptr;
   HANDLE thread_handle = nullptr;
 #endif

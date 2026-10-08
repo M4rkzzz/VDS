@@ -81,8 +81,8 @@
 +static bool vds_is_public_destination(const addr_record_t *record) {
 +	if (record->addr.ss_family != AF_INET) return false;
 +	uint32_t ip = ntohl(((const struct sockaddr_in *)&record->addr)->sin_addr.s_addr);
-+	return (ip >> 24) != 10 && (ip >> 24) != 127 && (ip >> 16) != 0xa9fe &&
-+	       (ip >> 20) != 0xac1 && (ip >> 16) != 0xc0a8;
++	return vds_nat_is_public_ipv4_destination(ip);
++
 +}
 +
 +static bool vds_server_requests_pending(const juice_agent_t *agent) {

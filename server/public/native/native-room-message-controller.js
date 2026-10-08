@@ -10,6 +10,8 @@
     const elements = options.elements || {};
     const p2pStateMachine = options.p2pStateMachine || null;
     const nativeSessionState = options.nativeSessionState || null;
+    let hostRoomRecovery = null;
+    let viewerSessionReset = null;
 
     function syncRendererAppState(reason, patch) {
       if (typeof options.syncRendererAppState === 'function') {
@@ -181,7 +183,120 @@
       }
     }
 
+    function cancelRoomRecovery(reason = 'host-room-recovery-cancelled') {
+      hostRoomRecovery = null;
+      setObsRoomCreatePending(false);
+      if (roomClient && typeof roomClient.clearPendingSignalingQueues === 'function') {
+        roomClient.clearPendingSignalingQueues(reason);
+      }
+    }
+
+    function isCurrentHostRecovery(recovery) {
+      return hostRoomRecovery === recovery &&
+        getOptionValue('getSessionRole', null) === 'host' &&
+        getBooleanOption('isNativeHostSessionRunning', false) &&
+        !getBooleanOption('isHostStopping', false) &&
+        getOptionValue('getHostStartGeneration', null) === recovery.generation &&
+        getOptionValue('getCurrentHostMediaSessionId', '') === recovery.mediaSessionId &&
+        !getOptionValue('getCurrentRoomId', null);
+    }
+
+    function recoverHostRoom() {
+      if (hostRoomRecovery && getOptionValue('getHostStartGeneration', null) === hostRoomRecovery.generation &&
+          getOptionValue('getCurrentHostMediaSessionId', '') === hostRoomRecovery.mediaSessionId) return hostRoomRecovery.promise;
+      hostRoomRecovery = null;
+      if (!getBooleanOption('isNativeHostSessionRunning', false) || getBooleanOption('isHostStopping', false)) {
+        return Promise.resolve();
+      }
+      const previousRoomId = normalizeRoomId(getOptionValue('getCurrentRoomId', ''));
+      if (!previousRoomId) return Promise.resolve();
+      const recovery = {
+        generation: getOptionValue('getHostStartGeneration', null),
+        mediaSessionId: getOptionValue('getCurrentHostMediaSessionId', ''),
+        awaitingAck: false,
+        promise: null
+      };
+      hostRoomRecovery = recovery;
+      recovery.promise = (async () => {
+        if (roomClient && typeof roomClient.clearPendingSignalingQueues === 'function') {
+          roomClient.clearPendingSignalingQueues('host-session-expired');
+        }
+        callOptional('clearAllRelayOfferRetries');
+        callOptional('setSessionRoomState', { roomId: null, role: 'host', sessionToken: '' });
+        callOptional('setViewerCount', 0);
+        callOptional('setRoomInfoHidden', true);
+        syncRendererAppState('host-session-expired', {
+          role: 'host', roomId: null, sessionToken: null,
+          hostId: null, upstreamPeerId: null, chainPosition: -1, viewerCount: 0
+        });
+        setObsRoomCreatePending(true);
+        setHostWaitingOrStatus('房间已失效，正在恢复分享...', true);
+        if (typeof options.clearAllPeerConnections === 'function') {
+          await options.clearAllPeerConnections({ clearRetryState: true });
+        }
+        if (!isCurrentHostRecovery(recovery)) return;
+        if (isObsIngestHostBackend() && !getObsIngestStreamActive()) {
+          setHostWaitingOrStatus('等待 OBS 推流...', true);
+          return;
+        }
+        const mediaManifest = getOptionValue('getCurrentMediaManifest', null);
+        if (!mediaManifest || !recovery.mediaSessionId || mediaManifest.mediaSessionId !== recovery.mediaSessionId ||
+            !roomClient || typeof roomClient.createRoom !== 'function') {
+          throw new Error('当前媒体会话不可用，请停止分享后重新开始');
+        }
+        // The capture, audio, preview and OBS listener remain owned by this media session.
+        recovery.awaitingAck = true;
+        roomClient.createRoom({
+          clientId: getOptionValue('getClientId', ''),
+          publicListing: getBooleanOption('getPublicRoomEnabled', false),
+          mediaManifest
+        });
+        logNativeStep('host-room:recreating', { previousRoomId, mediaSessionId: recovery.mediaSessionId }, 'connection');
+      })().catch((error) => {
+        recovery.awaitingAck = false;
+        if (isCurrentHostRecovery(recovery)) {
+          setHostWaitingOrStatus('房间恢复失败，请停止分享后重试', true);
+          showError(error && error.message ? error.message : '房间恢复失败');
+        }
+      }).finally(() => {
+        if (hostRoomRecovery === recovery && !recovery.awaitingAck) {
+          hostRoomRecovery = null;
+          setObsRoomCreatePending(false);
+        }
+      });
+      return recovery.promise;
+    }
+
+    function resetExpiredViewerSession(data) {
+      if (viewerSessionReset) return viewerSessionReset;
+      viewerSessionReset = (async () => {
+        clearViewerUpstreamOfferWaitTimer();
+        clearViewerMediaWaitTimer();
+        if (roomClient && typeof roomClient.clearPendingSignalingQueues === 'function') {
+          roomClient.clearPendingSignalingQueues('viewer-session-expired');
+        }
+        const handled = typeof window.__vdsHandleViewerJoinError === 'function' && data.code === 'room-not-found'
+          ? await window.__vdsHandleViewerJoinError(data)
+          : false;
+        if (!handled && typeof options.resetViewerState === 'function') await options.resetViewerState();
+        if (getOptionValue('getSessionRole', null)) return;
+        callOptional('setViewerConnectionState', '房间会话已失效，请重新加入');
+        showError('房间会话已失效，请重新加入；若分享者已恢复，请使用新的房间号');
+      })().finally(() => { viewerSessionReset = null; });
+      return viewerSessionReset;
+    }
+
     async function handleErrorMessage(data) {
+      if (data && ['session-not-found', 'room-not-found', 'session-token-invalid'].includes(data.code)) {
+        const role = getOptionValue('getSessionRole', null);
+        if (role === 'host') await recoverHostRoom();
+        else if (role === 'viewer') await resetExpiredViewerSession(data);
+        return;
+      }
+      if (hostRoomRecovery) {
+        cancelRoomRecovery('host-room-create-failed');
+        setHostWaitingOrStatus('房间恢复失败，请停止分享后重试', true);
+      }
       setObsRoomCreatePending(false);
       if (typeof window.__vdsHandleViewerJoinError === 'function') {
         const handled = await window.__vdsHandleViewerJoinError(data);
@@ -238,11 +353,13 @@
     }
 
     async function handleRoomCreatedMessage(data) {
-      setObsRoomCreatePending(false);
       const ackMediaSessionId = getAckMediaSessionId(data);
       const currentHostMediaSessionId = getOptionValue('getCurrentHostMediaSessionId', '');
       const nativeHostSessionRunning = Boolean(getOptionValue('isNativeHostSessionRunning', false));
-      if (!nativeHostSessionRunning || !currentHostMediaSessionId || !ackMediaSessionId || ackMediaSessionId !== currentHostMediaSessionId) {
+      if (!nativeHostSessionRunning || getBooleanOption('isHostStopping', false) ||
+          !currentHostMediaSessionId || !ackMediaSessionId || ackMediaSessionId !== currentHostMediaSessionId ||
+          hostRoomRecovery && ackMediaSessionId === hostRoomRecovery.mediaSessionId &&
+            getOptionValue('getHostStartGeneration', null) !== hostRoomRecovery.generation) {
         logNativeStep('room-created:stale-ignored', {
           roomId: data && data.roomId,
           mediaSessionId: ackMediaSessionId,
@@ -259,6 +376,8 @@
         }
         return;
       }
+      setObsRoomCreatePending(false);
+      hostRoomRecovery = null;
       callOptional('rememberMediaManifest', data && data.mediaManifest);
       if (isObsIngestHostBackend() && !getObsIngestStreamActive()) {
         sendLeaveRoom({
@@ -282,7 +401,8 @@
         viewerCount: 0
       });
       callOptional('resetShareStartPendingUi');
-      callOptional('setHostRoomActiveUi', { roomId: data && data.roomId });
+      callOptional('setViewerCount', 0);
+      callOptional('setHostRoomActiveUi', { roomId: data && data.roomId, viewerCount: 0 });
       if (typeof options.copyRoomIdToClipboard === 'function') {
         options.copyRoomIdToClipboard({
           roomId: data && data.roomId,
@@ -325,6 +445,20 @@
         });
       };
       if (role === 'host') {
+        const currentRoomId = normalizeRoomId(getOptionValue('getCurrentRoomId', ''));
+        const currentToken = String(getOptionValue('getCurrentSessionToken', '') || '');
+        const ackMediaSessionId = getAckMediaSessionId(data);
+        if (getOptionValue('getSessionRole', null) !== 'host' || !currentRoomId ||
+            currentRoomId !== normalizeRoomId(roomId) || !currentToken || currentToken !== sessionToken ||
+            !getBooleanOption('isNativeHostSessionRunning', false) || getBooleanOption('isHostStopping', false) ||
+            ackMediaSessionId && ackMediaSessionId !== getOptionValue('getCurrentHostMediaSessionId', '')) {
+          logNativeStep('session-resumed:stale-host-ignored', { roomId }, 'connection');
+          if (roomId && data.sessionToken && roomId !== currentRoomId && data.sessionToken !== currentToken) {
+            sendLeaveRoom({ roomId, clientId: getOptionValue('getClientId', ''), sessionToken: data.sessionToken,
+              sendOptions: { queueIfDisconnected: false } });
+          }
+          return;
+        }
         commitSessionState();
         setObsRoomCreatePending(false);
         if (nativeSessionState && typeof nativeSessionState.setObsIngestStreamActive === 'function') {
@@ -403,6 +537,7 @@
 
     return {
       registerHandlers,
+      cancelRoomRecovery,
       handleViewerCountUpdatedMessage,
       handleViewerLeftMessage,
       handleHostDisconnectedMessage,

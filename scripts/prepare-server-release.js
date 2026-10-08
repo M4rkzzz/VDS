@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { signReleaseDirectory } = require('./update-signature');
 
 const projectRoot = path.resolve(__dirname, '..');
 const serverDir = path.join(projectRoot, 'server');
@@ -10,7 +11,7 @@ const retainedOldVersionCount = Math.max(
   Number(process.env.UPDATE_RETENTION_OLD_COUNT || process.env.UPDATE_RETENTION_COUNT || 5)
 );
 
-const requiredFiles = ['latest.yml'];
+const requiredFiles = ['latest.yml', 'latest.yml.sig'];
 const installerPattern = /^VDS-Setup-(\d+\.\d+\.\d+)\.exe(?:\.blockmap)?$/;
 
 function ensureDir(dirPath) {
@@ -223,10 +224,11 @@ function pruneOldArtifacts(dirPath, currentVersion, oldVersions) {
   }
 }
 
-function main() {
+async function main() {
   const version = readLatestVersion();
   const artifactsDir = resolveArtifactsDir(version);
   validateLatestManifest(artifactsDir, version);
+  await signReleaseDirectory(artifactsDir, { version });
   const retainedVersions = uniqueVersions(
     [version]
       .concat(readRetainedVersions(updatesDir))
@@ -259,4 +261,7 @@ function main() {
   }
 }
 
-main();
+main().catch((error) => {
+  console.error(`Preparing server release failed: ${error.message}`);
+  process.exitCode = 1;
+});

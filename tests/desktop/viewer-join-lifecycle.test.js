@@ -153,3 +153,49 @@ test('a current preference failure remains best effort and still joins normally'
   assert.equal(calls.joins.length, 1);
   assert.equal(context.sessionRole, 'viewer');
 });
+
+test('expired viewer cleanup cannot overwrite a newer join or its UI after awaiting old peers', async () => {
+  const { context, join, prefs, calls } = createHarness();
+  const cleanup = deferred();
+  context.clearAllPeerConnections = () => cleanup.promise;
+  const resetting = context.resetViewerState();
+  const joining = join('NEWROOM');
+  prefs[0].resolve();
+  await joining;
+  context.elements.connectionStatus.textContent = '新会话正在连接';
+  cleanup.resolve();
+  await resetting;
+  assert.equal(context.currentRoomId, 'NEWROOM');
+  assert.equal(context.sessionRole, 'viewer');
+  assert.equal(context.viewerJoinPending, true);
+  assert.equal(context.elements.connectionStatus.textContent, '新会话正在连接');
+  assert.deepEqual(calls.joins.map(message => message.roomId), ['NEWROOM']);
+});
+
+test('expired viewer cleanup cannot reset the UI after the user starts hosting', async () => {
+  const { context } = createHarness();
+  const cleanup = deferred();
+  context.clearAllPeerConnections = () => cleanup.promise;
+  const resetting = context.resetViewerState();
+  context.sessionRole = 'host';
+  context.currentRoomId = 'HOSTROOM';
+  context.elements.connectionStatus.textContent = '房主已就绪';
+  cleanup.resolve();
+  await resetting;
+  assert.equal(context.currentRoomId, 'HOSTROOM');
+  assert.equal(context.elements.connectionStatus.textContent, '房主已就绪');
+});
+
+test('a delayed join error cannot toast or rerender after a new join supersedes cleanup', async () => {
+  const { context, join, prefs, calls } = createHarness();
+  const cleanup = deferred();
+  context.clearAllPeerConnections = () => cleanup.promise;
+  const failing = context.handleViewerJoinFailure('旧房间不存在');
+  const joining = join('NEWROOM');
+  prefs[0].resolve();
+  await joining;
+  cleanup.resolve();
+  await failing;
+  assert.equal(context.currentRoomId, 'NEWROOM');
+  assert.deepEqual(calls.errors, []);
+});

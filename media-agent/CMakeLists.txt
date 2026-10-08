@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 
+# Single-configuration generators (Ninja/Makefiles) otherwise build without the
+# Release optimization flags. Set this before project(): MSVC can initialize an
+# unspecified build type to Debug there. Explicit configurations are preserved.
+get_property(VDS_MEDIA_AGENT_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT VDS_MEDIA_AGENT_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build configuration" FORCE)
+endif()
+
 project(vds-media-agent VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -156,6 +164,41 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
   add_executable(vds-nat-port-prediction-tests tests/nat_port_prediction_tests.cpp)
   target_include_directories(vds-nat-port-prediction-tests PRIVATE src)
   add_test(NAME vds-nat-port-prediction-tests COMMAND vds-nat-port-prediction-tests)
+  add_executable(vds-encoded-media-transport-limits-tests tests/encoded_media_transport_limits_tests.cpp)
+  target_include_directories(vds-encoded-media-transport-limits-tests PRIVATE src)
+  add_test(NAME vds-encoded-media-transport-limits-tests COMMAND vds-encoded-media-transport-limits-tests)
+  add_executable(vds-video-access-unit-tests tests/video_access_unit_tests.cpp src/video_access_unit.cpp)
+  target_include_directories(vds-video-access-unit-tests PRIVATE src)
+  add_test(NAME vds-video-access-unit-tests COMMAND vds-video-access-unit-tests)
+  add_executable(vds-agent-rpc-boundary-tests tests/agent_rpc_boundary_tests.cpp src/json_protocol.cpp)
+  target_include_directories(vds-agent-rpc-boundary-tests PRIVATE src)
+  add_test(NAME vds-agent-rpc-boundary-tests COMMAND vds-agent-rpc-boundary-tests)
+  add_executable(vds-peer-shutdown-pipeline-tests
+    tests/peer_shutdown_pipeline_tests.cpp src/peer_lifecycle_pipeline.cpp src/runtime_registry.cpp)
+  target_include_directories(vds-peer-shutdown-pipeline-tests PRIVATE src)
+  add_test(NAME vds-peer-shutdown-pipeline-tests COMMAND vds-peer-shutdown-pipeline-tests)
+  add_executable(vds-wgc-frame-sampling-tests tests/wgc_frame_sampling_tests.cpp)
+  target_include_directories(vds-wgc-frame-sampling-tests PRIVATE src)
+  add_test(NAME vds-wgc-frame-sampling-tests COMMAND vds-wgc-frame-sampling-tests)
+  if(WIN32)
+    add_executable(vds-wasapi-packet-diagnostics-tests
+      tests/wasapi_packet_diagnostics_tests.cpp src/json_protocol.cpp)
+    target_include_directories(vds-wasapi-packet-diagnostics-tests PRIVATE src)
+    target_link_libraries(vds-wasapi-packet-diagnostics-tests PRIVATE Mmdevapi ole32 RuntimeObject windowsapp)
+    add_test(NAME vds-wasapi-packet-diagnostics-tests COMMAND vds-wasapi-packet-diagnostics-tests)
+    add_executable(vds-host-audio-dispatch-tests
+      tests/host_audio_dispatch_tests.cpp src/json_protocol.cpp src/audio_state_json.cpp)
+    target_include_directories(vds-host-audio-dispatch-tests PRIVATE src "${VDS_MEDIA_AGENT_FFMPEG_ROOT}/include")
+    target_link_libraries(vds-host-audio-dispatch-tests PRIVATE
+      "${VDS_MEDIA_AGENT_AVCODEC_LIBRARY}" "${VDS_MEDIA_AGENT_AVUTIL_LIBRARY}")
+    add_test(NAME vds-host-audio-dispatch-tests COMMAND vds-host-audio-dispatch-tests)
+    set_tests_properties(vds-host-audio-dispatch-tests PROPERTIES
+      ENVIRONMENT "PATH=${VDS_MEDIA_AGENT_FFMPEG_ROOT}/bin;$ENV{PATH}")
+    add_executable(vds-win32-owned-process-tests tests/win32_owned_process_tests.cpp)
+    target_include_directories(vds-win32-owned-process-tests PRIVATE src)
+    add_test(NAME vds-win32-owned-process-tests COMMAND vds-win32-owned-process-tests)
+    set_tests_properties(vds-win32-owned-process-tests PROPERTIES TIMEOUT 30)
+  endif()
   foreach(playback_policy_test IN ITEMS native_playback_scheduler relay_media_timing host_media_clock)
     string(REPLACE "_" "-" playback_policy_target "vds-${playback_policy_test}-tests")
     add_executable(${playback_policy_target} tests/${playback_policy_test}_tests.cpp)

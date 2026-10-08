@@ -43,6 +43,7 @@ PeerTransportCallbacks create_peer_transport_callbacks(const PeerTransportCallba
       };
   }
   PeerTransportCallbacks callbacks;
+  callbacks.allow_remote_media = context.role != "host-downstream" && context.role != "relay-downstream";
   callbacks.on_local_description = [peer_id = context.peer_id](const std::string& type, const std::string& sdp, const std::string& generation) {
     emit_event(
       "signal",

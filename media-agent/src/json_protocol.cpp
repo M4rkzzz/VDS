@@ -10,7 +10,8 @@ namespace vds::media_agent {
 
 std::string json_escape(const std::string& value) {
   std::ostringstream escaped;
-  for (const char ch : value) {
+  static constexpr char hex[] = "0123456789abcdef";
+  for (const unsigned char ch : value) {
     switch (ch) {
       case '\\':
         escaped << "\\\\";
@@ -27,8 +28,18 @@ std::string json_escape(const std::string& value) {
       case '\t':
         escaped << "\\t";
         break;
+      case '\b':
+        escaped << "\\b";
+        break;
+      case '\f':
+        escaped << "\\f";
+        break;
       default:
-        escaped << ch;
+        if (ch < 0x20) {
+          escaped << "\\u00" << hex[ch >> 4] << hex[ch & 0x0f];
+        } else {
+          escaped << static_cast<char>(ch);
+        }
         break;
     }
   }
@@ -77,6 +88,12 @@ std::string json_unescape(const std::string& value) {
         break;
       case 't':
         unescaped.push_back('\t');
+        break;
+      case 'b':
+        unescaped.push_back('\b');
+        break;
+      case 'f':
+        unescaped.push_back('\f');
         break;
       default:
         unescaped.push_back(escaped);

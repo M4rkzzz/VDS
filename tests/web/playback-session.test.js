@@ -152,6 +152,26 @@ function createHarness() {
   return h;
 }
 
+test('idle chunk cleanup is canceled on leave and expired pieces cannot complete a new playback frame', () => {
+  const h = createHarness();
+  const payload = new Uint8Array(12 * 1024 + 5).buffer;
+  h.session.start();
+  const old = h.messages(1, true, 'video', payload);
+  assert.equal(h.session.acceptMessage(old[0]), null);
+  assert.equal(h.clock.size, 1);
+  h.session.close();
+  assert.equal(h.clock.size, 0, 'leaving cancels reassembly expiry together with media work');
+  h.clock.advance(10000);
+  h.session.start();
+  const fresh = h.messages(2, true, 'video', payload);
+  assert.equal(h.session.acceptMessage(fresh[0]), null);
+  h.clock.advance(10000);
+  assert.equal(h.clock.size, 0, 'a silent upstream releases partial frames without another message');
+  assert.equal(h.session.acceptMessage(fresh[1]), null, 'the expired first fragment is not reused');
+  h.session.close();
+  assert.equal(h.clock.size, 0);
+});
+
 test('a source epoch changes on the same channel at sequence zero and rejects retired or downgraded media', async () => {
   const h = createHarness(); await h.session.resumeAudio(); h.session.start();
   h.acceptEpoch('source-A', 100); h.acceptEpoch('source-A', 100, true, 'audio'); await flushMicrotasks();

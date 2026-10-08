@@ -30,7 +30,7 @@ std::string to_lower_ascii(std::string value) {
 }
 
 size_t annexb_start_code_size(const std::vector<std::uint8_t>& data, size_t offset) {
-  if (offset + 3 >= data.size()) {
+  if (offset + 2 >= data.size()) {
     return 0;
   }
   if (data[offset] == 0 && data[offset + 1] == 0) {
@@ -42,40 +42,6 @@ size_t annexb_start_code_size(const std::vector<std::uint8_t>& data, size_t offs
     }
   }
   return 0;
-}
-
-size_t find_next_h264_aud_offset(const std::vector<std::uint8_t>& data, size_t start_offset) {
-  size_t offset = start_offset;
-  while (true) {
-    offset = find_next_annexb_start_code(data, offset);
-    if (offset == std::string::npos) {
-      return offset;
-    }
-
-    const size_t start_code_size = annexb_start_code_size(data, offset);
-    if (start_code_size == 0 || offset + start_code_size >= data.size()) {
-      return std::string::npos;
-    }
-
-    const std::uint8_t nal_type = data[offset + start_code_size] & 0x1F;
-    if (nal_type == 9) {
-      return offset;
-    }
-
-    offset += start_code_size;
-  }
-}
-
-bool h265_vcl_nal_is_first_slice_segment(
-  const std::vector<std::uint8_t>& data,
-  size_t offset,
-  size_t start_code_size) {
-  const size_t payload_offset = offset + start_code_size + 2;
-  if (payload_offset >= data.size()) {
-    return false;
-  }
-
-  return (data[payload_offset] & 0x80) != 0;
 }
 
 bool h264_access_unit_has_vcl_nal(const std::vector<std::uint8_t>& access_unit) {
@@ -220,141 +186,6 @@ bool should_emit_h265_access_unit(const std::vector<std::uint8_t>& access_unit) 
     h265_access_unit_has_decoder_config_nal(access_unit);
 }
 
-std::vector<std::vector<std::uint8_t>> extract_annexb_h264_access_units(
-  std::vector<std::uint8_t>& buffer,
-  bool flush) {
-  std::vector<std::vector<std::uint8_t>> access_units;
-
-  while (true) {
-    size_t first_aud = find_next_h264_aud_offset(buffer, 0);
-    if (first_aud == std::string::npos) {
-      if (!flush && buffer.size() > (1024 * 1024)) {
-        buffer.clear();
-      }
-      break;
-    }
-
-    if (first_aud > 0) {
-      buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(first_aud));
-      first_aud = 0;
-    }
-
-    const size_t second_aud = find_next_h264_aud_offset(buffer, 4);
-    if (second_aud == std::string::npos) {
-      if (flush && !buffer.empty()) {
-        if (should_emit_h264_access_unit(buffer)) {
-          access_units.push_back(buffer);
-        }
-        buffer.clear();
-      }
-      break;
-    }
-
-    std::vector<std::uint8_t> access_unit(
-      buffer.begin(),
-      buffer.begin() + static_cast<std::ptrdiff_t>(second_aud)
-    );
-    if (should_emit_h264_access_unit(access_unit)) {
-      access_units.push_back(std::move(access_unit));
-    }
-    buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(second_aud));
-  }
-
-  return access_units;
-}
-
-std::vector<std::vector<std::uint8_t>> extract_annexb_h265_access_units(
-  std::vector<std::uint8_t>& buffer,
-  bool flush) {
-  std::vector<std::vector<std::uint8_t>> access_units;
-  std::vector<size_t> nal_offsets;
-  size_t search_offset = 0;
-  while (true) {
-    const size_t nal_offset = find_next_annexb_start_code(buffer, search_offset);
-    if (nal_offset == std::string::npos) {
-      break;
-    }
-    nal_offsets.push_back(nal_offset);
-    search_offset = nal_offset + 3;
-  }
-
-  if (nal_offsets.empty()) {
-    if (!flush && buffer.size() > (1024 * 1024)) {
-      buffer.clear();
-    }
-    return access_units;
-  }
-
-  const size_t parsable_nal_count = flush
-    ? nal_offsets.size()
-    : (nal_offsets.size() > 1 ? nal_offsets.size() - 1 : 0);
-  if (parsable_nal_count == 0) {
-    if (!flush && nal_offsets.front() > 0) {
-      buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(nal_offsets.front()));
-    }
-    return access_units;
-  }
-
-  size_t current_access_unit_start = std::string::npos;
-  bool current_access_unit_has_vcl = false;
-
-  for (size_t index = 0; index < parsable_nal_count; ++index) {
-    const size_t nal_offset = nal_offsets[index];
-    const size_t nal_end = (index + 1 < nal_offsets.size()) ? nal_offsets[index + 1] : buffer.size();
-    const size_t start_code_size = annexb_start_code_size(buffer, nal_offset);
-    if (start_code_size == 0 || nal_offset + start_code_size + 1 >= nal_end) {
-      continue;
-    }
-
-    const std::uint8_t nal_type = (buffer[nal_offset + start_code_size] >> 1) & 0x3F;
-    const bool is_aud = nal_type == 35;
-    const bool is_vcl = nal_type <= 31;
-    const bool is_first_slice = is_vcl &&
-      h265_vcl_nal_is_first_slice_segment(buffer, nal_offset, start_code_size);
-
-    if (current_access_unit_start == std::string::npos) {
-      current_access_unit_start = nal_offset;
-    } else if ((is_aud || is_first_slice) && current_access_unit_has_vcl) {
-      std::vector<std::uint8_t> access_unit(
-        buffer.begin() + static_cast<std::ptrdiff_t>(current_access_unit_start),
-        buffer.begin() + static_cast<std::ptrdiff_t>(nal_offset)
-      );
-      if (should_emit_h265_access_unit(access_unit)) {
-        access_units.push_back(std::move(access_unit));
-      }
-      current_access_unit_start = nal_offset;
-      current_access_unit_has_vcl = false;
-    }
-
-    if (is_vcl) {
-      current_access_unit_has_vcl = true;
-    }
-  }
-
-  if (flush) {
-    if (current_access_unit_start != std::string::npos &&
-        current_access_unit_start < buffer.size()) {
-      std::vector<std::uint8_t> access_unit(
-        buffer.begin() + static_cast<std::ptrdiff_t>(current_access_unit_start),
-        buffer.end()
-      );
-      if (should_emit_h265_access_unit(access_unit)) {
-        access_units.push_back(std::move(access_unit));
-      }
-    }
-    buffer.clear();
-    return access_units;
-  }
-
-  const size_t retain_offset = current_access_unit_start != std::string::npos
-    ? current_access_unit_start
-    : nal_offsets[parsable_nal_count];
-  if (retain_offset > 0) {
-    buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(retain_offset));
-  }
-  return access_units;
-}
-
 } // namespace
 
 std::string normalize_video_codec(const std::string& codec, const std::string& fallback) {
@@ -369,11 +200,11 @@ std::string normalize_video_codec(const std::string& codec, const std::string& f
 }
 
 size_t find_next_annexb_start_code(const std::vector<std::uint8_t>& data, size_t start_offset) {
-  if (data.size() < 4 || start_offset >= data.size()) {
+  if (data.size() < 3 || start_offset >= data.size()) {
     return std::string::npos;
   }
 
-  for (size_t index = start_offset; index + 3 < data.size(); ++index) {
+  for (size_t index = start_offset; index + 2 < data.size(); ++index) {
     if (data[index] != 0 || data[index + 1] != 0) {
       continue;
     }
@@ -396,6 +227,144 @@ bool should_emit_video_access_unit(
   return normalize_video_codec(codec) == "h265"
     ? should_emit_h265_access_unit(access_unit)
     : should_emit_h264_access_unit(access_unit);
+}
+
+bool is_complete_annexb_video_access_unit(
+  const std::string& codec, const std::vector<std::uint8_t>& access_unit) {
+  if (access_unit.empty() || access_unit.size() > kMaxPendingAnnexBAccessUnitBytes) return false;
+  const bool hevc = normalize_video_codec(codec) == "h265";
+  size_t offset = find_next_annexb_start_code(access_unit, 0);
+  if (offset == std::string::npos ||
+      std::any_of(access_unit.begin(), access_unit.begin() + static_cast<std::ptrdiff_t>(offset),
+                  [](std::uint8_t byte) { return byte != 0; })) return false;
+  bool has_media = false;
+  while (offset != std::string::npos) {
+    const size_t prefix = annexb_start_code_size(access_unit, offset);
+    const size_t next = find_next_annexb_start_code(access_unit, offset + prefix);
+    const size_t end = next == std::string::npos ? access_unit.size() : next;
+    const size_t header = offset + prefix;
+    if (header + (hevc ? 2 : 1) >= end || (access_unit[header] & 0x80)) return false;
+    const unsigned type = hevc ? (access_unit[header] >> 1) & 0x3f : access_unit[header] & 0x1f;
+    if (hevc) {
+      if ((access_unit[header + 1] & 7) == 0) return false;
+      has_media = has_media || type <= 31 || (type >= 32 && type <= 34);
+    } else {
+      if (type == 0 || type > 23) return false;
+      has_media = has_media || (type >= 1 && type <= 5) || type == 7 || type == 8;
+    }
+    offset = next;
+  }
+  return has_media;
+}
+
+void AnnexBVideoAccessUnitParser::clear() {
+  buffer_.clear();
+  scan_offset_ = 0;
+  access_unit_start_ = std::string::npos;
+  access_unit_has_vcl_ = false;
+  access_unit_has_media_ = false;
+  discarding_ = false;
+}
+
+void AnnexBVideoAccessUnitParser::discard_incomplete_access_unit() {
+  ++discarded_access_units_;
+  // Keep only a split start-code prefix; never decode the tail of the lost AU.
+  const size_t retain = std::min<size_t>(3, buffer_.size());
+  buffer_.erase(buffer_.begin(), buffer_.end() - static_cast<std::ptrdiff_t>(retain));
+  scan_offset_ = 0;
+  access_unit_start_ = std::string::npos;
+  access_unit_has_vcl_ = false;
+  access_unit_has_media_ = false;
+  discarding_ = true;
+}
+
+void AnnexBVideoAccessUnitParser::scan(
+  std::vector<std::vector<std::uint8_t>>& units, bool flush) {
+  const bool hevc = codec_ == "h265";
+  while (scan_offset_ < buffer_.size()) {
+    const size_t offset = find_next_annexb_start_code(buffer_, scan_offset_);
+    scanned_bytes_ += offset == std::string::npos
+      ? buffer_.size() - scan_offset_ : offset - scan_offset_ + 1;
+    if (offset == std::string::npos) {
+      scan_offset_ = buffer_.size() > 3 ? buffer_.size() - 3 : 0;
+      break;
+    }
+    const size_t prefix = annexb_start_code_size(buffer_, offset);
+    const size_t header = offset + prefix;
+    // A first-slice flag may arrive in the next read, even when the start code
+    // and NAL header were already available. Revisit only this tiny prefix.
+    if (header + (hevc ? 2 : 1) >= buffer_.size()) {
+      scan_offset_ = offset;
+      break;
+    }
+    const unsigned type = hevc ? (buffer_[header] >> 1) & 0x3f : buffer_[header] & 0x1f;
+    const bool is_aud = type == (hevc ? 35u : 9u);
+    const bool is_vcl = hevc ? type <= 31 : type >= 1 && type <= 5;
+    const bool is_config = hevc ? type >= 32 && type <= 34 : type == 7 || type == 8;
+    const bool first_slice = is_vcl && (buffer_[header + (hevc ? 2 : 1)] & 0x80) != 0;
+    scan_offset_ = header + (hevc ? 2 : 1);
+    if (discarding_) {
+      if (!is_aud && !first_slice && !is_config) continue;
+      discarding_ = false;
+    }
+    if (access_unit_start_ == std::string::npos) {
+      access_unit_start_ = offset;
+    } else if (access_unit_has_vcl_ && (is_aud || first_slice || is_config)) {
+      std::vector<std::uint8_t> unit(
+        buffer_.begin() + static_cast<std::ptrdiff_t>(access_unit_start_),
+        buffer_.begin() + static_cast<std::ptrdiff_t>(offset));
+      if (is_complete_annexb_video_access_unit(codec_, unit)) units.push_back(std::move(unit));
+      access_unit_start_ = offset;
+      access_unit_has_vcl_ = false;
+      access_unit_has_media_ = false;
+    }
+    access_unit_has_vcl_ = access_unit_has_vcl_ || is_vcl;
+    access_unit_has_media_ = access_unit_has_media_ || is_vcl || is_config;
+  }
+
+  if (flush) {
+    if (!discarding_ && access_unit_has_media_ && access_unit_start_ != std::string::npos) {
+      std::vector<std::uint8_t> unit(
+        buffer_.begin() + static_cast<std::ptrdiff_t>(access_unit_start_), buffer_.end());
+      if (is_complete_annexb_video_access_unit(codec_, unit)) units.push_back(std::move(unit));
+    }
+    clear();
+    return;
+  }
+  const size_t retain = access_unit_start_ == std::string::npos ? scan_offset_ : access_unit_start_;
+  if (retain > 0) {
+    buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(retain));
+    scan_offset_ -= retain;
+    if (access_unit_start_ != std::string::npos) access_unit_start_ -= retain;
+  }
+}
+
+std::vector<std::vector<std::uint8_t>> AnnexBVideoAccessUnitParser::push(
+  const std::string& codec, const std::uint8_t* bytes, size_t size, bool flush) {
+  const auto normalized = normalize_video_codec(codec);
+  if (codec_ != normalized) { clear(); codec_ = normalized; }
+  std::vector<std::vector<std::uint8_t>> units;
+  while (size > 0) {
+    if (buffer_.size() == kMaxPendingAnnexBAccessUnitBytes) discard_incomplete_access_unit();
+    const size_t count = std::min({size, size_t{64 * 1024}, kMaxPendingAnnexBAccessUnitBytes - buffer_.size()});
+    const size_t required = buffer_.size() + count;
+    if (required > buffer_.capacity()) {
+      buffer_.reserve(std::min(kMaxPendingAnnexBAccessUnitBytes,
+        std::max(required, std::max<size_t>(64 * 1024, buffer_.capacity() * 2))));
+    }
+    buffer_.insert(buffer_.end(), bytes, bytes + count);
+    bytes += count;
+    size -= count;
+    scan(units, false);
+  }
+  if (flush) scan(units, true);
+  return units;
+}
+
+std::vector<std::uint8_t> AnnexBVideoAccessUnitParser::take_pending_bytes() {
+  auto result = std::move(buffer_);
+  clear();
+  return result;
 }
 
 bool video_access_unit_has_decoder_config_nal(
@@ -431,9 +400,10 @@ std::vector<std::vector<std::uint8_t>> extract_annexb_video_access_units(
   const std::string& codec,
   std::vector<std::uint8_t>& buffer,
   bool flush) {
-  return normalize_video_codec(codec) == "h265"
-    ? extract_annexb_h265_access_units(buffer, flush)
-    : extract_annexb_h264_access_units(buffer, flush);
+  AnnexBVideoAccessUnitParser parser;
+  auto result = parser.push(codec, buffer.data(), buffer.size(), flush);
+  buffer = parser.take_pending_bytes();
+  return result;
 }
 
 } // namespace vds::media_agent

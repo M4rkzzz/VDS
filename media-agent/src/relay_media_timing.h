@@ -6,6 +6,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "media_frame_timing.h"
@@ -64,7 +65,29 @@ class RelayVideoBootstrapCache {
   static constexpr std::size_t kMaxAccessUnits = 96;
   static constexpr std::size_t kMaxBytes = 16 * 1024 * 1024;
 
+  struct Inspection {
+    video_bootstrap_detail::ParameterSets parameter_sets;
+    bool keyframe = false;
+  };
+
+  // Parse immutable AU bytes before taking the shared relay runtime lock.
+  static Inspection inspect(const std::string& codec, const std::vector<std::uint8_t>& bytes) {
+    Inspection result;
+    video_bootstrap_detail::visit_nals(codec, bytes,
+      [&](unsigned int type, std::size_t begin, std::size_t end) {
+        result.keyframe = result.keyframe || (codec == "h265" ? type >= 16 && type <= 21 : type == 5);
+        const bool config = codec == "h265" ? type >= 32 && type <= 34 : type == 7 || type == 8;
+        if (config) result.parameter_sets[type] = std::vector<std::uint8_t>(bytes.begin() + begin, bytes.begin() + end);
+      });
+    return result;
+  }
+
   Observation observe(const std::string& codec, RelayTimedVideoAccessUnit unit) {
+    const auto inspection = inspect(codec, unit.bytes);
+    return observe(codec, std::move(unit), inspection);
+  }
+
+  Observation observe(const std::string& codec, RelayTimedVideoAccessUnit unit, const Inspection& inspection) {
     Observation result;
     if (codec_ != codec || (!source_id_.empty() && source_id_ != unit.timing.source_id) ||
         source_epoch_ != unit.timing.source_epoch) {
@@ -93,7 +116,7 @@ class RelayVideoBootstrapCache {
     last_sequence_valid_ = unit.timing.sequence_valid;
 
     bool changed_config = false;
-    const auto config_in_unit = video_bootstrap_detail::parameter_sets(codec_, unit.bytes);
+    const auto& config_in_unit = inspection.parameter_sets;
     for (const auto& nal : config_in_unit) {
       const auto found = config_by_nal_type_.find(nal.first);
       if (found != config_by_nal_type_.end() && found->second != nal.second) {
@@ -101,7 +124,7 @@ class RelayVideoBootstrapCache {
       }
       config_by_nal_type_[nal.first] = nal.second;
     }
-    unit.timing.keyframe = contains_random_access(codec_, unit.bytes);
+    unit.timing.keyframe = inspection.keyframe;
     unit.timing.config = !config_in_unit.empty();
     if (changed_config && !unit.timing.keyframe) {
       invalidate_gop();
@@ -141,13 +164,6 @@ class RelayVideoBootstrapCache {
   }
 
  private:
-  static bool contains_random_access(const std::string& codec, const std::vector<std::uint8_t>& bytes) {
-    bool found = false;
-    video_bootstrap_detail::visit_nals(codec, bytes, [&](unsigned int type, std::size_t, std::size_t) {
-      found = found || (codec == "h265" ? type >= 16 && type <= 21 : type == 5);
-    });
-    return found;
-  }
   bool configuration_complete() const {
     return codec_ == "h265"
       ? config_by_nal_type_.count(32) && config_by_nal_type_.count(33) && config_by_nal_type_.count(34)

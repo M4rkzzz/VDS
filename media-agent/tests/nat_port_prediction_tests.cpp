@@ -188,9 +188,29 @@ void test_deterministic_noise_invariants() {
     expect_valid_predictions(input, neighbors(input), "randomized neighbor prediction invariant");
   }
 }
+
+void test_shared_carrier_address_boundaries() {
+  expect(vds_nat_is_public_ipv4_destination(0x643fffffu),
+      "100.63.255.255 remains outside shared carrier range");
+  expect(!vds_nat_is_public_ipv4_destination(0x64400000u),
+      "100.64.0.0 bypasses public NAT sampling wait");
+  expect(!vds_nat_is_public_ipv4_destination(0x647fffffu),
+      "100.127.255.255 bypasses public NAT sampling wait");
+  expect(vds_nat_is_public_ipv4_destination(0x64800000u),
+      "100.128.0.0 remains outside shared carrier range");
+  expect(!vds_nat_is_public_ipv4_destination(0x0a000001u) &&
+      !vds_nat_is_public_ipv4_destination(0xac100001u) &&
+      !vds_nat_is_public_ipv4_destination(0xc0a80101u) &&
+      !vds_nat_is_public_ipv4_destination(0x7f000001u) &&
+      !vds_nat_is_public_ipv4_destination(0xa9fe0001u),
+      "LAN, loopback and link-local checks retain the immediate path");
+  expect(vds_nat_is_public_ipv4_destination(0xc0000201u),
+      "ordinary remote IPv4 checks still use NAT sampling");
+}
 } // namespace
 
 int main() {
+  test_shared_carrier_address_boundaries();
   test_linear_and_reply_order();
   test_mapping_classification();
   test_no_cross_address_or_invalid_inputs();

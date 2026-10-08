@@ -18,6 +18,8 @@
   let pendingReconnect = false;
   let wsGeneration = 0;
   let wsCancelConnect = null;
+  let pendingSessionRequest = null;
+  let sessionAckBarrier = null;
 
   function installLegacyAdapter(adapter) {
     legacyAdapter = adapter && typeof adapter === 'object' ? adapter : null;
@@ -181,8 +183,14 @@
     return 3;
   }
 
-  function removePendingMessages(predicate) {
-    if (typeof predicate !== 'function' || pendingMessages.length === 0) {
+  function releaseSessionAckBarrier(barrier = sessionAckBarrier) {
+    if (!barrier) return;
+    if (sessionAckBarrier === barrier) sessionAckBarrier = null;
+    barrier.resolve();
+  }
+
+  function removeQueuedMessages(predicate) {
+    if (typeof predicate !== 'function') {
       return 0;
     }
 
@@ -198,9 +206,19 @@
     return removed;
   }
 
+  function removePendingMessages(predicate) {
+    if (typeof predicate === 'function' && pendingSessionRequest && predicate(pendingSessionRequest)) {
+      pendingSessionRequest = null;
+      releaseSessionAckBarrier();
+    }
+    return removeQueuedMessages(predicate);
+  }
+
   function clearPendingMessages() {
     const queuedMessages = pendingMessages.length;
     pendingMessages.length = 0;
+    pendingSessionRequest = null;
+    releaseSessionAckBarrier();
     return queuedMessages;
   }
 
@@ -252,11 +270,12 @@
 
   function sendResumeSessionMessageIfNeeded() {
     const resumeMessage = callOptionalAdapter('consumeResumeSessionMessage', [], null);
-    if (!resumeMessage || typeof resumeMessage !== 'object') {
+    if (!resumeMessage || typeof resumeMessage !== 'object' ||
+        typeof resumeMessage.sessionToken !== 'string' || !resumeMessage.sessionToken.trim()) {
       return false;
     }
 
-    removePendingMessages((entry) => {
+    removeQueuedMessages((entry) => {
       if (!entry || typeof entry !== 'object') {
         return false;
       }
@@ -264,7 +283,42 @@
         entry.type === 'create-room' ||
         entry.type === 'resume-session';
     });
+    pendingSessionRequest = null;
     return sendRawMessage(resumeMessage);
+  }
+
+  function resendPendingSessionRequest() {
+    const request = pendingSessionRequest;
+    if (!request) return;
+    removeQueuedMessages((entry) => entry && (entry.type === 'create-room' || entry.type === 'join-room' || entry.type === 'resume-session'));
+    sendRawMessage(request);
+  }
+
+  function settlePendingSessionRequest(data) {
+    const request = pendingSessionRequest;
+    if (!request) return;
+    const acknowledged = normalizeRoomId(data.roomId) && typeof data.sessionToken === 'string' && Boolean(data.sessionToken) && (
+      (request.type === 'join-room' && data.type === 'room-joined' && normalizeRoomId(data.roomId) === normalizeRoomId(request.roomId)) ||
+      (request.type === 'create-room' && data.type === 'room-created' &&
+        (!request.mediaManifest || !request.mediaManifest.mediaSessionId ||
+          (data.mediaManifest && data.mediaManifest.mediaSessionId === request.mediaManifest.mediaSessionId)))
+    );
+    if (acknowledged || data.type === 'error') {
+      removeQueuedMessages((entry) => entry && (entry.type === 'create-room' || entry.type === 'join-room' || entry.type === 'resume-session'));
+      pendingSessionRequest = null;
+    }
+    if (acknowledged) {
+      // Renderer acknowledgement handlers can await old peer cleanup before
+      // publishing their token. During that interval the server has confirmed
+      // this session already, so a transport retry must resume it, never rejoin.
+      pendingSessionRequest = {
+        type: 'resume-session', roomId: normalizeRoomId(data.roomId), clientId: request.clientId,
+        role: request.type === 'create-room' ? 'host' : 'viewer', sessionToken: data.sessionToken,
+        needsMediaReconnect: request.type === 'join-room'
+      };
+      return pendingSessionRequest;
+    }
+    return null;
   }
 
   function scheduleReconnect() {
@@ -288,7 +342,7 @@
     }, delay);
   }
 
-  function connectWebSocket() {
+  function connectWebSocket(options = {}) {
     if (isWebSocketOpen()) {
       return Promise.resolve();
     }
@@ -323,20 +377,48 @@
     wsConnectPromise = new Promise((resolve, reject) => {
       let settled = false;
       let cancelConnect = null;
+      let connectTimer = null;
 
       const settle = (callback, value) => {
         if (settled) {
           return;
         }
         settled = true;
+        if (connectTimer !== null) {
+          clearTimeout(connectTimer);
+          connectTimer = null;
+        }
         if (wsCancelConnect === cancelConnect) {
           wsCancelConnect = null;
         }
         callback(value);
       };
 
-      cancelConnect = () => settle(reject, new Error('websocket-connect-cancelled'));
+      const failConnection = (error) => {
+        if (!isCurrentConnection()) {
+          return;
+        }
+        wsGeneration += 1;
+        wsConnected = false;
+        ws = null;
+        wsConnectPromise = null;
+        settle(reject, error);
+        // A black-holed handshake need not emit close; invalidate it before closing.
+        try {
+          if (socket.readyState < 2) socket.close();
+        } catch (_error) {}
+        callOptionalAdapter('onWebSocketClose', [{ manualClose: false }]);
+        if (callOptionalAdapter('onWebSocketUnexpectedClose', [], true) !== false) {
+          scheduleReconnect();
+        }
+      };
+      cancelConnect = (error) => error
+        ? failConnection(error)
+        : settle(reject, new Error('websocket-connect-cancelled'));
       wsCancelConnect = cancelConnect;
+      const requestedTimeout = Number(options.timeoutMs);
+      const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0 ? requestedTimeout : 10000;
+      connectTimer = setTimeout(() => failConnection(new Error('websocket-timeout')), timeoutMs);
 
       socket.onopen = () => {
         if (!isCurrentConnection()) {
@@ -353,7 +435,7 @@
         }
 
         callOptionalAdapter('onWebSocketOpen', []);
-        sendResumeSessionMessageIfNeeded();
+        if (!sendResumeSessionMessageIfNeeded()) resendPendingSessionRequest();
         flushPendingMessages();
         settle(resolve);
       };
@@ -367,7 +449,24 @@
           if (!data || typeof data !== 'object') {
             return;
           }
-          await dispatchMessage(data);
+          // A room ACK may await native peer cleanup. Let it commit its token
+          // before a replacement socket's resume ACK or offers are dispatched.
+          // Existing join deadlines/explicit cancellation release this barrier.
+          while (sessionAckBarrier) await sessionAckBarrier.promise;
+          if (!isCurrentConnection()) return;
+          const confirmation = settlePendingSessionRequest(data);
+          let barrier = null;
+          if (data.type === 'room-created' || data.type === 'room-joined' || data.type === 'session-resumed') {
+            barrier = {};
+            barrier.promise = new Promise((resolve) => { barrier.resolve = resolve; });
+            sessionAckBarrier = barrier;
+          }
+          try {
+            await dispatchMessage(data);
+          } finally {
+            if (confirmation && pendingSessionRequest === confirmation) pendingSessionRequest = null;
+            if (barrier) releaseSessionAckBarrier(barrier);
+          }
         } catch (error) {
           debugLog('connection', 'Unhandled message processing error:', error && error.message ? error.message : String(error));
         }
@@ -378,16 +477,7 @@
           return;
         }
         debugLog('connection', 'WebSocket disconnected');
-        wsConnected = false;
-        ws = null;
-        wsConnectPromise = null;
-        settle(reject, new Error('websocket-connect-closed'));
-        callOptionalAdapter('onWebSocketClose', [{ manualClose: false }]);
-
-        const shouldReconnect = callOptionalAdapter('onWebSocketUnexpectedClose', [], true);
-        if (shouldReconnect !== false) {
-          scheduleReconnect();
-        }
+        failConnection(new Error('websocket-connect-closed'));
       };
 
       socket.onerror = (error) => {
@@ -396,10 +486,7 @@
         }
         debugLog('connection', 'WebSocket error:', error && error.message ? error.message : String(error));
 
-        if (!settled) {
-          wsConnectPromise = null;
-          settle(reject, new Error('websocket-connect-failed'));
-        }
+        failConnection(new Error('websocket-connect-failed'));
       };
     });
 
@@ -437,17 +524,40 @@
     if (isWebSocketOpen()) {
       return;
     }
+    timeoutMs = Number(timeoutMs);
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) timeoutMs = 10000;
 
-    await Promise.race([
-      connectWebSocket(),
-      new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('websocket-timeout')), timeoutMs);
-      })
-    ]);
+    const connection = connectWebSocket({ timeoutMs });
+    const generation = wsGeneration;
+    const cancelConnect = wsCancelConnect;
+    let timer;
+    try {
+      await Promise.race([
+        connection,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const error = new Error('websocket-timeout');
+            if (generation === wsGeneration && wsCancelConnect === cancelConnect && cancelConnect) {
+              cancelConnect(error);
+            }
+            reject(error);
+          }, timeoutMs);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   function sendMessage(data, options = {}) {
     const { queueIfDisconnected = true } = options;
+
+    if (data && (data.type === 'create-room' || data.type === 'join-room') &&
+        (isWebSocketOpen() || queueIfDisconnected)) {
+      // A sent request is still unconfirmed until its token arrives. Retain its
+      // exact payload across a transport failure, including failure after send.
+      pendingSessionRequest = JSON.parse(JSON.stringify(data));
+    }
 
     if (isWebSocketOpen()) {
       sendRawMessage(data);
@@ -586,6 +696,8 @@
   }
 
   function leaveRoom(options = {}) {
+    removePendingMessages((entry) => entry && entry.type === 'join-room' &&
+      normalizeRoomId(entry.roomId) === normalizeRoomId(options.roomId) && entry.clientId === options.clientId);
     return sendMessage(buildLeaveRoomMessage(options), options.sendOptions || { queueIfDisconnected: false });
   }
 

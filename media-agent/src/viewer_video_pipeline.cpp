@@ -147,6 +147,7 @@ void consume_remote_peer_video_frame(
   std::string codec_path;
   std::vector<std::vector<std::uint8_t>> decode_units;
   std::vector<std::vector<std::uint8_t>> relay_decode_units;
+  bool invalid_access_unit = false;
   std::shared_ptr<NativeVideoSurface> surface;
   {
     std::lock_guard<std::mutex> lock(runtime.mutex);
@@ -190,27 +191,29 @@ void consume_remote_peer_video_frame(
     runtime.surface_reference_chain_resets_observed = surface_snapshot.reference_chain_resets;
 
     if (codec_path == "h264" || codec_path == "h265") {
-      const bool frame_has_annexb_start_code =
-        vds::media_agent::find_next_annexb_start_code(frame, 0) != std::string::npos;
-      if (runtime.pending_video_annexb_bytes.empty() && frame_has_annexb_start_code) {
-        if (vds::media_agent::should_emit_video_access_unit(codec_path, frame)) {
-          decode_units.push_back(frame);
-        }
+      // Both the encoded DataChannel protocol and the RTP frame assembler
+      // deliver a complete AU. A broken frame cannot become the prefix of the
+      // next frame, steal its timestamp, or hold an unbounded byte stream.
+      runtime.pending_video_annexb_bytes.clear();
+      if (vds::media_agent::is_complete_annexb_video_access_unit(codec_path, frame)) {
+        decode_units.push_back(frame);
       } else {
-        runtime.pending_video_annexb_bytes.insert(
-          runtime.pending_video_annexb_bytes.end(),
-          frame.begin(),
-          frame.end()
-        );
-        decode_units = vds::media_agent::extract_annexb_video_access_units(
-          codec_path,
-          runtime.pending_video_annexb_bytes,
-          false
-        );
+        invalid_access_unit = true;
+        runtime.startup_waiting_for_random_access = true;
+        ++runtime.dropped_video_units;
+        runtime.reason = "peer-video-invalid-access-unit";
+        runtime.last_error = runtime.reason;
       }
     } else {
       decode_units.push_back(frame);
     }
+  }
+  if (invalid_access_unit) {
+    add_peer_transport_dropped_video_units(transport_session, 1);
+    request_peer_transport_keyframe(transport_session, "invalid-access-unit", nullptr);
+    refresh_peer_video_receiver_runtime(runtime);
+    update_peer_decoder_state_from_runtime(runtime_ptr, transport_session);
+    return;
   }
   relay_decode_units = decode_units;
 

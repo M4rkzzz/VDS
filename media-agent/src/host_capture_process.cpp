@@ -24,6 +24,7 @@
 #include "process_runner.h"
 #include "string_utils.h"
 #include "time_utils.h"
+#include "win32_owned_process.h"
 
 namespace fs = std::filesystem;
 
@@ -97,6 +98,10 @@ bool initialize_host_capture_artifact_paths(HostCaptureProcessState& state) {
 
 #ifdef _WIN32
 void close_host_capture_process_handles(HostCaptureProcessState& state) {
+  if (state.process_job_handle) {
+    CloseHandle(state.process_job_handle);
+    state.process_job_handle = nullptr;
+  }
   if (state.thread_handle) {
     CloseHandle(state.thread_handle);
     state.thread_handle = nullptr;
@@ -376,8 +381,7 @@ void stop_host_capture_process(
 
 #ifdef _WIN32
   if (state.process_handle && state.running) {
-    TerminateProcess(state.process_handle, 0);
-    WaitForSingleObject(state.process_handle, 2000);
+    vds::media_agent::terminate_owned_process_tree(state.process_job_handle, state.process_handle);
   }
 
   close_host_capture_process_handles(state);
@@ -461,13 +465,6 @@ HostCaptureProcessState start_host_capture_process(
     return finish(state);
   }
 
-  STARTUPINFOW startup_info {};
-  startup_info.cb = sizeof(startup_info);
-  startup_info.dwFlags = STARTF_USESTDHANDLES;
-  startup_info.hStdInput = nul_handle;
-  startup_info.hStdOutput = nul_handle;
-  startup_info.hStdError = nul_handle;
-
   PROCESS_INFORMATION process_info {};
   std::wstring command_line = vds::media_agent::utf8_to_wide(state.command_line);
   if (command_line.empty()) {
@@ -480,29 +477,23 @@ HostCaptureProcessState start_host_capture_process(
   std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
   mutable_command.push_back(L'\0');
 
-  const BOOL created = CreateProcessW(
-    nullptr,
-    mutable_command.data(),
-    nullptr,
-    nullptr,
-    TRUE,
-    CREATE_NO_WINDOW,
-    nullptr,
-    nullptr,
-    &startup_info,
-    &process_info
-  );
+  HANDLE process_job = nullptr;
+  DWORD launch_error = ERROR_SUCCESS;
+  const bool created = vds::media_agent::create_owned_child_process(nullptr,
+      mutable_command.data(), nul_handle, nul_handle, nul_handle,
+      process_info, process_job, launch_error);
 
   CloseHandle(nul_handle);
 
   if (!created) {
     state.reason = "host-capture-process-launch-failed";
-    state.last_error = vds::media_agent::format_windows_error(GetLastError());
+    state.last_error = vds::media_agent::format_windows_error(launch_error);
     return finish(state);
   }
 
   state.running = true;
   state.process_id = static_cast<unsigned long>(process_info.dwProcessId);
+  state.process_job_handle = process_job;
   state.process_handle = process_info.hProcess;
   state.thread_handle = process_info.hThread;
   state.started_at_unix_ms = vds::media_agent::current_time_millis();

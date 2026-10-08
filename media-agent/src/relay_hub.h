@@ -29,6 +29,7 @@ class RelayHub {
   bool query_subscriber_state(const std::string& peer_id, RelaySubscriberState* out_state) const;
   std::string subscriber_runtime_json(const std::string& peer_id) const;
   void shutdown_runtime() const;
+  void close_runtime() const;
 
   void publish_video_units(
     const std::string& upstream_peer_id,

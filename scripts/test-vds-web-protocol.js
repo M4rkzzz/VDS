@@ -958,12 +958,19 @@ function testNativeOfferChecksWebCodecCompatibilityBeforeSignaling() {
 
 function testNativeTransportEnforcesAdvertisedEncodedFrameLimit() {
   const source = fs.readFileSync(path.join(repoRoot, 'media-agent/src/peer_transport.cpp'), 'utf8');
-  assert.match(source, /constexpr std::size_t kEncodedMediaMaxFrameBytes = 2 \* 1024 \* 1024;/);
+  const limits = fs.readFileSync(path.join(repoRoot, 'media-agent/src/encoded_media_transport_limits.h'), 'utf8');
+  const protocol = loadTsModule('vds_web/src/datachannel-protocol.ts');
+  const frameLimit = limits.match(/kFrameBytes = (\d+) \* 1024 \* 1024;/);
+  const chunkLimit = limits.match(/kChunkBytes = (\d+) \* 1024;/);
+  assert.ok(frameLimit && chunkLimit, 'native protocol limits must be explicit');
+  assert.equal(Number(frameLimit[1]) * 1024 * 1024, protocol.MAX_ENCODED_FRAME_BYTES);
+  assert.equal(Number(chunkLimit[1]) * 1024, protocol.DATA_CHANNEL_CHUNK_PAYLOAD_BYTES);
+  assert.match(source, /kEncodedMediaMaxFrameBytes = vds::media_agent::encoded_transport::kFrameBytes;/);
   assert.match(source, /maxFrameBytes\\\":" \+ std::to_string\(kEncodedMediaMaxFrameBytes\)/);
-  assert.match(source, /parsed\.payload\.size\(\) > kEncodedMediaMaxFrameBytes/);
-  assert.match(source, /parsed\.frame_payload_bytes > kEncodedMediaMaxFrameBytes/);
+  assert.match(source, /encoded_reassembler\.accept\(/);
+  assert.match(limits, /frame\.payload\.size\(\) > kFrameBytes/);
+  assert.match(limits, /frame\.frame_payload_bytes > kFrameBytes/);
   assert.match(source, /frame\.payload\.size\(\) > kEncodedMediaMaxFrameBytes/);
-  assert.match(source, /throw std::runtime_error\("datachannel-frame-too-large"\)/);
 }
 
 function testDataChannelFrameEnvelope() {

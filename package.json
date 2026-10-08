@@ -1,6 +1,6 @@
 {
   "name": "screenshare-relay",
-  "version": "1.7.2",
+  "version": "1.7.3",
   "description": "Multi-viewer screen sharing with cascade relay (蜈蚣法) - Electron Edition",
   "main": "desktop/main.js",
   "engines": {
@@ -29,7 +29,7 @@
     "build:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/build-media-agent.ps1 -Configuration Release",
     "smoke:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/smoke-media-agent.ps1",
     "test:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/test-media-agent.ps1 -Configuration Release",
-    "test:server": "node scripts/test-server-core.js",
+    "test:server": "node scripts/test-server-core.js && node scripts/test-server-static.js",
     "test:server-revival": "node scripts/test-server-revival.js",
     "test:server-reconnect": "node scripts/test-server-reconnect.js",
     "test:desktop": "node --test tests/desktop/*.test.js",
@@ -55,17 +55,17 @@
   },
   "dependencies": {
     "electron-updater": "^6.8.9",
-    "express": "^4.22.3",
     "koffi": "^2.16.3",
-    "process-audio-capture": "^1.0.14",
-    "ws": "^8.22.0"
+    "process-audio-capture": "^1.0.14"
   },
   "devDependencies": {
     "electron": "^42.11.11",
     "electron-builder": "^26.15.3",
     "@electron/rebuild": "^4.2.1",
+    "express": "^4.22.3",
     "typescript": "^6.0.3",
-    "vite": "^8.3.3"
+    "vite": "^8.3.3",
+    "ws": "^8.22.0"
   },
   "build": {
     "appId": "com.vds.app",
@@ -89,6 +89,11 @@
     "win": {
       "target": "nsis",
       "icon": "desktop/app.ico",
+      "files": [
+        "desktop/**/*",
+        "server/public/**/*",
+        "!node_modules/koffi/build/koffi/!(win32_${arch}){,/**/*}"
+      ],
       "artifactName": "VDS-Setup-${version}.${ext}"
     },
     "nsis": {

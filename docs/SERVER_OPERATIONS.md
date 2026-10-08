@@ -19,9 +19,23 @@ Git 不包含 `public/vds_web/` 和 `updates/`。从 Git 更新时，需要先�
 | `ADMIN_HOST=0.0.0.0` | Docker 内管理服务的监听地址 |
 | `ICE_SERVERS_JSON` | 可选 STUN 配置；服务端过滤 TURN 地址 |
 
-管理页面和 API 无需管理令牌，直接读取房间与拓扑。接口只读、响应禁止缓存，快照不包含房主或观看者的会话令牌；恢复房间连接仍需合法会话身份。保留旧部署所需的环境参数；需要内网直接访问 3010 时，按原部署调整宿主端口映射。部署目录的 `.env` 不提交 Git，也不发送到 Docker 构建上下文。
+管理页面和 API 无需管理令牌，直接读取房间与拓扑。接口只读、响应禁止缓存，快照不包含房主或观看者的会话令牌；恢复房间连接仍需合法会话身份。2026-10-08 未发布修复将公网 3000 的管理快照限制为公开房间（`scope=public-rooms`），3010 保留全量视图（`scope=all-rooms`），因此 3010 只向本机或可信内网提供。保留旧部署所需的环境参数；需要内网直接访问 3010 时，按原部署调整宿主端口映射。部署目录的 `.env` 不提交 Git，也不发送到 Docker 构建上下文。
+
+新服务端生成 12 位房号，仍接受旧 6 位房号。旧版 1.7.2 桌面手动输入最多 6 位，必须先发布支持 12 位输入的新桌面，再部署新服务端；不能只靠旧房号兼容测试认定旧桌面完全兼容。
 
 公网反代必须支持 WebSocket Upgrade。使用 FRP `https2http` 时，HTTPS/WSS 在 FRP 客户端终止 TLS，再转发到本机 3000。证书过期会同时影响默认桌面客户端和浏览器入口，不能只验证容器是否运行。
+
+## 2026-10-08 静态响应优化（未部署）
+
+当前工作区使用 compression 1.8.2，压缩级别 4、阈值 1 KiB，仅压缩适用文本响应。`/updates`、安装包、blockmap、Range/206 和 SSE 不压缩，更新清单及签名保持原始内容。
+
+仅 `vds_web/assets/` 内匹配构建 hash 命名的资源返回 `public, max-age=31536000, immutable`；HTML、`latest.yml` 和 `latest.yml.sig` 返回 `no-store`。普通静态文件不会因带查询参数就获得一年缓存；部署应同时更新 HTML 与其引用的 assets，不能给更新目录统一添加 immutable。
+
+本地最终构建的实际 gzip 响应为 JS 97,293 → 28,428 字节、CSS 7,045 → 2,247 字节，7 项静态响应回归通过。此结果只说明对应文本传输体积；没有改变 WebSocket 信令或客户端 P2P 媒体传输，也不代表线上已经启用。
+
+Docker 用 `COPY --chown=node:node` 设置部署文件属主，去掉后续递归 `RUN chown`，保留 `USER node`。根目录 Express/ws 仅用于开发；`server/package.json` 仍将 Express、ws 和 compression 作为生产依赖，容器继续执行 `npm ci --omit=dev`。这些改动尚未发布或部署，不新增连接、码率或运行时长配额。
+
+对应桌面本地产物已通过离线签验、ASAR 源文件与范围检查、原生 runtime 一致性及实际应用启动退出；最终 NSIS 为 235,375,656 字节，仍只是未发布的 1.7.2 验证包。部署前继续遵守上方客户端优先的迁移顺序，不覆盖线上同版本资产。
 
 ## 恢复顺序
 
@@ -33,9 +47,17 @@ Git 不包含 `public/vds_web/` 和 `updates/`。从 Git 更新时，需要先�
 
 ## 验收端点
 
-`/api/version`、`/api/config`、`/api/public-rooms`、`/vds_web/` 及其引用的 JS/CSS 应正常响应。`/admin` 应自动读取 `/api/admin/rooms`，无凭据访问返回 200。独立管理端口对应 `/` 与 `/api/rooms`，同样直接访问。
+`/api/version`、`/api/config`、`/api/public-rooms`、`/vds_web/` 及其引用的 JS/CSS 应正常响应。`/admin` 应自动读取 `/api/admin/rooms`，无凭据访问返回 200；新版本确认该接口不会枚举非公开房号、节点或 manifest。独立管理端口对应 `/` 与 `/api/rooms`，同样直接访问，保留全量视图。
 
 仅测试 HTTP 页面或临时跳过 TLS 验证不能证明公网入口已恢复。浏览器播放能力、实际媒体传输和跨运营商 P2P 连通仍需独立验收。
+
+## 离线更新签名（未发布客户端）
+
+2026-10-08 源码新增 `latest.yml.sig`，使用项目外离线 Ed25519 私钥签署原始清单。发布主流程继续使用 `npm run build:release`；`prepare-server-release` 在本地 staging 签名和验包，`release:check` 核验包内公钥及两处产物，`release:github` 上传安装包、blockmap、清单和签名共四份资产。仅准备本地文件可运行 `node scripts/update-signature.js sign --dir dist` 和 `verify --dir dist`，不能直接对 live 更新目录运行 staging 脚本。
+
+本机私钥位于 `%LOCALAPPDATA%\VDS\release-signing\release-ed25519-private.pem`，目录 ACL 仅当前用户与 SYSTEM；公钥位于 `desktop/update-trust.json`。私钥应另做受保护的离线备份，不进入 Git、安装包或 NAS。换钥需要通过已有信任链先分发包含新公钥的客户端，不能只替换服务器文件。
+
+部署更新源时，先完整上传安装包与 blockmap，再切换匹配的一对 `latest.yml` / `latest.yml.sig`，保留可恢复旧文件。新客户端缺签名或清单/包不匹配时仅拒绝更新，不阻断正常启动与媒体播放。差分更新停用，客户端下载完整安装包；Windows Authenticode 仍未配置。已经发布的 1.7.2 不含新公钥，首次迁移仍须可信分发，不能宣称旧包已受新签名保护。
 
 ## HTTPS 证书渠道
 

@@ -4,6 +4,8 @@ const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const { validateNativeRuntime } = require('./native-runtime-integrity');
 const { assertNatTestsRegistered } = require('./test-native-nat');
+const { verifyReleaseDirectory } = require('./update-signature');
+const { publicKeyId } = require('../desktop/update-integrity');
 
 const projectRoot = path.resolve(__dirname, '..');
 const mode = process.argv.includes('--prebuild')
@@ -63,6 +65,51 @@ function validatePackagedMediaAgentRuntime() {
   console.log('\nPackaged EXE and enhanced ICE DLLs match the current native build and runtime.');
 }
 
+function validateReleaseTrust(packaged = false) {
+  const trustPath = path.join(projectRoot, 'desktop', 'update-trust.json');
+  const bytes = fs.readFileSync(trustPath);
+  const trust = JSON.parse(bytes);
+  if (trust.format !== 1 || !Array.isArray(trust.keys) || !trust.keys.length || trust.keys.length > 4 ||
+      trust.keys.some((key) => key.keyId !== publicKeyId(key.publicKey))) {
+    throw new Error('Release signing public key configuration is missing or invalid');
+  }
+  if (packaged) {
+    const archive = path.join(projectRoot, 'dist', 'win-unpacked', 'resources', 'app.asar');
+    ensureFile(archive);
+    validatePackagedScope(archive);
+    const packagedTrust = require('@electron/asar').extractFile(archive, 'desktop/update-trust.json');
+    if (!bytes.equals(packagedTrust)) throw new Error('Packaged release trust differs from the signing public keys');
+  }
+}
+
+function assertPackagedScope(entries) {
+  const topLevel = new Set();
+  for (const entry of entries) {
+    if (typeof entry !== 'string') throw new Error('Invalid packaged application path');
+    const relative = entry.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    const segments = relative.split('/');
+    const top = segments[0];
+    const malformed = segments.some(segment => !segment || segment === '.' || segment === '..');
+    const allowed = ['desktop', 'server', 'node_modules'].includes(top) ||
+      (top === 'package.json' && segments.length === 1);
+    if (malformed || !allowed || (top === 'server' && segments.length > 1 && segments[1] !== 'public')) {
+      throw new Error(`Packaged application contains an out-of-scope path: ${relative}`);
+    }
+    topLevel.add(top);
+  }
+  const required = ['desktop', 'node_modules', 'package.json', 'server'];
+  const actual = [...topLevel].sort();
+  if (actual.join('|') !== required.join('|')) throw new Error('Packaged application is missing its expected top-level paths');
+  return { entries: entries.length, topLevel: actual };
+}
+
+function validatePackagedScope(archive = path.join(projectRoot, 'dist', 'win-unpacked', 'resources', 'app.asar')) {
+  ensureFile(archive);
+  const result = assertPackagedScope(require('@electron/asar').listPackage(archive));
+  console.log(`Packaged application scope verified (${result.entries} paths).`);
+  return result;
+}
+
 function validateLatestManifest(dirPath, version, label) {
   const installerName = `VDS-Setup-${version}.exe`;
   const latestPath = path.join(dirPath, 'latest.yml');
@@ -101,10 +148,16 @@ function validateLatestManifest(dirPath, version, label) {
   };
 }
 
-function validateReleaseArtifacts() {
+async function validateReleaseArtifacts() {
   const version = readPackageVersion();
   const distResult = validateLatestManifest(path.join(projectRoot, 'dist'), version, 'dist');
   const updatesResult = validateLatestManifest(path.join(projectRoot, 'server', 'updates'), version, 'server/updates');
+  await verifyReleaseDirectory(path.join(projectRoot, 'dist'), { version });
+  await verifyReleaseDirectory(path.join(projectRoot, 'server', 'updates'), { version });
+  if (!fs.readFileSync(path.join(projectRoot, 'dist', 'latest.yml.sig')).equals(
+    fs.readFileSync(path.join(projectRoot, 'server', 'updates', 'latest.yml.sig')))) {
+    throw new Error('dist and server/updates metadata signatures differ');
+  }
 
   if (distResult.size !== updatesResult.size || distResult.sha512 !== updatesResult.sha512) {
     throw new Error('dist and server/updates installer metadata differ');
@@ -127,12 +180,13 @@ function validateUnreleasedSection() {
   }
 }
 
-function main() {
+async function main() {
   const syntaxFiles = [
     'server/public/app.js',
     'server/public/app-native-overrides.js',
     'desktop/main.js',
     'desktop/preload.js',
+    'desktop/update-integrity.js',
     'server/server-core.js',
     'server/index.js',
     'scripts/prepare-server-release.js',
@@ -149,12 +203,14 @@ function main() {
     'scripts/test-native-runtime-integrity.js',
     'scripts/test-native-nat.js',
     'scripts/test-native-nat-contract.js',
-    'scripts/release-check.js'
+    'scripts/release-check.js',
+    'scripts/update-signature.js'
   ];
 
   for (const fileName of syntaxFiles) {
     run('node', ['--check', fileName]);
   }
+  validateReleaseTrust();
 
   run('npm', ['run', 'check:vds-web']);
   run('npm', ['run', 'test:vds-web']);
@@ -182,16 +238,19 @@ function main() {
 
   if (mode === 'postbuild') {
     validatePackagedMediaAgentRuntime();
-    validateReleaseArtifacts();
+    validateReleaseTrust(true);
+    await validateReleaseArtifacts();
   }
   validateUnreleasedSection();
 
   console.log(`\nRelease ${mode} check passed.`);
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(`\nRelease ${mode} check failed: ${error && error.message ? error.message : error}`);
-  process.exitCode = 1;
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`\nRelease ${mode} check failed: ${error && error.message ? error.message : error}`);
+    process.exitCode = 1;
+  });
 }
+
+module.exports = { assertPackagedScope, validatePackagedScope };

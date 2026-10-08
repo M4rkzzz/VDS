@@ -19,6 +19,7 @@ static WasapiProbeResult probe_wasapi_backend();
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -44,6 +45,22 @@ namespace {
 using vds::media_agent::json_escape;
 
 constexpr int kWasapiStartTimeoutMs = 7000;
+
+bool audio_packet_diagnostics_enabled() {
+#ifdef _MSC_VER
+  char* verbose = nullptr;
+  std::size_t length = 0;
+  if (_dupenv_s(&verbose, &length, "VDS_VERBOSE_MEDIA_LOGS") != 0 || !verbose) {
+    return false;
+  }
+  const bool enabled = std::string(verbose) == "1";
+  std::free(verbose);
+  return enabled;
+#else
+  const char* verbose = std::getenv("VDS_VERBOSE_MEDIA_LOGS");
+  return verbose && std::string(verbose) == "1";
+#endif
+}
 
 std::string hresult_to_string(HRESULT hr) {
   char buffer[32];
@@ -198,6 +215,7 @@ struct WasapiRuntime {
   std::thread worker;
   bool stop_requested = false;
   bool start_completed = false;
+  bool packet_diagnostics_enabled = false;
   WasapiSessionStatus status;
   WasapiEventCallback event_callback = nullptr;
   WasapiPcmPacketCallback pcm_packet_callback = nullptr;
@@ -279,7 +297,9 @@ void emit_audio_packet_event(
   WasapiPcmPacketCallback pcm_callback = nullptr;
   {
     std::lock_guard<std::mutex> lock(state.mutex);
-    callback = state.event_callback;
+    // PCM always reaches the encoder. Per-packet JSON/base64 is diagnostics
+    // only; the switch is cached at capture start, outside this hot path.
+    callback = state.packet_diagnostics_enabled ? state.event_callback : nullptr;
     pcm_callback = state.pcm_packet_callback;
   }
 
@@ -847,6 +867,7 @@ WasapiSessionStatus start_wasapi_process_loopback_session(int pid, const std::st
     state.status.last_error = probe.last_error;
     state.start_completed = false;
     state.stop_requested = false;
+    state.packet_diagnostics_enabled = audio_packet_diagnostics_enabled();
   }
 
   if (pid <= 0) {

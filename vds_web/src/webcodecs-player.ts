@@ -206,7 +206,7 @@ export class WebCodecsVideoPlayer {
       this.diagnostics.onDroppedFrame(`webcodecs-${normalizedCodec}-payload-format-unsupported`);
       return;
     }
-    const units = splitAnnexBNalUnits(annexB);
+    let units = splitAnnexBNalUnits(annexB);
     if (this.configurationCodec !== normalizedCodec) {
       if (this.configurationCodec) this.releaseDecoder();
       this.configurationUnits.clear(); this.configurationPrefix = null;
@@ -215,36 +215,46 @@ export class WebCodecsVideoPlayer {
     const configuration = units.filter((unit) => normalizedCodec === 'h264'
       ? [7, 8].includes(unit[0] & 0x1f) : [32, 33, 34].includes((unit[0] >> 1) & 0x3f));
     if (configuration.length) {
-      for (const unit of configuration) this.configurationUnits.set(normalizedCodec === 'h264' ? unit[0] & 0x1f : (unit[0] >> 1) & 0x3f, unit);
-      const prefix = packAnnexBUnits([...this.configurationUnits.values()]);
-      if (prefix.byteLength <= 64 * 1024) this.configurationPrefix = prefix;
-      else { this.configurationUnits.clear(); this.configurationPrefix = null; }
+      const nextConfiguration = new Map(this.configurationUnits);
+      for (const unit of configuration) nextConfiguration.set(normalizedCodec === 'h264' ? unit[0] & 0x1f : (unit[0] >> 1) & 0x3f, unit);
+      const prefixBytes = [...nextConfiguration.values()].reduce((sum, unit) => sum + 4 + unit.byteLength, 0);
+      if (prefixBytes <= 64 * 1024) {
+        // NAL views borrow the current frame. Persist only these small copies,
+        // so cached SPS/PPS/VPS neither retain nor alias an entire encoded AU.
+        for (const unit of configuration) nextConfiguration.set(normalizedCodec === 'h264' ? unit[0] & 0x1f : (unit[0] >> 1) & 0x3f, unit.slice());
+        this.configurationUnits = nextConfiguration;
+        this.configurationPrefix = packAnnexBUnits([...nextConfiguration.values()]);
+      } else { this.configurationUnits.clear(); this.configurationPrefix = null; }
     }
     const hasVcl = units.some((unit) => normalizedCodec === 'h264'
       ? (unit[0] & 0x1f) >= 1 && (unit[0] & 0x1f) <= 5 : ((unit[0] >> 1) & 0x3f) <= 31);
     if (!hasVcl) return; // A configuration message still consumed its transport sequence.
     const presentConfigurationTypes = new Set(configuration.map((unit) => normalizedCodec === 'h264' ? unit[0] & 0x1f : (unit[0] >> 1) & 0x3f));
     if (header.keyframe && this.configurationPrefix && presentConfigurationTypes.size < this.configurationUnits.size) {
-      const missingPrefix = packAnnexBUnits([...this.configurationUnits].filter(([type]) => !presentConfigurationTypes.has(type)).map(([, unit]) => unit));
+      const missingUnits = [...this.configurationUnits].filter(([type]) => !presentConfigurationTypes.has(type)).map(([, unit]) => unit);
+      const missingPrefix = packAnnexBUnits(missingUnits);
       const prefixed = new Uint8Array(missingPrefix.byteLength + annexB.byteLength);
       prefixed.set(new Uint8Array(missingPrefix));
       prefixed.set(new Uint8Array(annexB), missingPrefix.byteLength);
       annexB = prefixed.buffer;
+      units = [...missingUnits, ...units];
     }
-    const avcc = convertAnnexBToLengthPrefixed(annexB);
 
     const hevcMinLevel = normalizedCodec === 'h265' ? this.getMinimumHevcLevel() : 0;
+    const hevcCandidates = normalizedCodec === 'h265' ? buildHevcCodecCandidates(units, hevcMinLevel) : [];
     const codec = normalizedCodec === 'h265'
-      ? (selectPreferredCodec(buildHevcCodecCandidates(annexB, hevcMinLevel), this.configuredCodec, 'hev1.1.6.L120.B0'))
-      : (buildAvcCodecString(annexB) || this.configuredCodec || 'avc1.42E01F');
+      ? (selectPreferredCodec(hevcCandidates, this.configuredCodec, 'hev1.1.6.L120.B0'))
+      : (buildAvcCodecString(units) || this.configuredCodec || 'avc1.42E01F');
     if (!this.decoder || this.decoder.state !== 'configured' || this.configuredCodec !== codec) {
       if (!header.keyframe && this.waitingForKeyframe) {
         this.diagnostics.onDroppedFrame('webcodecs-waiting-for-keyframe');
         return;
       }
+      // Length-prefixed availability depends only on the parsed NAL list.
+      // Allocate that representation only if the selected decoder needs it.
       const configuredFormat = normalizedCodec === 'h265'
-        ? await this.configureAny(buildHevcCodecCandidates(annexB, hevcMinLevel), codec, normalizedCodec, Boolean(avcc), generation)
-        : await this.configure(codec, normalizedCodec, Boolean(avcc), generation);
+        ? await this.configureAny(hevcCandidates, codec, normalizedCodec, units.length > 0, generation)
+        : await this.configure(codec, normalizedCodec, units.length > 0, generation);
       if (generation !== this.generation) {
         return;
       }
@@ -277,7 +287,7 @@ export class WebCodecsVideoPlayer {
       this.diagnostics.onKeyframeNeeded?.(); return;
     }
     try {
-      const decodePayload = this.configuredPayloadFormat === 'avcc' ? avcc : annexB;
+      const decodePayload = this.configuredPayloadFormat === 'avcc' ? convertAnnexBToLengthPrefixed(units) : annexB;
       if (!decodePayload) {
         this.diagnostics.onDroppedFrame(`webcodecs-${normalizedCodec}-${this.configuredPayloadFormat}-payload-unavailable`);
         return;
@@ -801,7 +811,7 @@ function convertAvccToAnnexB(payload: ArrayBuffer): ArrayBuffer | null {
     if (size <= 0 || offset + size > bytes.length) {
       return null;
     }
-    units.push(bytes.slice(offset, offset + size));
+    units.push(bytes.subarray(offset, offset + size));
     offset += size;
   }
   if (offset !== bytes.length || units.length === 0) {
@@ -820,8 +830,7 @@ function convertAvccToAnnexB(payload: ArrayBuffer): ArrayBuffer | null {
   return output.buffer;
 }
 
-function convertAnnexBToLengthPrefixed(payload: ArrayBuffer): ArrayBuffer | null {
-  const units = splitAnnexBNalUnits(payload);
+function convertAnnexBToLengthPrefixed(units: Uint8Array[]): ArrayBuffer | null {
   if (units.length === 0) {
     return null;
   }
@@ -840,8 +849,8 @@ function convertAnnexBToLengthPrefixed(payload: ArrayBuffer): ArrayBuffer | null
   return output.buffer;
 }
 
-function buildAvcCodecString(payload: ArrayBuffer): string | null {
-  for (const unit of splitAnnexBNalUnits(payload)) {
+function buildAvcCodecString(units: Uint8Array[]): string | null {
+  for (const unit of units) {
     if ((unit[0] & 0x1f) !== 7 || unit.length < 4) {
       continue;
     }
@@ -850,8 +859,8 @@ function buildAvcCodecString(payload: ArrayBuffer): string | null {
   return null;
 }
 
-function buildHevcCodecCandidates(payload: ArrayBuffer, minLevel = 93): string[] {
-  for (const unit of splitAnnexBNalUnits(payload)) {
+function buildHevcCodecCandidates(units: Uint8Array[], minLevel = 93): string[] {
+  for (const unit of units) {
     const nalType = (unit[0] >> 1) & 0x3f;
     if (nalType === 33 && unit.length >= 7) {
       const level = Math.max(clampHevcLevel(unit[6]), minLevel);
@@ -907,7 +916,7 @@ function splitAnnexBNalUnits(payload: ArrayBuffer): Uint8Array[] {
     while (end > start && bytes[end - 1] === 0) {
       end -= 1;
     }
-    return bytes.slice(start, end);
+    return bytes.subarray(start, end);
   }).filter((unit) => unit.length > 0);
 }
 

@@ -23,6 +23,7 @@ class PeerSessionController {
   void refresh_transport_runtime();
   void perform_host_video_sender_soft_refresh();
   void refresh_host_audio_senders();
+  void stop_all_media_bindings();
   void close_all_receiver_handles();
   void close_all_transport_sessions();
 

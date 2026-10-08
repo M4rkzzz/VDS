@@ -2122,16 +2122,17 @@ async function testStartServerSupportsRandomPort() {
 
 function testGenerateRoomIdAvoidsCollision() {
   const originalRandomBytes = crypto.randomBytes;
-  const existingRooms = new Map([['AAAAAA', {}]]);
+  const existingRooms = new Map([['AAAAAAAAAAAA', {}]]);
   let calls = 0;
-  crypto.randomBytes = () => {
+  crypto.randomBytes = (bytes) => {
+    assert.strictEqual(bytes, 6, 'new room codes must have 48 bits of randomness');
     calls += 1;
     return calls === 1
-      ? Buffer.from([0xaa, 0xaa, 0xaa])
-      : Buffer.from([0xbb, 0xbb, 0xbb]);
+      ? Buffer.alloc(bytes, 0xaa)
+      : Buffer.alloc(bytes, 0xbb);
   };
   try {
-    assert.strictEqual(generateRoomId(existingRooms), 'BBBBBB');
+    assert.strictEqual(generateRoomId(existingRooms), 'BBBBBBBBBBBB');
   } finally {
     crypto.randomBytes = originalRandomBytes;
   }

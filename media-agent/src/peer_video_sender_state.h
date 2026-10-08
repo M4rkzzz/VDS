@@ -46,6 +46,7 @@ struct PeerVideoSenderRuntime {
   std::atomic<bool> soft_refresh_requested { false };
   std::atomic<bool> stop_requested { false };
 #ifdef _WIN32
+  HANDLE process_job_handle = nullptr;
   HANDLE process_handle = nullptr;
   HANDLE thread_handle = nullptr;
   HANDLE stdin_write_handle = nullptr;

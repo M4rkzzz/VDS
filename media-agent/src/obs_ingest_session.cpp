@@ -484,19 +484,8 @@ void ObsIngestSession::run_worker(ObsIngestState* session_ptr, ObsIngestSessionR
             bytes,
             true
           );
-          if (units.empty()) {
-            std::lock_guard<std::mutex> lock(session.mutex);
-            session.pending_video_annexb_bytes.insert(
-              session.pending_video_annexb_bytes.end(),
-              bytes.begin(),
-              bytes.end()
-            );
-            units = vds::media_agent::extract_annexb_video_access_units(
-              video_codec,
-              session.pending_video_annexb_bytes,
-              false
-            );
-          }
+          // The demuxer/bitstream filter already supplies packet boundaries.
+          // Invalid packets are independent; never join them to the next PTS.
           if (units.empty()) {
             return;
           }

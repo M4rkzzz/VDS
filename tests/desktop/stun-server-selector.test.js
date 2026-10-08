@@ -74,10 +74,10 @@ test('only STUN URLs can reach native selection and unavailable STUN does not re
 function createPeerIpcHandler(globals) {
   const source = ts.createSourceFile('main.js', fs.readFileSync(path.join(__dirname, '../../desktop/main.js'), 'utf8'), ts.ScriptTarget.ES2022, true);
   const call = source.statements.map((statement) => statement.expression).find((expression) =>
-    expression && ts.isCallExpression(expression) && expression.expression.getText(source) === 'ipcMain.handle' &&
-    expression.arguments[0]?.text === 'media-engine-create-peer');
+    expression && ts.isCallExpression(expression) && expression.expression.getText(source) === 'ipcBoundary.handle' &&
+    expression.arguments[0]?.getText(source) === 'ipcMain' && expression.arguments[1]?.text === 'media-engine-create-peer');
   assert.ok(call, 'production createPeer IPC handler exists');
-  return new Function(...Object.keys(globals), `return (${call.arguments[1].getText(source)});`)(...Object.values(globals));
+  return new Function(...Object.keys(globals), `return (${call.arguments[2].getText(source)});`)(...Object.values(globals));
 }
 
 test('native IPC receives the reachable primary followed by a bounded pure STUN pool', async () => {

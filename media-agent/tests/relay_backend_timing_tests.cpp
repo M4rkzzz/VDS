@@ -39,6 +39,10 @@ PeerTransportSnapshot get_peer_transport_snapshot(const std::shared_ptr<PeerTran
   return snapshot;
 }
 
+PeerTransportMediaReadiness get_peer_transport_media_readiness(const std::shared_ptr<PeerTransportSession>& session) {
+  return session ? PeerTransportMediaReadiness{true, true, true, true} : PeerTransportMediaReadiness{};
+}
+
 bool send_peer_transport_encoded_media_frame(const std::shared_ptr<PeerTransportSession>& session,
     const PeerEncodedMediaDataChannelFrame& frame, std::string* error) {
   std::unique_lock<std::mutex> lock(session->mutex);
@@ -622,6 +626,30 @@ void test_origin_change_discards_old_queued_frames() {
     expect(!viewer->block_timed_out, "origin-change queue regression releases its send within the timeout");
   }
 }
+void test_dispatch_shutdown_and_final_close() {
+  Runtime runtime;
+  auto viewer = std::make_shared<PeerTransportSession>();
+  runtime.register_subscriber("upstream", "viewer", viewer, true);
+  runtime.fanout_video_units("upstream", "h264", {join(kConfig, kIdr)}, 0, timing(0, 0));
+  expect(wait_live(runtime, "viewer", 0), "shutdown regression starts with a live video subscriber");
+
+  runtime.shutdown_dispatch();
+  runtime.fanout_video_units("upstream", "h264", {kP}, 1500, timing(1, 16667));
+  expect(wait_live(runtime, "viewer", 1), "ordinary dispatch shutdown remains reusable within a media session");
+  runtime.close();
+  const auto sent_before_close = frames(viewer).size();
+  runtime.register_subscriber("upstream", "late-viewer", viewer, true);
+  runtime.fanout_video_units("upstream", "h264", {join(kConfig, kIdr)}, 3000, timing(2, 33334));
+  runtime.fanout_audio_frame("upstream", {1, 2, 3}, "opus", 1600, timing(3, 33334));
+  // Even the reusable stop entry point must not reopen a finally closed runtime.
+  runtime.shutdown_dispatch();
+  runtime.fanout_video_units("upstream", "h264", {join(kConfig, kIdr)}, 4500, timing(4, 50001));
+  runtime.shutdown_dispatch();
+  expect(frames(viewer).size() == sent_before_close, "late audio/video cannot restart a finally closed relay");
+  RelaySubscriberState late;
+  expect(!runtime.query_subscriber_state("late-viewer", &late), "final close rejects late subscriber registration");
+  runtime.close();
+}
 } // namespace
 
 int main() {
@@ -637,6 +665,7 @@ int main() {
   test_origin_round_trip_and_stable_av_epoch();
   test_subscriber_rebind_rotates_epoch();
   test_origin_change_discards_old_queued_frames();
+  test_dispatch_shutdown_and_final_close();
   std::cout << "Relay backend timing: " << checks << " checks, " << failures << " failures\n";
   return failures == 0 ? 0 : 1;
 }

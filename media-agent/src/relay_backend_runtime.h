@@ -30,7 +30,10 @@ class Runtime {
 
   void unregister_subscriber(const std::string& peer_id);
   void clear_upstream_bootstrap_state(const std::string& upstream_peer_id);
+  // Stops the worker for a reusable media session.
   void shutdown_dispatch();
+  // Final runtime shutdown: future producers cannot restart dispatch.
+  void close();
 
   bool query_subscriber_state(
     const std::string& peer_id,

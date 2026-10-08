@@ -10,6 +10,7 @@
 #include "peer_transport.h"
 #include "peer_video_sender_state.h"
 #include "json_protocol.h"
+#include "encoded_media_transport_limits.h"
 
 #include <rtc/rtc.hpp>
 
@@ -173,7 +174,8 @@ struct ProductionPair {
 
   ProductionPair(const std::string& name,
                  std::function<std::string(const std::string&)> handler = {},
-                 std::function<void(const PeerTransportSnapshot&, const std::string&)> on_state_change = {}) {
+                 std::function<void(const PeerTransportSnapshot&, const std::string&)> on_state_change = {},
+                 std::function<void(const PeerEncodedMediaDataChannelFrame&)> on_media = {}) {
     auto publisher_callbacks = signaling_callbacks(bridge, 0);
     publisher_callbacks.on_keyframe_requested = std::move(handler);
     publisher_callbacks.on_state_change = std::move(on_state_change);
@@ -183,8 +185,13 @@ struct ProductionPair {
     publisher = create_peer_transport_session(name + "-publisher", true,
       publisher_callbacks, true, local_stun.front(), local_stun, &error);
     require(publisher != nullptr, "publisher creation failed: " + error);
+    const auto starting = get_peer_transport_media_readiness(publisher);
+    require(!starting.connected && starting.use_encoded_data_channel && !starting.video_ready && !starting.audio_ready,
+            "unconnected transport reported writable media");
+    auto viewer_callbacks = signaling_callbacks(bridge, 1);
+    viewer_callbacks.on_encoded_media_data_channel_frame = std::move(on_media);
     viewer = create_peer_transport_session(name + "-viewer", false,
-      signaling_callbacks(bridge, 1), true, local_stun.front(), local_stun, &error);
+      viewer_callbacks, true, local_stun.front(), local_stun, &error);
     require(viewer != nullptr, "viewer creation failed: " + error);
     bind_production_destination(bridge, 0, publisher);
     bind_production_destination(bridge, 1, viewer);
@@ -202,6 +209,11 @@ struct ProductionPair {
             "test must exercise DC with no RTP video track");
     require(!get_peer_transport_snapshot(publisher).video_track_configured,
             "test must not configure a host RTP video track");
+    for (const auto& session : {publisher, viewer}) {
+      const auto ready = get_peer_transport_media_readiness(session);
+      require(ready.connected && ready.use_encoded_data_channel && ready.video_ready && ready.audio_ready,
+              "handshaken DC readiness did not match media usability");
+    }
   }
 
   ~ProductionPair() {
@@ -250,7 +262,9 @@ struct RawControlPair {
   std::shared_ptr<std::atomic<unsigned>> events = std::make_shared<std::atomic<unsigned>>(0);
 
   explicit RawControlPair(std::function<std::string(const std::string&)> handler,
-      std::function<void(const PeerTransportSnapshot&, const std::string&)> on_state_change = {}) {
+      std::function<void(const PeerTransportSnapshot&, const std::string&)> on_state_change = {},
+      bool allow_remote_media = true,
+      std::function<void(const PeerEncodedMediaDataChannelFrame&)> on_media = {}) {
     rtc::Configuration config;
     config.disableAutoNegotiation = true;
     raw = std::make_shared<rtc::PeerConnection>(config);
@@ -281,6 +295,8 @@ struct RawControlPair {
     });
 
     auto callbacks = signaling_callbacks(bridge, 1);
+    callbacks.allow_remote_media = allow_remote_media;
+    callbacks.on_encoded_media_data_channel_frame = std::move(on_media);
     callbacks.on_keyframe_requested = std::move(handler);
     callbacks.on_state_change = [count = events, observer = std::move(on_state_change)](
         const PeerTransportSnapshot& snapshot, const std::string& logical_state) {
@@ -318,11 +334,164 @@ struct RawControlPair {
     require(channel->send(message), "raw SCTP send failed");
   }
 
+  void send_binary(const std::string& header, std::size_t bytes) {
+    rtc::binary payload;
+    payload.reserve(8 + header.size() + bytes);
+    for (const auto ch : std::string("VDS1")) payload.push_back(static_cast<std::byte>(ch));
+    for (int shift = 24; shift >= 0; shift -= 8)
+      payload.push_back(static_cast<std::byte>((header.size() >> shift) & 255));
+    for (const auto ch : header) payload.push_back(static_cast<std::byte>(ch));
+    payload.insert(payload.end(), bytes, static_cast<std::byte>(0x55));
+    // false is an accepted queued message; it must not be retried.
+    channel->send(std::move(payload));
+  }
+
   template <class Predicate>
   void wait(Predicate predicate, const std::string& message) {
     wait_until(predicate, [&] { bridge->pump(); }, message);
   }
 };
+
+std::string chunk_header(const std::string& id, std::uint64_t count, std::uint64_t index,
+                         std::uint64_t total) {
+  return "{\"protocol\":\"vds-media-encoded-v1\",\"type\":\"chunk\",\"streamType\":\"video\","
+    "\"codec\":\"h264\",\"payloadFormat\":\"annexb\",\"sourceEpoch\":\"raw-epoch\","
+    "\"frameId\":\"" + id + "\",\"chunkCount\":" + std::to_string(count) +
+    ",\"chunkIndex\":" + std::to_string(index) + ",\"framePayloadBytes\":" + std::to_string(total) + "}";
+}
+
+void test_encoded_media_receive_limits() {
+  using namespace vds::media_agent::encoded_transport;
+  std::atomic<unsigned> frames{0};
+  std::atomic<unsigned> media_events{0};
+  std::atomic<unsigned> malformed_outputs{0};
+  RawControlPair pair([](const std::string&) { return std::string("unused"); },
+    [&](const PeerTransportSnapshot&, const std::string& state) {
+      if (state == "receiving") ++media_events;
+    }, true, [&](const PeerEncodedMediaDataChannelFrame& frame) {
+      if (frame.payload.size() != kChunkBytes + 10 || frame.message_type != "frame") ++malformed_outputs;
+      ++frames;
+    });
+  for (unsigned id = 0; id < 10; ++id) {
+    pair.send_binary(chunk_header("normal-" + std::to_string(id), 2, 0, kChunkBytes + 10), kChunkBytes);
+    pair.wait([&] { return get_peer_transport_snapshot(pair.receiver).encoded_media_data_channel_pending_frames == 1; },
+              "valid first fragment was not retained");
+    pair.send_binary(chunk_header("normal-" + std::to_string(id), 2, 1, kChunkBytes + 10), 10);
+    pair.wait([&] { return frames.load() == id + 1; }, "valid complete frame did not reach callback");
+  }
+  auto state = get_peer_transport_snapshot(pair.receiver);
+  require(state.encoded_media_data_channel_chunks_received == 20 && frames.load() == 10 && malformed_outputs.load() == 0,
+          "real SCTP fragment/frame counters or assembly changed");
+  pair.wait([&] { return media_events.load() == 1; }, "initial media state transition was not published");
+  require(media_events.load() == 1, "media fragments still publish a peer-state per message");
+  require(state.encoded_media_data_channel_pending_bytes == 0, "completed SCTP frames retained bytes");
+
+  const std::vector<std::pair<std::string, std::size_t>> invalid = {
+    {chunk_header("count-max", UINT64_MAX, 0, kChunkBytes + 10), kChunkBytes},
+    {chunk_header("count-wrong", 3, 0, kChunkBytes + 10), kChunkBytes},
+    {chunk_header("oversized", 2, 0, kChunkBytes + 10), kChunkBytes + 1},
+    {chunk_header("tail-wrong", 2, 1, kChunkBytes + 10), 11},
+    {chunk_header("frame-large", kChunksPerFrame + 1, 0, kFrameBytes + 1), kChunkBytes}
+  };
+  for (const auto& message : invalid) {
+    const auto before = get_peer_transport_snapshot(pair.receiver).encoded_media_data_channel_invalid_frames;
+    pair.send_binary(message.first, message.second);
+    pair.wait([&] { return get_peer_transport_snapshot(pair.receiver).encoded_media_data_channel_invalid_frames == before + 1; },
+              "hostile SCTP fragment did not reach production rejection");
+    state = get_peer_transport_snapshot(pair.receiver);
+    require(state.encoded_media_data_channel_pending_frames == 0 && state.encoded_media_data_channel_pending_bytes == 0,
+            "invalid fragment allocated pending state");
+    require(frames.load() == 10, "invalid fragment reached media callback");
+  }
+  for (unsigned id = 0; id <= kPendingFrames; ++id) {
+    const auto before = get_peer_transport_snapshot(pair.receiver).encoded_media_data_channel_chunks_received;
+    pair.send_binary(chunk_header("pending-" + std::to_string(id), 2, 0, kChunkBytes + 10), kChunkBytes);
+    pair.wait([&] { return get_peer_transport_snapshot(pair.receiver).encoded_media_data_channel_chunks_received == before + 1; },
+              "incomplete SCTP fragment not processed");
+  }
+  state = get_peer_transport_snapshot(pair.receiver);
+  require(state.encoded_media_data_channel_pending_frames == kPendingFrames &&
+          state.encoded_media_data_channel_incomplete_frames_dropped == 1 &&
+          state.encoded_media_data_channel_pending_bytes == kPendingFrames * kChunkBytes,
+          "production pending count/byte accounting or eviction wrong");
+  close_peer_transport_session(pair.receiver);
+  state = get_peer_transport_snapshot(pair.receiver);
+  require(state.encoded_media_data_channel_pending_frames == 0 && state.encoded_media_data_channel_pending_bytes == 0,
+          "closing production transport retained fragments");
+  std::cout << "encoded media: real SCTP count/shape rejection, ordered assembly, 20 fragments -> one state event, bounded pending/close passed\n";
+}
+
+void test_downstream_reverse_media() {
+  std::atomic<unsigned> invoked{0};
+  std::atomic<unsigned> frames{0};
+  RawControlPair pair([&](const std::string&) { ++invoked; return std::string("control-ok"); }, {}, false,
+    [&](const PeerEncodedMediaDataChannelFrame&) { ++frames; });
+  pair.send_binary(chunk_header("reverse-max", UINT64_MAX, 0, 12289), 12288);
+  pair.wait([&] { return get_peer_transport_snapshot(pair.receiver).encoded_media_data_channel_invalid_frames == 1; },
+            "downstream binary media was not rejected");
+  const auto state = get_peer_transport_snapshot(pair.receiver);
+  require(state.last_error == "datachannel-reverse-media-forbidden" &&
+          state.encoded_media_data_channel_pending_frames == 0 && frames.load() == 0,
+          "reverse media reached parsing/allocation/dispatch");
+  pair.send(control_message("keyframe-request", "raw-session"));
+  pair.wait([&] { return invoked.load() == 1; }, "downstream media gate disabled keyframe control");
+  require(get_peer_transport_snapshot(pair.receiver).keyframe_requests_received == 1,
+          "downstream control no longer counted");
+  std::cout << "downstream: reverse media refused before fragment parsing while real SCTP keyframe control remains available passed\n";
+}
+
+void test_production_encoded_wire_copy() {
+  std::mutex received_mutex;
+  std::vector<PeerEncodedMediaDataChannelFrame> received;
+  ProductionPair pair("wire-copy", {}, {}, [&](const PeerEncodedMediaDataChannelFrame& frame) {
+    std::lock_guard<std::mutex> lock(received_mutex);
+    received.push_back(frame);
+  });
+  std::vector<PeerEncodedMediaDataChannelFrame> expected;
+  for (const auto size : {std::size_t(256), std::size_t(12300), std::size_t(24800)}) {
+    PeerEncodedMediaDataChannelFrame frame;
+    frame.stream_type = size == 256 ? "audio" : "video";
+    frame.codec = size == 256 ? "opus" : "h264";
+    frame.payload_format = size == 256 ? "opus-raw" : "annexb";
+    frame.source_epoch = "wire-copy-epoch";
+    frame.sequence = expected.size() + 1;
+    frame.timestamp_us = 1234567 + frame.sequence * 20000;
+    frame.keyframe = frame.stream_type == "video";
+    frame.config = frame.keyframe;
+    frame.payload.resize(size);
+    for (std::size_t i = 0; i < size; ++i) frame.payload[i] = static_cast<std::uint8_t>(i & 255);
+    expected.push_back(frame);
+    std::string error;
+    require(send_peer_transport_encoded_media_frame(pair.publisher, frame, &error),
+            "production encoded sender rejected valid wire fixture: " + error);
+    pair.wait([&] {
+      std::lock_guard<std::mutex> lock(received_mutex);
+      return received.size() == expected.size();
+    }, "production encoded message did not complete across real SCTP");
+  }
+  {
+    std::lock_guard<std::mutex> lock(received_mutex);
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+      const auto& a = received[i];
+      const auto& b = expected[i];
+      require(a.payload == b.payload && a.stream_type == b.stream_type && a.codec == b.codec &&
+              a.payload_format == b.payload_format && a.source_epoch == b.source_epoch &&
+              a.sequence == b.sequence && a.timestamp_us == b.timestamp_us && a.keyframe == b.keyframe &&
+              a.config == b.config && a.message_type == "frame" && a.frame_id.empty(),
+              "bulk-copy/common-header optimization changed payload bytes or frame metadata");
+    }
+  }
+  const auto snapshot = get_peer_transport_snapshot(pair.publisher);
+  require(snapshot.encoded_media_data_channel_frames_sent == expected.size() &&
+          snapshot.connection_state == "connected" && snapshot.remote_description_set &&
+          !snapshot.selected_local_candidate.empty() && !snapshot.selected_remote_candidate.empty(),
+          "explicit diagnostics no longer refresh candidates/counters after optimized sends");
+  close_peer_transport_session(pair.publisher);
+  const auto closed = get_peer_transport_media_readiness(pair.publisher);
+  require(!closed.connected && !closed.video_ready && !closed.audio_ready && !closed.use_encoded_data_channel,
+          "closed transport retained media readiness");
+  std::cout << "wire copy: production sender -> real SCTP -> receiver preserves all byte values/metadata for frame and chunks; diagnostics/readiness passed\n";
+}
 
 void test_host_control() {
   auto runtime = host_runtime();
@@ -685,11 +854,17 @@ int main() {
     std::string error;
     require(!request_peer_transport_keyframe(nullptr, "decoder-recovery", &error),
             "missing session accepted a keyframe request");
+    const auto missing = get_peer_transport_media_readiness(nullptr);
+    require(!missing.connected && !missing.use_encoded_data_channel && !missing.video_ready && !missing.audio_ready,
+            "missing session readiness is not all false");
     test_host_control();
     test_host_waiting_for_bootstrap();
     test_handler_rebind_race();
     test_receiver_validation();
     test_relay_forwarding();
+    test_encoded_media_receive_limits();
+    test_downstream_reverse_media();
+    test_production_encoded_wire_copy();
     std::cout << "peer-keyframe-control-e2e: " << checks << " checks passed\n";
     return 0;
   } catch (const std::exception& ex) {

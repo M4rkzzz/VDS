@@ -312,14 +312,11 @@ bool send_host_audio_opus_frame_locked(
     }
     std::string send_error;
     for (const auto& session : sessions) {
-      const PeerTransportSnapshot snapshot = get_peer_transport_snapshot(session);
-      const bool use_encoded_data_channel =
-        snapshot.encoded_media_data_channel_requested ||
-        snapshot.encoded_media_data_channel_supported;
-      if (use_encoded_data_channel) {
-        if (!snapshot.encoded_media_data_channel_ready) {
-          continue;
-        }
+      const auto readiness = get_peer_transport_media_readiness(session);
+      if (!readiness.audio_ready) {
+        continue;
+      }
+      if (readiness.use_encoded_data_channel) {
         PeerEncodedMediaDataChannelFrame encoded_frame;
         encoded_frame.stream_type = "audio";
         encoded_frame.codec = "opus";

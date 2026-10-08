@@ -496,7 +496,12 @@ function setViewerJoinMode(mode) {
 
 async function handleViewerJoinFailure(message) {
   const failedSource = viewerPendingJoinSource;
-  await resetViewerState();
+  const resetting = resetViewerState();
+  const resetGeneration = viewerJoinGeneration;
+  await resetting;
+  if (viewerJoinGeneration !== resetGeneration || sessionRole !== null) {
+    return;
+  }
   if (failedSource === 'lobby') {
     setViewerJoinMode('lobby');
     await refreshPublicRooms({ force: true }).catch(() => {});
@@ -2110,8 +2115,12 @@ async function resetViewerState() {
   cancelPublicRoomsRefresh();
   cancelPendingViewerJoin();
   clearPendingSignalingQueues('reset-viewer');
+  const resetGeneration = viewerJoinGeneration;
 
   await clearAllPeerConnections({ clearRetryState: true });
+  if (viewerJoinGeneration !== resetGeneration || sessionRole !== null) {
+    return;
+  }
   elements.joinForm.classList.remove('hidden');
   elements.viewerStatus.classList.add('hidden');
   elements.btnLeave.classList.add('hidden');
@@ -2175,7 +2184,7 @@ if (window.VDS && window.VDS.roomClient && typeof window.VDS.roomClient.installL
       syncAppState({ connectionState: 'disconnected' }, { reason: 'ws-close' });
     },
     onWebSocketUnexpectedClose: () => {
-      resumeOnNextConnect = Boolean(currentRoomId && sessionRole);
+      resumeOnNextConnect = Boolean(currentRoomId && sessionRole && currentSessionToken);
       return true;
     },
     onWebSocketDisconnected: () => {
@@ -2190,7 +2199,7 @@ if (window.VDS && window.VDS.roomClient && typeof window.VDS.roomClient.installL
       }
     },
     consumeResumeSessionMessage: () => {
-      if (!resumeOnNextConnect || !currentRoomId || !sessionRole) {
+      if (!resumeOnNextConnect || !currentRoomId || !sessionRole || !currentSessionToken) {
         return null;
       }
       resumeOnNextConnect = false;

@@ -1,6 +1,8 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 const SERVER_URL = normalizeBaseUrl(process.env.SERVER_URL || 'https://boshan.s.3q.hair');
+const updateFeedArgument = [...process.argv].reverse().find((argument) => argument.startsWith('--vds-update-feed='));
+const UPDATE_FEED_URL = updateFeedArgument ? updateFeedArgument.slice('--vds-update-feed='.length) : '';
 const DISCONNECT_GRACE_MS = Number(process.env.DISCONNECT_GRACE_MS || 30000);
 const PREFERRED_AUDIO_BACKEND = String(process.env.VDS_PREFERRED_AUDIO_BACKEND || '').trim().toLowerCase();
 const ENABLE_NATIVE_HOST_SESSION_BRIDGE = process.env.VDS_ENABLE_NATIVE_HOST_SESSION_BRIDGE !== '0';
@@ -16,6 +18,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
   getRuntimeConfig: () => ({
     serverUrl: SERVER_URL,
+    updateFeedUrl: UPDATE_FEED_URL,
     disconnectGraceMs: DISCONNECT_GRACE_MS,
     preferredAudioBackend: PREFERRED_AUDIO_BACKEND,
     enableNativeHostSessionBridge: ENABLE_NATIVE_HOST_SESSION_BRIDGE,

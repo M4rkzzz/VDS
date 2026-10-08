@@ -342,6 +342,10 @@ void PeerSessionController::close_all_receiver_handles() {
   close_all_peer_receiver_handles(runtime_state_);
 }
 
+void PeerSessionController::stop_all_media_bindings() {
+  stop_all_peer_media_bindings(runtime_state_);
+}
+
 void PeerSessionController::close_all_transport_sessions() {
   close_all_peer_transport_sessions(runtime_state_);
 }

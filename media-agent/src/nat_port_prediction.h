@@ -8,6 +8,14 @@
 #define VDS_NAT_MAX_OBSERVATIONS 8u
 #define VDS_NAT_MAX_PREDICTED_PORTS 16u
 
+/* Controls only whether an IPv4 ICE check waits for NAT sampling. Shared
+ * carrier addresses use the immediate path, like private LAN peers. */
+static inline bool vds_nat_is_public_ipv4_destination(uint32_t address) {
+  return (address >> 24) != 10 && (address >> 24) != 127 &&
+      (address >> 16) != 0xa9fe && (address >> 20) != 0xac1 &&
+      (address >> 16) != 0xc0a8 && (address & 0xffc00000u) != 0x64400000u;
+}
+
 /* Inputs must come from validated STUN responses on the transport socket.
  * sequence is the first-send order, not the order in which replies arrive.
  * address is the mapped IPv4 address in the caller's consistent byte order.

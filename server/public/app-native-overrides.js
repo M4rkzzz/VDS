@@ -85,6 +85,7 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
   const viewerFullscreenVolumeValue = document.getElementById('viewer-volume-fullscreen-value');
 
   let nativeHostStartGeneration = 0;
+  let nativeHostRoomGeneration = 0;
 
   const HOST_PREVIEW_SURFACE_ID = 'embedded-host-preview';
 
@@ -310,6 +311,10 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
       getViewerCount: () => nativeRendererState.getViewerCount(),
       setViewerCount: (count) => nativeRendererState.setViewerCount(count),
       getCurrentHostMediaSessionId: () => currentHostMediaSessionId,
+      getCurrentMediaManifest: () => currentMediaManifest,
+      getHostStartGeneration: () => nativeHostStartGeneration,
+      isHostStopping: () => stopScreenShareInFlight,
+      getPublicRoomEnabled: () => Boolean(qualitySettings && qualitySettings.publicRoomEnabled),
       isNativeHostSessionRunning: () => nativeHostSessionRunning,
       isHost: () => isHost,
       logNativeStep: (event, payload, category) => nativeDiagnostics.logNativeStep(event, payload, category),
@@ -322,6 +327,8 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
       isObsIngestHostBackend: () => isObsIngestHostBackend(),
       setHostRoomState: (state) => nativeRendererState.setHostRoomState(state),
       setHostRoomActiveUi: (state) => nativeRendererState.setHostRoomActiveUi(state),
+      setRoomInfoHidden: (hidden) => nativeRendererState.setRoomInfoHidden(hidden),
+      setHostStatus: (text, waiting) => nativeRendererState.setHostStatus(text, waiting),
       setSessionRoomState: (state) => nativeRendererState.setSessionRoomState(state),
       setViewerResumeState: (state) => nativeRendererState.setViewerResumeState(state),
       setIsHost: (value) => nativeRendererState.setIsHost(value),
@@ -461,7 +468,9 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
       },
       setHostStopUiState: (stopping) => nativeRendererState.setHostStopUiState(stopping),
       setNativeHostSessionRunning: (running) => {
+        const wasRunning = nativeHostSessionRunning;
         nativeHostSessionRunning = Boolean(running);
+        if (wasRunning && !nativeHostSessionRunning) cancelNativeRoomRequests('host-stopped');
       },
       setCurrentHostBackend: (backend) => {
         nativeSessionState.setCurrentHostBackend(backend);
@@ -505,21 +514,30 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
         });
       },
       updateHostEncoderDetail: (pipeline, obsIngest) => nativeStatsController.updateHostEncoderDetail(pipeline || null, obsIngest || null),
-      ensureObsHostRoomCreated: (obsIngest) => nativeSessionController.ensureObsHostRoomCreated(obsIngest || null, {
-        clientId,
-        timeoutMs: 5000
-      }).catch((error) => {
-        nativeSessionState.setObsRoomCreatePending(false);
-        showError(error && error.message ? error.message : 'websocket-timeout');
-      }),
-      teardownObsHostRoom: (reason) => nativeSessionController.teardownObsHostRoom({ reason: reason || 'host-room-ended' }).catch((error) => {
-        nativeDiagnostics.logRecoverableNativeWarning('obs-host-room:teardown-failed', error, {
-          key: 'obs-host-room-teardown',
-          category: 'connection',
-          channel: 'nativeSteps',
-          fallbackLabel: '[media-engine] OBS room teardown failed:'
+      ensureObsHostRoomCreated: (obsIngest) => {
+        if (!isHost || !nativeHostSessionRunning || stopScreenShareInFlight || currentRoomId ||
+            nativeSessionState.getObsRoomCreatePending()) return Promise.resolve(null);
+        const requestGeneration = nativeHostRoomGeneration;
+        return nativeSessionController.ensureObsHostRoomCreated(obsIngest || null, {
+          clientId,
+          timeoutMs: 5000
+        }).catch((error) => {
+          if (requestGeneration !== nativeHostRoomGeneration) return;
+          nativeSessionState.setObsRoomCreatePending(false);
+          showError(error && error.message ? error.message : 'websocket-timeout');
         });
-      }),
+      },
+      teardownObsHostRoom: (reason) => {
+        cancelNativeRoomRequests('obs-room-ended');
+        return nativeSessionController.teardownObsHostRoom({ reason: reason || 'host-room-ended' }).catch((error) => {
+          nativeDiagnostics.logRecoverableNativeWarning('obs-host-room:teardown-failed', error, {
+            key: 'obs-host-room-teardown',
+            category: 'connection',
+            channel: 'nativeSteps',
+            fallbackLabel: '[media-engine] OBS room teardown failed:'
+          });
+        });
+      },
       logRecoverableNativeWarning: (scope, error, warningOptions) => nativeDiagnostics.logRecoverableNativeWarning(scope, error, warningOptions),
       stopHostStatsPolling: () => nativeStatsController.stopHostStatsPolling(),
       stopViewerStatsPolling: () => nativeStatsController.stopViewerStatsPolling(),
@@ -539,8 +557,19 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
       attachHostPreviewSurface: () => nativeSurfaceController.attachHostPreviewSurface(),
       shouldRequestHostPreview: (backend) => shouldShowNativeHostPreviewForBackend(backend),
       showError: (message) => showError(message),
-      waitForWsConnected: (timeoutMs) => waitForWsConnected(timeoutMs),
-      sendHostCreateRoom: (message) => roomClient.createRoom(message),
+      waitForWsConnected: async (timeoutMs) => {
+        const requestGeneration = nativeHostRoomGeneration;
+        await waitForWsConnected(timeoutMs);
+        if (requestGeneration !== nativeHostRoomGeneration || stopScreenShareInFlight || !nativeHostSessionRunning) {
+          throw new Error('native-host-room-superseded');
+        }
+      },
+      sendHostCreateRoom: (message) => {
+        if (!nativeHostSessionRunning || stopScreenShareInFlight || !message.mediaManifest ||
+            message.mediaManifest.mediaSessionId !== currentHostMediaSessionId ||
+            message.backend === 'obs-ingest' && !nativeSessionState.getObsIngestStreamActive()) return false;
+        return roomClient.createRoom(message);
+      },
       waitForHostRoomCreated: (request) => waitForHostRoomCreated(request),
       resetShareStartPendingUi: () => {
         if (typeof window.__vdsResetShareStartPendingUi === 'function') {
@@ -650,7 +679,13 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
     await waitForNextPaint();
   }
 
+  function cancelNativeRoomRequests(reason) {
+    nativeHostRoomGeneration += 1;
+    nativeRoomMessages.cancelRoomRecovery(reason);
+  }
+
   function resetHostUiAfterFailedStart() {
+    cancelNativeRoomRequests('host-start-failed');
     nativeHostSessionRunning = false;
     hostWaitingWindowRestore = false;
     nativeSessionState.setObsRoomCreatePending(false);
@@ -666,6 +701,7 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
   }
 
   function markNativeHostSessionStopped() {
+    cancelNativeRoomRequests('host-stopped');
     nativeHostSessionRunning = false;
     hostWaitingWindowRestore = false;
     nativeSessionState.setObsRoomCreatePending(false);
@@ -825,6 +861,7 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
   }
 
   async function stopScreenShare(context = {}) {
+    cancelNativeRoomRequests('host-stopping');
     await nativeSessionController.runStopShare({
       event: context && context.event,
       peerCount: nativePeerController.getPeerHandleCount(),

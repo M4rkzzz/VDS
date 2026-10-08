@@ -478,7 +478,8 @@ class WgcFrameSource::Impl {
 #endif
   }
 
-  bool wait_for_frame_bgra(int timeout_ms, WgcFrameCpuBuffer* frame, std::string* error) {
+  bool wait_for_frame_bgra(int timeout_ms, WgcFrameCpuBuffer* frame, std::string* error,
+      WgcFrameReadbackSampler* sampler) {
 #ifdef _WIN32
     if (!frame) {
       if (error) {
@@ -489,7 +490,7 @@ class WgcFrameSource::Impl {
 
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame latest_frame{ nullptr };
     if (try_get_latest_frame(&latest_frame)) {
-      return copy_frame_to_cpu(latest_frame, frame, error);
+      return copy_frame_to_cpu(latest_frame, frame, error, sampler);
     }
 
     const auto event_state = frame_event_state_;
@@ -513,7 +514,7 @@ class WgcFrameSource::Impl {
       }
 
       if (try_get_latest_frame(&latest_frame)) {
-        return copy_frame_to_cpu(latest_frame, frame, error);
+        return copy_frame_to_cpu(latest_frame, frame, error, sampler);
       }
     }
 
@@ -524,6 +525,7 @@ class WgcFrameSource::Impl {
 #else
     (void)timeout_ms;
     (void)frame;
+    (void)sampler;
     if (error) {
       *error = "wgc-only-available-on-windows";
     }
@@ -607,7 +609,8 @@ class WgcFrameSource::Impl {
   bool copy_frame_to_cpu(
     const winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame& frame,
     WgcFrameCpuBuffer* output,
-    std::string* error
+    std::string* error,
+    WgcFrameReadbackSampler* sampler
   ) {
     const auto content_size = frame.ContentSize();
     if (content_size.Width <= 0 || content_size.Height <= 0) {
@@ -664,6 +667,12 @@ class WgcFrameSource::Impl {
 
     D3D11_TEXTURE2D_DESC desc{};
     texture->GetDesc(&desc);
+    const auto timestamp_100ns = static_cast<std::uint64_t>(frame.SystemRelativeTime().count());
+    if (sampler && !sampler->accept(static_cast<int>(desc.Width), static_cast<int>(desc.Height),
+        static_cast<int>(desc.Width * 4), timestamp_100ns, total_start)) {
+      if (error) *error = "wgc-frame-skipped";
+      return false;
+    }
     if (!staging_texture_ ||
         desc.Width != staging_desc_.Width ||
         desc.Height != staging_desc_.Height ||
@@ -692,7 +701,9 @@ class WgcFrameSource::Impl {
     output->width = static_cast<int>(desc.Width);
     output->height = static_cast<int>(desc.Height);
     output->stride = static_cast<int>(desc.Width * 4);
-    output->timestamp_100ns = static_cast<std::uint64_t>(frame.SystemRelativeTime().count());
+    output->timestamp_100ns = timestamp_100ns;
+    // The caller retains this buffer across frames; resize at equal size does
+    // not allocate or clear pixels that the mapped texture will overwrite.
     output->bgra.resize(static_cast<std::size_t>(output->stride * output->height));
 
     const auto* source_bytes = static_cast<const std::uint8_t*>(mapped.pData);
@@ -750,8 +761,9 @@ WgcFrameSource::~WgcFrameSource() {
   }
 }
 
-bool WgcFrameSource::wait_for_frame_bgra(int timeout_ms, WgcFrameCpuBuffer* frame, std::string* error) {
-  return impl_->wait_for_frame_bgra(timeout_ms, frame, error);
+bool WgcFrameSource::wait_for_frame_bgra(int timeout_ms, WgcFrameCpuBuffer* frame, std::string* error,
+    WgcFrameReadbackSampler* sampler) {
+  return impl_->wait_for_frame_bgra(timeout_ms, frame, error, sampler);
 }
 
 void WgcFrameSource::close() {

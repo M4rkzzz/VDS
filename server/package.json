@@ -1,13 +1,14 @@
 {
   "name": "screenshare-server",
-  "version": "1.7.2",
+  "version": "1.7.3",
   "description": "Screen sharing signaling server",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node ../scripts/test-server-core.js && node ../scripts/test-server-revival.js"
+    "test": "node ../scripts/test-server-core.js && node ../scripts/test-server-revival.js && node ../scripts/test-server-static.js"
   },
   "dependencies": {
+    "compression": "1.8.2",
     "express": "^4.22.3",
     "ws": "^8.22.0"
   }

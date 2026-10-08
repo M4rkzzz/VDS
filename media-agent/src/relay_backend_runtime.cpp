@@ -50,6 +50,7 @@ struct QueuedRelayVideoDispatch {
 
 struct RelayBackendState {
   std::mutex mutex;
+  std::mutex shutdown_mutex;
   std::condition_variable video_cv;
   std::thread video_worker;
   std::map<std::string, std::vector<RelaySubscriberState>> subscribers_by_upstream_peer;
@@ -62,6 +63,7 @@ struct RelayBackendState {
   std::size_t pending_video_bytes = 0;
   bool video_worker_started = false;
   bool video_worker_stop = false;
+  bool closed = false;
 };
 
 struct RelayDispatchTarget {
@@ -85,7 +87,7 @@ std::unique_ptr<Runtime> create_runtime() {
 }
 
 Runtime::~Runtime() {
-  shutdown_dispatch();
+  close();
 }
 
 Runtime::State& relay_backend_state(Runtime& runtime) {
@@ -150,6 +152,7 @@ bool collect_relay_video_bootstrap_access_units(
   if (!out_access_units || upstream_peer_id.empty() || peer_id.empty()) return false;
   auto& state = relay_backend_state(runtime);
   std::lock_guard<std::mutex> lock(state.mutex);
+  if (state.closed) return false;
   if (state.video_generation_by_upstream_peer[upstream_peer_id] != upstream_generation) return false;
   const auto upstream = state.subscribers_by_upstream_peer.find(upstream_peer_id);
   const auto cached = state.video_bootstrap_by_upstream_peer.find(upstream_peer_id);
@@ -209,6 +212,7 @@ std::vector<RelayDispatchTarget> collect_relay_dispatch_targets(
 
   auto& state = relay_backend_state(runtime);
   std::lock_guard<std::mutex> lock(state.mutex);
+  if (state.closed) return targets;
   if (expected_upstream_generation &&
       state.video_generation_by_upstream_peer[upstream_peer_id] != *expected_upstream_generation) return targets;
   auto upstream_it = state.subscribers_by_upstream_peer.find(upstream_peer_id);
@@ -299,16 +303,24 @@ void fanout_relay_video_units_now(
   const std::vector<RelayTimedVideoAccessUnit>& access_units,
   std::uint64_t upstream_generation) {
   if (upstream_peer_id.empty() || access_units.empty()) return;
+  auto inspected_units = access_units;
+  std::vector<RelayVideoBootstrapCache::Inspection> inspections;
+  inspections.reserve(inspected_units.size());
+  for (auto& unit : inspected_units) {
+    inspections.push_back(RelayVideoBootstrapCache::inspect(codec, unit.bytes));
+    unit.timing.keyframe = inspections.back().keyframe;
+    unit.timing.config = !inspections.back().parameter_sets.empty();
+  }
   std::vector<RelayTimedVideoAccessUnit> live_units;
+  live_units.reserve(inspected_units.size());
   {
     auto& state = relay_backend_state(runtime);
     std::lock_guard<std::mutex> lock(state.mutex);
     if (state.video_generation_by_upstream_peer[upstream_peer_id] != upstream_generation) return;
     auto& cache = state.video_bootstrap_by_upstream_peer[upstream_peer_id];
-    for (auto access_unit : access_units) {
-      access_unit.timing.keyframe = vds::media_agent::video_access_unit_has_random_access_nal(codec, access_unit.bytes);
-      access_unit.timing.config = vds::media_agent::video_access_unit_has_decoder_config_nal(codec, access_unit.bytes);
-      const auto observation = cache.observe(codec, access_unit);
+    for (std::size_t index = 0; index < inspected_units.size(); ++index) {
+      auto& access_unit = inspected_units[index];
+      const auto observation = cache.observe(codec, access_unit, inspections[index]);
       if (observation.reset_subscribers) mark_relay_video_recovery_locked(state, upstream_peer_id, observation.sequence_reset);
       if (!observation.duplicate) live_units.push_back(std::move(access_unit));
     }
@@ -316,28 +328,28 @@ void fanout_relay_video_units_now(
   if (live_units.empty()) return;
 
   for (const auto& target : collect_relay_dispatch_targets(runtime, upstream_peer_id, &upstream_generation)) {
-    const PeerTransportSnapshot snapshot = get_peer_transport_snapshot(target.session);
-    const bool use_encoded_data_channel = snapshot.encoded_media_data_channel_requested || snapshot.encoded_media_data_channel_supported;
+    const auto readiness = get_peer_transport_media_readiness(target.session);
+    const bool use_encoded_data_channel = readiness.use_encoded_data_channel;
     std::string waiting_reason;
-    if (!snapshot.remote_description_set || snapshot.connection_state != "connected") waiting_reason = "relay-waiting-for-peer-connected";
-    else if (use_encoded_data_channel && !snapshot.encoded_media_data_channel_ready) waiting_reason = "relay-waiting-for-datachannel-encoded-ready";
-    else if (!use_encoded_data_channel && !snapshot.video_track_open) waiting_reason = "relay-waiting-for-video-track-open";
+    if (!readiness.connected) waiting_reason = "relay-waiting-for-peer-connected";
+    else if (!readiness.video_ready) waiting_reason = use_encoded_data_channel
+      ? "relay-waiting-for-datachannel-encoded-ready" : "relay-waiting-for-video-track-open";
     if (!waiting_reason.empty()) {
       update_relay_subscriber_runtime(runtime, upstream_peer_id, target.peer_id, waiting_reason, "", 0, 0, 0, nullptr, true);
       continue;
     }
 
-    std::vector<RelayTimedVideoAccessUnit> units_to_send;
+    std::vector<RelayTimedVideoAccessUnit> bootstrap_units;
     const bool using_bootstrap = collect_relay_video_bootstrap_access_units(
-      runtime, upstream_peer_id, target.peer_id, &units_to_send, upstream_generation, target.video_recovery_generation);
+      runtime, upstream_peer_id, target.peer_id, &bootstrap_units, upstream_generation, target.video_recovery_generation);
     if (!using_bootstrap) {
       RelaySubscriberState subscriber;
       if (!runtime.query_subscriber_state(target.peer_id, &subscriber) || subscriber.pending_video_bootstrap) {
         update_relay_subscriber_runtime(runtime, upstream_peer_id, target.peer_id, "relay-waiting-for-random-access", "", 0);
         continue;
       }
-      units_to_send = live_units;
     }
+    const auto& units_to_send = using_bootstrap ? bootstrap_units : live_units;
 
     std::string send_error;
     unsigned long long sent_frames = 0;
@@ -391,14 +403,14 @@ void fanout_relay_video_units_now(
       sent_frames ? &last_sent_timing : nullptr, send_failed, &target.video_recovery_generation);
   }
 }
-void ensure_relay_video_dispatch_worker_running(vds::media_agent::relay_backend::Runtime& runtime) {
+bool ensure_relay_video_dispatch_worker_running(vds::media_agent::relay_backend::Runtime& runtime) {
   auto& state = relay_backend_state(runtime);
   std::lock_guard<std::mutex> lock(state.mutex);
+  if (state.closed || state.video_worker_stop) return false;
   if (state.video_worker_started) {
-    return;
+    return true;
   }
 
-  state.video_worker_started = true;
   state.video_worker_stop = false;
   auto* worker_runtime = &runtime;
   state.video_worker = std::thread([worker_runtime]() {
@@ -427,6 +439,8 @@ void ensure_relay_video_dispatch_worker_running(vds::media_agent::relay_backend:
       );
     }
   });
+  state.video_worker_started = true;
+  return true;
 }
 
 } // namespace
@@ -434,9 +448,10 @@ void ensure_relay_video_dispatch_worker_running(vds::media_agent::relay_backend:
 namespace vds::media_agent::relay_backend {
 
 void Runtime::shutdown_dispatch() {
+  auto& state = relay_backend_state(*this);
+  std::lock_guard<std::mutex> shutdown_lock(state.shutdown_mutex);
   std::thread worker;
   {
-    auto& state = relay_backend_state(*this);
     std::lock_guard<std::mutex> lock(state.mutex);
     state.video_worker_stop = true;
     state.pending_video_dispatches.clear();
@@ -445,16 +460,31 @@ void Runtime::shutdown_dispatch() {
       worker = std::move(state.video_worker);
     }
   }
-  relay_backend_state(*this).video_cv.notify_all();
+  state.video_cv.notify_all();
   if (worker.joinable()) {
     worker.join();
   }
   {
-    auto& state = relay_backend_state(*this);
     std::lock_guard<std::mutex> lock(state.mutex);
     state.video_worker_started = false;
-    state.video_worker_stop = false;
+    state.video_worker_stop = state.closed;
   }
+}
+
+void Runtime::close() {
+  auto& state = relay_backend_state(*this);
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.closed = true;
+  }
+  shutdown_dispatch();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.subscribers_by_upstream_peer.clear();
+  state.video_bootstrap_by_upstream_peer.clear();
+  state.video_clock_by_upstream_peer.clear();
+  state.audio_clock_by_upstream_peer.clear();
+  state.video_generation_by_upstream_peer.clear();
+  state.source_epoch_by_upstream_peer.clear();
 }
 
 void Runtime::register_subscriber(
@@ -468,6 +498,7 @@ void Runtime::register_subscriber(
 
   auto& state = relay_backend_state(*this);
   std::lock_guard<std::mutex> lock(state.mutex);
+  if (state.closed) return;
   auto& subscribers = state.subscribers_by_upstream_peer[upstream_peer_id];
   for (auto& subscriber : subscribers) {
     if (subscriber.peer_id == peer_id) {
@@ -600,11 +631,12 @@ void Runtime::fanout_video_units(
     return;
   }
 
-  ensure_relay_video_dispatch_worker_running(*this);
+  if (!ensure_relay_video_dispatch_worker_running(*this)) return;
 
   auto& state = relay_backend_state(*this);
   {
     std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.closed || state.video_worker_stop || !state.video_worker_started) return;
     prepare_relay_source_origin_locked(state, upstream_peer_id, timing.source_epoch);
     QueuedRelayVideoDispatch task;
     task.upstream_peer_id = upstream_peer_id;
@@ -671,6 +703,7 @@ void Runtime::fanout_audio_frame(
   {
     auto& state = relay_backend_state(*this);
     std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.closed) return;
     prepare_relay_source_origin_locked(state, upstream_peer_id, timing.source_epoch);
     upstream_generation = state.video_generation_by_upstream_peer[upstream_peer_id];
     auto& clock = state.audio_clock_by_upstream_peer[upstream_peer_id];
@@ -698,8 +731,8 @@ void Runtime::fanout_audio_frame(
       continue;
     }
 
-    const PeerTransportSnapshot snapshot = get_peer_transport_snapshot(target.session);
-    if (!snapshot.remote_description_set || snapshot.connection_state != "connected") {
+    const auto readiness = get_peer_transport_media_readiness(target.session);
+    if (!readiness.connected) {
       update_relay_subscriber_runtime(
         *this,
         upstream_peer_id,
@@ -710,10 +743,8 @@ void Runtime::fanout_audio_frame(
       );
       continue;
     }
-    const bool use_encoded_data_channel =
-      snapshot.encoded_media_data_channel_requested ||
-      snapshot.encoded_media_data_channel_supported;
-    if (use_encoded_data_channel && !snapshot.encoded_media_data_channel_ready) {
+    const bool use_encoded_data_channel = readiness.use_encoded_data_channel;
+    if (use_encoded_data_channel && !readiness.audio_ready) {
       update_relay_subscriber_runtime(
         *this,
         upstream_peer_id,
@@ -724,7 +755,7 @@ void Runtime::fanout_audio_frame(
       );
       continue;
     }
-    if (!use_encoded_data_channel && !snapshot.audio_track_open) {
+    if (!use_encoded_data_channel && !readiness.audio_ready) {
       update_relay_subscriber_runtime(
         *this,
         upstream_peer_id,

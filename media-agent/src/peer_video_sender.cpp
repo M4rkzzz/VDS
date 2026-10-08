@@ -31,13 +31,13 @@
 #include "video_bootstrap_helpers.h"
 #include "peer_video_sender_state.h"
 #include "win32_placeholder_frame.h"
+#include "win32_owned_process.h"
 #include "wgc_capture.h"
 
 namespace {
 
 using vds::media_agent::current_time_micros_steady;
 using vds::media_agent::current_time_millis;
-using vds::media_agent::extract_annexb_video_access_units;
 using vds::media_agent::normalize_video_codec;
 using vds::media_agent::sleep_until_steady_us;
 using vds::media_agent::video_access_unit_has_decoder_config_nal;
@@ -132,6 +132,10 @@ bool video_access_unit_has_picture(const std::string& codec, const std::vector<s
 
 #ifdef _WIN32
 void close_peer_video_sender_handles(PeerVideoSenderRuntime& runtime) {
+  if (runtime.process_job_handle) {
+    CloseHandle(runtime.process_job_handle);
+    runtime.process_job_handle = nullptr;
+  }
   if (runtime.thread_handle) {
     CloseHandle(runtime.thread_handle);
     runtime.thread_handle = nullptr;
@@ -255,13 +259,6 @@ bool start_peer_video_sender(
     return false;
   }
 
-  STARTUPINFOW startup_info{};
-  startup_info.cb = sizeof(startup_info);
-  startup_info.dwFlags = STARTF_USESTDHANDLES;
-  startup_info.hStdInput = stdin_read ? stdin_read : nul_handle;
-  startup_info.hStdOutput = stdout_write;
-  startup_info.hStdError = nul_handle;
-
   PROCESS_INFORMATION process_info{};
   std::wstring command_line_wide = utf8_to_wide(command_line);
   if (command_line_wide.empty()) {
@@ -283,18 +280,11 @@ bool start_peer_video_sender(
   std::vector<wchar_t> mutable_command(command_line_wide.begin(), command_line_wide.end());
   mutable_command.push_back(L'\0');
 
-  const BOOL created = CreateProcessW(
-    nullptr,
-    mutable_command.data(),
-    nullptr,
-    nullptr,
-    TRUE,
-    CREATE_NO_WINDOW,
-    nullptr,
-    nullptr,
-    &startup_info,
-    &process_info
-  );
+  HANDLE process_job = nullptr;
+  DWORD launch_error = ERROR_SUCCESS;
+  const bool created = vds::media_agent::create_owned_child_process(nullptr,
+      mutable_command.data(), stdin_read ? stdin_read : nul_handle, stdout_write,
+      nul_handle, process_info, process_job, launch_error);
 
   CloseHandle(nul_handle);
   if (stdin_read) {
@@ -308,12 +298,13 @@ bool start_peer_video_sender(
     }
     CloseHandle(stdout_read);
     if (error) {
-      *error = format_windows_error(GetLastError());
+      *error = format_windows_error(launch_error);
     }
     return false;
   }
 
   runtime->running = true;
+  runtime->process_job_handle = process_job;
   runtime->process_handle = process_info.hProcess;
   runtime->thread_handle = process_info.hThread;
   runtime->stdin_write_handle = stdin_write;
@@ -440,11 +431,9 @@ bool start_peer_video_sender(
         }
         return placeholder_frame;
       };
-      const std::uint64_t min_frame_interval_100ns =
-        std::max<std::uint64_t>(1, runtime->frame_interval_us) * 10;
-      std::uint64_t next_source_timestamp_100ns = 0;
-      auto next_source_time = std::chrono::steady_clock::time_point {};
-      const auto source_frame_interval = std::chrono::microseconds(runtime->frame_interval_us);
+      WgcFrameReadbackSampler readback_sampler(runtime->frame_interval_us, source_frame_width, source_frame_height);
+      WgcFrameCpuBuffer frame;
+      std::string frame_error;
 
       if (use_window_restore_placeholder) {
 #ifdef _WIN32
@@ -535,18 +524,16 @@ bool start_peer_video_sender(
             break;
           }
           next_placeholder_deadline_us = -1;
-          next_source_timestamp_100ns = 0;
-          next_source_time = std::chrono::steady_clock::time_point {};
+          readback_sampler.reset();
           placeholder_mode_active = false;
         }
 
-        WgcFrameCpuBuffer frame;
-        std::string frame_error;
-        if (!wgc_source->wait_for_frame_bgra(250, &frame, &frame_error)) {
+        if (!wgc_source->wait_for_frame_bgra(250, &frame, &frame_error, &readback_sampler)) {
           if (runtime->stop_requested.load()) {
             break;
           }
-          if (frame_error == "wgc-frame-timeout" || frame_error == "wgc-frame-pool-recreated") {
+          if (frame_error == "wgc-frame-timeout" || frame_error == "wgc-frame-pool-recreated" ||
+              frame_error == "wgc-frame-skipped") {
             continue;
           }
           update_runtime_state("peer-video-source-frame-failed", frame_error, false);
@@ -580,29 +567,6 @@ bool start_peer_video_sender(
           runtime->source_map_us_total += frame.map_us;
           runtime->source_memcpy_us_total += frame.memcpy_us;
           runtime->source_total_readback_us_total += frame.total_readback_us;
-        }
-
-        if (frame.timestamp_100ns > 0) {
-          if (next_source_timestamp_100ns == 0) {
-            next_source_timestamp_100ns = frame.timestamp_100ns;
-          }
-          if (frame.timestamp_100ns < next_source_timestamp_100ns) {
-            continue;
-          }
-          do {
-            next_source_timestamp_100ns += min_frame_interval_100ns;
-          } while (next_source_timestamp_100ns <= frame.timestamp_100ns);
-        } else {
-          const auto now = std::chrono::steady_clock::now();
-          if (next_source_time == std::chrono::steady_clock::time_point {}) {
-            next_source_time = now;
-          }
-          if (now < next_source_time) {
-            continue;
-          }
-          do {
-            next_source_time += source_frame_interval;
-          } while (next_source_time <= now);
         }
 
         if (!write_bgra_frame(frame.bgra, vds::media_agent::host_media_system_relative_timestamp_us(
@@ -658,8 +622,7 @@ bool start_peer_video_sender(
         CloseHandle(handle_to_close);
       }
       if (runtime->process_handle) {
-        TerminateProcess(runtime->process_handle, 0);
-        WaitForSingleObject(runtime->process_handle, 2000);
+        vds::media_agent::terminate_owned_process_tree(runtime->process_job_handle, runtime->process_handle);
       }
       if (runtime->source_thread.joinable()) {
         runtime->source_thread.join();
@@ -677,6 +640,7 @@ bool start_peer_video_sender(
   runtime->pump_thread = std::thread([runtime, transport_session]() {
     std::vector<std::uint8_t> read_buffer(64 * 1024);
     const std::string codec_path = normalize_video_codec(runtime->codec_path);
+    vds::media_agent::AnnexBVideoAccessUnitParser access_unit_parser;
 
     const auto process_video_access_unit = [&](const std::vector<std::uint8_t>& access_unit) {
       const bool has_picture = video_access_unit_has_picture(codec_path, access_unit);
@@ -727,13 +691,12 @@ bool start_peer_video_sender(
         }
       }
 
-      const auto snapshot = get_peer_transport_snapshot(transport_session);
-      const bool use_data_channel = snapshot.encoded_media_data_channel_requested || snapshot.encoded_media_data_channel_supported;
-      const bool media_ready = use_data_channel ? snapshot.encoded_media_data_channel_ready : snapshot.video_track_open;
-      if (!snapshot.remote_description_set || snapshot.connection_state != "connected" || !media_ready) {
+      const auto readiness = get_peer_transport_media_readiness(transport_session);
+      const bool use_data_channel = readiness.use_encoded_data_channel;
+      if (!readiness.video_ready) {
         std::lock_guard<std::mutex> lock(runtime->mutex);
         runtime->pending_video_bootstrap = true;
-        runtime->reason = !snapshot.remote_description_set || snapshot.connection_state != "connected"
+        runtime->reason = !readiness.connected
           ? "peer-video-sender-waiting-for-peer-connected"
           : (use_data_channel ? "peer-video-sender-waiting-for-datachannel-ready" : "peer-video-sender-waiting-for-video-track-open");
         return;
@@ -798,23 +761,13 @@ bool start_peer_video_sender(
       if (!ok || bytes_read == 0) {
         break;
       }
-      std::vector<std::vector<std::uint8_t>> access_units;
-      {
-        std::lock_guard<std::mutex> lock(runtime->mutex);
-        runtime->pending_video_annexb_bytes.insert(runtime->pending_video_annexb_bytes.end(),
-          read_buffer.begin(), read_buffer.begin() + static_cast<std::ptrdiff_t>(bytes_read));
-        access_units = extract_annexb_video_access_units(codec_path, runtime->pending_video_annexb_bytes, false);
-      }
+      auto access_units = access_unit_parser.push(codec_path, read_buffer.data(), bytes_read);
       for (const auto& access_unit : access_units) {
         process_video_access_unit(access_unit);
       }
     }
 
-    std::vector<std::vector<std::uint8_t>> remaining_access_units;
-    {
-      std::lock_guard<std::mutex> lock(runtime->mutex);
-      remaining_access_units = extract_annexb_video_access_units(codec_path, runtime->pending_video_annexb_bytes, true);
-    }
+    auto remaining_access_units = access_unit_parser.push(codec_path, nullptr, 0, true);
     if (!runtime->stop_requested.load()) {
       for (const auto& access_unit : remaining_access_units) {
         process_video_access_unit(access_unit);
@@ -942,8 +895,7 @@ bool stop_peer_video_sender(PeerState& peer, const std::string& reason, std::str
 
 #ifdef _WIN32
   if (runtime->process_handle) {
-    TerminateProcess(runtime->process_handle, 0);
-    WaitForSingleObject(runtime->process_handle, 2000);
+    vds::media_agent::terminate_owned_process_tree(runtime->process_job_handle, runtime->process_handle);
   }
 #endif
 

@@ -2,6 +2,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { verifyReleaseDirectory } = require('./update-signature');
 
 const projectRoot = path.resolve(__dirname, '..');
 
@@ -142,24 +143,27 @@ function writeNotesFile(version) {
   return notesPath;
 }
 
-function publishRelease(version) {
+async function publishRelease(version) {
   const tagName = process.env.GITHUB_RELEASE_TAG || `v${version}`;
   const releaseTitle = process.env.GITHUB_RELEASE_TITLE || `VDS ${version}`;
   const distDir = path.join(projectRoot, 'dist');
   const installer = path.join(distDir, `VDS-Setup-${version}.exe`);
   const blockmap = `${installer}.blockmap`;
   const latest = path.join(distDir, 'latest.yml');
+  const signature = path.join(distDir, 'latest.yml.sig');
 
   ensureFile(installer);
   ensureFile(blockmap);
   ensureFile(latest);
+  ensureFile(signature);
+  await verifyReleaseDirectory(distDir, { version });
   ensureGitHubCliReady();
   ensureCleanWorktreeUnlessAllowed();
   ensureTag(version, tagName);
   ensureTagPushed(tagName);
 
   const notesPath = writeNotesFile(version);
-  const assets = [installer, blockmap, latest];
+  const assets = [installer, blockmap, latest, signature];
 
   if (releaseExists(tagName)) {
     if (process.env.GITHUB_RELEASE_REPLACE !== '1') {
@@ -180,4 +184,7 @@ function publishRelease(version) {
   console.log(`\nPublished GitHub release ${tagName}.`);
 }
 
-publishRelease(readPackageVersion());
+publishRelease(readPackageVersion()).catch((error) => {
+  console.error(`GitHub release failed: ${error.message}`);
+  process.exitCode = 1;
+});

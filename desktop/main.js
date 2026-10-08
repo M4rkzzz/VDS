@@ -4,6 +4,11 @@ const dgram = require('dgram');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { pathToFileURL } = require('node:url');
+const { createIpcBoundary } = require('./ipc-boundary');
+const { getUpdateFeedBaseUrl: resolveUpdateFeedBaseUrl } = require('./update-source');
+const { createSignedUpdateFeedOptions, verifyDownloadedUpdate } = require('./update-integrity');
+const { SessionLogWriter } = require('./session-log-writer');
 const { MediaAgentManager } = require('./media-agent-manager');
 const { HostVideoRefreshWakeup } = require('./host-video-refresh-wakeup');
 const { StunServerSelector, getStunServerPool } = require('./stun-server-selector');
@@ -11,7 +16,6 @@ const { buildPcpMapRequest, parsePcpMapResponse } = require('./pcp-packet');
 const crypto = require('node:crypto');
 const nativeStunSelector = new StunServerSelector();
 
-const SERVER_URL = normalizeBaseUrl(process.env.SERVER_URL || 'https://boshan.s.3q.hair');
 const DISCONNECT_GRACE_MS = Number(process.env.DISCONNECT_GRACE_MS || 30000);
 const PREFERRED_AUDIO_BACKEND = String(process.env.VDS_PREFERRED_AUDIO_BACKEND || '').trim().toLowerCase();
 const ENABLE_NATIVE_HOST_SESSION_BRIDGE = process.env.VDS_ENABLE_NATIVE_HOST_SESSION_BRIDGE !== '0';
@@ -31,9 +35,11 @@ const DEBUG_CHANNELS = ['renderer', 'nativeEvents', 'nativeSteps', 'periodicStat
 let mainWindow = null;
 let tray = null;
 let updateLogFilePath = null;
+let updateLogWriter = null;
 const updateLogSessionStamp = createUpdateLogSessionStamp();
 const updateLogEntries = [];
 const UPDATE_LOG_ENTRY_LIMIT = 200;
+const UPDATE_LOG_MESSAGE_LIMIT = 64 * 1024;
 let win32WindowCaptureApi = undefined;
 let mediaAgentManager = null;
 let autoUpdater = null;
@@ -46,6 +52,14 @@ let quitFinalizeTimer = null;
 let updateInstallInProgress = false;
 let updateCheckInProgressPromise = null;
 let updateDownloadInProgress = false;
+let verifiedUpdate = null;
+let updateVerificationGeneration = 0;
+const rendererEntryPath = path.resolve(__dirname, '../server/public/index.html');
+const ipcBoundary = createIpcBoundary({
+  getWindow: () => mainWindow,
+  entryUrl: pathToFileURL(rendererEntryPath).href,
+  onRejected: (error, channel) => writeUpdateLog('warn', `[ipc] ${channel}: ${error.message}`)
+});
 let audioCapture = undefined;
 const hostVideoRefreshWakeup = new HostVideoRefreshWakeup({
   isRunning: isHostVideoRefreshAgentRunning,
@@ -170,8 +184,8 @@ if (process.env.HW_ACCEL === 'false') {
   app.commandLine.appendSwitch('disable-software-rasterizer');
 }
 
-ipcMain.handle('get-app-version', () => app.getVersion());
-ipcMain.handle('clipboard-write-text', (_event, text) => {
+ipcBoundary.handle(ipcMain, 'get-app-version', () => app.getVersion());
+ipcBoundary.handle(ipcMain, 'clipboard-write-text', (_event, text) => {
   const value = String(text || '');
   if (!value) {
     throw new Error('clipboard-text-empty');
@@ -179,12 +193,12 @@ ipcMain.handle('clipboard-write-text', (_event, text) => {
   clipboard.writeText(value);
   return { ok: true };
 });
-ipcMain.handle('get-update-log-snapshot', () => ({
+ipcBoundary.handle(ipcMain, 'get-update-log-snapshot', () => ({
   path: getUpdateLogFilePath(),
   entries: updateLogEntries.slice()
 }));
-ipcMain.handle('media-engine-start', async () => getMediaAgentManager().start());
-ipcMain.handle('media-engine-list-capture-targets', async () => {
+ipcBoundary.handle(ipcMain, 'media-engine-start', async () => getMediaAgentManager().start());
+ipcBoundary.handle(ipcMain, 'media-engine-list-capture-targets', async () => {
   try {
     return await withTimeout(
       listCaptureTargets(),
@@ -196,7 +210,7 @@ ipcMain.handle('media-engine-list-capture-targets', async () => {
     throw error;
   }
 });
-ipcMain.handle('media-engine-get-capture-target-thumbnail', async (_event, options) => {
+ipcBoundary.handle(ipcMain, 'media-engine-get-capture-target-thumbnail', async (_event, options) => {
   try {
     return await withTimeout(
       getCaptureTargetThumbnail(options || {}),
@@ -208,35 +222,35 @@ ipcMain.handle('media-engine-get-capture-target-thumbnail', async (_event, optio
     throw error;
   }
 });
-ipcMain.handle('media-engine-audio-is-platform-supported', () => invokeAudioCaptureOperation('isPlatformSupported'));
-ipcMain.handle('media-engine-audio-check-permission', () => invokeAudioCaptureOperation('checkPermission'));
-ipcMain.handle('media-engine-audio-get-process-list', () => invokeAudioCaptureOperation('getProcessList'));
-ipcMain.handle('media-engine-start-host-session', async (_event, options) => invokeMediaEngineHostSessionBridge('startHostSession', options || {}));
-ipcMain.handle('media-engine-stop-host-session', async (_event, options) => invokeMediaEngineHostSessionBridge('stopHostSession', options || {}));
-ipcMain.handle('media-engine-prepare-obs-ingest', async (_event, options) => invokeMediaEngine('prepareObsIngest', options || {}));
-ipcMain.handle('media-engine-start-audio-session', async (_event, options) => invokeMediaEngine('startAudioSession', options || {}));
-ipcMain.handle('media-engine-stop-audio-session', async (_event, options) => invokeMediaEngine('stopAudioSession', options || {}));
-ipcMain.handle('media-engine-create-peer', async (_event, options) => {
+ipcBoundary.handle(ipcMain, 'media-engine-audio-is-platform-supported', () => invokeAudioCaptureOperation('isPlatformSupported'));
+ipcBoundary.handle(ipcMain, 'media-engine-audio-check-permission', () => invokeAudioCaptureOperation('checkPermission'));
+ipcBoundary.handle(ipcMain, 'media-engine-audio-get-process-list', () => invokeAudioCaptureOperation('getProcessList'));
+ipcBoundary.handle(ipcMain, 'media-engine-start-host-session', async (_event, options) => invokeMediaEngineHostSessionBridge('startHostSession', options || {}));
+ipcBoundary.handle(ipcMain, 'media-engine-stop-host-session', async (_event, options) => invokeMediaEngineHostSessionBridge('stopHostSession', options || {}));
+ipcBoundary.handle(ipcMain, 'media-engine-prepare-obs-ingest', async (_event, options) => invokeMediaEngine('prepareObsIngest', options || {}));
+ipcBoundary.handle(ipcMain, 'media-engine-start-audio-session', async (_event, options) => invokeMediaEngine('startAudioSession', options || {}));
+ipcBoundary.handle(ipcMain, 'media-engine-stop-audio-session', async (_event, options) => invokeMediaEngine('stopAudioSession', options || {}));
+ipcBoundary.handle(ipcMain, 'media-engine-create-peer', async (_event, options) => {
   const { iceServers, ...peerOptions } = options || {};
   const selection = await nativeStunSelector.select(iceServers);
   const stunServers = [selection.url, ...getStunServerPool(iceServers).filter((url) => url !== selection.url)].slice(0, 4);
   logMainProcessDebug('p2p', '[p2p-stun] selected:', selection.url, 'reachable:', selection.reachable);
   return invokeMediaEngine('createPeer', { ...peerOptions, stunServer: selection.url, stunServers });
 });
-ipcMain.handle('media-engine-close-peer', async (_event, options) => invokeMediaEngine('closePeer', options || {}));
-ipcMain.handle('media-engine-set-remote-description', async (_event, options) => invokeMediaEngine('setRemoteDescription', options || {}));
-ipcMain.handle('media-engine-add-remote-ice-candidate', async (_event, options) => invokeMediaEngine('addRemoteIceCandidate', options || {}));
-ipcMain.handle('media-engine-attach-peer-media-source', async (_event, options) => invokeMediaEngine('attachPeerMediaSource', options || {}));
-ipcMain.handle('media-engine-detach-peer-media-source', async (_event, options) => invokeMediaEngine('detachPeerMediaSource', options || {}));
-ipcMain.handle('media-engine-attach-surface', async (_event, options) => invokeMediaEngine('attachSurface', enrichEmbeddedSurfaceOptions(options || {})));
-ipcMain.handle('media-engine-update-surface', async (_event, options) => invokeMediaEngine('updateSurface', enrichEmbeddedSurfaceOptions(options || {})));
-ipcMain.handle('media-engine-detach-surface', async (_event, options) => invokeMediaEngine('detachSurface', options || {}));
-ipcMain.handle('media-engine-set-viewer-audio-delay', async (_event, options) => invokeMediaEngine('setViewerAudioDelay', options || {}));
-ipcMain.handle('media-engine-set-viewer-volume', async (_event, volume) => invokeMediaEngine('setViewerVolume', {
+ipcBoundary.handle(ipcMain, 'media-engine-close-peer', async (_event, options) => invokeMediaEngine('closePeer', options || {}));
+ipcBoundary.handle(ipcMain, 'media-engine-set-remote-description', async (_event, options) => invokeMediaEngine('setRemoteDescription', options || {}));
+ipcBoundary.handle(ipcMain, 'media-engine-add-remote-ice-candidate', async (_event, options) => invokeMediaEngine('addRemoteIceCandidate', options || {}));
+ipcBoundary.handle(ipcMain, 'media-engine-attach-peer-media-source', async (_event, options) => invokeMediaEngine('attachPeerMediaSource', options || {}));
+ipcBoundary.handle(ipcMain, 'media-engine-detach-peer-media-source', async (_event, options) => invokeMediaEngine('detachPeerMediaSource', options || {}));
+ipcBoundary.handle(ipcMain, 'media-engine-attach-surface', async (_event, options) => invokeMediaEngine('attachSurface', enrichEmbeddedSurfaceOptions(options || {})));
+ipcBoundary.handle(ipcMain, 'media-engine-update-surface', async (_event, options) => invokeMediaEngine('updateSurface', enrichEmbeddedSurfaceOptions(options || {})));
+ipcBoundary.handle(ipcMain, 'media-engine-detach-surface', async (_event, options) => invokeMediaEngine('detachSurface', options || {}));
+ipcBoundary.handle(ipcMain, 'media-engine-set-viewer-audio-delay', async (_event, options) => invokeMediaEngine('setViewerAudioDelay', options || {}));
+ipcBoundary.handle(ipcMain, 'media-engine-set-viewer-volume', async (_event, volume) => invokeMediaEngine('setViewerVolume', {
   pid: getRendererProcessId(),
   volume
 }));
-ipcMain.handle('media-engine-get-viewer-volume', async () => {
+ipcBoundary.handle(ipcMain, 'media-engine-get-viewer-volume', async () => {
   try {
     return await invokeMediaEngine('getViewerVolume', {
       pid: getRendererProcessId()
@@ -251,35 +265,35 @@ ipcMain.handle('media-engine-get-viewer-volume', async () => {
     throw error;
   }
 });
-ipcMain.handle('media-engine-get-capabilities', async () => invokeMediaEngine('getCapabilities'));
-ipcMain.handle('media-engine-get-stats', async (_event, options) => invokeMediaEngine('getStats', options || {}));
-ipcMain.handle('p2p-open-nat-mapping', async (_event, options) => openP2PNatMappings(options || {}));
-ipcMain.handle('window-is-maximized', () => Boolean(mainWindow && mainWindow.isMaximized()));
-ipcMain.handle('window-get-bounds', () => {
+ipcBoundary.handle(ipcMain, 'media-engine-get-capabilities', async () => invokeMediaEngine('getCapabilities'));
+ipcBoundary.handle(ipcMain, 'media-engine-get-stats', async (_event, options) => invokeMediaEngine('getStats', options || {}));
+ipcBoundary.handle(ipcMain, 'p2p-open-nat-mapping', async (_event, options) => openP2PNatMappings(options || {}));
+ipcBoundary.handle(ipcMain, 'window-is-maximized', () => Boolean(mainWindow && mainWindow.isMaximized()));
+ipcBoundary.handle(ipcMain, 'window-get-bounds', () => {
   if (!mainWindow) {
     return null;
   }
   return getRendererWindowBounds();
 });
-ipcMain.handle('window-get-cursor-screen-point', () => {
+ipcBoundary.handle(ipcMain, 'window-get-cursor-screen-point', () => {
   const point = screen.getCursorScreenPoint();
   return {
     x: Number(point && point.x) || 0,
     y: Number(point && point.y) || 0
   };
 });
-ipcMain.handle('window-set-fullscreen', (_event, enabled) => {
+ipcBoundary.handle(ipcMain, 'window-set-fullscreen', (_event, enabled) => {
   return applyWindowFullscreenState(enabled);
 });
-ipcMain.handle('window-is-fullscreen', () => isWindowFullscreenActive());
+ipcBoundary.handle(ipcMain, 'window-is-fullscreen', () => isWindowFullscreenActive());
 
-ipcMain.on('window-minimize', () => {
+ipcBoundary.on(ipcMain, 'window-minimize', () => {
   if (isMainWindowUsable() && !quitInProgress) {
     mainWindow.minimize();
   }
 });
 
-ipcMain.on('window-minimize-to-tray', () => {
+ipcBoundary.on(ipcMain, 'window-minimize-to-tray', () => {
   if (!isMainWindowUsable() || quitInProgress) {
     return;
   }
@@ -290,7 +304,7 @@ ipcMain.on('window-minimize-to-tray', () => {
   }
 });
 
-ipcMain.on('window-maximize', () => {
+ipcBoundary.on(ipcMain, 'window-maximize', () => {
   if (!isMainWindowUsable() || quitInProgress) {
     return;
   }
@@ -302,18 +316,18 @@ ipcMain.on('window-maximize', () => {
   }
 });
 
-ipcMain.on('window-close', () => {
+ipcBoundary.on(ipcMain, 'window-close', () => {
   if (quitInProgress) {
     return;
   }
   requestAppQuit();
 });
 
-ipcMain.on('renderer-debug-config-changed', (_event, config) => {
+ipcBoundary.on(ipcMain, 'renderer-debug-config-changed', (_event, config) => {
   rendererDebugConfig = normalizeRendererDebugConfig(config, false);
 });
 
-ipcMain.handle('check-for-updates', async () => {
+ipcBoundary.handle(ipcMain, 'check-for-updates', async () => {
   if (!app.isPackaged) {
     writeUpdateLog('info', 'Skip update check in dev mode because app.isPackaged is false.');
     return { devMode: true };
@@ -328,11 +342,7 @@ ipcMain.handle('check-for-updates', async () => {
     try {
       const updater = getAutoUpdater();
       writeUpdateLog('info', `Starting update check. version=${app.getVersion()} feed=${getUpdateFeedBaseUrl()}`);
-      updater.setFeedURL({
-        provider: 'generic',
-        url: getUpdateFeedBaseUrl(),
-        useMultipleRangeRequest: false
-      });
+      updater.setFeedURL(createSignedUpdateFeedOptions(getUpdateFeedBaseUrl()));
       writeUpdateLog('info', `Feed URL configured: ${getUpdateManifestUrl()} (multi-range disabled)`);
       return await updater.checkForUpdates();
     } catch (error) {
@@ -347,7 +357,7 @@ ipcMain.handle('check-for-updates', async () => {
   return updateCheckInProgressPromise;
 });
 
-ipcMain.handle('download-update', async () => {
+ipcBoundary.handle(ipcMain, 'download-update', async () => {
   if (!app.isPackaged) {
     writeUpdateLog('info', 'Skip update download in dev mode because app.isPackaged is false.');
     return false;
@@ -358,6 +368,7 @@ ipcMain.handle('download-update', async () => {
     return true;
   }
   updateDownloadInProgress = true;
+  verifiedUpdate = null;
 
   try {
     const updater = getAutoUpdater();
@@ -372,20 +383,32 @@ ipcMain.handle('download-update', async () => {
   }
 });
 
-ipcMain.handle('quit-and-install', () => {
+ipcBoundary.handle(ipcMain, 'quit-and-install', async () => {
   if (updateInstallInProgress) {
     writeUpdateLog('info', 'Ignoring duplicate quitAndInstall request.');
     return false;
   }
-  updateInstallInProgress = true;
-  if (app.isPackaged) {
-    const updater = getAutoUpdater();
-    writeUpdateLog('info', 'quitAndInstall requested by renderer. mode=silent');
-    updater.quitAndInstall(true, true);
-    return true;
+  if (!app.isPackaged) {
+    writeUpdateLog('info', 'Skip quitAndInstall in dev mode because app.isPackaged is false.');
+    return false;
   }
-  writeUpdateLog('info', 'Skip quitAndInstall in dev mode because app.isPackaged is false.');
-  return false;
+  updateInstallInProgress = true;
+  const generation = updateVerificationGeneration;
+  try {
+    if (!verifiedUpdate) throw new Error('update-not-verified');
+    const update = verifiedUpdate;
+    await verifyDownloadedUpdate(update.filePath, update.info);
+    if (generation !== updateVerificationGeneration) return false;
+    if (verifiedUpdate !== update) throw new Error('update-changed-before-install');
+    const updater = getAutoUpdater();
+    writeUpdateLog('info', 'quitAndInstall requested by renderer after signature and package verification. mode=silent');
+    updater.quitAndInstall(true, true);
+    // The updater can synchronously report a failed installation through its error event.
+    return updateInstallInProgress;
+  } catch (error) {
+    if (generation === updateVerificationGeneration) reportUpdateError(error);
+    return false;
+  }
 });
 
 function isAllowedExternalUrl(value) {
@@ -408,6 +431,7 @@ function createWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       webSecurity: true,
+      additionalArguments: [`--vds-update-feed=${getUpdateFeedBaseUrl()}`],
       preload: path.join(__dirname, 'preload.js')
     }
   });
@@ -453,7 +477,7 @@ function createWindow() {
     writeUpdateLog('info', '[electron] renderer process became responsive');
   });
 
-  mainWindow.loadFile(path.resolve(__dirname, '../server/public', 'index.html'));
+  mainWindow.loadFile(rendererEntryPath);
 
   mainWindow.on('close', (event) => {
     if (!app.isQuitting) {
@@ -742,7 +766,8 @@ function requestAppQuit() {
     .catch((error) => {
       console.error('[media-agent] Failed to stop during quit:', error);
     })
-    .finally(() => {
+    .finally(async () => {
+      if (updateLogWriter) await updateLogWriter.close();
       finalizeQuit();
     });
 }
@@ -1981,7 +2006,11 @@ function configureAutoUpdater() {
     error: (message) => writeUpdateLog('error', message)
   };
   autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.disableWebInstaller = true;
+  // Only the complete installer is authenticated; do not parse unsigned blockmaps.
+  autoUpdater.disableDifferentialDownload = true;
+  // The renderer requests installation only after our signed metadata/package checks.
+  autoUpdater.autoInstallOnAppQuit = false;
 
   autoUpdater.on('checking-for-update', () => {
     writeUpdateLog('info', `checking-for-update: currentVersion=${app.getVersion()} manifest=${getUpdateManifestUrl()}`);
@@ -2031,68 +2060,52 @@ function configureAutoUpdater() {
     });
   });
 
-  autoUpdater.on('update-downloaded', (info) => {
-    updateDownloadInProgress = false;
-    writeUpdateLog('info', `update-downloaded: version=${info.version} releaseDate=${info.releaseDate || 'n/a'}`);
-    cacheDownloadedInstallerForDifferentialUpdate(info.downloadedFile);
-    sendToRenderer('update-status', {
-      status: 'downloaded',
-      version: info.version,
-      currentVersion: app.getVersion(),
-      feedUrl: getUpdateManifestUrl()
-    });
+  autoUpdater.on('update-downloaded', async (info) => {
+    const generation = ++updateVerificationGeneration;
+    verifiedUpdate = null;
+    try {
+      await verifyDownloadedUpdate(info.downloadedFile, info);
+      if (generation !== updateVerificationGeneration) return;
+      verifiedUpdate = { filePath: info.downloadedFile, info };
+      updateDownloadInProgress = false;
+      writeUpdateLog('info', `update-downloaded: verified signed version=${info.version} releaseDate=${info.releaseDate || 'n/a'}`);
+      sendToRenderer('update-status', {
+        status: 'downloaded',
+        version: info.version,
+        currentVersion: app.getVersion(),
+        feedUrl: getUpdateManifestUrl()
+      });
+    } catch (error) {
+      if (generation === updateVerificationGeneration) reportUpdateError(error);
+    }
   });
 
   autoUpdater.on('error', (error) => {
-    updateDownloadInProgress = false;
-    writeUpdateLog('error', `autoUpdater error event: ${formatLogMessage(error)}`);
-    sendToRenderer('update-status', {
-      status: 'error',
-      error: error.message,
-      currentVersion: app.getVersion(),
-      feedUrl: getUpdateManifestUrl()
-    });
+    reportUpdateError(error);
   });
 
   autoUpdaterConfigured = true;
 }
 
 function getUpdateFeedBaseUrl() {
-  return `${SERVER_URL}/updates/`;
+  return resolveUpdateFeedBaseUrl(app.isPackaged);
+}
+
+function reportUpdateError(error) {
+  updateDownloadInProgress = false;
+  updateInstallInProgress = false;
+  updateVerificationGeneration += 1;
+  writeUpdateLog('error', `autoUpdater error: ${formatLogMessage(error)}`);
+  sendToRenderer('update-status', {
+    status: 'error',
+    error: error && error.message ? error.message : String(error),
+    currentVersion: app.getVersion(),
+    feedUrl: getUpdateManifestUrl()
+  });
 }
 
 function getUpdateManifestUrl() {
   return `${getUpdateFeedBaseUrl()}latest.yml`;
-}
-
-function getAutoUpdaterCacheDir() {
-  if (!autoUpdater || !autoUpdater.downloadedUpdateHelper || !autoUpdater.downloadedUpdateHelper.cacheDir) {
-    return '';
-  }
-  return String(autoUpdater.downloadedUpdateHelper.cacheDir || '');
-}
-
-function cacheDownloadedInstallerForDifferentialUpdate(downloadedFile) {
-  const cacheDir = getAutoUpdaterCacheDir();
-  const sourcePath = String(downloadedFile || '').trim();
-  if (!cacheDir || !sourcePath) {
-    writeUpdateLog('warn', 'Differential update cache seed skipped: updater cache dir or downloaded file is missing.');
-    return;
-  }
-
-  if (!fs.existsSync(sourcePath)) {
-    writeUpdateLog('warn', `Differential update cache seed skipped: downloaded installer not found at ${sourcePath}`);
-    return;
-  }
-
-  const targetPath = path.join(cacheDir, 'installer.exe');
-  try {
-    fs.mkdirSync(cacheDir, { recursive: true });
-    fs.copyFileSync(sourcePath, targetPath);
-    writeUpdateLog('info', `Seeded differential update installer cache: ${targetPath}`);
-  } catch (error) {
-    writeUpdateLog('warn', `Failed to seed differential update installer cache: ${formatLogMessage(error)}`);
-  }
 }
 
 function normalizeDesktopSource(source) {
@@ -2276,7 +2289,10 @@ function createUpdateLogSessionStamp() {
 
 function writeUpdateLog(level, message) {
   const normalizedLevel = String(level || 'info').toUpperCase();
-  const normalizedMessage = formatLogMessage(message);
+  const formattedMessage = formatLogMessage(message);
+  const normalizedMessage = formattedMessage.length > UPDATE_LOG_MESSAGE_LIMIT
+    ? `${formattedMessage.slice(0, UPDATE_LOG_MESSAGE_LIMIT)} [log message truncated]`
+    : formattedMessage;
   const timestamp = new Date().toISOString();
   const line = `[${timestamp}] [${normalizedLevel}] ${normalizedMessage}`;
 
@@ -2299,8 +2315,12 @@ function writeUpdateLog(level, message) {
   console[consoleMethod](line);
 
   try {
-    fs.mkdirSync(path.dirname(getUpdateLogFilePath()), { recursive: true });
-    fs.appendFileSync(getUpdateLogFilePath(), line + os.EOL, 'utf8');
+    if (!updateLogWriter) {
+      updateLogWriter = new SessionLogWriter(getUpdateLogFilePath(), {
+        onError: (error) => console.error('[update-log] Failed to persist update log:', error)
+      });
+    }
+    updateLogWriter.append(line);
   } catch (error) {
     console.error('[update-log] Failed to persist update log:', error);
   }
@@ -2383,10 +2403,6 @@ function installProcessDiagnostics() {
       details
     });
   });
-}
-
-function normalizeBaseUrl(baseUrl) {
-  return String(baseUrl || '').replace(/\/+$/, '');
 }
 
 app.isQuitting = false;

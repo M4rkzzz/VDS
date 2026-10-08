@@ -22,6 +22,7 @@ export type SignalMessage = {
 
 type MessageHandler = (message: SignalMessage) => void;
 type StatusHandler = (status: 'connecting' | 'open' | 'closed' | 'error') => void;
+const WEBSOCKET_HANDSHAKE_TIMEOUT_MS = 10000;
 
 export class VdsWebSignaling {
   private ws: WebSocket | null = null;
@@ -38,43 +39,57 @@ export class VdsWebSignaling {
       return this.connectPromise;
     }
 
-    this.emitStatus('connecting');
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${location.host}`);
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(`${protocol}//${location.host}`);
+    } catch (error) {
+      return Promise.reject(error);
+    }
     this.ws = ws;
 
-    this.connectPromise = new Promise((resolve, reject) => {
-      this.rejectConnect = reject;
+    const pending = new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+      const settle = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        timeoutId = null;
+        if (this.ws === ws) {
+          this.connectPromise = null;
+          this.rejectConnect = null;
+        }
+        if (error) reject(error);
+        else resolve();
+      };
+      const fail = (error: Error, emitError: boolean) => {
+        if (this.ws !== ws) return;
+        // Closing a CONNECTING socket need not produce another event. Invalidate
+        // it first so a late open/close cannot complete or clear its replacement.
+        this.ws = null;
+        this.connectPromise = null;
+        this.rejectConnect = null;
+        settle(error);
+        try { ws.close(); } catch { /* The failed handshake is already detached. */ }
+        if (emitError) this.emitStatus('error');
+        if (this.ws === null) this.emitStatus('closed');
+      };
+      this.rejectConnect = (error) => settle(error);
+      timeoutId = setTimeout(() => fail(new Error('WebSocket connection timeout'), true),
+        WEBSOCKET_HANDSHAKE_TIMEOUT_MS);
       ws.addEventListener('open', () => {
         if (this.ws !== ws) {
           return;
         }
-        this.connectPromise = null;
-        this.rejectConnect = null;
+        settle();
         this.emitStatus('open');
-        resolve();
       }, { once: true });
       ws.addEventListener('error', () => {
-        if (this.ws !== ws) {
-          return;
-        }
-        this.ws = null;
-        this.connectPromise = null;
-        this.rejectConnect = null;
-        ws.close();
-        this.emitStatus('error');
-        reject(new Error('WebSocket connection failed'));
-        this.emitStatus('closed');
+        fail(new Error('WebSocket connection failed'), true);
       }, { once: true });
       ws.addEventListener('close', () => {
-        if (this.ws !== ws) {
-          return;
-        }
-        this.ws = null;
-        this.connectPromise = null;
-        this.rejectConnect = null;
-        reject(new Error('WebSocket closed before connection completed'));
-        this.emitStatus('closed');
+        fail(new Error('WebSocket closed before connection completed'), false);
       });
       ws.addEventListener('message', (event) => {
         if (this.ws === ws) {
@@ -82,7 +97,9 @@ export class VdsWebSignaling {
         }
       });
     });
-    return this.connectPromise;
+    this.connectPromise = pending;
+    this.emitStatus('connecting');
+    return pending;
   }
 
   onMessage(handler: MessageHandler): () => void {
@@ -109,7 +126,7 @@ export class VdsWebSignaling {
     this.connectPromise = null;
     this.rejectConnect = null;
     rejectConnect?.(new Error('WebSocket connection cancelled'));
-    ws?.close();
+    try { ws?.close(); } catch { /* Cancelling is complete even if close throws. */ }
   }
 
   private handleMessage(raw: unknown): void {

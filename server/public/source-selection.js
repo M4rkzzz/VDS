@@ -25,6 +25,8 @@
     let sourceConfirmInFlight = false;
     let sourceAudioSelectionSeq = 0;
     let currentCaptureSource = null;
+    let sourceAudioEnabledState = null;
+    let audioDiscovery = { status: 'idle', processes: [], error: null, supported: null, promise: null };
 
     function getSourceModal() {
       return document.getElementById('source-modal');
@@ -96,9 +98,10 @@
 
     async function refreshSources() {
       const btn = elements.btnRefreshSources;
-      if (sourceListRefreshInFlight || sourceConfirmInFlight) {
+      if (sourceListRefreshInFlight) {
         return;
       }
+      resetPendingUi();
       const refreshSeq = sourceListRefreshSeq + 1;
       sourceListRefreshSeq = refreshSeq;
       sourceAudioSelectionSeq += 1;
@@ -166,12 +169,13 @@
         return promise;
       }
 
+      let timer;
       return Promise.race([
         promise,
         new Promise((_, reject) => {
-          setTimeout(() => reject(new Error(timeoutMessage || 'operation-timeout')), normalizedTimeout);
+          timer = setTimeout(() => reject(new Error(timeoutMessage || 'operation-timeout')), normalizedTimeout);
         })
-      ]);
+      ]).finally(() => clearTimeout(timer));
     }
 
     function normalizeAudioProcessMatchValue(value) {
@@ -200,68 +204,82 @@
 
     function matchAudioCandidatesForSource(source, processList) {
       const processes = Array.isArray(processList) ? processList : [];
-      if (!source || !processes.length) {
+      if (!source || audioDiscovery.supported === false) {
         return [];
       }
-
+      const candidates = [];
+      const seenPids = new Set();
+      const isDisplay = source.kind === 'display' || source.captureMode === 'display' || String(source.id || '').startsWith('screen:');
       const sourcePid = Number(source.pid);
       const normalizedPid = Number.isFinite(sourcePid) && sourcePid > 0 ? sourcePid : null;
-      if (normalizedPid) {
-        const exactMatches = processes.filter((processInfo) => Number(processInfo && processInfo.pid) === normalizedPid);
-        if (exactMatches.length > 0) {
-          return exactMatches.map((processInfo) => buildClientAudioCandidate(processInfo, 1, 'window-pid-match'));
-        }
+      if (!isDisplay && normalizedPid) {
+        const exact = processes.find(processInfo => Number(processInfo && processInfo.pid) === normalizedPid);
+        candidates.push(buildClientAudioCandidate(exact || {
+          pid: normalizedPid, name: source.appName || source.title || source.name
+        }, 1, 'window-process-tree'));
+        seenPids.add(normalizedPid);
       }
-
       const normalizedTitle = normalizeAudioProcessMatchValue(source.title || source.name || '');
-      if (!normalizedTitle) {
-        return [];
-      }
-
-      const fuzzyMatches = [];
+      const related = [];
+      const others = [];
       for (const processInfo of processes) {
+        const pid = Number(processInfo && processInfo.pid);
+        if (!Number.isFinite(pid) || pid <= 0 || seenPids.has(pid)) continue;
+        seenPids.add(pid);
         const processToken = normalizeAudioProcessMatchValue(processInfo && processInfo.name);
-        if (!processToken) {
-          continue;
-        }
-
-        if (normalizedTitle.includes(processToken) || processToken.includes(normalizedTitle)) {
-          fuzzyMatches.push(buildClientAudioCandidate(processInfo, 0.35, 'window-title-match'));
-        }
-
-        if (fuzzyMatches.length >= 3) {
-          break;
-        }
+        const matchesTitle = !isDisplay && normalizedTitle && processToken &&
+          (normalizedTitle.includes(processToken) || processToken.includes(normalizedTitle));
+        (matchesTitle ? related : others).push(buildClientAudioCandidate(processInfo,
+          matchesTitle ? 0.35 : 0, matchesTitle ? 'window-title-match' : 'active-audio-process'));
       }
-
-      return fuzzyMatches;
+      return candidates.concat(related, others);
     }
 
-    async function discoverAudioCandidatesForSource(source) {
-      const mediaEngine = getMediaEngine();
-      const audioApi = mediaEngine && mediaEngine.audio;
-      if (!audioApi || !audioApi.isPlatformSupported || !audioApi.checkPermission || !audioApi.getProcessList) {
-        return [];
-      }
+    function refreshAudioCandidates() {
+      document.querySelectorAll('.source-item').forEach(item => {
+        const source = item.__captureSource;
+        const previous = parseSelectedSourceAudioCandidates(item)[Number(item.dataset.audioIndex)];
+        const candidates = matchAudioCandidatesForSource(source, audioDiscovery.processes);
+        let index = previous ? candidates.findIndex(candidate => candidate.pid === previous.pid) : -1;
+        if (index < 0) index = candidates.findIndex(candidate => candidate.reason === 'window-process-tree');
+        item.dataset.audioCandidates = JSON.stringify(candidates);
+        item.dataset.audioIndex = String(index);
+      });
+    }
 
-      try {
-        const supported = await withClientTimeout(audioApi.isPlatformSupported(), 1500, 'audio-platform-probe-timeout');
-        if (!supported) {
-          return [];
+    function ensureAudioDiscovery() {
+      if (audioDiscovery.promise) return audioDiscovery.promise;
+      const discovery = audioDiscovery;
+      discovery.status = 'loading';
+      discovery.promise = (async () => {
+        try {
+          const mediaEngine = getMediaEngine();
+          const audioApi = mediaEngine && mediaEngine.audio;
+          if (!audioApi || !audioApi.isPlatformSupported || !audioApi.checkPermission || !audioApi.getProcessList) {
+            throw new Error('audio-discovery-unavailable');
+          }
+          discovery.supported = Boolean(await withClientTimeout(audioApi.isPlatformSupported(), 1500, 'audio-platform-probe-timeout'));
+          if (discovery.supported) {
+            const permission = await withClientTimeout(audioApi.checkPermission(), 1500, 'audio-permission-probe-timeout');
+            const status = String(permission && permission.status || 'unknown');
+            if (status !== 'authorized') throw new Error(`audio-permission-${status}`);
+            const processes = await withClientTimeout(audioApi.getProcessList(), 2500, 'audio-process-list-timeout');
+            if (!Array.isArray(processes)) throw new Error('audio-process-list-invalid');
+            discovery.processes = processes;
+          }
+          discovery.status = 'ready';
+        } catch (error) {
+          discovery.status = 'error';
+          discovery.error = error && error.message ? error.message : String(error);
+          debugLog('audio', '[source-audio] audio discovery failed:', discovery.error);
         }
-
-        const permission = await withClientTimeout(audioApi.checkPermission(), 1500, 'audio-permission-probe-timeout');
-        const permissionStatus = String(permission && permission.status ? permission.status : 'unknown');
-        if (permissionStatus !== 'authorized') {
-          return [];
+        if (discovery === audioDiscovery) {
+          refreshAudioCandidates();
+          updateSourceAudioUi();
         }
-
-        const processList = await withClientTimeout(audioApi.getProcessList(), 2500, 'audio-process-list-timeout');
-        return matchAudioCandidatesForSource(source, processList);
-      } catch (error) {
-        debugLog('audio', '[source-audio] deferred audio discovery failed:', error && error.message ? error.message : String(error));
-        return [];
-      }
+        return discovery;
+      })();
+      return discovery.promise;
     }
 
     function createSourceThumbnailPlaceholder() {
@@ -403,10 +421,13 @@
     function updateSourceAudioUi() {
       const selectedItem = getSelectedSourceItem();
       const candidates = parseSelectedSourceAudioCandidates(selectedItem);
-      const selectedIndex = Math.max(0, Number(selectedItem && selectedItem.dataset.audioIndex) || 0);
+      const selectedIndex = selectedItem ? Number(selectedItem.dataset.audioIndex) : -1;
       const selectedCandidate = candidates[selectedIndex] || null;
       const audioEnabled = Boolean(elements.sourceAudioEnabled && elements.sourceAudioEnabled.checked);
-      const shouldShowCandidateList = audioEnabled && candidates.length > 1;
+      if (sourceAudioEnabledState !== null && sourceAudioEnabledState !== audioEnabled) resetPendingUi();
+      sourceAudioEnabledState = audioEnabled;
+      if (selectedItem && audioEnabled && audioDiscovery.status === 'idle') ensureAudioDiscovery();
+      const shouldShowCandidateList = audioEnabled && candidates.length > 0;
 
       if (elements.sourceAudioProcessList) {
         elements.sourceAudioProcessList.innerHTML = '';
@@ -420,6 +441,7 @@
               if (!selectedItem) {
                 return;
               }
+              resetPendingUi();
               selectedItem.dataset.audioIndex = String(index);
               updateSourceAudioUi();
               debugLog('audio', '[source-audio] selected candidate:', candidate.processName || candidate.pid || 'n/a');
@@ -445,18 +467,28 @@
         elements.sourceAudioSummary.textContent = '当前仅共享画面';
         return;
       }
-
-      if (!selectedCandidate) {
-        elements.sourceAudioSummary.textContent = '当前目标没有可用的进程音频匹配';
+      const selectedText = selectedCandidate
+        ? `当前音频目标: ${selectedCandidate.processName || 'PID'} (${selectedCandidate.pid})`
+        : '';
+      if (audioDiscovery.status === 'loading') {
+        elements.sourceAudioSummary.textContent = selectedText ? `${selectedText} · 正在检测其他音频进程…` : '正在检测音频进程…';
         return;
       }
-
-      if (shouldShowCandidateList) {
-        elements.sourceAudioSummary.textContent = `检测到 ${candidates.length} 个音频进程，请手动选择`;
+      if (audioDiscovery.status === 'error') {
+        elements.sourceAudioSummary.textContent = `音频进程检测失败: ${audioDiscovery.error}${selectedText ? ` · ${selectedText}` : ' · 可关闭音频继续共享画面'}`;
         return;
       }
-
-      elements.sourceAudioSummary.textContent = `当前音频目标: ${selectedCandidate.processName || 'PID'} (${selectedCandidate.pid})`;
+      if (audioDiscovery.supported === false) {
+        elements.sourceAudioSummary.textContent = '当前平台不支持进程音频，可继续共享画面';
+        return;
+      }
+      if (selectedText) {
+        elements.sourceAudioSummary.textContent = `${selectedText}${selectedCandidate.reason === 'window-process-tree' ? ' · 包含其子进程' : ''}`;
+      } else {
+        elements.sourceAudioSummary.textContent = candidates.length
+          ? '请选择要共享的音频进程，未选择时仅共享画面'
+          : '当前没有活跃音频进程，可继续共享画面';
+      }
     }
 
     function showSourceModal(sources) {
@@ -466,7 +498,11 @@
         throw new Error('source-modal-unavailable');
       }
 
+      resetPendingUi();
+      currentCaptureSource = null;
       sourceList.innerHTML = '';
+      audioDiscovery = { status: 'idle', processes: [], error: null, supported: null, promise: null };
+      sourceAudioEnabledState = null;
 
       sources.forEach((source, index) => {
         const item = document.createElement('div');
@@ -480,7 +516,7 @@
         item.dataset.state = source.state || 'normal';
         item.dataset.isMinimized = source.isMinimized ? 'true' : 'false';
         item.dataset.audioCandidates = JSON.stringify(Array.isArray(source.audioCandidates) ? source.audioCandidates : []);
-        item.dataset.audioIndex = '0';
+        item.dataset.audioIndex = '-1';
         item.__captureSource = source;
 
         if (source.thumbnail) {
@@ -510,9 +546,9 @@
         }
 
         item.addEventListener('click', () => {
+          resetPendingUi();
           document.querySelectorAll('.source-item').forEach((element) => element.classList.remove('selected'));
           item.classList.add('selected');
-          sourceAudioSelectionSeq += 1;
           updateSourceAudioUi();
         });
 
@@ -526,8 +562,9 @@
       if (elements.sourceAudioEnabled) {
         elements.sourceAudioEnabled.checked = true;
       }
-      updateSourceAudioUi();
       modal.classList.remove('hidden');
+      refreshAudioCandidates();
+      updateSourceAudioUi();
       startAsyncThumbnailLoading(sourceListRefreshSeq);
     }
 
@@ -578,77 +615,69 @@
         return;
       }
       sourceConfirmInFlight = true;
-      sourceListRefreshSeq += 1;
-      sourceAudioSelectionSeq += 1;
-      markShareStartInFlight();
+      const selectionSeq = sourceAudioSelectionSeq;
       if (elements.btnConfirmSource) {
         elements.btnConfirmSource.disabled = true;
       }
-      if (elements.btnRefreshSources) {
-        elements.btnRefreshSources.disabled = true;
-      }
 
       currentCaptureSource = selectedSource;
-      const modal = getSourceModal();
-      if (modal) {
-        modal.classList.add('hidden');
-      }
       try {
-        await showAudioProcessSelection();
+        await showAudioProcessSelection(selectionSeq, selectedSource);
       } catch (error) {
-        resetShareStartPendingUi();
         const message = error && error.message ? error.message : String(error);
         if (message === 'source-audio-selection-superseded') {
           debugLog('audio', '[source-audio] selection superseded before share start');
           return;
         }
+        resetShareStartPendingUi();
         debugLog('video', 'Failed to start native share session:', message);
         showError(message || 'failed-to-start-native-share');
+      } finally {
+        if (selectionSeq === sourceAudioSelectionSeq) resetPendingUi();
       }
     }
 
-    async function showAudioProcessSelection() {
+    async function showAudioProcessSelection(selectionSeq, selectedSource) {
       const selectedItem = getSelectedSourceItem();
-      const selectionSeq = sourceAudioSelectionSeq;
-      const selectedSourceId = currentCaptureSource && currentCaptureSource.id ? String(currentCaptureSource.id) : '';
+      const selectedSourceId = String(selectedSource.id || '');
       const audioEnabled = Boolean(elements.sourceAudioEnabled && elements.sourceAudioEnabled.checked);
-
-      if (!audioEnabled) {
-        await startScreenShareWithSource(currentCaptureSource);
-        return;
-      }
-
       let audioCandidates = parseSelectedSourceAudioCandidates(selectedItem);
-      if (!audioCandidates.length) {
-        audioCandidates = await discoverAudioCandidatesForSource(currentCaptureSource);
-        if (selectionSeq !== sourceAudioSelectionSeq || !currentCaptureSource || String(currentCaptureSource.id || '') !== selectedSourceId) {
-          throw new Error('source-audio-selection-superseded');
-        }
-        if (selectedItem && audioCandidates.length) {
-          selectedItem.dataset.audioCandidates = JSON.stringify(audioCandidates);
-          selectedItem.dataset.audioIndex = '0';
-          updateSourceAudioUi();
-        }
+      let waitedForDiscovery = false;
+      if (audioEnabled && !audioCandidates.length) {
+        waitedForDiscovery = audioDiscovery.status === 'idle' || audioDiscovery.status === 'loading';
+        await ensureAudioDiscovery();
+        audioCandidates = parseSelectedSourceAudioCandidates(selectedItem);
       }
-
-      const audioIndex = Math.max(0, Number(selectedItem && selectedItem.dataset.audioIndex) || 0);
+      const currentSource = getSelectedCaptureSource();
+      if (selectionSeq !== sourceAudioSelectionSeq || !currentSource || String(currentSource.id || '') !== selectedSourceId) {
+        throw new Error('source-audio-selection-superseded');
+      }
+      const audioIndex = selectedItem ? Number(selectedItem.dataset.audioIndex) : -1;
       const audioCandidate = audioCandidates[audioIndex] || null;
-
-      if (!audioCandidate || !audioCandidate.pid) {
-        showError('当前窗口没有可用音频，将仅共享画面');
-        await startScreenShareWithSource(currentCaptureSource);
+      if (waitedForDiscovery && audioCandidates.length && !audioCandidate) {
+        showError('已检测到音频进程，请选择音频目标，或关闭音频仅共享画面');
         return;
       }
-
-      await startScreenShareWithAudio(currentCaptureSource, Number(audioCandidate.pid));
+      markShareStartInFlight();
+      sourceListRefreshSeq += 1;
+      const modal = getSourceModal();
+      if (modal) modal.classList.add('hidden');
+      if (audioEnabled && audioCandidate && audioCandidate.pid) {
+        await startScreenShareWithAudio(selectedSource, Number(audioCandidate.pid));
+      } else {
+        if (audioEnabled) showError(audioDiscovery.status === 'error'
+          ? `音频进程检测失败: ${audioDiscovery.error}，将仅共享画面`
+          : '未选择音频进程，将仅共享画面');
+        await startScreenShareWithSource(selectedSource);
+      }
     }
 
     function cancelSourceSelection() {
-      if (sourceConfirmInFlight) {
-        return;
-      }
       sourceListRefreshSeq += 1;
-      sourceAudioSelectionSeq += 1;
+      sourceListRefreshInFlight = false;
+      if (elements.btnRefreshSources) elements.btnRefreshSources.style.animation = '';
+      resetPendingUi();
+      audioDiscovery = { status: 'idle', processes: [], error: null, supported: null, promise: null };
       currentCaptureSource = null;
       resetShareStartPendingUi();
       const modal = getSourceModal();
@@ -662,7 +691,9 @@
         sourceSelectionInFlight,
         sourceListRefreshInFlight,
         sourceConfirmInFlight,
-        currentCaptureSource
+        currentCaptureSource,
+        audioDiscoveryStatus: audioDiscovery.status,
+        audioDiscoveryError: audioDiscovery.error
       };
     }
 

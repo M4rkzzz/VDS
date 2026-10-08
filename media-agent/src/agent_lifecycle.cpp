@@ -1,5 +1,6 @@
 #include "agent_lifecycle.h"
 
+#include <exception>
 #include <string>
 
 #include "agent_status_json.h"
@@ -97,16 +98,31 @@ void restart_host_capture_surface_attachments(AgentRuntimeState& state) {
 
 void shutdown_agent_runtime(AgentRuntimeState& state) {
   AgentLifecycleSessions sessions(state);
-  stop_wasapi_process_loopback_session();
-  stop_all_surface_attachments(sessions, "agent-shutdown");
-  sessions.peer_sessions.close_all_receiver_handles();
-  sessions.host_audio.reset_transport_sessions();
-  ViewerAudioSession viewer_audio;
-  viewer_audio.stop();
-  sessions.peer_sessions.close_all_transport_sessions();
-  vds::media_agent::stop_obs_ingest_session(state, sessions.host, sessions.obs);
-  relay_hub().shutdown_runtime();
-  vds::media_agent::stop_host_capture_process(sessions.host, "agent-shutdown");
+  std::exception_ptr failure;
+  const auto cleanup = [&](auto&& step) {
+    try {
+      step();
+    } catch (...) {
+      if (!failure) failure = std::current_exception();
+    }
+  };
+
+  // Stop producers before closing their transports or the relay dispatch worker.
+  // Use the same sender/subscriber cleanup as closePeer, including FFmpeg joins.
+  cleanup([&] { stop_wasapi_process_loopback_session(); });
+  cleanup([&] { sessions.host_audio.reset_transport_sessions(); });
+  cleanup([&] { vds::media_agent::stop_obs_ingest_session(state, sessions.host, sessions.obs); });
+  cleanup([&] { sessions.peer_sessions.stop_all_media_bindings(); });
+  cleanup([&] { vds::media_agent::stop_host_capture_process(sessions.host, "agent-shutdown"); });
+  cleanup([&] { stop_all_surface_attachments(sessions, "agent-shutdown"); });
+  cleanup([&] { sessions.peer_sessions.close_all_receiver_handles(); });
+  cleanup([&] {
+    ViewerAudioSession viewer_audio;
+    viewer_audio.stop();
+  });
+  cleanup([&] { sessions.peer_sessions.close_all_transport_sessions(); });
+  cleanup([&] { relay_hub().close_runtime(); });
+  if (failure) std::rethrow_exception(failure);
 }
 
 AgentLifecycleCommandResult get_status_result(AgentRuntimeState& state) {

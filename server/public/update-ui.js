@@ -57,6 +57,11 @@
     const updateLogEntries = [];
 
     function getUpdateManifestUrl() {
+      const api = getElectronApi();
+      const runtimeConfig = api && typeof api.getRuntimeConfig === 'function' ? api.getRuntimeConfig() : null;
+      if (runtimeConfig && runtimeConfig.updateFeedUrl) {
+        return `${String(runtimeConfig.updateFeedUrl).replace(/\/+$/, '')}/latest.yml`;
+      }
       return `${getServerBaseUrl()}/updates/latest.yml`;
     }
 
@@ -74,7 +79,7 @@
       }
     }
 
-    function requestQuitAndInstall() {
+    async function requestQuitAndInstall() {
       if (updateInstallRequested) {
         return;
       }
@@ -85,8 +90,13 @@
         elements.btnInstallUpdate.disabled = true;
       }
       const electronApi = getElectronApi();
-      if (electronApi && electronApi.quitAndInstall) {
-        electronApi.quitAndInstall();
+      try {
+        if (!electronApi || !electronApi.quitAndInstall || await electronApi.quitAndInstall() === false) {
+          throw new Error('update-install-failed');
+        }
+      } catch (error) {
+        // Preserve a more specific error already delivered by the main process.
+        if (updateInstallRequested) applyUpdateStatus({ status: 'error', error: error.message || String(error) });
       }
     }
 
@@ -211,7 +221,7 @@
       if (!status || typeof status !== 'object') {
         return;
       }
-      if (updateReadyToInstall && status.status !== 'downloaded') {
+      if (updateReadyToInstall && !['downloaded', 'error'].includes(status.status)) {
         debugLog('update', 'Ignoring update status after downloaded:', status.status || 'unknown');
         return;
       }
@@ -223,6 +233,7 @@
       const feedUrl = status.feedUrl || getUpdateManifestUrl();
 
       if (status.status === 'checking') {
+        updateInstallRequested = false;
         updateReadyToInstall = false;
         updateDownloadRequested = false;
         renderUpdateModal({
@@ -320,6 +331,7 @@
       }
 
       if (status.status === 'error') {
+        updateInstallRequested = false;
         updateReadyToInstall = false;
         updateDownloadRequested = false;
         renderUpdateModal({

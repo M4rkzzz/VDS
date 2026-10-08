@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <memory>
@@ -23,6 +24,7 @@
 #include "json_protocol.h"
 #include "peer_stun_config.h"
 #include "media_source_epoch.h"
+#include "encoded_media_transport_limits.h"
 
 #ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
 #ifdef RTC_ENABLE_MEDIA
@@ -319,9 +321,9 @@ std::uint64_t count_nack_requested_packets(const rtc::message_vector& messages) 
 
 constexpr const char* kEncodedMediaDataChannelLabel = "vds-media-encoded-v1";
 constexpr const char* kEncodedMediaProtocol = "vds-media-encoded-v1";
-constexpr std::size_t kEncodedMediaFrameHeaderLimit = 16 * 1024;
-constexpr std::size_t kEncodedMediaMaxFrameBytes = 2 * 1024 * 1024;
-constexpr std::size_t kEncodedMediaChunkPayloadBytes = 12 * 1024;
+constexpr std::size_t kEncodedMediaFrameHeaderLimit = vds::media_agent::encoded_transport::kHeaderBytes;
+constexpr std::size_t kEncodedMediaMaxFrameBytes = vds::media_agent::encoded_transport::kFrameBytes;
+constexpr std::size_t kEncodedMediaChunkPayloadBytes = vds::media_agent::encoded_transport::kChunkBytes;
 
 bool string_contains(const std::string& value, const std::string& needle) {
   return value.find(needle) != std::string::npos;
@@ -364,6 +366,10 @@ std::uint64_t extract_uint64_json_value(const std::string& json, const std::stri
   if (end_pos == value_pos) {
     return fallback;
   }
+  if (end_pos - value_pos > 1 && json[value_pos] == '0') return fallback;
+  auto delimiter_pos = end_pos;
+  while (delimiter_pos < json.size() && std::isspace(static_cast<unsigned char>(json[delimiter_pos]))) ++delimiter_pos;
+  if (delimiter_pos >= json.size() || (json[delimiter_pos] != ',' && json[delimiter_pos] != '}')) return fallback;
   try {
     return static_cast<std::uint64_t>(std::stoull(json.substr(value_pos, end_pos - value_pos)));
   } catch (...) {
@@ -554,6 +560,13 @@ bool decode_encoded_media_frame_message(
     return false;
   }
 
+  const auto payload_bytes = payload.size() - 8 - header_size;
+  if (payload_bytes == 0 || payload_bytes > (message_type == "chunk"
+      ? kEncodedMediaChunkPayloadBytes : kEncodedMediaMaxFrameBytes)) {
+    if (reason) *reason = "datachannel-frame-too-large";
+    return false;
+  }
+
   const std::string source_epoch = vds::media_agent::extract_string_value(header, "sourceEpoch");
   if (!vds::media_agent::media_source_epoch_is_valid(source_epoch)) {
     if (reason) *reason = "datachannel-frame-invalid-source-epoch";
@@ -580,14 +593,12 @@ bool decode_encoded_media_frame_message(
     decoded_frame->keyframe = vds::media_agent::extract_bool_value(header, "keyframe", false);
     decoded_frame->config = vds::media_agent::extract_bool_value(header, "config", false);
     decoded_frame->frame_id = vds::media_agent::extract_string_value(header, "frameId");
-    decoded_frame->chunk_index = extract_uint64_json_value(header, "chunkIndex", 0);
+    decoded_frame->chunk_index = extract_uint64_json_value(header, "chunkIndex",
+      message_type == "chunk" ? std::numeric_limits<std::uint64_t>::max() : 0);
     decoded_frame->chunk_count = extract_uint64_json_value(header, "chunkCount", 0);
     decoded_frame->frame_payload_bytes = extract_uint64_json_value(header, "framePayloadBytes", 0);
-    decoded_frame->payload.clear();
-    decoded_frame->payload.reserve(payload.size() - 8 - header_size);
-    for (std::size_t index = 8 + header_size; index < payload.size(); index += 1) {
-      decoded_frame->payload.push_back(std::to_integer<std::uint8_t>(payload[index]));
-    }
+    decoded_frame->payload.resize(payload_bytes);
+    std::memcpy(decoded_frame->payload.data(), payload.data() + 8 + header_size, payload_bytes);
   }
 
   return true;
@@ -791,6 +802,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
   }
 
   void send_data_channel_text(const std::string& text) {
+    std::lock_guard<std::mutex> send_lock(outbound_mutex);
     std::shared_ptr<rtc::DataChannel> channel;
     {
       std::lock_guard<std::mutex> lock(mutex);
@@ -799,7 +811,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
       channel = data_channel;
     }
-    if (channel && channel->isOpen()) {
+    if (channel && channel->isOpen() && send_admission.allow_control(text.size(), channel->bufferedAmount())) {
       channel->send(text);
     }
   }
@@ -823,6 +835,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       }
 
       closed = true;
+      encoded_reassembler.clear();
+      snapshot.encoded_media_data_channel_pending_frames = 0;
+      snapshot.encoded_media_data_channel_pending_bytes = 0;
       keyframe_request_handler = {};
       ++keyframe_request_handler_revision;
       snapshot.connection_state = "closed";
@@ -867,8 +882,28 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
   PeerTransportSnapshot get_snapshot() {
     std::lock_guard<std::mutex> lock(mutex);
+    encoded_reassembler.expire(vds::media_agent::current_time_micros_steady() / 1000);
+    refresh_reassembly_stats_locked();
     refresh_from_peer_connection_locked();
     return snapshot;
+  }
+
+  PeerTransportMediaReadiness get_media_readiness() {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (closed || !pc) return {};
+    PeerTransportMediaReadiness readiness;
+    readiness.use_encoded_data_channel = snapshot.encoded_media_data_channel_requested ||
+      snapshot.encoded_media_data_channel_supported;
+    readiness.connected = snapshot.remote_description_set && pc->state() == rtc::PeerConnection::State::Connected;
+    if (!readiness.connected) return readiness;
+    if (readiness.use_encoded_data_channel) {
+      readiness.video_ready = readiness.audio_ready = snapshot.encoded_media_data_channel_ready &&
+        data_channel && data_channel->isOpen();
+    } else {
+      readiness.video_ready = video_track && video_track->isOpen();
+      readiness.audio_ready = audio_track && audio_track->isOpen();
+    }
+    return readiness;
   }
 
   void configure_video_sender(const PeerVideoTrackConfig& config) {
@@ -1139,11 +1174,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       throw std::runtime_error("video-track-codec-mismatch");
     }
 
-    rtc::binary payload;
-    payload.reserve(frame.size());
-    for (const std::uint8_t byte_value : frame) {
-      payload.push_back(static_cast<std::byte>(byte_value));
-    }
+    rtc::binary payload(frame.size());
+    if (!frame.empty()) std::memcpy(payload.data(), frame.data(), frame.size());
 
     local_video_track->sendFrame(
       std::move(payload),
@@ -1153,7 +1185,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     std::lock_guard<std::mutex> lock(mutex);
     snapshot.video_frames_sent += 1;
     snapshot.reason = "video-frame-sent";
-    refresh_from_peer_connection_locked();
   }
 
   void send_audio_frame(const std::vector<std::uint8_t>& frame, std::uint64_t timestamp_us) {
@@ -1167,11 +1198,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       local_audio_track = audio_track;
     }
 
-    rtc::binary payload;
-    payload.reserve(frame.size());
-    for (const std::uint8_t byte_value : frame) {
-      payload.push_back(static_cast<std::byte>(byte_value));
-    }
+    rtc::binary payload(frame.size());
+    if (!frame.empty()) std::memcpy(payload.data(), frame.data(), frame.size());
 
     local_audio_track->sendFrame(
       std::move(payload),
@@ -1181,13 +1209,20 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     std::lock_guard<std::mutex> lock(mutex);
     snapshot.audio_frames_sent += 1;
     snapshot.reason = "audio-frame-sent";
-    refresh_from_peer_connection_locked();
   }
 
   void send_encoded_media_frame(const PeerEncodedMediaDataChannelFrame& frame) {
+    using namespace vds::media_agent::encoded_transport;
     if (!vds::media_agent::media_source_epoch_is_valid(frame.source_epoch)) {
       throw std::runtime_error("datachannel-frame-invalid-source-epoch");
     }
+    if (frame.payload.empty() || frame.payload.size() > kEncodedMediaMaxFrameBytes)
+      throw std::runtime_error("datachannel-frame-too-large");
+    if (frame.stream_type != "video" && frame.stream_type != "audio")
+      throw std::runtime_error("datachannel-frame-invalid-stream");
+    // Serialize admission and the complete frame, including audio/control
+    // writers, so concurrent producers cannot oversubscribe the same queue.
+    std::lock_guard<std::mutex> send_lock(outbound_mutex);
     std::shared_ptr<rtc::DataChannel> local_data_channel;
 
     {
@@ -1201,86 +1236,81 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       local_data_channel = data_channel;
     }
 
-    const auto send_payload = [&local_data_channel, &frame](const std::string& message_type,
-                                                            const std::vector<std::uint8_t>& bytes,
-                                                            std::uint64_t sequence,
-                                                            const std::string& frame_id,
-                                                            std::size_t chunk_index,
-                                                            std::size_t chunk_count,
-                                                            std::size_t frame_payload_bytes) {
-      std::string header =
-      std::string("{\"protocol\":\"") + kEncodedMediaProtocol +
-      "\",\"type\":\"" + message_type +
+    const bool chunked = frame.payload.size() > kEncodedMediaChunkPayloadBytes;
+    const auto chunk_count = chunked
+      ? (frame.payload.size() + kEncodedMediaChunkPayloadBytes - 1) / kEncodedMediaChunkPayloadBytes : 1;
+    const std::string frame_id = frame.stream_type + ":" + frame.source_epoch + ":" +
+      std::to_string(frame.timestamp_us) + ":" + std::to_string(frame.sequence) + ":" +
+      std::to_string(frame.payload.size());
+    std::vector<std::string> headers;
+    headers.reserve(chunk_count);
+    std::size_t wire_bytes = frame.payload.size();
+    std::string common_header = std::string("{\"protocol\":\"") + kEncodedMediaProtocol +
+      "\",\"type\":\"" + (chunked ? "chunk" : "frame") +
       "\",\"streamType\":\"" + vds::media_agent::json_escape(frame.stream_type) +
       "\",\"codec\":\"" + vds::media_agent::json_escape(frame.codec) +
       "\",\"payloadFormat\":\"" + vds::media_agent::json_escape(encoded_frame_payload_format(frame)) +
       "\",\"timestampUs\":" + std::to_string(frame.timestamp_us) +
-      ",\"sequence\":" + std::to_string(sequence) +
+      ",\"sequence\":" + std::to_string(frame.sequence) +
       ",\"keyframe\":" + (frame.keyframe ? "true" : "false") +
       ",\"config\":" + (frame.config ? "true" : "false");
-      if (!frame.source_epoch.empty()) {
-        header += ",\"sourceEpoch\":\"" + vds::media_agent::json_escape(frame.source_epoch) + "\"";
-      }
-      if (message_type == "chunk") {
-        header +=
-          ",\"frameId\":\"" + vds::media_agent::json_escape(frame_id) +
-          "\",\"chunkIndex\":" + std::to_string(chunk_index) +
-          ",\"chunkCount\":" + std::to_string(chunk_count) +
-          ",\"framePayloadBytes\":" + std::to_string(frame_payload_bytes);
-      }
-      header += "}";
-      const std::uint32_t header_size = static_cast<std::uint32_t>(header.size());
-      rtc::binary payload;
-      payload.reserve(8 + header.size() + bytes.size());
-      payload.push_back(static_cast<std::byte>('V'));
-      payload.push_back(static_cast<std::byte>('D'));
-      payload.push_back(static_cast<std::byte>('S'));
-      payload.push_back(static_cast<std::byte>('1'));
-      payload.push_back(static_cast<std::byte>((header_size >> 24) & 0xff));
-      payload.push_back(static_cast<std::byte>((header_size >> 16) & 0xff));
-      payload.push_back(static_cast<std::byte>((header_size >> 8) & 0xff));
-      payload.push_back(static_cast<std::byte>(header_size & 0xff));
-      for (const char ch : header) {
-        payload.push_back(static_cast<std::byte>(static_cast<unsigned char>(ch)));
-      }
-      for (const std::uint8_t byte_value : bytes) {
-        payload.push_back(static_cast<std::byte>(byte_value));
-      }
-      local_data_channel->send(std::move(payload));
-    };
-
-    if (frame.payload.size() <= kEncodedMediaChunkPayloadBytes) {
-      send_payload("frame", frame.payload, frame.sequence, "", 0, 0, frame.payload.size());
-    } else {
-      if (frame.payload.size() > kEncodedMediaMaxFrameBytes) {
-        throw std::runtime_error("datachannel-frame-too-large");
-      }
-      const std::size_t chunk_count =
-        (frame.payload.size() + kEncodedMediaChunkPayloadBytes - 1) / kEncodedMediaChunkPayloadBytes;
-      const std::string frame_id =
-        frame.stream_type + ":" + frame.source_epoch + ":" + std::to_string(frame.timestamp_us) + ":" +
-        std::to_string(frame.sequence) + ":" + std::to_string(frame.payload.size());
-      for (std::size_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
-        const std::size_t start = chunk_index * kEncodedMediaChunkPayloadBytes;
-        const std::size_t end = std::min(frame.payload.size(), start + kEncodedMediaChunkPayloadBytes);
-        std::vector<std::uint8_t> chunk(frame.payload.begin() + start, frame.payload.begin() + end);
-        send_payload(
-          "chunk",
-          chunk,
-          frame.sequence,
-          frame_id,
-          chunk_index,
-          chunk_count,
-          frame.payload.size()
-        );
-      }
+    if (!frame.source_epoch.empty()) {
+      common_header += ",\"sourceEpoch\":\"" + vds::media_agent::json_escape(frame.source_epoch) + "\"";
     }
+    const std::string chunk_prefix = chunked
+      ? ",\"frameId\":\"" + vds::media_agent::json_escape(frame_id) + "\",\"chunkIndex\":" : "";
+    const std::string chunk_suffix = chunked
+      ? ",\"chunkCount\":" + std::to_string(chunk_count) +
+        ",\"framePayloadBytes\":" + std::to_string(frame.payload.size()) : "";
+    for (std::size_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+      std::string header = common_header;
+      if (chunked) header += chunk_prefix + std::to_string(chunk_index) + chunk_suffix;
+      header += "}";
+      if (header.size() > kEncodedMediaFrameHeaderLimit)
+        throw std::runtime_error("datachannel-frame-invalid-header");
+      wire_bytes += 8 + header.size();
+      headers.push_back(std::move(header));
+    }
+    const auto kind = frame.stream_type == "audio" ? SendAdmission::Kind::audio :
+      frame.keyframe ? SendAdmission::Kind::keyframe :
+      configuration_only(frame) ? SendAdmission::Kind::configuration : SendAdmission::Kind::video;
+    std::string rejection;
+    if (!send_admission.admit(kind, wire_bytes, local_data_channel->bufferedAmount(), &rejection)) {
+      std::lock_guard<std::mutex> lock(mutex);
+      ++snapshot.encoded_media_data_channel_backpressure_drops;
+      if (frame.stream_type == "video") ++snapshot.dropped_video_units;
+      snapshot.last_error = rejection;
+      throw std::runtime_error(rejection);
+    }
+    try {
+      for (std::size_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+        const auto& header = headers[chunk_index];
+        const auto start = chunked ? chunk_index * kEncodedMediaChunkPayloadBytes : 0;
+        const auto end = chunked ? std::min(frame.payload.size(), start + kEncodedMediaChunkPayloadBytes) : frame.payload.size();
+        const std::uint32_t header_size = static_cast<std::uint32_t>(header.size());
+        rtc::binary payload(8 + header.size() + end - start);
+        std::memcpy(payload.data(), "VDS1", 4);
+        payload[4] = static_cast<std::byte>((header_size >> 24) & 0xff);
+        payload[5] = static_cast<std::byte>((header_size >> 16) & 0xff);
+        payload[6] = static_cast<std::byte>((header_size >> 8) & 0xff);
+        payload[7] = static_cast<std::byte>(header_size & 0xff);
+        std::memcpy(payload.data() + 8, header.data(), header.size());
+        std::memcpy(payload.data() + 8 + header.size(), frame.payload.data() + start, end - start);
+        // false means accepted into libdatachannel's send queue, not failure.
+        // Never retry it or stop halfway through this admitted complete frame.
+        local_data_channel->send(std::move(payload));
+      }
+    } catch (...) {
+      send_admission.failed(kind);
+      throw;
+    }
+    send_admission.sent(kind, wire_bytes, vds::media_agent::current_time_micros_steady());
 
     std::lock_guard<std::mutex> lock(mutex);
     snapshot.encoded_media_data_channel_frames_sent += 1;
     snapshot.encoded_media_data_channel_state = "frame-sent";
     snapshot.reason = "encoded-media-datachannel-frame-sent";
-    refresh_from_peer_connection_locked();
+    snapshot.encoded_media_data_channel_buffered_bytes = local_data_channel->bufferedAmount();
   }
 
   void set_decoder_state(
@@ -1304,7 +1334,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
   void request_keyframe(const std::string& reason) {
     std::shared_ptr<rtc::Track> local_inbound_video_track;
     std::shared_ptr<rtc::DataChannel> local_data_channel;
-    PeerTransportSnapshot request_snapshot;
+    std::string session_fields;
     {
       std::lock_guard<std::mutex> lock(mutex);
       if (closed) throw std::runtime_error("peer-transport-closed");
@@ -1321,13 +1351,17 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         throw std::runtime_error("peer-keyframe-source-unavailable");
       }
       last_keyframe_request_sent_us = now;
-      request_snapshot = snapshot;
+      session_fields = build_encoded_media_session_fields(snapshot);
     }
     if (local_data_channel) {
       const auto bounded_reason = reason.substr(0, 128);
-      local_data_channel->send(std::string("{\"protocol\":\"") + kEncodedMediaProtocol +
+      const auto message = std::string("{\"protocol\":\"") + kEncodedMediaProtocol +
         "\",\"type\":\"keyframe-request\",\"protocolVersion\":1,\"reason\":\"" +
-        vds::media_agent::json_escape(bounded_reason) + "\"" + build_encoded_media_session_fields(request_snapshot) + "}");
+        vds::media_agent::json_escape(bounded_reason) + "\"" + session_fields + "}";
+      std::lock_guard<std::mutex> send_lock(outbound_mutex);
+      if (!send_admission.allow_control(message.size(), local_data_channel->bufferedAmount()))
+        throw std::runtime_error("datachannel-control-backpressure");
+      local_data_channel->send(message);
     } else {
       local_inbound_video_track->requestKeyframe();
     }
@@ -1407,13 +1441,11 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
   }
 
  private:
-  struct PendingEncodedMediaChunkFrame {
-    PeerEncodedMediaDataChannelFrame header;
-    std::vector<std::vector<std::uint8_t>> chunks;
-    std::size_t received_count = 0;
-    std::size_t payload_bytes = 0;
-    std::int64_t created_at_unix_ms = 0;
-  };
+  void refresh_reassembly_stats_locked() {
+    snapshot.encoded_media_data_channel_pending_frames = encoded_reassembler.pending_frames();
+    snapshot.encoded_media_data_channel_pending_bytes = encoded_reassembler.pending_bytes();
+    snapshot.encoded_media_data_channel_incomplete_frames_dropped = encoded_reassembler.dropped_frames();
+  }
 
   bool decode_or_reassemble_encoded_media_frame(
     const rtc::binary& payload,
@@ -1423,94 +1455,13 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     if (!decode_encoded_media_frame_message(payload, &parsed, reason)) {
       return false;
     }
-    if (parsed.message_type == "frame") {
-      if (parsed.payload.size() > kEncodedMediaMaxFrameBytes) {
-        if (reason) {
-          *reason = "datachannel-frame-too-large";
-        }
-        return false;
-      }
-      if (decoded_frame) {
-        *decoded_frame = std::move(parsed);
-      }
-      return true;
-    }
-    if (parsed.frame_id.empty() ||
-        parsed.chunk_count == 0 ||
-        parsed.chunk_index >= parsed.chunk_count ||
-        parsed.frame_payload_bytes == 0 ||
-        parsed.frame_payload_bytes > kEncodedMediaMaxFrameBytes) {
-      if (reason) {
-        *reason = "datachannel-chunk-invalid-header";
-      }
-      return false;
-    }
-
-    const std::int64_t now_ms = current_time_millis();
-    for (auto it = pending_encoded_media_chunks.begin(); it != pending_encoded_media_chunks.end();) {
-      if (now_ms - it->second.created_at_unix_ms > 10000) {
-        it = pending_encoded_media_chunks.erase(it);
-      } else {
-        ++it;
-      }
-    }
-
-    auto& entry = pending_encoded_media_chunks[parsed.frame_id];
-    if (entry.chunks.empty()) {
-      entry.header = parsed;
-      entry.header.message_type = "frame";
-      entry.header.frame_id.clear();
-      entry.header.chunk_index = 0;
-      entry.header.chunk_count = 0;
-      entry.header.frame_payload_bytes = 0;
-      entry.header.payload.clear();
-      entry.chunks.resize(static_cast<std::size_t>(parsed.chunk_count));
-      entry.payload_bytes = static_cast<std::size_t>(parsed.frame_payload_bytes);
-      entry.created_at_unix_ms = now_ms;
-    }
-    if (entry.chunks.size() != static_cast<std::size_t>(parsed.chunk_count) ||
-        entry.payload_bytes != static_cast<std::size_t>(parsed.frame_payload_bytes) ||
-        entry.header.source_epoch != parsed.source_epoch ||
-        entry.header.stream_type != parsed.stream_type || entry.header.codec != parsed.codec ||
-        entry.header.timestamp_us != parsed.timestamp_us || entry.header.sequence != parsed.sequence ||
-        entry.header.keyframe != parsed.keyframe || entry.header.config != parsed.config) {
-      pending_encoded_media_chunks.erase(parsed.frame_id);
-      if (reason) {
-        *reason = "datachannel-chunk-mismatch";
-      }
-      return false;
-    }
-
-    const std::size_t chunk_index = static_cast<std::size_t>(parsed.chunk_index);
-    if (entry.chunks[chunk_index].empty()) {
-      entry.chunks[chunk_index] = std::move(parsed.payload);
-      entry.received_count += 1;
-    }
-    if (entry.received_count != entry.chunks.size()) {
-      if (reason) {
-        *reason = "datachannel-chunk-pending";
-      }
-      return false;
-    }
-
-    entry.header.payload.clear();
-    entry.header.payload.reserve(entry.payload_bytes);
-    for (const auto& chunk : entry.chunks) {
-      entry.header.payload.insert(entry.header.payload.end(), chunk.begin(), chunk.end());
-    }
-    if (entry.header.payload.size() != entry.payload_bytes) {
-      pending_encoded_media_chunks.erase(parsed.frame_id);
-      if (reason) {
-        *reason = "datachannel-chunk-size-mismatch";
-      }
-      return false;
-    }
-
-    if (decoded_frame) {
-      *decoded_frame = std::move(entry.header);
-    }
-    pending_encoded_media_chunks.erase(parsed.frame_id);
-    return true;
+    const bool chunk = parsed.message_type == "chunk";
+    const auto result = encoded_reassembler.accept(std::move(parsed), decoded_frame,
+      vds::media_agent::current_time_micros_steady() / 1000, reason);
+    if (chunk && result != vds::media_agent::encoded_transport::Reassembler::Result::rejected)
+      ++snapshot.encoded_media_data_channel_chunks_received;
+    refresh_reassembly_stats_locked();
+    return result == vds::media_agent::encoded_transport::Reassembler::Result::complete;
   }
 
   std::optional<std::string> codec_profile_from_rtp_map(const rtc::Description::Media::RtpMap& rtp_map) const {
@@ -1553,15 +1504,12 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     });
     track->onFrame([weak_self](rtc::binary frame, rtc::FrameInfo info) {
       auto self = weak_self.lock();
-      if (!self) {
+      if (!self || !self->callbacks.allow_remote_media) {
         return;
       }
 
-      std::vector<std::uint8_t> frame_copy;
-      frame_copy.reserve(frame.size());
-      for (const std::byte value : frame) {
-        frame_copy.push_back(static_cast<std::uint8_t>(value));
-      }
+      std::vector<std::uint8_t> frame_copy(frame.size());
+      if (!frame.empty()) std::memcpy(frame_copy.data(), frame.data(), frame.size());
 
       std::string codec_copy;
       std::uint32_t timestamp = info.timestamp;
@@ -1613,15 +1561,12 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     });
     track->onFrame([weak_self](rtc::binary frame, rtc::FrameInfo info) {
       auto self = weak_self.lock();
-      if (!self) {
+      if (!self || !self->callbacks.allow_remote_media) {
         return;
       }
 
-      std::vector<std::uint8_t> frame_copy;
-      frame_copy.reserve(frame.size());
-      for (const std::byte value : frame) {
-        frame_copy.push_back(static_cast<std::uint8_t>(value));
-      }
+      std::vector<std::uint8_t> frame_copy(frame.size());
+      if (!frame.empty()) std::memcpy(frame_copy.data(), frame.data(), frame.size());
 
       std::string codec_copy;
       std::uint32_t timestamp = info.timestamp;
@@ -2043,6 +1988,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
           self->snapshot.encoded_media_data_channel_open = false;
           self->snapshot.encoded_media_data_channel_ready = false;
           self->snapshot.encoded_media_data_channel_state = "closed";
+          self->encoded_reassembler.clear();
+          self->refresh_reassembly_stats_locked();
         }
         self->snapshot.reason = "data-channel-closed";
         self->refresh_from_peer_connection_locked();
@@ -2140,7 +2087,8 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
         if (request_keyframe) {
           self->handle_keyframe_request(control.reason, &control);
-          snapshot_copy = self->get_snapshot();
+          std::lock_guard<std::mutex> lock(self->mutex);
+          snapshot_copy = self->snapshot;
         }
         if (send_ack) {
           self->send_data_channel_text(build_encoded_media_hello_ack(snapshot_copy));
@@ -2163,13 +2111,27 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         PeerEncodedMediaDataChannelFrame decoded_frame;
         bool valid_frame = false;
         bool chunk_pending = false;
+        bool notify_state = false;
         PeerTransportSnapshot snapshot_copy;
         {
           std::lock_guard<std::mutex> lock(self->mutex);
           if (self->closed) {
             return;
           }
-          valid_frame = self->decode_or_reassemble_encoded_media_frame(payload, &decoded_frame, &invalid_reason);
+          const auto previous_state = self->snapshot.encoded_media_data_channel_state;
+          if (!self->callbacks.allow_remote_media) {
+            invalid_reason = "datachannel-reverse-media-forbidden";
+          } else if (!self->snapshot.encoded_media_data_channel_ready) {
+            invalid_reason = "datachannel-media-not-ready";
+          } else {
+            try {
+              valid_frame = self->decode_or_reassemble_encoded_media_frame(payload, &decoded_frame, &invalid_reason);
+            } catch (const std::exception&) {
+              self->encoded_reassembler.clear();
+              self->refresh_reassembly_stats_locked();
+              invalid_reason = "datachannel-frame-resource-error";
+            }
+          }
           chunk_pending = invalid_reason == "datachannel-chunk-pending";
           self->snapshot.encoded_media_data_channel_supported = true;
           self->snapshot.encoded_media_data_channel_open = true;
@@ -2180,26 +2142,27 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
             } else if (decoded_frame.stream_type == "audio") {
               self->snapshot.remote_audio_frames_received += 1;
             }
-            self->snapshot.encoded_media_data_channel_state = "frame-received";
+            self->snapshot.encoded_media_data_channel_state = "receiving";
             self->snapshot.reason = "encoded-media-datachannel-frame-received";
           } else if (chunk_pending) {
-            self->snapshot.encoded_media_data_channel_state = "chunk-received";
+            self->snapshot.encoded_media_data_channel_state = "receiving";
             self->snapshot.reason = "encoded-media-datachannel-chunk-received";
           } else {
             self->snapshot.encoded_media_data_channel_invalid_frames += 1;
             self->snapshot.encoded_media_data_channel_state = invalid_reason;
             self->snapshot.last_error = invalid_reason;
           }
-          snapshot_copy = self->snapshot;
+          notify_state = previous_state != self->snapshot.encoded_media_data_channel_state;
+          if (notify_state) snapshot_copy = self->snapshot;
         }
 
-        if (!valid_frame && !chunk_pending) {
+        if (!valid_frame && !chunk_pending && notify_state) {
           self->send_encoded_media_error(invalid_reason);
         }
         if (valid_frame && self->callbacks.on_encoded_media_data_channel_frame) {
           self->callbacks.on_encoded_media_data_channel_frame(decoded_frame);
         }
-        if (self->callbacks.on_state_change) {
+        if (notify_state && self->callbacks.on_state_change) {
           self->callbacks.on_state_change(snapshot_copy, snapshot_copy.encoded_media_data_channel_state);
         }
       }
@@ -2233,6 +2196,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     }
 
     if (data_channel) {
+      snapshot.encoded_media_data_channel_buffered_bytes = data_channel->bufferedAmount();
       snapshot.data_channel_label = data_channel->label();
       if (is_encoded_media_data_channel_label(snapshot.data_channel_label)) {
         snapshot.encoded_media_data_channel_supported = true;
@@ -2268,7 +2232,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
   std::shared_ptr<rtc::RtcpReceivingSession> inbound_audio_rtcp_session;
   std::shared_ptr<rtc::RtpPacketizationConfig> video_rtp_config;
   std::shared_ptr<rtc::RtpPacketizationConfig> audio_rtp_config;
-  std::map<std::string, PendingEncodedMediaChunkFrame> pending_encoded_media_chunks;
+  std::mutex outbound_mutex;
+  vds::media_agent::encoded_transport::Reassembler encoded_reassembler;
+  vds::media_agent::encoded_transport::SendAdmission send_admission;
 };
 
 #endif
@@ -2794,6 +2760,16 @@ PeerTransportSnapshot get_peer_transport_snapshot(const std::shared_ptr<PeerTran
 #endif
 }
 
+PeerTransportMediaReadiness get_peer_transport_media_readiness(
+    const std::shared_ptr<PeerTransportSession>& session) {
+#ifdef VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL
+  return session ? session->get_media_readiness() : PeerTransportMediaReadiness{};
+#else
+  (void)session;
+  return {};
+#endif
+}
+
 std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot) {
   std::ostringstream payload;
   payload
@@ -2819,6 +2795,12 @@ std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot) 
     << ",\"encodedMediaDataChannelFramesSent\":" << snapshot.encoded_media_data_channel_frames_sent
     << ",\"encodedMediaDataChannelFramesReceived\":" << snapshot.encoded_media_data_channel_frames_received
     << ",\"encodedMediaDataChannelInvalidFrames\":" << snapshot.encoded_media_data_channel_invalid_frames
+    << ",\"encodedMediaDataChannelChunksReceived\":" << snapshot.encoded_media_data_channel_chunks_received
+    << ",\"encodedMediaDataChannelIncompleteFramesDropped\":" << snapshot.encoded_media_data_channel_incomplete_frames_dropped
+    << ",\"encodedMediaDataChannelBackpressureDrops\":" << snapshot.encoded_media_data_channel_backpressure_drops
+    << ",\"encodedMediaDataChannelPendingFrames\":" << snapshot.encoded_media_data_channel_pending_frames
+    << ",\"encodedMediaDataChannelPendingBytes\":" << snapshot.encoded_media_data_channel_pending_bytes
+    << ",\"encodedMediaDataChannelBufferedBytes\":" << snapshot.encoded_media_data_channel_buffered_bytes
     << ",\"decodedFramesRendered\":" << snapshot.decoded_frames_rendered
     << ",\"nackRetransmissions\":" << snapshot.nack_retransmissions
     << ",\"pliRequestsReceived\":" << snapshot.pli_requests_received
