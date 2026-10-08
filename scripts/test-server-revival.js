@@ -156,7 +156,7 @@ async function testViewerIdentityCollision() {
   await withServer(async (instance, port) => {
     const host = await connect(port);
     const room = await request(host, { type: 'create-room', clientId: 'owner', mediaManifest: manifest });
-    assert.match(room.roomId, /^[A-F0-9]{12}$/);
+    assert.match(room.roomId, /^[2-9A-HJ-NP-Z]{6}$/);
     for (const clientId of ['host', 'HOST', ' host ', 'owner', '']) {
       const attacker = await connect(port);
       const rejected = await request(attacker, { type: 'join-room', roomId: room.roomId, clientId });
@@ -169,13 +169,6 @@ async function testViewerIdentityCollision() {
     const duplicate = await connect(port);
     assert.strictEqual((await request(duplicate, { type: 'join-room', roomId: room.roomId, clientId: 'ordinary-viewer' })).code, 'session-token-invalid');
     assert.strictEqual(instance.rooms.get(room.roomId).viewers.length, 1);
-    // Retain compatibility with already-created six-character room codes.
-    const state = instance.rooms.get(room.roomId);
-    instance.rooms.delete(room.roomId);
-    state.id = 'ABC123';
-    instance.rooms.set(state.id, state);
-    const legacyViewer = await connect(port);
-    assert.strictEqual((await request(legacyViewer, { type: 'join-room', roomId: state.id, clientId: 'legacy-viewer' })).type, 'room-joined');
   });
 }
 

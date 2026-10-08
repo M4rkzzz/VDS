@@ -21,7 +21,7 @@
 
 两种播放器的轻量稳帧改造已落地，见 [播放稳帧改造与验收](docs/PLAYBACK_STABILITY_PLAN.md)。共享源 PTS、媒体代次、参考链背压、解码与呈现分离及输出音频时钟已接入。队列随源帧率、短突发和实际音频进度调整，合法长音频单元按实际时长消费，不增加固定帧率、分辨率、换源次数或运行时长限制。2026-10-07 的开发验证已通过统一 `npm run check`、原生 CTest 15/15、Web 行为回归 125/125、实际 1080p30/60 与零音量八阶段恢复，以及当时 1.7.1 本地产物的一致性与实际启动检查。
 
-当前工作区、本机安装、正式发布与线上/NAS 版本：`1.7.3`。发布源码 `c4ebf0a` 已推 GitHub master，`v1.7.3` 标签对应同一源码，[GitHub Release](https://github.com/M4rkzzz/VDS/releases/tag/v1.7.3) 四份资产与本地大小/digest 一致；默认 HTTPS 更新源和 NAS `vds-signaling:1.7.3` 已更新。清单原始签名、三个小文件哈希、安装包头尾 Range 及旧 1.7.2 NsisUpdater 识别新版本通过；严格 TLS 公网与内网信令、12 位私房与双后台 scope 验证通过，不代替跨运营商真实媒体验收。仍纯 P2P、禁止 TURN、无新增运行配额，Windows 安装包仍无 Authenticode 签名。
+1.7.3 原始发布与部署基线：本机安装、正式发布与线上/NAS 版本均为 `1.7.3`。发布源码 `c4ebf0a` 已推 GitHub master，`v1.7.3` 标签对应同一源码，[GitHub Release](https://github.com/M4rkzzz/VDS/releases/tag/v1.7.3) 四份资产与本地大小/digest 一致；默认 HTTPS 更新源和 NAS `vds-signaling:1.7.3` 已更新。清单原始签名、三个小文件哈希、安装包头尾 Range 及旧 1.7.2 NsisUpdater 识别新版本通过；严格 TLS 公网与内网信令、12 位私房与双后台 scope 验证通过，不代替跨运营商真实媒体验收。仍纯 P2P、禁止 TURN、无新增运行配额，Windows 安装包仍无 Authenticode 签名。六位房号服务端热修现已上线，见下方；原十二位验证保留为历史。
 
 此前已发布版本：`1.7.2`，已于 2026-10-08 发布至 [GitHub Release](https://github.com/M4rkzzz/VDS/releases/tag/v1.7.2) 与默认公网自动更新源。发布前后门禁、NSIS 构建、35 个源码/静态文件与原生 runtime 完整性、实际打包程序启动退出均通过；原生 CTest 15/15，生产依赖审计均为 0。安装包为 239,871,320 字节，SHA256 `62E5BBAEBED840A654CBA841060DEF9F395171FE321F996D6240F67BE78192CB`，GitHub 三份资产哈希一致。NAS 信令与 Web 服务已更新为 1.7.2，公网 HTTPS/WSS 和 1.7.1 至 1.7.2 的更新元数据识别均通过。Windows 构建仍未签名，跨运营商实机连通与长时间物理音画同步仍待验收。
 
@@ -31,7 +31,14 @@
 
 当前未发布改动：
 
-- 无。本轮内容已随 1.7.3 发布并部署，下方保留实现详情与发布前基线。
+- 无。六位房号服务端热修已上线，下方保留热修结果与原始发布历史。
+
+### 2026-10-08 服务端热修（已上线）
+
+- 新房固定 6 位，从 `23456789ABCDEFGHJKLMNPQRSTUVWXYZ` 随机生成并检查当前 Map，碰撞最多重试 32 次；房间关闭或失效后作废，不保留额外旧码兼容，sessionToken 不变。Web 加入入口补 trim 与转大写。
+- 镜像 `vds-signaling:1.7.3-short-rooms` 已部署，API 仍为 1.7.3；仅更新服务端/Web，现有客户端无需重装，已发布 v1.7.3 标签、四资产与默认更新源内容不变。
+- 完整 check（Web 151/151、桌面 213/213、静态响应 7/7）及 core/revival/reconnect 通过；严格 TLS 公网的六位建房、直接/接力信令、恢复、伪造 token 拒绝和退出清理通过，另验证私房过期后旧码拒绝、新六位重建与加入/清理、双后台 scope 和 token 隔离。Web 两资产哈希/gzip/immutable 与原更新签名/三个小文件哈希/安装包头尾 206 Range 通过；未据此宣称跨运营商真实媒体验收。
+- NAS 全部 updates 逐文件哈希和其他三个容器 ID/启动时间不变，证书/FRP 未动；私密回滚备份为 `/vol1/1000/docker/vds/ops/room-code-6-before`。下方十二位发布验证与历史基线不改写。
 
 ### 1.7.3 安全修复与发布
 

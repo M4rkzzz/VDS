@@ -14,6 +14,7 @@ function fakeClock() {
   return {
     setTimeout(callback, ms) { const id = nextId++; timers.set(id, { at: now + ms, callback }); return id; },
     clearTimeout(id) { timers.delete(id); },
+    pendingCount() { return timers.size; },
     advance(ms) {
       const target = now + ms;
       for (;;) {
@@ -38,15 +39,106 @@ function loadRecovery(clock) {
 }
 
 function loadHandler(name, prelude, globals) {
+  return loadHandlers([name], prelude, name, globals);
+}
+
+function loadHandlers(names, prelude, returned, globals) {
   const filename = path.join(root, 'vds_web/src/main.ts');
   const source = ts.createSourceFile(filename, fs.readFileSync(filename, 'utf8'), ts.ScriptTarget.ES2022, true);
-  const declaration = source.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === name);
-  assert.ok(declaration, `missing production handler ${name}`);
-  const code = ts.transpileModule(`${prelude}\n${declaration.getText(source)}`, {
+  const declarations = names.map((name) => {
+    const declaration = source.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === name);
+    assert.ok(declaration, `missing production handler ${name}`);
+    return declaration.getText(source);
+  });
+  const code = ts.transpileModule(`${prelude}\n${declarations.join('\n')}`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
   }).outputText;
-  return new Function(...Object.keys(globals), `${code}\nreturn ${name};`)(...Object.values(globals));
+  return new Function(...Object.keys(globals), `${code}\nreturn ${returned};`)(...Object.values(globals));
 }
+
+function createJoinHarness(initialSession = null) {
+  const clock = fakeClock();
+  const calls = { audio: 0, connect: 0, sent: [], errors: [], updates: [], stored: [] };
+  const element = () => ({ disabled: false, textContent: '', value: '', classList: { add() {}, remove() {} } });
+  const flow = loadHandlers(['joinRoom', 'handleJoined', 'setJoinPending', 'startJoinAckTimer', 'clearJoinAckTimer'], `
+    const capabilityDetectionComplete = true, capability = { ok: true, maxDirectDownstreams: 0 };
+    let session = initialSession, restoringStoredSession = Boolean(initialSession);
+    let joinPending = false, pendingJoinRoomId = '', joinAttemptSeq = 0, joinAckTimer = null;
+    let viewerReadySent = false, upstreamRecoveryAttempts = 0;
+    const refreshRoomsInFlight = false;
+  `, `{
+    joinRoom, handleJoined,
+    snapshot: () => ({ session, joinPending, pendingJoinRoomId, restoringStoredSession })
+  }`, {
+    initialSession, clientId: 'web-client',
+    window: { setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
+    playback: { resumeAudio: async () => { calls.audio++; } },
+    signaling: { connect: async () => { calls.connect++; }, send: (message) => calls.sent.push(message), close() {} },
+    setError: (message) => calls.errors.push(message), setStatus() {},
+    diagnostics: { update: (value) => calls.updates.push(value) },
+    errorToMessage: (error) => error.message,
+    getWebEncodedMediaCapabilities: () => ({}), getManifestCompatibilityFailure: () => null,
+    upstreamRecovery: { start() {} }, requestUpstreamRecovery() {},
+    sessionStorage: { setItem: (key, value) => calls.stored.push({ key, value: JSON.parse(value) }) },
+    formatChainPosition: (position) => String(position),
+    joinButton: element(), roomIdInput: element(), refreshRoomsButton: element(),
+    lobbyTabButton: element(), directTabButton: element(), roomList: { querySelectorAll: () => [] },
+    joinCard: element(), leaveButton: element(), viewerRoomId: element(), chainPositionText: element()
+  });
+  return { ...flow, calls, clock };
+}
+
+test('production Web join sends trimmed uppercase input and waits for the same room acknowledgement', async () => {
+  const h = createJoinHarness();
+  await h.joinRoom(' \tabc234\n ');
+  assert.equal(h.calls.audio, 1);
+  assert.equal(h.calls.connect, 1);
+  assert.equal(h.calls.sent.length, 1);
+  assert.equal(h.calls.sent[0].roomId, 'ABC234');
+  assert.equal(h.snapshot().pendingJoinRoomId, 'ABC234');
+  assert.equal(h.clock.pendingCount(), 1);
+
+  h.handleJoined({ type: 'room-joined', roomId: 'ABC235' });
+  assert.equal(h.snapshot().joinPending, true);
+  assert.equal(h.snapshot().session, null);
+  assert.equal(h.clock.pendingCount(), 1);
+
+  h.handleJoined({ type: 'room-joined', roomId: 'ABC234', sessionToken: 'new-token' });
+  assert.equal(h.snapshot().joinPending, false);
+  assert.equal(h.snapshot().session.roomId, 'ABC234');
+  assert.equal(h.calls.stored[0].value.roomId, 'ABC234');
+  assert.equal(h.clock.pendingCount(), 0);
+  assert.deepEqual(h.calls.errors, []);
+});
+
+test('production Web restore compares its session against the normalized room code before sending the token', async () => {
+  const h = createJoinHarness({ roomId: 'ABC234', sessionToken: 'saved-token' });
+  await h.joinRoom('  abc234  ');
+  assert.equal(h.calls.sent.length, 1);
+  assert.equal(h.calls.sent[0].roomId, 'ABC234');
+  assert.equal(h.calls.sent[0].sessionToken, 'saved-token');
+  assert.equal(h.snapshot().pendingJoinRoomId, 'ABC234');
+  h.handleJoined({ type: 'session-resumed', roomId: 'ABC234', sessionToken: 'saved-token' });
+  assert.equal(h.snapshot().restoringStoredSession, false);
+  assert.equal(h.snapshot().joinPending, false);
+  assert.equal(h.clock.pendingCount(), 0);
+  assert.deepEqual(h.calls.errors, []);
+});
+
+test('production Web join rejects whitespace through the empty-input path without starting a join', async () => {
+  const h = createJoinHarness();
+  await h.joinRoom(' \r\n\t ');
+  assert.deepEqual(h.calls.errors, ['请输入房间码。']);
+  assert.equal(h.calls.audio, 0);
+  assert.equal(h.calls.connect, 0);
+  assert.deepEqual(h.calls.sent, []);
+  assert.equal(h.snapshot().joinPending, false);
+  assert.equal(h.snapshot().pendingJoinRoomId, '');
+  assert.equal(h.clock.pendingCount(), 0);
+  await h.joinRoom('abc234');
+  assert.equal(h.calls.sent.length, 1);
+  assert.equal(h.calls.sent[0].roomId, 'ABC234');
+});
 
 test('upstream failure in the production peer handler reaches recovery while stale/downstream failures do not', () => {
   const current = { connectionState: 'failed', iceConnectionState: 'failed' };

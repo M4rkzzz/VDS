@@ -264,6 +264,7 @@ async function bootstrap(): Promise<void> {
 }
 
 async function joinRoom(roomId: string): Promise<void> {
+  roomId = roomId.trim().toUpperCase();
   if (!capabilityDetectionComplete) {
     setError('浏览器能力检测尚未完成。');
     return;
@@ -285,7 +286,7 @@ async function joinRoom(roomId: string): Promise<void> {
   }
 
   setJoinPending(true);
-  pendingJoinRoomId = roomId.trim().toUpperCase();
+  pendingJoinRoomId = roomId;
   const joinSeq = ++joinAttemptSeq;
   startJoinAckTimer(joinSeq);
   try {

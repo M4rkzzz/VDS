@@ -2188,8 +2188,12 @@ function notifyPendingDownstreams(room, upstreamViewer) {
 }
 
 function generateRoomId(existingRooms) {
+  const alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
   for (let attempt = 0; attempt < 32; attempt += 1) {
-    const roomId = crypto.randomBytes(6).toString('hex').toUpperCase();
+    let roomId = '';
+    for (const byte of crypto.randomBytes(6)) {
+      roomId += alphabet[byte & 31];
+    }
     if (!existingRooms || !existingRooms.has(roomId)) {
       return roomId;
     }

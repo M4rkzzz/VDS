@@ -2122,20 +2122,58 @@ async function testStartServerSupportsRandomPort() {
 
 function testGenerateRoomIdAvoidsCollision() {
   const originalRandomBytes = crypto.randomBytes;
-  const existingRooms = new Map([['AAAAAAAAAAAA', {}]]);
+  const existingRoom = { id: '222222' };
+  const existingRooms = new Map([['222222', existingRoom]]);
   let calls = 0;
   crypto.randomBytes = (bytes) => {
-    assert.strictEqual(bytes, 6, 'new room codes must have 48 bits of randomness');
+    assert.strictEqual(bytes, 6, 'generate one random byte per room-code character');
     calls += 1;
     return calls === 1
-      ? Buffer.alloc(bytes, 0xaa)
-      : Buffer.alloc(bytes, 0xbb);
+      ? Buffer.alloc(bytes, 0)
+      : Buffer.alloc(bytes, 255);
   };
   try {
-    assert.strictEqual(generateRoomId(existingRooms), 'BBBBBBBBBBBB');
+    assert.strictEqual(generateRoomId(existingRooms), 'ZZZZZZ');
+    assert.strictEqual(calls, 2, 'an occupied code must trigger a fresh random draw');
+    assert.strictEqual(existingRooms.get('222222'), existingRoom);
   } finally {
     crypto.randomBytes = originalRandomBytes;
   }
+}
+
+function testGenerateRoomIdRejectsExhaustedCollisions() {
+  const originalRandomBytes = crypto.randomBytes;
+  const existingRooms = new Map([['222222', {}]]);
+  let calls = 0;
+  crypto.randomBytes = (bytes) => {
+    assert.strictEqual(bytes, 6);
+    calls += 1;
+    return Buffer.alloc(bytes, 0);
+  };
+  try {
+    assert.throws(() => generateRoomId(existingRooms), /room-id-generation-failed/);
+    assert.strictEqual(calls, 32, 'stop after the existing collision-retry budget');
+    assert.strictEqual(existingRooms.size, 1);
+  } finally {
+    crypto.randomBytes = originalRandomBytes;
+  }
+}
+
+function testGenerateRoomIdIsShortReadableAndRandom() {
+  const codes = new Set();
+  const charactersByPosition = Array.from({ length: 6 }, () => new Set());
+  for (let sample = 0; sample < 256; sample += 1) {
+    const roomId = generateRoomId();
+    assert.match(roomId, /^[2-9A-HJ-NP-Z]{6}$/, 'six uppercase characters without 0/O/1/I');
+    codes.add(roomId);
+    for (let position = 0; position < roomId.length; position += 1) {
+      charactersByPosition[position].add(roomId[position]);
+    }
+  }
+  // Allow random collisions instead of making this a flaky uniqueness test.
+  assert.ok(codes.size >= 240, 'random draws must produce varied room codes');
+  assert.ok(charactersByPosition.every((characters) => characters.size >= 24),
+    'every position must draw from the readable alphabet');
 }
 
 function testValidateInboundMessageRateLimit() {
@@ -2216,6 +2254,8 @@ async function testBrowserRootUsesVdsWebWhenBuilt() {
 
 (async () => {
   testGenerateRoomIdAvoidsCollision();
+  testGenerateRoomIdRejectsExhaustedCollisions();
+  testGenerateRoomIdIsShortReadableAndRandom();
   testValidateInboundMessageRateLimit();
   testServerSupportsOptionalHttpsForLanMobileWeb();
   testAdminDashboardShowsMobileWebCapabilities();
