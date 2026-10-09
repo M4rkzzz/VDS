@@ -5,6 +5,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const yaml = require('js-yaml');
+const { parseBlockmap } = require('../desktop/update-differential');
 const {
   verifySignedManifest, verifyDownloadedUpdate, publicKeyId, signaturePayload,
   MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES
@@ -117,6 +119,8 @@ async function verifyReleaseDirectory(directory, options = {}) {
   const info = verifySignedManifest(rawManifest, rawSignature, { trust: readTrust() });
   if (options.version && info.version !== options.version) throw new Error('Signed release version does not match package.json');
   await verifyDownloadedUpdate(path.join(directory, info.path), info);
+  if (info.blockmap) parseBlockmap(readBoundedFile(path.join(directory, info.blockmap.path), 2 * 1024 * 1024, 'blockmap'),
+    { size: info.files[0].size, blockmap: info.blockmap });
   return info;
 }
 
@@ -124,7 +128,17 @@ async function signReleaseDirectory(directory, options = {}) {
   const resolvedKey = assertOutsideProject(options.privateKeyPath || defaultPrivateKeyPath);
   const rawKey = readBoundedFile(resolvedKey, 16 * 1024, 'private release key');
   const privateKey = crypto.createPrivateKey(rawKey);
-  const rawManifest = readBoundedFile(path.join(directory, 'latest.yml'), MAX_MANIFEST_BYTES, 'update manifest');
+  const manifestPath = path.join(directory, 'latest.yml');
+  let rawManifest = readBoundedFile(manifestPath, MAX_MANIFEST_BYTES, 'update manifest');
+  const manifest = yaml.load(rawManifest.toString('utf8'));
+  if (!manifest || !/^\d+\.\d+\.\d+$/.test(manifest.version) || manifest.path !== `VDS-Setup-${manifest.version}.exe` ||
+      (options.version && manifest.version !== options.version)) throw new Error('Invalid release installer path or version');
+  const blockmapPath = `${manifest.path}.blockmap`;
+  const blockmap = readBoundedFile(path.join(directory, blockmapPath), 2 * 1024 * 1024, 'blockmap');
+  manifest.blockmap = { path: blockmapPath, size: blockmap.length,
+    sha512: crypto.createHash('sha512').update(blockmap).digest('base64') };
+  parseBlockmap(blockmap, { size: manifest.files[0].size, blockmap: manifest.blockmap });
+  rawManifest = Buffer.from(yaml.dump(manifest, { lineWidth: -1 }));
   const rawSignature = createManifestSignature(rawManifest, privateKey);
   const info = verifySignedManifest(rawManifest, rawSignature, { trust: readTrust() });
   if (options.version && info.version !== options.version) throw new Error('Signed release version does not match package.json');
@@ -134,6 +148,7 @@ async function signReleaseDirectory(directory, options = {}) {
   const signaturePath = path.join(directory, 'latest.yml.sig');
   const temporary = `${signaturePath}.${process.pid}.tmp`;
   try {
+    fs.writeFileSync(manifestPath, rawManifest);
     fs.writeFileSync(temporary, rawSignature, { flag: 'wx' });
     fs.renameSync(temporary, signaturePath);
   } finally {

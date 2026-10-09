@@ -6,6 +6,7 @@ const { validateNativeRuntime } = require('./native-runtime-integrity');
 const { assertNatTestsRegistered } = require('./test-native-nat');
 const { verifyReleaseDirectory } = require('./update-signature');
 const { publicKeyId } = require('../desktop/update-integrity');
+const { parseLatestManifest } = require('./prepare-server-release');
 
 const projectRoot = path.resolve(__dirname, '..');
 const mode = process.argv.includes('--prebuild')
@@ -43,14 +44,7 @@ function ensureFile(filePath) {
 }
 
 function readLatestManifest(filePath) {
-  const manifest = {};
-  for (const line of fs.readFileSync(filePath, 'utf8').split(/\r?\n/)) {
-    const match = /^-?\s*([A-Za-z0-9_-]+):\s*(.+?)\s*$/.exec(line.trimStart());
-    if (match) {
-      manifest[match[1]] = match[2].replace(/^['"]|['"]$/g, '');
-    }
-  }
-  return manifest;
+  return parseLatestManifest(fs.readFileSync(filePath, 'utf8'));
 }
 
 function fileSha512(filePath) {
@@ -187,6 +181,7 @@ async function main() {
     'desktop/main.js',
     'desktop/preload.js',
     'desktop/update-integrity.js',
+    'desktop/update-differential.js',
     'server/server-core.js',
     'server/index.js',
     'scripts/prepare-server-release.js',

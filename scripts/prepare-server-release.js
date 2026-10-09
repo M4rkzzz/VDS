@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const yaml = require('js-yaml');
 const { signReleaseDirectory } = require('./update-signature');
 
 const projectRoot = path.resolve(__dirname, '..');
@@ -135,6 +136,9 @@ function copyFile(artifactsDir, fileName) {
 
 function copyVersionedArtifacts(version, options = {}) {
   const { includeInstaller = false } = options;
+  // Old maps are retained as published; a local rebuild is not that release.
+  // Authenticated differential baselines now carry their own verified maps.
+  if (!includeInstaller) return null;
   let artifactsDir = null;
   try {
     artifactsDir = resolveArtifactsDir(version);
@@ -154,14 +158,8 @@ function copyVersionedArtifacts(version, options = {}) {
 }
 
 function parseLatestManifest(content) {
-  const result = {};
-  for (const line of String(content || '').split(/\r?\n/)) {
-    const match = /^-?\s*([A-Za-z0-9_-]+):\s*(.+?)\s*$/.exec(line.trimStart());
-    if (match) {
-      result[match[1]] = match[2].replace(/^['"]|['"]$/g, '');
-    }
-  }
-  return result;
+  const result = yaml.load(String(content || ''));
+  return { ...result, size: result.size ?? result.files?.[0]?.size };
 }
 
 function validateLatestManifest(artifactsDir, version) {
@@ -261,7 +259,8 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+module.exports = { copyVersionedArtifacts, parseLatestManifest };
+if (require.main === module) main().catch((error) => {
   console.error(`Preparing server release failed: ${error.message}`);
   process.exitCode = 1;
 });

@@ -15,6 +15,7 @@ function harness(options = {}) {
   const messages = [];
   const verificationCalls = [];
   const fileCopies = [];
+  const baselineCalls = [];
   const app = Object.assign(new EventEmitter(), {
     isPackaged: true,
     commandLine: { appendSwitch() {} },
@@ -59,6 +60,14 @@ function harness(options = {}) {
           if (options.verify) await options.verify(file, info);
         }
       };
+      if (name === './update-differential') return {
+        configureDifferentialUpdates: (value) => { value.disableDifferentialDownload = false; },
+        prepareDifferentialBaseline: async (_updater, file, info) => {
+          baselineCalls.push({ file, info });
+          if (options.baseline) return options.baseline(file, info);
+          return true;
+        }
+      };
       return localRequire(name);
     }
   });
@@ -69,7 +78,7 @@ function harness(options = {}) {
   vm.runInContext('mainWindow = testWindow; getAutoUpdater();', context);
   const event = { sender: contents, senderFrame: frame };
   return {
-    updater, messages, verificationCalls, fileCopies,
+    updater, messages, verificationCalls, fileCopies, baselineCalls,
     invoke: (channel) => handlers.get(channel)(event),
     downloaded: (info) => updater.listeners('update-downloaded')[0](info),
     statuses: () => messages.filter(message => message.channel === 'update-status').map(message => message.value.status)
@@ -85,7 +94,7 @@ test('main update checks use the signed provider and independent HTTPS feed', as
   assert.equal(updater.feed.url, 'https://boshan.s.3q.hair/updates/');
   assert.equal(updater.autoInstallOnAppQuit, false);
   assert.equal(updater.disableWebInstaller, true);
-  assert.equal(updater.disableDifferentialDownload, true);
+  assert.equal(updater.disableDifferentialDownload, false);
 });
 
 test('installation is refused before verification and retries after a valid download', async () => {
@@ -99,8 +108,8 @@ test('installation is refused before verification and retries after a valid down
   assert.equal(updater.installCalls, 1);
 });
 
-test('full-install updates use the verified downloaded file without duplicating a differential baseline', async () => {
-  const { invoke, updater, downloaded, statuses, verificationCalls, fileCopies } = harness();
+test('installation prepares its authenticated differential baseline before invoking NSIS', async () => {
+  const { invoke, updater, downloaded, statuses, verificationCalls, fileCopies, baselineCalls } = harness();
   updater.downloadedUpdateHelper = { cacheDir: '/unused-vds-updater-cache' };
   const info = updateInfo();
   await downloaded(info);
@@ -109,7 +118,30 @@ test('full-install updates use the verified downloaded file without duplicating 
   assert.equal(verificationCalls.length, 2);
   assert.ok(verificationCalls.every(call => call.file === info.downloadedFile));
   assert.deepEqual(fileCopies, []);
+  assert.equal(baselineCalls.length, 1);
+  assert.equal(baselineCalls[0].file, info.downloadedFile);
   assert.equal(updater.installCalls, 1);
+});
+
+test('unavailable differential baseline does not block a verified full installation', async () => {
+  const { invoke, updater, downloaded } = harness({ baseline: () => { throw new Error('blockmap-unavailable'); } });
+  await downloaded(updateInfo());
+  assert.equal(await invoke('quit-and-install'), true);
+  assert.equal(updater.installCalls, 1);
+});
+
+test('an updater error during baseline preparation prevents a stale installation', async () => {
+  let complete, entered;
+  const ready = new Promise(resolve => { entered = resolve; });
+  const pending = new Promise(resolve => { complete = resolve; });
+  const { invoke, updater, downloaded } = harness({ baseline: async () => { entered(); await pending; } });
+  await downloaded(updateInfo());
+  const installing = invoke('quit-and-install');
+  await ready;
+  updater.emit('error', new Error('install-cancelled'));
+  complete();
+  assert.equal(await installing, false);
+  assert.equal(updater.installCalls, 0);
 });
 
 test('rejected signature or package never publishes install readiness', async () => {

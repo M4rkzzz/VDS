@@ -80,6 +80,7 @@ for (const fileName of referencedUpdateFiles) {
     throw new Error(`Docker context missing update artifact referenced by latest.yml: ${relativePath}`);
   }
 
+  if (fileName.endsWith('.blockmap')) continue;
   const blockmapPath = `${absolutePath}.blockmap`;
   if (!fs.existsSync(blockmapPath) || fs.statSync(blockmapPath).size <= 0) {
     throw new Error(`Docker context missing update blockmap referenced by latest.yml: ${relativePath}.blockmap`);

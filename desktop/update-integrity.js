@@ -19,6 +19,7 @@ const defaultTrust = require('./update-trust.json');
 
 const MAX_MANIFEST_BYTES = 64 * 1024;
 const MAX_SIGNATURE_BYTES = 4 * 1024;
+const MAX_BLOCKMAP_BYTES = 2 * 1024 * 1024;
 const SIGNATURE_CONTEXT = Buffer.from('VDS update manifest v1\0', 'utf8');
 const authenticated = Symbol('VDS authenticated update');
 const authenticatedRecords = new WeakSet();
@@ -92,7 +93,14 @@ function validateManifestInfo(info, baseUrl) {
     const url = httpsUrl(new URL(file.url, base).href);
     if (url.origin !== base.origin) fail('installer must use the authenticated update origin');
   }
-  return { version: info.version, path: installerName, size: file.size, sha512: file.sha512 };
+  let blockmap = null;
+  if (info.blockmap != null) {
+    const map = info.blockmap;
+    if (map.path !== `${installerName}.blockmap` || !Number.isSafeInteger(map.size) ||
+        map.size <= 0 || map.size > MAX_BLOCKMAP_BYTES) fail('invalid signed blockmap path or size');
+    blockmap = Object.freeze({ path: map.path, size: map.size, sha512: sha512Value(map.sha512) });
+  }
+  return { version: info.version, path: installerName, size: file.size, sha512: file.sha512, blockmap };
 }
 
 function manifestFingerprint(info) {
@@ -120,7 +128,9 @@ function verifySignedManifest(rawManifest, rawSignature, options = {}) {
   }
   const info = parseUpdateInfo(decodeUtf8(manifest, 'manifest'), 'latest.yml', options.baseUrl || 'offline release');
   const expected = validateManifestInfo(info, options.baseUrl);
-  const record = Object.freeze({ ...expected, fingerprint: manifestFingerprint(info) });
+  const record = Object.freeze({ ...expected, fingerprint: manifestFingerprint(info),
+    rawManifest: Buffer.from(manifest), rawSignature: Buffer.from(sidecar), baseUrl: options.baseUrl,
+    identity: Object.freeze({}) });
   authenticatedRecords.add(record);
   // electron-updater spreads updateInfo when emitting update-downloaded. An
   // enumerable private Symbol preserves the authenticated identity through it,
@@ -137,6 +147,11 @@ function requireAuthenticatedInfo(info) {
   const { downloadedFile: _downloadedFile, ...manifest } = info;
   if (manifestFingerprint(manifest) !== record.fingerprint) fail('authenticated metadata was modified');
   return record;
+}
+
+function authenticatedRelease(info) {
+  const record = requireAuthenticatedInfo(info);
+  return { ...record, rawManifest: Buffer.from(record.rawManifest), rawSignature: Buffer.from(record.rawSignature) };
 }
 
 function signedDownloadExecutor(executor) {
@@ -335,5 +350,5 @@ function createSignedUpdateFeedOptions(feedUrl) {
 
 module.exports = {
   createSignedUpdateFeedOptions, verifyDownloadedUpdate, verifySignedManifest,
-  publicKeyId, signaturePayload, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES
+  authenticatedRelease, publicKeyId, signaturePayload, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES, MAX_BLOCKMAP_BYTES
 };

@@ -8,6 +8,7 @@ const { pathToFileURL } = require('node:url');
 const { createIpcBoundary } = require('./ipc-boundary');
 const { getUpdateFeedBaseUrl: resolveUpdateFeedBaseUrl } = require('./update-source');
 const { createSignedUpdateFeedOptions, verifyDownloadedUpdate } = require('./update-integrity');
+const { configureDifferentialUpdates, prepareDifferentialBaseline } = require('./update-differential');
 const { SessionLogWriter } = require('./session-log-writer');
 const { MediaAgentManager } = require('./media-agent-manager');
 const { HostVideoRefreshWakeup } = require('./host-video-refresh-wakeup');
@@ -401,6 +402,14 @@ ipcBoundary.handle(ipcMain, 'quit-and-install', async () => {
     if (generation !== updateVerificationGeneration) return false;
     if (verifiedUpdate !== update) throw new Error('update-changed-before-install');
     const updater = getAutoUpdater();
+    try {
+      const prepared = await prepareDifferentialBaseline(updater, update.filePath, update.info);
+      writeUpdateLog('info', `Differential baseline prepared for ${update.info.version}: ${prepared}`);
+    } catch (error) {
+      // Baseline preparation must not block a verified full installation.
+      writeUpdateLog('warn', `Differential baseline unavailable: ${formatLogMessage(error)}`);
+    }
+    if (generation !== updateVerificationGeneration || verifiedUpdate !== update) return false;
     writeUpdateLog('info', 'quitAndInstall requested by renderer after signature and package verification. mode=silent');
     updater.quitAndInstall(true, true);
     // The updater can synchronously report a failed installation through its error event.
@@ -2007,8 +2016,7 @@ function configureAutoUpdater() {
   };
   autoUpdater.autoDownload = false;
   autoUpdater.disableWebInstaller = true;
-  // Only the complete installer is authenticated; do not parse unsigned blockmaps.
-  autoUpdater.disableDifferentialDownload = true;
+  configureDifferentialUpdates(autoUpdater);
   // The renderer requests installation only after our signed metadata/package checks.
   autoUpdater.autoInstallOnAppQuit = false;
 
