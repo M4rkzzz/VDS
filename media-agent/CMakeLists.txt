@@ -181,6 +181,12 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
   target_include_directories(vds-wgc-frame-sampling-tests PRIVATE src)
   add_test(NAME vds-wgc-frame-sampling-tests COMMAND vds-wgc-frame-sampling-tests)
   if(WIN32)
+    add_executable(vds-wgc-apartment-lifecycle-tests
+      tests/wgc_apartment_lifecycle_tests.cpp src/wgc_capture.cpp)
+    target_include_directories(vds-wgc-apartment-lifecycle-tests PRIVATE src)
+    target_link_libraries(vds-wgc-apartment-lifecycle-tests PRIVATE d3d11 dxgi user32 gdi32 ole32 RuntimeObject windowsapp)
+    add_test(NAME vds-wgc-apartment-lifecycle-tests COMMAND vds-wgc-apartment-lifecycle-tests)
+    set_tests_properties(vds-wgc-apartment-lifecycle-tests PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(vds-wasapi-packet-diagnostics-tests
       tests/wasapi_packet_diagnostics_tests.cpp src/json_protocol.cpp)
     target_include_directories(vds-wasapi-packet-diagnostics-tests PRIVATE src)

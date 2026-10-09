@@ -83,7 +83,7 @@ class WgcFrameSource {
 
   bool wait_for_frame_bgra(int timeout_ms, WgcFrameCpuBuffer* frame, std::string* error,
     WgcFrameReadbackSampler* sampler = nullptr);
-  void close();
+  void close() noexcept;
 
  private:
   class Impl;

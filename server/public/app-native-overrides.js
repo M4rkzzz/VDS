@@ -441,6 +441,7 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
     });
   const nativeSessionController = nativeEntry.createRequired('nativeSession', 'createController', 'native-session-controller-unavailable', {
       mediaEngine,
+      getNativeHostSessionRunning: () => nativeHostSessionRunning,
       getQualitySettings: () => qualitySettings || {},
       getCurrentHostBackend: () => nativeSessionState.getCurrentHostBackend(),
       getRequestedVideoCodec: () => (typeof getRequestedCodecPreference === 'function'

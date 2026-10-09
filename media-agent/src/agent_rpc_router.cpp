@@ -128,7 +128,16 @@ void run_agent_rpc_loop(AgentRuntimeState& runtime_state) {
         }
         HostSessionController host_sessions(runtime_state);
         HostSessionControllerCallbacks callbacks = make_stop_host_session_callbacks(runtime_state);
-        write_command_result(id, host_sessions.stop(callbacks));
+        // Audio owns the same share lifetime. Leaving process loopback alive
+        // prevents the next mediaSessionId from activating even after video stops.
+        HostAudioDispatchSession host_audio_dispatch = bind_active_host_audio_dispatch(runtime_state, peer_sessions);
+        const auto audio_result = host_audio_dispatch.stop_from_request();
+        const auto host_result = host_sessions.stop(callbacks);
+        if (!audio_result.ok) {
+          write_command_result(id, audio_result);
+        } else {
+          write_command_result(id, host_result);
+        }
         return;
       }
 

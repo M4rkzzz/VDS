@@ -72,7 +72,12 @@ $requests = @(
   @{ id = 51; method = 'createPeer'; nested = $true; peerId = 'reject-invalid-ipv6-pool'; stunServers = @('stun:[:::]:3478') },
   @{ id = 52; method = 'createPeer'; nested = $true; peerId = 'reject-nested-single-turn'; stunServer = 'turn:relay.example.com:3478' },
   @{ id = 53; method = 'createPeer'; nested = $true; peerId = 'reject-nested-single-type'; stunServer = 3478 },
-  @{ id = 54; method = 'getStats' }
+  @{ id = 54; method = 'getStats' },
+  @{ id = 55; method = 'startAudioSession'; mediaSessionId = 'owner-a'; pid = $PID; processName = 'VDS owned lifecycle fixture' },
+  @{ id = 56; method = 'startHostSession'; mediaSessionId = 'owner-b'; backend = 'obs-ingest'; port = $portB },
+  @{ id = 57; method = 'stopHostSession'; mediaSessionId = 'owner-a' },
+  @{ id = 58; method = 'startHostSession'; mediaSessionId = 'owner-b'; backend = 'obs-ingest'; port = $portB },
+  @{ id = 59; method = 'stopHostSession'; mediaSessionId = 'owner-b' }
 )
 
 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -196,6 +201,12 @@ try {
     if ($responses[$id].error.code -ne 'BAD_REQUEST') { throw "Invalid or ambiguous RPC params were accepted for id=$id." }
   }
   if (@($responses[54].result.peers).Count -ne 0) { throw 'Rejected RPC params requests created peer state.' }
+  if ($responses[55].error) { throw 'Owned process audio start failed.' }
+  if ($responses[56].error.code -ne 'MEDIA_SESSION_ACTIVE') { throw 'Active share owner isolation was lost.' }
+  if ($responses[57].error -or $responses[57].result.running) { throw 'Combined audio/video stop failed.' }
+  if ($responses[58].error -or -not $responses[58].result.running) { throw 'Host stop left audio blocking the next owner.' }
+  if ($responses[59].error -or $responses[59].result.running) { throw 'Restarted owner stop failed.' }
+  Write-Host "Owned process audio was active before host stop: $($responses[55].result.captureActive)"
   Write-Host 'media-agent RPC lifecycle tests passed'
 } finally {
   if (-not $process.HasExited) { $process.Kill() }

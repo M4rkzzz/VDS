@@ -48,6 +48,20 @@ std::string format_wgc_stage_error(const std::string& stage, const std::string& 
 }
 
 #ifdef _WIN32
+// COM apartments belong to threads, not capture objects. A source can be
+// created by the RPC thread and later closed by a preview worker.
+class ThreadWinrtApartment {
+ public:
+  ThreadWinrtApartment() { winrt::init_apartment(winrt::apartment_type::multi_threaded); }
+  ~ThreadWinrtApartment() { winrt::uninit_apartment(); }
+  ThreadWinrtApartment(const ThreadWinrtApartment&) = delete;
+  ThreadWinrtApartment& operator=(const ThreadWinrtApartment&) = delete;
+};
+
+void ensure_thread_winrt_apartment() {
+  thread_local ThreadWinrtApartment apartment;
+}
+
 struct WgcSehException : public std::exception {
   explicit WgcSehException(unsigned int code) : code(code) {}
 
@@ -363,6 +377,8 @@ class WgcFrameSource::Impl {
 
   bool initialize(std::string* error) {
 #ifdef _WIN32
+    set_creation_stage("winrt-init-apartment");
+    ensure_thread_winrt_apartment();
     set_creation_stage("support-check");
     if (!winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported()) {
       if (error) {
@@ -370,10 +386,6 @@ class WgcFrameSource::Impl {
       }
       return false;
     }
-
-    set_creation_stage("winrt-init-apartment");
-    winrt::init_apartment(winrt::apartment_type::multi_threaded);
-    apartment_initialized_ = true;
 
     set_creation_stage("d3d11-device-create");
     if (!create_d3d11_device(&device_, &context_, error)) {
@@ -481,6 +493,7 @@ class WgcFrameSource::Impl {
   bool wait_for_frame_bgra(int timeout_ms, WgcFrameCpuBuffer* frame, std::string* error,
       WgcFrameReadbackSampler* sampler) {
 #ifdef _WIN32
+    ensure_thread_winrt_apartment();
     if (!frame) {
       if (error) {
         *error = "wgc-frame-output-missing";
@@ -541,6 +554,7 @@ class WgcFrameSource::Impl {
       if (event_state->closed) {
         return;
       }
+      ensure_thread_winrt_apartment();
       event_state->closed = true;
       event_state->frame_arrived = false;
     }
@@ -555,11 +569,11 @@ class WgcFrameSource::Impl {
       }
     }
     if (session_) {
-      session_.Close();
+      try { session_.Close(); } catch (...) {}
       session_ = nullptr;
     }
     if (pool_) {
-      pool_.Close();
+      try { pool_.Close(); } catch (...) {}
       pool_ = nullptr;
     }
     if (context_) {
@@ -571,10 +585,6 @@ class WgcFrameSource::Impl {
     staging_texture_ = nullptr;
     context_ = nullptr;
     device_ = nullptr;
-    if (apartment_initialized_) {
-      winrt::uninit_apartment();
-      apartment_initialized_ = false;
-    }
 #endif
   }
 
@@ -734,7 +744,6 @@ class WgcFrameSource::Impl {
 
   WgcFrameSourceConfig config_;
   std::string creation_stage_;
-  bool apartment_initialized_ = false;
   winrt::com_ptr<ID3D11Device> device_;
   winrt::com_ptr<ID3D11DeviceContext> context_;
   winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice winrt_device_ { nullptr };
@@ -756,25 +765,45 @@ WgcFrameSource::WgcFrameSource(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 
 WgcFrameSource::~WgcFrameSource() {
-  if (impl_) {
-    impl_->close();
-  }
+  close();
 }
 
 bool WgcFrameSource::wait_for_frame_bgra(int timeout_ms, WgcFrameCpuBuffer* frame, std::string* error,
     WgcFrameReadbackSampler* sampler) {
-  return impl_->wait_for_frame_bgra(timeout_ms, frame, error, sampler);
+#ifdef _WIN32
+  ScopedSehTranslator seh_translator;
+#endif
+  try {
+    return impl_->wait_for_frame_bgra(timeout_ms, frame, error, sampler);
+#ifdef _WIN32
+  } catch (const winrt::hresult_error& ex) {
+    if (error) *error = format_hresult_error("wgc-frame-readback-hresult-error", ex);
+  } catch (const WgcSehException& ex) {
+    if (error) *error = format_seh_error("wgc-frame-readback-seh-error", ex);
+#endif
+  } catch (const std::exception& ex) {
+    if (error) *error = std::string("wgc-frame-readback-error:") + ex.what();
+  } catch (...) {
+    if (error) *error = "wgc-frame-readback-unknown-error";
+  }
+  return false;
 }
 
-void WgcFrameSource::close() {
-  if (impl_) {
-    impl_->close();
+void WgcFrameSource::close() noexcept {
+#ifdef _WIN32
+  ScopedSehTranslator seh_translator;
+#endif
+  try {
+    if (impl_) impl_->close();
+  } catch (...) {
+    // Teardown failure must not terminate the capture worker or skip destruction.
   }
 }
 
 WgcCaptureProbe probe_wgc_capture_backend() {
   WgcCaptureProbe probe;
 #ifdef _WIN32
+  ensure_thread_winrt_apartment();
   probe.platform_supported = true;
   probe.display_capture_supported = false;
   probe.window_capture_supported = false;
@@ -828,6 +857,10 @@ std::shared_ptr<WgcFrameSource> create_wgc_frame_source(
     if (!impl->initialize(error)) {
       if (error) {
         *error = format_wgc_stage_error(impl->creation_stage(), *error);
+      }
+      try {
+        impl->close();
+      } catch (...) {
       }
       return nullptr;
     }

@@ -707,6 +707,12 @@
       if (context.nativeHostSessionEnabled === false) {
         throw new Error('native-host-session-disabled');
       }
+      // Selecting a new source replaces the current share, including a host
+      // whose first peer failed to attach its capture source.
+      if (getNativeHostSessionRunning()) {
+        const stopped = await runStopShare({ requireHostStop: true });
+        if (!stopped || stopped.stopped !== true) throw new Error('native-host-stop-in-progress');
+      }
       const startGeneration = beginHostStart();
       try {
         applyEffects(buildHostStartBeginEffects({ backend: 'native' }));
@@ -725,16 +731,15 @@
 
         for (let attempt = 0; attempt < 2; attempt += 1) {
           let sessionStarted = false;
+          let sessionStartAttempted = false;
           try {
             assertHostStartCurrent(startGeneration);
+            sessionStartAttempted = true;
             const session = await startHostSession(parsedSource);
             callOptional('logNativeDebug', 'video', '[media-engine] host session result:', JSON.stringify(session));
             assertHostStartCurrent(startGeneration);
             const validation = validateHostStartResult({ backend: 'native', session });
             if (!validation.ok) {
-              if (validation.shouldStop) {
-                await stopHostSession({}).catch(() => {});
-              }
               throw new Error(validation.reason || 'native-host-session-start-failed');
             }
             sessionStarted = true;
@@ -772,12 +777,14 @@
               timeoutMs: 5000
             });
             assertHostStartCurrent(startGeneration);
-            return { started: true, session, effectiveCodec };
+            return { started: true, session, effectiveCodec, startGeneration, mediaSessionId: getMediaSessionId() };
           } catch (error) {
             // A cancelled attempt no longer owns the running host or its UI.
             assertHostStartCurrent(startGeneration);
-            if (sessionStarted) {
-              await stopHostSession({}).catch(() => {});
+            if (sessionStarted || sessionStartAttempted) {
+              // Keep ownership visible if cleanup fails, so the next attempt
+              // retries that stop before allocating another media session.
+              await stopHostSession({});
               assertHostStartCurrent(startGeneration);
             }
             await cleanupFailedHostStart();
@@ -806,29 +813,44 @@
       if (optionsForStart.nativeHostSessionEnabled === false) {
         throw new Error('native-host-session-disabled');
       }
+      if (getNativeHostSessionRunning()) {
+        const stopped = await runStopShare({ requireHostStop: true });
+        if (!stopped || stopped.stopped !== true) throw new Error('native-host-stop-in-progress');
+      }
       const startGeneration = beginHostStart();
+      let sessionStartAttempted = false;
       try {
         applyEffects(buildHostStartBeginEffects({ backend: 'obs-ingest' }));
         await callOptional('ensureNativeUiReady');
+        assertHostStartCurrent(startGeneration);
         await callOptional('ensureMediaEngineStarted');
+        assertHostStartCurrent(startGeneration);
         await callOptional('waitForHostUiReady');
+        assertHostStartCurrent(startGeneration);
         const requestedPort = Number.isFinite(Number(optionsForStart && optionsForStart.port))
           ? Math.round(Number(optionsForStart.port))
           : 0;
+        sessionStartAttempted = true;
         const session = await startHostSession({ backend: 'obs-ingest', port: requestedPort });
         callOptional('logNativeDebug', 'video', '[media-engine] obs ingest session result:', JSON.stringify(session));
-        if (!isHostStartCurrent(startGeneration, { stopInFlight: getStopShareInFlight() })) {
-          await stopHostSession({}).catch(() => {});
-          throw new Error('native-host-start-superseded');
-        }
+        assertHostStartCurrent(startGeneration);
         const validation = validateHostStartResult({ backend: 'obs-ingest', session });
         if (!validation.ok) {
           throw new Error(validation.reason || 'obs-ingest-session-start-failed');
         }
         applyEffects(buildHostStartSuccessEffects({ backend: 'obs-ingest', session }));
         return { started: true, session };
+      } catch (error) {
+        assertHostStartCurrent(startGeneration);
+        if (sessionStartAttempted) {
+          await stopHostSession({});
+          assertHostStartCurrent(startGeneration);
+        }
+        await cleanupFailedHostStart();
+        assertHostStartCurrent(startGeneration);
+        throw error;
       } finally {
-        finishHostStart();
+        if (isHostStartCurrent(startGeneration, { stopInFlight: getStopShareInFlight() })) finishHostStart();
       }
     }
 
@@ -894,7 +916,10 @@
     }
 
     async function runNativeCaptureHostStartWithAudio(sourceId, audioPid, context = {}) {
-      await runNativeCaptureHostStart(sourceId, context);
+      const host = await runNativeCaptureHostStart(sourceId, context);
+      const isCurrent = () => isHostStartCurrent(host.startGeneration, { stopInFlight: getStopShareInFlight() }) &&
+        getMediaSessionId() === host.mediaSessionId;
+      if (!isCurrent()) return { started: false, reason: 'native-host-start-superseded' };
 
       if (!audioPid) {
         return { started: true, audioStarted: false, audioSkipped: true };
@@ -903,14 +928,17 @@
       try {
         const result = await startNativeAudioForShare({
           pid: Number(audioPid),
-          processName: ''
+          processName: '',
+          mediaSessionId: host.mediaSessionId
         });
+        if (!isCurrent()) return { started: false, reason: 'native-host-start-superseded' };
         if (!result || result.ok !== true) {
           callOptional('showError', (result && result.warningText) || '原生音频当前不可用，将仅共享画面');
           return { started: true, audioStarted: false, audioWarning: result || null };
         }
         return { started: true, audioStarted: true, audioResult: result };
       } catch (error) {
+        if (!isCurrent()) return { started: false, reason: 'native-host-start-superseded' };
         callOptional('logRecoverableNativeWarning', 'native-audio-session:start-failed', error, {
           key: 'native-audio-session-start-failed',
           category: 'audio',
@@ -983,7 +1011,7 @@
       callOptional('resetShareStartPendingUi');
     }
 
-    async function cleanupStopResources() {
+    async function cleanupStopResources(context = {}) {
       callOptional('stopHostStatsPolling');
       callOptional('stopViewerStatsPolling');
       callOptional('detachHostPreviewSurface');
@@ -991,7 +1019,11 @@
       for (const peerId of Array.isArray(peerIds) ? peerIds : []) {
         await Promise.resolve(callOptional('closePeer', peerId, { clearRetryState: true })).catch(() => {});
       }
-      await stopHostSession({}).catch(() => {});
+      if (context.requireHostStop) {
+        await stopHostSession({});
+      } else {
+        await stopHostSession({}).catch(() => {});
+      }
       setHostPreviewAttached(false);
       setHostWaitingWindowRestore(false);
     }
@@ -1041,7 +1073,7 @@
         return { stopped: false, reason: stopStart && stopStart.reason ? stopStart.reason : 'stop-share-not-started' };
       }
       try {
-        await cleanupStopResources();
+        await cleanupStopResources(context);
         await finalizeStopState();
         return { stopped: true };
       } finally {
