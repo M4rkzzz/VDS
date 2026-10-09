@@ -2,6 +2,12 @@
 
 信令、公开房间、Web 观看端和管理后台由同一个 Node.js 服务提供。服务器只传递信令与拓扑，音视频仍由客户端纯 P2P 传输，禁止 TURN。Docker 基础运行时为 Node 22.23.3 / Alpine 3.24。
 
+## 2026-10-09：桌面 1.7.4 更新源已发布
+
+桌面 WGC、预览与音视频会话恢复修复源码为 `197b3d5`，`v1.7.4` 标签对应同一源码；[正式 Release](https://github.com/M4rkzzz/VDS/releases/tag/v1.7.4) 四份资产大小及 SHA256 与最终本地产物一致。默认 HTTPS 更新源已切换为 1.7.4，原始清单签名、三个小文件哈希和安装包头尾 206 Range 验证通过，真实 NsisUpdater 已确认 1.7.3 可识别 1.7.4；保留签名认证与全量下载路线。
+
+本次只在 `/vol1/1000/docker/vds/server/updates` 添加新的版本化安装包、地图并切换签名清单。NAS 信令仍为 `vds-signaling:1.7.3-short-rooms`，API 版本仍为 1.7.3；没有重启信令或其他三个容器，全部 ID/启动时间、旧安装包与地图、证书及 FRP 保持原样。安装包 235,379,496 字节，SHA256 `e991c41479a6ee2b44dea40f7bee5b175d938b53f6b8e7e7017b17d3ec5379a7`。发布暂存文件在 `/vol1/1000/docker/vds/releases/1.7.4`；旧清单、签名、旧 updates 哈希和容器状态在私密备份 `/vol1/1000/docker/vds/ops/release-1.7.4-before`，可成对恢复旧清单与签名回退更新源。以下保留此前服务端部署历史。
+
 ## 2026-10-08 六位一次性房号热修（已上线）
 
 线上服务端已将新房号改为固定 6 位，字符集为 `23456789ABCDEFGHJKLMNPQRSTUVWXYZ`，仅对应当前活动房间，关闭或失效后旧码作废，不保留额外旧码兼容。随机生成并检查当前 Map，碰撞最多重试 32 次，sessionToken 不变；Web 加入入口先 trim 再转大写。
