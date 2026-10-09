@@ -10,6 +10,9 @@ struct FfmpegProbeResult;
 namespace vds::media_agent {
 
 FfmpegProbeResult probe_ffmpeg(const std::string& agent_binary_path);
+// The child performs one synthetic encoder test and exits before starting any
+// RPC, capture, audio, or peer runtime.
+int run_ffmpeg_encoder_probe_child(const std::string& video_encoder);
 std::string ffmpeg_probe_json(const FfmpegProbeResult& probe);
 
 std::string select_preferred_audio_encoder(const std::vector<std::string>& audio_encoders);

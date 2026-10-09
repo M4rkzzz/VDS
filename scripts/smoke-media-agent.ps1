@@ -1,6 +1,7 @@
 param(
   [string]$AgentPath = '',
-  [int]$TimeoutSeconds = 15,
+  # Includes the bounded cold-start capabilities and the short RPC fixture.
+  [int]$TimeoutSeconds = 105,
   [switch]$RequireTransportReady
 )
 

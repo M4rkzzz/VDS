@@ -16,6 +16,8 @@
 #include "agent_rpc_router.h"
 #include "agent_runtime.h"
 #include "agent_status_json.h"
+#include "ffmpeg_probe.h"
+#include "wgc_capability_probe.h"
 
 namespace {
 void report_agent_failure(const char* stage, const char* message) noexcept {
@@ -29,6 +31,15 @@ void report_agent_failure(const char* stage, const char* message) noexcept {
 
 int main(int argc, char* argv[]) {
   std::ios::sync_with_stdio(false);
+
+  if (argc > 1 && argv[1] && std::string(argv[1]) == "--probe-video-encoder") {
+    return argc == 3 && argv[2]
+      ? vds::media_agent::run_ffmpeg_encoder_probe_child(argv[2])
+      : 1;
+  }
+  if (argc > 1 && argv[1] && std::string(argv[1]) == "--probe-wgc-capability") {
+    return argc == 2 ? run_wgc_capture_probe_child() : 1;
+  }
 
   AgentRuntimeState runtime_state;
   int result = 0;

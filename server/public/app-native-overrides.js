@@ -715,6 +715,7 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
     if (nativeUiReadyPromise) {
       await nativeUiReadyPromise;
     }
+    return nativeMediaEngineController.ensureStarted();
   }
 
   function isNativePeerDriverActive() {
@@ -988,10 +989,9 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
     await nativeSurfaceController.bindLayoutEvents();
 
     nativeDiagnostics.bindMediaEngineEvents(mediaEngine, {
-      onEvent: (event) => nativeMediaEngineController.handleEvent(event)
+      onEvent: (event) => nativeMediaEngineController.handleEvent(event),
+      onStatus: (status) => nativeMediaEngineController.handleStatus(status)
     });
-
-    await nativeMediaEngineController.ensureStarted();
   }
 
   const legacyGlobalBindings = {
@@ -1023,7 +1023,7 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
   nativePeerMessages.registerHandlers();
   nativeUiReadyPromise = initializeNativeUi();
 
-  nativeUiReadyPromise.catch((error) => {
+  ensureNativeUiReady().catch((error) => {
     console.error('[media-engine] native override init failed:', error);
     showError(`Native init failed: ${error && error.message ? error.message : String(error)}`);
   });

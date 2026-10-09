@@ -13,10 +13,14 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/log.h>
 #include <libavutil/mem.h>
 }
 
 #include "ffmpeg_probe_state.h"
+#include "agent_diagnostics.h"
+#include "agent_events.h"
+#include "capability_probe_budget.h"
 #include "json_protocol.h"
 #include "platform_utils.h"
 #include "process_runner.h"
@@ -26,6 +30,22 @@ namespace fs = std::filesystem;
 
 namespace vds::media_agent {
 namespace {
+
+constexpr unsigned long kCapabilityProbeTimeoutMs = 5000;
+constexpr unsigned long kStartupCapabilityBudgetMs = 60000;
+
+const std::vector<std::string>& capability_probe_encoders() {
+  static const std::vector<std::string> encoders {
+    // Preserve software fallback even when unhealthy optional drivers consume
+    // the shared cold-start diagnostic budget. Pipeline preference is still
+    // chosen separately and continues to favour validated hardware.
+    "libx264", "libopenh264", "libx265",
+    "h264_nvenc", "h264_amf", "h264_qsv", "h264_d3d12va", "h264_mf",
+    "hevc_nvenc", "hevc_amf", "hevc_qsv",
+    "hevc_d3d12va", "hevc_mf"
+  };
+  return encoders;
+}
 
 std::string ffmpeg_error_string(int error_code) {
   char buffer[AV_ERROR_MAX_STRING_SIZE] = {};
@@ -217,6 +237,63 @@ bool fill_probe_test_frame(AVFrame* frame, std::string* error) {
 
 VideoEncoderProbeResult run_video_encoder_probe(const std::string& video_encoder);
 
+VideoEncoderProbeResult run_isolated_video_encoder_probe(
+    const std::string& agent_binary_path, const std::string& video_encoder,
+    unsigned long timeout_ms = kCapabilityProbeTimeoutMs) {
+#ifdef _WIN32
+  VideoEncoderProbeResult probe;
+  probe.name = trim_copy(video_encoder);
+  probe.hardware = is_hardware_video_encoder(probe.name);
+  probe.priority = video_encoder_probe_priority(probe.name);
+  // Querying the codec registry does not open a GPU driver or device.
+  probe.exists = avcodec_find_encoder_by_name(probe.name.c_str()) != nullptr;
+  if (!probe.exists) {
+    probe.reason = "encoder-missing";
+    probe.error = "avcodec-find-encoder-by-name-failed";
+    return probe;
+  }
+  if (timeout_ms == 0) {
+    probe.reason = "encoder-self-test-startup-budget-exhausted";
+    probe.error = "startup-capability-budget-exhausted:" + probe.name;
+    return probe;
+  }
+
+  emit_agent_breadcrumb("startup-encoder-probe:" + probe.name);
+  const CommandResult child = run_probe_process_capture(agent_binary_path,
+      {"--probe-video-encoder", probe.name}, timeout_ms);
+  if (child.timed_out) {
+    probe.reason = "encoder-self-test-timeout";
+    probe.error = "isolated-encoder-probe-timeout:" + probe.name;
+  } else if (!child.launched || child.exit_code != 0) {
+    probe.reason = child.launched ? "encoder-self-test-process-failed" : "encoder-self-test-process-unavailable";
+    probe.error = child.launched
+      ? "isolated-encoder-probe-exit:" + std::to_string(child.exit_code)
+      : child.output;
+  } else {
+    // Driver libraries may write their own diagnostics. Accept only the child
+    // result line for the exact requested encoder, never a partial response.
+    for (const std::string& line : split_lines(child.output)) {
+      if (line.empty() || line.front() != '{' ||
+          extract_string_value(line, "name") != probe.name) continue;
+      probe.validated = extract_bool_value(line, "validated", false);
+      probe.reason = extract_string_value(line, "reason");
+      probe.error = extract_string_value(line, "error");
+    }
+    if (probe.reason.empty()) {
+      probe.validated = false;
+      probe.reason = "encoder-self-test-invalid-result";
+      probe.error = "isolated-encoder-probe-result-missing";
+    }
+  }
+  emit_agent_breadcrumb("startup-encoder-probe-finished:" + probe.name + ":" + probe.reason);
+  return probe;
+#else
+  (void)agent_binary_path;
+  (void)timeout_ms;
+  return run_video_encoder_probe(video_encoder);
+#endif
+}
+
 std::vector<std::string> build_ffmpeg_candidates(const std::string& agent_binary_path) {
   std::vector<std::string> candidates;
   std::set<std::string> seen;
@@ -228,10 +305,10 @@ std::vector<std::string> build_ffmpeg_candidates(const std::string& agent_binary
   };
 
 #ifdef _WIN32
-  char* env_path = nullptr;
+  wchar_t* env_path = nullptr;
   std::size_t env_length = 0;
-  if (_dupenv_s(&env_path, &env_length, "VDS_FFMPEG_PATH") == 0 && env_path) {
-    append_candidate(env_path);
+  if (_wdupenv_s(&env_path, &env_length, L"VDS_FFMPEG_PATH") == 0 && env_path) {
+    append_candidate(fs::path(env_path).u8string());
     std::free(env_path);
   }
 #else
@@ -241,13 +318,13 @@ std::vector<std::string> build_ffmpeg_candidates(const std::string& agent_binary
 #endif
 
   if (!agent_binary_path.empty()) {
-    const fs::path agent_path(agent_binary_path);
+    const fs::path agent_path = fs::u8path(agent_binary_path);
     const fs::path agent_dir = agent_path.parent_path();
-    append_candidate((agent_dir / "ffmpeg.exe").string());
-    append_candidate((agent_dir / "ffmpeg" / "ffmpeg.exe").string());
-    append_candidate((agent_dir / "ffmpeg" / "bin" / "ffmpeg.exe").string());
-    append_candidate((agent_dir.parent_path() / "ffmpeg.exe").string());
-    append_candidate((agent_dir.parent_path() / "ffmpeg" / "bin" / "ffmpeg.exe").string());
+    append_candidate((agent_dir / "ffmpeg.exe").u8string());
+    append_candidate((agent_dir / "ffmpeg" / "ffmpeg.exe").u8string());
+    append_candidate((agent_dir / "ffmpeg" / "bin" / "ffmpeg.exe").u8string());
+    append_candidate((agent_dir.parent_path() / "ffmpeg.exe").u8string());
+    append_candidate((agent_dir.parent_path() / "ffmpeg" / "bin" / "ffmpeg.exe").u8string());
   }
 
   append_candidate("ffmpeg");
@@ -487,6 +564,17 @@ VideoEncoderProbeResult run_video_encoder_probe(const std::string& video_encoder
 
 }  // namespace
 
+int run_ffmpeg_encoder_probe_child(const std::string& video_encoder) {
+  if (video_encoder.empty()) return 1;
+#ifdef _WIN32
+  SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+#endif
+  av_log_set_level(AV_LOG_QUIET);
+  const VideoEncoderProbeResult probe = run_video_encoder_probe(video_encoder);
+  write_json_line(json_object_from_video_encoder_probe(probe));
+  return 0;
+}
+
 std::string select_preferred_audio_encoder(const std::vector<std::string>& audio_encoders) {
   if (std::find(audio_encoders.begin(), audio_encoders.end(), "libopus") != audio_encoders.end()) {
     return "libopus";
@@ -499,7 +587,17 @@ std::string select_preferred_audio_encoder(const std::vector<std::string>& audio
 
 FfmpegProbeResult probe_ffmpeg(const std::string& agent_binary_path) {
   FfmpegProbeResult probe;
-  const std::vector<std::string> candidates = build_ffmpeg_candidates(agent_binary_path);
+  const CapabilityProbeBudget budget(kStartupCapabilityBudgetMs);
+  probe.probe_agent_path = agent_binary_path;
+#ifdef _WIN32
+  std::vector<wchar_t> current_agent_path(32768);
+  const DWORD path_size = GetModuleFileNameW(nullptr, current_agent_path.data(),
+      static_cast<DWORD>(current_agent_path.size()));
+  if (path_size > 0 && path_size < current_agent_path.size()) {
+    probe.probe_agent_path = fs::path(std::wstring(current_agent_path.data(), path_size)).u8string();
+  }
+#endif
+  const std::vector<std::string> candidates = build_ffmpeg_candidates(probe.probe_agent_path);
 
   for (const std::string& candidate : candidates) {
     const bool requires_existence_check =
@@ -507,12 +605,19 @@ FfmpegProbeResult probe_ffmpeg(const std::string& agent_binary_path) {
       candidate.find('/') != std::string::npos ||
       candidate.find(':') != std::string::npos;
 
-    if (requires_existence_check && !fs::exists(candidate)) {
+    std::error_code candidate_path_error;
+    if (requires_existence_check && !fs::exists(fs::u8path(candidate), candidate_path_error)) {
       continue;
     }
+    const unsigned long version_timeout_ms = budget.next_timeout_ms(kCapabilityProbeTimeoutMs);
+    if (version_timeout_ms == 0) {
+      probe.error = "startup-capability-budget-exhausted";
+      break;
+    }
 
-    const std::string command_target = requires_existence_check ? quote_command_path(candidate) : candidate;
-    const CommandResult version_result = run_command_capture(command_target + " -hide_banner -version 2>&1");
+    emit_agent_breadcrumb("startup-ffmpeg-version-probe");
+    const CommandResult version_result = run_probe_process_capture(candidate,
+        {"-hide_banner", "-version"}, version_timeout_ms);
     const std::string parsed_version = parse_ffmpeg_version(version_result.output);
 
     if (command_failed_to_resolve(version_result)) {
@@ -520,47 +625,43 @@ FfmpegProbeResult probe_ffmpeg(const std::string& agent_binary_path) {
       continue;
     }
 
-    if (!version_result.launched || (version_result.exit_code != 0 && parsed_version.empty())) {
+    if (version_result.timed_out || !version_result.launched ||
+        (version_result.exit_code != 0 && parsed_version.empty())) {
       if (!requires_existence_check && parsed_version.empty()) {
         probe.error = "ffmpeg-binary-not-found";
       } else {
         probe.error = trim_copy(version_result.output);
       }
 
-      if (probe.error.empty()) {
+      if (version_result.timed_out) {
+        probe.error = "ffmpeg-version-probe-timeout";
+      } else if (probe.error.empty()) {
         probe.error = "ffmpeg-version-probe-failed";
       }
       continue;
     }
 
+    emit_agent_breadcrumb("startup-ffmpeg-encoder-inventory");
+    const unsigned long inventory_timeout_ms = budget.next_timeout_ms(kCapabilityProbeTimeoutMs);
+    if (inventory_timeout_ms == 0) {
+      probe.error = "startup-capability-budget-exhausted";
+      break;
+    }
+    const CommandResult encoders_result = run_probe_process_capture(candidate,
+        {"-hide_banner", "-encoders"}, inventory_timeout_ms);
+    if (!encoders_result.launched || encoders_result.timed_out || encoders_result.exit_code != 0) {
+      probe.error = encoders_result.timed_out ? "ffmpeg-encoder-inventory-timeout" : "ffmpeg-encoder-inventory-failed";
+      continue;
+    }
+    probe.video_encoders = collect_codec_names(encoders_result.output, { "264", "265", "hevc" });
+    probe.audio_encoders = collect_codec_names(encoders_result.output, { "opus" });
     probe.available = true;
     probe.path = candidate;
     probe.version = parsed_version;
 
-    const std::vector<std::string> capability_probe_encoders = {
-      "h264_nvenc",
-      "h264_amf",
-      "h264_qsv",
-      "h264_d3d12va",
-      "h264_mf",
-      "libx264",
-      "libopenh264",
-      "hevc_nvenc",
-      "hevc_amf",
-      "hevc_qsv",
-      "hevc_d3d12va",
-      "hevc_mf",
-      "libx265"
-    };
-
-    const CommandResult encoders_result = run_command_capture(command_target + " -hide_banner -encoders 2>&1");
-    if (encoders_result.launched && encoders_result.exit_code == 0) {
-      probe.video_encoders = collect_codec_names(encoders_result.output, { "264", "265", "hevc" });
-      probe.audio_encoders = collect_codec_names(encoders_result.output, { "opus" });
-    }
-
-    for (const std::string& encoder : capability_probe_encoders) {
-      VideoEncoderProbeResult validation = run_video_encoder_probe(encoder);
+    for (const std::string& encoder : capability_probe_encoders()) {
+      VideoEncoderProbeResult validation = run_isolated_video_encoder_probe(probe.probe_agent_path, encoder,
+          budget.next_timeout_ms(kCapabilityProbeTimeoutMs));
       probe.video_encoder_probes.push_back(validation);
       if (validation.validated) {
         probe.validated_video_encoders.push_back(encoder);
@@ -638,7 +739,7 @@ CommandResult run_ffmpeg_encoder_self_test(
   const VideoEncoderProbeResult* cached_probe = find_video_encoder_probe(ffmpeg, video_encoder);
   const VideoEncoderProbeResult probe = cached_probe
     ? *cached_probe
-    : run_video_encoder_probe(video_encoder);
+    : run_isolated_video_encoder_probe(ffmpeg.probe_agent_path, video_encoder);
   result.launched = probe.exists;
   result.exit_code = probe.validated ? 0 : 1;
   result.output = probe.error.empty() ? probe.reason : (probe.reason + ": " + probe.error);

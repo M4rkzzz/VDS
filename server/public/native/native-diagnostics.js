@@ -305,6 +305,9 @@
       if (typeof mediaEngine.onStatus === 'function') {
         mediaEngine.onStatus((status) => {
           logNativeDebug('misc', 'Native media engine status updated:', status);
+          if (typeof callbacks.onStatus === 'function') {
+            callbacks.onStatus(status);
+          }
         });
       }
     }

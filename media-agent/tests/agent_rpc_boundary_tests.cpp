@@ -21,6 +21,9 @@ bool diagnostic_failure = false;
 int initialized = 0;
 int rpc_calls = 0;
 int shutdown_calls = 0;
+int encoder_probe_calls = 0;
+int wgc_probe_calls = 0;
+std::string last_probe_encoder;
 
 void expect(bool condition, const char* message) {
   ++checks;
@@ -56,6 +59,16 @@ void emit_agent_breadcrumb(const std::string&) {
   if (diagnostic_failure) throw std::runtime_error("injected diagnostic failure");
 }
 std::string build_agent_ready_json(const AgentRuntimeState&) { return "{}"; }
+
+int vds::media_agent::run_ffmpeg_encoder_probe_child(const std::string& encoder) {
+  ++encoder_probe_calls;
+  last_probe_encoder = encoder;
+  return 71;
+}
+int run_wgc_capture_probe_child() {
+  ++wgc_probe_calls;
+  return 72;
+}
 
 namespace {
 void test_control_character_serialization() {
@@ -140,12 +153,35 @@ void test_entry_point_cleanup() {
   }
   std::cerr.rdbuf(previous);
 }
+
+void test_isolated_probe_entry_points() {
+  initialized = rpc_calls = shutdown_calls = 0;
+  encoder_probe_calls = wgc_probe_calls = 0;
+  char executable[] = "agent";
+  char encoder_mode[] = "--probe-video-encoder";
+  char encoder[] = "libx264";
+  char wgc_mode[] = "--probe-wgc-capability";
+  char* encoder_arguments[] {executable, encoder_mode, encoder};
+  expect(media_agent_entry_for_test(3, encoder_arguments) == 71 &&
+      encoder_probe_calls == 1 && last_probe_encoder == "libx264",
+      "isolated encoder mode forwards one requested codec and returns the child result");
+  expect(media_agent_entry_for_test(2, encoder_arguments) == 1 && encoder_probe_calls == 1,
+      "missing encoder argument cannot start the RPC runtime");
+  char* wgc_arguments[] {executable, wgc_mode, encoder};
+  expect(media_agent_entry_for_test(2, wgc_arguments) == 72 && wgc_probe_calls == 1,
+      "isolated WGC mode returns only its capability result");
+  expect(media_agent_entry_for_test(3, wgc_arguments) == 1 && wgc_probe_calls == 1,
+      "unexpected WGC arguments cannot start the RPC runtime");
+  expect(initialized == 0 && rpc_calls == 0 && shutdown_calls == 0,
+      "all child diagnostic entry points bypass ordinary initialization, RPC, and shutdown");
+}
 }  // namespace
 
 int main() {
   test_control_character_serialization();
   test_request_isolation();
   test_entry_point_cleanup();
+  test_isolated_probe_entry_points();
   std::cout << "Agent RPC boundary: " << checks << " checks, " << failures << " failures\n";
   return failures == 0 ? 0 : 1;
 }

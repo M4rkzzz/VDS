@@ -9,7 +9,7 @@ const { test } = require('node:test');
 const managerPath = path.resolve(__dirname, '../../desktop/media-agent-manager.js');
 const managerSource = fs.readFileSync(managerPath, 'utf8');
 
-function createHarness() {
+function createHarness(options = {}) {
   const children = [];
   const spawn = () => {
     const child = new EventEmitter();
@@ -33,6 +33,9 @@ function createHarness() {
     };
     child.reply = (request, result = {}) => {
       child.stdout.write(JSON.stringify({ id: request.id, result }) + '\n');
+    };
+    child.ready = (params = {}) => {
+      child.stdout.write(JSON.stringify({ event: 'agent-ready', params }) + '\n');
     };
     child.exit = () => {
       child.exitCode = 0;
@@ -62,14 +65,19 @@ function createHarness() {
   const manager = new module.exports.MediaAgentManager({
     logger: { log() {}, warn() {}, error() {} },
     defaultInvokeTimeoutMs: 1000,
-    pingTimeoutMs: 1000
+    pingTimeoutMs: 1000,
+    startupTimeoutMs: 1000,
+    ...options
   });
   return { manager, children };
 }
 
 async function startReady(harness) {
   const started = harness.manager.start();
+  await new Promise((resolve) => setImmediate(resolve));
   const child = harness.children.at(-1);
+  child.ready();
+  await Promise.resolve();
   child.reply(child.requests[0], { ok: true });
   await started;
   return child;
@@ -94,6 +102,8 @@ test('concurrent starts wait for the same successful ping', async () => {
   assert.equal(secondStartCompleted, false);
   assert.equal(harness.children.length, 1);
   const child = harness.children[0];
+  child.ready();
+  await Promise.resolve();
   child.reply(child.requests[0], { ok: true });
   const statuses = await Promise.all([firstStart, secondStart]);
   assert.ok(statuses.every((status) => status.running));
@@ -113,6 +123,8 @@ test('restart waits for an in-flight stop and duplicate stops share cleanup', as
   await Promise.all([firstStop, secondStop]);
   const secondChild = harness.children[1];
   assert.ok(secondChild);
+  secondChild.ready();
+  await Promise.resolve();
   secondChild.reply(secondChild.requests[0], { ok: true });
   assert.equal((await restarted).running, true);
   assert.equal(harness.manager.child, secondChild);
@@ -125,8 +137,11 @@ test('late exit and stream errors after an RPC timeout cannot erase the replacem
   const timedOut = harness.manager.invoke('getStats');
   await assert.rejects(timedOut, { code: 'MEDIA_AGENT_INVOKE_TIMEOUT' });
   assert.equal(firstChild.__vdsExpectedExitReason, 'invoke-timeout');
+  firstChild.exit();
+  await Promise.resolve();
   const secondChild = await startReady(harness);
   const request = harness.manager.invoke('getCapabilities');
+  await Promise.resolve();
   firstChild.stderr.write('stale process error');
   firstChild.stdin.emit('error', new Error('late stdin error'));
   firstChild.emit('error', new Error('late child error'));
@@ -140,7 +155,7 @@ test('late exit and stream errors after an RPC timeout cannot erase the replacem
   await stopAndExit(harness.manager, secondChild);
 });
 
-test('stopping during the startup ping allows a clean replacement startup', async () => {
+test('stopping during startup readiness allows a clean replacement startup', async () => {
   const harness = createHarness();
   const initialStart = harness.manager.start();
   const rejectedStart = assert.rejects(initialStart, /media-agent-stopped/);
@@ -152,6 +167,8 @@ test('stopping during the startup ping allows a clean replacement startup', asyn
   await rejectedStart;
   const secondChild = harness.children[1];
   assert.ok(secondChild);
+  secondChild.ready();
+  await Promise.resolve();
   secondChild.reply(secondChild.requests[0], { ok: true });
   await restarted;
   assert.equal(secondChild.killCount, 0);
@@ -159,11 +176,146 @@ test('stopping during the startup ping allows a clean replacement startup', asyn
   await stopAndExit(harness.manager, secondChild);
 });
 
+test('capabilities calls wait for readiness and ping before entering the RPC queue', async () => {
+  const harness = createHarness();
+  const started = harness.manager.start();
+  const capabilities = harness.manager.invoke('getCapabilities');
+  const child = harness.children[0];
+  assert.equal(harness.manager.getStatus().state, 'starting');
+  assert.equal(harness.manager.getStatus().running, false);
+  assert.equal(child.requests.length, 0);
+  child.ready({ implementation: 'fixture' });
+  await Promise.resolve();
+  assert.deepEqual(child.requests.map((request) => request.method), ['ping']);
+  child.reply(child.requests[0], { ok: true });
+  await started;
+  await Promise.resolve();
+  assert.deepEqual(child.requests.map((request) => request.method), ['ping', 'getCapabilities']);
+  child.reply(child.requests[1], { ready: true });
+  assert.equal((await capabilities).ready, true);
+  await stopAndExit(harness.manager, child);
+});
+
+test('cold initialization time does not consume the RPC ping timeout', async () => {
+  const harness = createHarness({ startupTimeoutMs: 3000 });
+  const started = harness.manager.start();
+  const child = harness.children[0];
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.equal(child.killCount, 0);
+  assert.equal(child.requests.length, 0);
+  child.ready();
+  await Promise.resolve();
+  child.reply(child.requests[0], { ok: true });
+  assert.equal((await started).running, true);
+  await stopAndExit(harness.manager, child);
+});
+
+test('a startup timeout retains the native stage and waits for retirement before retry', async () => {
+  const harness = createHarness();
+  const initialStart = harness.manager.start();
+  const child = harness.children[0];
+  const capabilities = harness.manager.invoke('getCapabilities');
+  child.stderr.write('[media-agent breadcrumb] runtime-probe:waiting-for-driver\n');
+  const results = await Promise.allSettled([initialStart, capabilities]);
+  assert.ok(results.every((result) => result.status === 'rejected' &&
+    result.reason.code === 'MEDIA_AGENT_STARTUP_TIMEOUT' &&
+    result.reason.message.includes('runtime-probe:waiting-for-driver')));
+  assert.equal(harness.manager.getStatus().state, 'failed');
+  assert.equal(harness.manager.getStatus().reason, 'startup-timeout');
+  assert.equal(harness.manager.pendingRequests.size, 0);
+  const restarted = harness.manager.start();
+  await Promise.resolve();
+  assert.equal(harness.children.length, 1);
+  child.exit();
+  await new Promise((resolve) => setImmediate(resolve));
+  const replacement = harness.children[1];
+  assert.ok(replacement);
+  replacement.ready();
+  await Promise.resolve();
+  replacement.reply(replacement.requests[0], { ok: true });
+  assert.equal((await restarted).running, true);
+  assert.equal(harness.manager.getStatus().lastError, null);
+  await stopAndExit(harness.manager, replacement);
+});
+
+test('a broken startup input pipe cannot leave a live process that bypasses retry', async () => {
+  const harness = createHarness();
+  const started = harness.manager.start();
+  const child = harness.children[0];
+  const rejectedStart = assert.rejects(started, /fixture stdin failed/);
+  child.stdin.emit('error', new Error('fixture stdin failed'));
+  await rejectedStart;
+  assert.equal(harness.manager.child, null);
+  assert.equal(harness.manager.getStatus().reason, 'stdin-error');
+  const restarted = harness.manager.start();
+  child.exit();
+  await new Promise((resolve) => setImmediate(resolve));
+  const replacement = harness.children[1];
+  replacement.ready();
+  await Promise.resolve();
+  replacement.reply(replacement.requests[0], { ok: true });
+  await restarted;
+  await stopAndExit(harness.manager, replacement);
+});
+
+test('agent-ready alone cannot release queued work when the startup ping is unresponsive', async () => {
+  const harness = createHarness();
+  const started = harness.manager.start();
+  const capabilities = harness.manager.invoke('getCapabilities');
+  const child = harness.children[0];
+  child.stderr.write('[media-agent breadcrumb] startup-ready\n');
+  child.ready();
+  await Promise.resolve();
+  assert.equal(harness.manager.getStatus().running, false);
+  assert.deepEqual(child.requests.map((request) => request.method), ['ping']);
+  const results = await Promise.allSettled([started, capabilities]);
+  assert.ok(results.every((result) => result.status === 'rejected' &&
+    result.reason.code === 'MEDIA_AGENT_INVOKE_TIMEOUT' &&
+    result.reason.message.includes('startup-ready')));
+  assert.equal(harness.manager.getStatus().reason, 'invoke-timeout');
+  assert.equal(child.killCount, 1);
+  child.exit();
+  await harness.manager.stop();
+});
+
+test('failed retirement blocks replacements until the old process actually exits', async () => {
+  const harness = createHarness();
+  const started = harness.manager.start();
+  const child = harness.children[0];
+  await assert.rejects(started, { code: 'MEDIA_AGENT_STARTUP_TIMEOUT' });
+  await assert.rejects(harness.manager.stopPromise, { code: 'MEDIA_AGENT_STOP_TIMEOUT' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.manager.retiringChild, child);
+  assert.equal(harness.manager.getStatus().reason, 'stop-failed');
+  await assert.rejects(harness.manager.start(), { code: 'MEDIA_AGENT_STOP_TIMEOUT' });
+  assert.equal(harness.children.length, 1);
+  child.exit();
+  const replacement = await startReady(harness);
+  assert.notEqual(replacement, child);
+  assert.equal(harness.manager.retiringChild, null);
+  await stopAndExit(harness.manager, replacement);
+});
+
+test('a failed process kill does not report successful stop or allow an overlap', async () => {
+  const harness = createHarness();
+  const child = await startReady(harness);
+  child.kill = () => { throw new Error('fixture termination denied'); };
+  await assert.rejects(harness.manager.stop(), /fixture termination denied/);
+  assert.equal(harness.manager.retiringChild, child);
+  assert.equal(harness.manager.getStatus().running, false);
+  await assert.rejects(harness.manager.start(), { code: 'MEDIA_AGENT_STOP_TIMEOUT' });
+  assert.equal(harness.children.length, 1);
+  child.exit();
+  const replacement = await startReady(harness);
+  await stopAndExit(harness.manager, replacement);
+});
+
 test('unexpected current-process exit rejects pending RPCs and allows recovery', async () => {
   const harness = createHarness();
   const firstChild = await startReady(harness);
   const request = harness.manager.invoke('getStats');
   const rejectedRequest = assert.rejects(request, /media-agent-exited/);
+  await Promise.resolve();
   firstChild.exit();
   await rejectedRequest;
   assert.equal(harness.manager.pendingRequests.size, 0);

@@ -119,8 +119,8 @@ std::string resolve_ffprobe_path(const FfmpegProbeResult& ffmpeg) {
   }
 
   try {
-    const fs::path ffprobe_path = fs::path(ffmpeg.path).parent_path() / "ffprobe.exe";
-    return fs::exists(ffprobe_path) ? ffprobe_path.string() : std::string{};
+    const fs::path ffprobe_path = fs::u8path(ffmpeg.path).parent_path() / "ffprobe.exe";
+    return fs::exists(ffprobe_path) ? ffprobe_path.u8string() : std::string{};
   } catch (...) {
     return {};
   }

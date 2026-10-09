@@ -13,6 +13,7 @@
     const eventHandlers = options.eventHandlers || {};
     let started = false;
     let startPromise = null;
+    let lifecycleGeneration = 0;
 
     async function ensureStarted() {
       if (started) {
@@ -25,24 +26,40 @@
         throw new Error('native-media-engine-start-unavailable');
       }
 
-      startPromise = (async () => {
+      const generation = lifecycleGeneration;
+      const operation = (async () => {
         const status = await mediaEngine.start();
         if (!status || status.available === false || status.running !== true) {
           const reason = status && status.reason ? String(status.reason) : 'media-engine-not-running';
           throw new Error(`native-media-engine-unavailable:${reason}`);
         }
-        started = true;
         if (typeof mediaEngine.getCapabilities === 'function') {
           logCapabilities(await mediaEngine.getCapabilities());
         }
+        if (generation !== lifecycleGeneration) {
+          throw new Error('native-media-engine-start-superseded');
+        }
+        started = true;
         return status;
       })();
+      startPromise = operation;
 
       try {
-        return await startPromise;
+        return await operation;
       } finally {
-        startPromise = null;
+        if (startPromise === operation) {
+          startPromise = null;
+        }
       }
+    }
+
+    function handleStatus(status) {
+      if (!status || status.running !== false || status.state === 'starting') {
+        return false;
+      }
+      started = false;
+      lifecycleGeneration += 1;
+      return true;
     }
 
     function handleEvent(event) {
@@ -73,6 +90,7 @@
     return {
       ensureStarted,
       isStarted: () => started,
+      handleStatus,
       handleEvent
     };
   }

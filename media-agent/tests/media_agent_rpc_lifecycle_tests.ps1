@@ -112,7 +112,8 @@ try {
   }
   # EOF must join the last active OBS worker as well as previously stopped workers.
   $process.StandardInput.Close()
-  if (-not $process.WaitForExit(30000)) {
+  # The fixture includes cold initialization, then the existing RPC lifecycle.
+  if (-not $process.WaitForExit(105000)) {
     throw 'Native RPC lifecycle test timed out.'
   }
   $process.WaitForExit()

@@ -4,6 +4,7 @@
 #include <string>
 
 #include "agent_status_json.h"
+#include "agent_diagnostics.h"
 #include "ffmpeg_probe.h"
 #include "ffmpeg_probe_state.h"
 #include "host_audio_dispatch_session.h"
@@ -22,6 +23,7 @@
 #include "viewer_audio_session.h"
 #include "wasapi_backend.h"
 #include "wgc_capture.h"
+#include "wgc_capability_probe.h"
 
 namespace {
 
@@ -78,12 +80,17 @@ void refresh_agent_runtime_state(AgentRuntimeState& state) {
 void initialize_agent_runtime(AgentRuntimeState& state, const std::string& agent_binary_path) {
   AgentLifecycleSessions sessions(state);
   sessions.host_audio.attach_wasapi_callbacks();
+  emit_agent_breadcrumb("startup-peer-transport");
   vds::media_agent::peer_transport_backend(state) = get_peer_transport_backend_info();
+  emit_agent_breadcrumb("startup-ffmpeg-capabilities");
   vds::media_agent::ffmpeg_probe_result(state) = vds::media_agent::probe_ffmpeg(agent_binary_path);
-  vds::media_agent::wgc_capture_backend(state) = probe_wgc_capture_backend();
+  emit_agent_breadcrumb("startup-wgc-capabilities");
+  vds::media_agent::wgc_capture_backend(state) = probe_wgc_capture_backend_isolated(
+      vds::media_agent::ffmpeg_probe_result(state).probe_agent_path);
   sessions.host_audio.refresh_session_status();
   vds::media_agent::initialize_default_capture_runtime(state, sessions.host);
   refresh_host_capture_runtime(sessions);
+  emit_agent_breadcrumb("startup-ready");
 }
 
 void stop_all_surface_attachments(AgentRuntimeState& state, const std::string& reason) {

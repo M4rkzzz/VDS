@@ -16,6 +16,7 @@ struct VideoEncoderProbeResult {
 struct FfmpegProbeResult {
   bool available = false;
   std::string path;
+  std::string probe_agent_path;
   std::string version;
   std::vector<std::string> video_encoders;
   std::vector<std::string> validated_video_encoders;

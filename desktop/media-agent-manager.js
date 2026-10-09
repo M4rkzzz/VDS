@@ -9,6 +9,9 @@ const DEFAULT_BINARY_NAME = process.platform === 'win32'
   : 'vds-media-agent';
 const DEFAULT_INVOKE_TIMEOUT_MS = 30000;
 const DEFAULT_PING_TIMEOUT_MS = 5000;
+// Cold startup inventories codecs and validates native drivers in isolated
+// probes; this deadline is separate from a responsive agent's RPC timeout.
+const DEFAULT_STARTUP_TIMEOUT_MS = 90000;
 
 class MediaAgentManager extends EventEmitter {
   constructor(options = {}) {
@@ -20,8 +23,11 @@ class MediaAgentManager extends EventEmitter {
     this.requestId = 1;
     this.startPromise = null;
     this.stopPromise = null;
+    this.retiringChild = null;
+    this.startupReadiness = null;
     this.defaultInvokeTimeoutMs = Number(options.defaultInvokeTimeoutMs || DEFAULT_INVOKE_TIMEOUT_MS);
     this.pingTimeoutMs = Number(options.pingTimeoutMs || DEFAULT_PING_TIMEOUT_MS);
+    this.startupTimeoutMs = Number(options.startupTimeoutMs || DEFAULT_STARTUP_TIMEOUT_MS);
     this.recentStderrLines = [];
     this.status = {
       state: 'idle',
@@ -58,13 +64,14 @@ class MediaAgentManager extends EventEmitter {
 
     const binaryPath = this.resolveBinaryPath();
     const available = Boolean(binaryPath);
+    const failed = available && this.status.state === 'failed';
     return {
       ...this.status,
       available,
       binaryPath: binaryPath || this.buildCandidatePaths()[0],
-      state: available ? 'idle' : 'unavailable',
+      state: failed ? 'failed' : available ? 'idle' : 'unavailable',
       running: false,
-      reason: available ? 'ready-to-start' : 'missing-binary'
+      reason: failed ? this.status.reason : available ? 'ready-to-start' : 'missing-binary'
     };
   }
 
@@ -85,15 +92,25 @@ class MediaAgentManager extends EventEmitter {
       return this.startPromise;
     }
 
+    if (this.retiringChild) {
+      if (this.retiringChild.exitCode === null && this.retiringChild.signalCode === null) {
+        throw createMediaAgentError('MEDIA_AGENT_STOP_TIMEOUT', 'media-agent-process-still-stopping');
+      }
+      this.retiringChild = null;
+    }
+
     if (this.child && !this.child.killed && this.child.exitCode === null && this.child.signalCode === null) {
       return this.getStatus();
     }
 
-    this.startPromise = this.startInternal();
+    const started = this.startInternal();
+    this.startPromise = started;
     try {
-      return await this.startPromise;
+      return await started;
     } finally {
-      this.startPromise = null;
+      if (this.startPromise === started) {
+        this.startPromise = null;
+      }
     }
   }
 
@@ -102,7 +119,8 @@ class MediaAgentManager extends EventEmitter {
       return this.stopPromise;
     }
 
-    if (!this.child) {
+    const child = this.child || this.retiringChild;
+    if (!child) {
       this.updateStatus({
         state: 'idle',
         running: false,
@@ -111,12 +129,26 @@ class MediaAgentManager extends EventEmitter {
       return this.getStatus();
     }
 
-    const child = this.child;
     this.child = null;
+    this.retiringChild = child;
     this.disposeLineReader();
     this.rejectAllPending(new Error('media-agent-stopped'));
+    this.rejectStartupReadiness(new Error('media-agent-stopped'), child);
     this.stopPromise = (async () => {
-      await this.stopChildProcess(child);
+      try {
+        await this.stopChildProcess(child);
+      } catch (error) {
+        this.updateStatus({
+          state: 'failed',
+          running: false,
+          reason: 'stop-failed',
+          lastError: error.message
+        });
+        throw error;
+      }
+      if (this.retiringChild === child) {
+        this.retiringChild = null;
+      }
       if (!this.child) {
         this.updateStatus({
           state: 'idle',
@@ -141,7 +173,7 @@ class MediaAgentManager extends EventEmitter {
     child.__vdsExpectedExit = true;
     child.__vdsExpectedExitReason = child.__vdsExpectedExitReason || 'manager-stop';
 
-    await new Promise((resolve) => {
+    await new Promise((resolve, reject) => {
       let settled = false;
       let killTimer = null;
       let forceTimer = null;
@@ -167,6 +199,15 @@ class MediaAgentManager extends EventEmitter {
         resolve();
       };
 
+      const fail = (error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+
       const onExit = () => {
         finish();
       };
@@ -175,8 +216,16 @@ class MediaAgentManager extends EventEmitter {
 
       try {
         child.kill();
-      } catch (_error) {
-        finish();
+      } catch (error) {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          finish();
+        } else {
+          fail(error);
+        }
+        return;
+      }
+
+      if (settled) {
         return;
       }
 
@@ -186,21 +235,26 @@ class MediaAgentManager extends EventEmitter {
         }
 
         if (process.platform === 'win32' && child.pid) {
-          spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+          const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
             stdio: 'ignore',
             windowsHide: true
           });
+          killer.once('error', (error) => this.logger.error('[media-agent] taskkill failed:', error));
         } else {
           try {
             child.kill('SIGKILL');
-          } catch (_error) {
-            finish();
+          } catch (error) {
+            fail(error);
             return;
           }
         }
 
         forceTimer = setTimeout(() => {
-          finish();
+          if (child.exitCode !== null || child.signalCode !== null) {
+            finish();
+          } else {
+            fail(createMediaAgentError('MEDIA_AGENT_STOP_TIMEOUT', 'media-agent-stop-timeout:process-exit-not-observed'));
+          }
         }, 1000);
       }, timeoutMs);
     });
@@ -219,41 +273,35 @@ class MediaAgentManager extends EventEmitter {
       return status;
     }
 
-    if (!this.child || this.child.killed || this.child.exitCode !== null || this.child.signalCode !== null) {
-      await this.start();
-    }
+    // A live process can still be initializing. All external calls share startup
+    // readiness rather than queuing work ahead of its handshake.
+    await this.start();
 
     if (!this.child || this.child.killed || this.child.exitCode !== null || this.child.signalCode !== null) {
       throw createMediaAgentError('MEDIA_AGENT_UNAVAILABLE', 'Native media agent binary is not available.');
     }
 
+    return this.sendRequest(method, params, options, this.child);
+  }
+
+  sendRequest(method, params, options = {}, child = this.child) {
     return new Promise((resolve, reject) => {
       const id = this.requestId++;
+      const payload = JSON.stringify({ id, method, params });
       const timeoutMs = Math.max(1000, Number(options.timeoutMs || this.defaultInvokeTimeoutMs || DEFAULT_INVOKE_TIMEOUT_MS));
-      const child = this.child;
       const timeoutId = setTimeout(() => {
         const request = this.pendingRequests.get(id);
-        if (!request) {
+        if (!request || request.child !== child) {
           return;
         }
         this.pendingRequests.delete(id);
-        const error = new Error(`media-agent-invoke-timeout:${method}`);
+        const suffix = this.recentStderrLines.length
+          ? `:stderr=${this.recentStderrLines.join(' | ')}`
+          : '';
+        const error = new Error(`media-agent-invoke-timeout:${method}${suffix}`);
         error.code = 'MEDIA_AGENT_INVOKE_TIMEOUT';
         request.reject(error);
-        this.rejectAllPending(error);
-        if (child && this.child === child) {
-          child.__vdsExpectedExit = true;
-          child.__vdsExpectedExitReason = 'invoke-timeout';
-          this.disposeLineReader();
-          this.stopChildProcess(child, 1000).catch(() => {});
-          this.child = null;
-          this.updateStatus({
-            state: 'failed',
-            running: false,
-            reason: 'invoke-timeout',
-            lastError: error.message
-          });
-        }
+        this.retireChild(child, error, 'invoke-timeout');
       }, timeoutMs);
       const finishResolve = (value) => {
         clearTimeout(timeoutId);
@@ -263,23 +311,28 @@ class MediaAgentManager extends EventEmitter {
         clearTimeout(timeoutId);
         reject(error);
       };
-      this.pendingRequests.set(id, { resolve: finishResolve, reject: finishReject, timeoutId });
-      const payload = JSON.stringify({ id, method, params });
+      this.pendingRequests.set(id, { child, resolve: finishResolve, reject: finishReject, timeoutId });
       const stdin = child && child.stdin;
-      if (!stdin || stdin.destroyed || child.exitCode !== null || child.signalCode !== null) {
+      if (!stdin || stdin.destroyed || this.child !== child || child.exitCode !== null || child.signalCode !== null) {
         this.pendingRequests.delete(id);
         clearTimeout(timeoutId);
         reject(this.buildExitError(child && child.exitCode, child && child.signalCode));
         return;
       }
-      stdin.write(payload + '\n', 'utf8', (error) => {
-        if (!error) {
+      const rejectWrite = (error) => {
+        const request = this.pendingRequests.get(id);
+        if (!error || !request || request.child !== child) {
           return;
         }
         this.pendingRequests.delete(id);
-        clearTimeout(timeoutId);
-        reject(error);
-      });
+        request.reject(error);
+        this.retireChild(child, error, 'stdin-error');
+      };
+      try {
+        stdin.write(payload + '\n', 'utf8', rejectWrite);
+      } catch (error) {
+        rejectWrite(error);
+      }
     });
   }
 
@@ -446,15 +499,7 @@ class MediaAgentManager extends EventEmitter {
         return;
       }
       this.recordStderr(error && error.message ? error.message : String(error));
-      this.rejectAllPending(error);
-      this.updateStatus({
-        state: 'failed',
-        available: true,
-        running: false,
-        reason: 'stdin-error',
-        binaryPath,
-        lastError: error && error.message ? error.message : String(error)
-      });
+      this.retireChild(child, error, 'stdin-error');
     });
     child.stderr.on('data', (chunk) => {
       if (this.child !== child) {
@@ -471,31 +516,28 @@ class MediaAgentManager extends EventEmitter {
       if (this.child !== child) {
         return;
       }
-      this.rejectAllPending(error);
-      this.updateStatus({
-        state: 'failed',
-        available: true,
-        running: false,
-        reason: 'spawn-error',
-        binaryPath,
-        lastError: error.message
-      });
+      this.retireChild(child, error, 'spawn-error');
     });
 
     child.once('exit', (code, signal) => {
       const expectedExit = Boolean(child.__vdsExpectedExit);
       const exitReason = child.__vdsExpectedExitReason || 'process-exit';
+      if (this.retiringChild === child) {
+        this.retiringChild = null;
+      }
       if (this.child !== child) {
         return;
       }
       this.disposeLineReader();
       if (expectedExit) {
         this.rejectAllPending(new Error('media-agent-stopped'));
+        this.rejectStartupReadiness(new Error('media-agent-stopped'), child);
         this.logger.log(`[media-agent] process exited as expected: code=${code ?? 'null'} signal=${signal ?? 'null'} reason=${exitReason}`);
       } else {
         const exitError = this.buildExitError(code, signal);
         this.logger.error('[media-agent] process exited:', exitError.message);
         this.rejectAllPending(exitError);
+        this.rejectStartupReadiness(exitError, child);
       }
       this.child = null;
       this.updateStatus({
@@ -510,25 +552,107 @@ class MediaAgentManager extends EventEmitter {
     });
 
     this.child = child;
+    const ready = this.waitForAgentReady(child);
     this.attachStdoutReader(child.stdout, child);
     this.updateStatus({
-      state: 'running',
+      state: 'starting',
       available: true,
-      running: true,
-      reason: 'started',
-      binaryPath
+      running: false,
+      reason: 'initializing',
+      binaryPath,
+      agent: null,
+      lastError: null
     });
 
     try {
-      await this.invoke('ping', {}, { timeoutMs: this.pingTimeoutMs });
+      await ready;
+      await this.sendRequest('ping', {}, { timeoutMs: this.pingTimeoutMs }, child);
     } catch (error) {
       if (this.child === child) {
-        await this.stop();
+        this.retireChild(child, error, 'startup-failed');
       }
       throw error;
     }
 
+    if (this.child !== child) {
+      throw new Error('media-agent-stopped');
+    }
+    this.updateStatus({
+      state: 'running',
+      running: true,
+      reason: 'agent-ready'
+    });
     return this.getStatus();
+  }
+
+  waitForAgentReady(child) {
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        if (!this.startupReadiness || this.startupReadiness.child !== child) {
+          return;
+        }
+        const suffix = this.recentStderrLines.length
+          ? `:stderr=${this.recentStderrLines.join(' | ')}`
+          : '';
+        const error = createMediaAgentError('MEDIA_AGENT_STARTUP_TIMEOUT', `media-agent-startup-timeout:agent-ready${suffix}`);
+        this.retireChild(child, error, 'startup-timeout');
+      }, Math.max(1000, this.startupTimeoutMs));
+      this.startupReadiness = { child, resolve, reject, timeoutId };
+    });
+  }
+
+  rejectStartupReadiness(error, child) {
+    const readiness = this.startupReadiness;
+    if (!readiness || readiness.child !== child) {
+      return;
+    }
+    this.startupReadiness = null;
+    clearTimeout(readiness.timeoutId);
+    readiness.reject(error);
+  }
+
+  retireChild(child, error, reason) {
+    if (!child || this.child !== child) {
+      return;
+    }
+    this.child = null;
+    this.disposeLineReader();
+    this.rejectStartupReadiness(error, child);
+    this.rejectAllPending(error, child);
+    this.retiringChild = child;
+    child.__vdsExpectedExit = true;
+    child.__vdsExpectedExitReason = reason;
+    // A replacement must not overlap a timed-out native process that still owns
+    // capture, audio or GPU resources. Stop is shared with normal stop/start.
+    const stopping = this.stopChildProcess(child, 1000).then(() => {
+      if (this.retiringChild === child) {
+        this.retiringChild = null;
+      }
+      return this.getStatus();
+    });
+    this.stopPromise = stopping;
+    this.updateStatus({
+      state: 'failed',
+      available: true,
+      running: false,
+      reason,
+      lastError: error && error.message ? error.message : String(error)
+    });
+    stopping.catch((stopError) => {
+      this.logger.error('[media-agent] failed to retire process:', stopError);
+      if (this.retiringChild === child) {
+        this.updateStatus({
+          state: 'failed',
+          running: false,
+          reason: 'stop-failed',
+          lastError: `${error.message}; ${stopError.message}`
+        });
+      }
+    }).finally(() => {
+      if (this.stopPromise === stopping) {
+        this.stopPromise = null;
+      }
+    });
   }
 
   attachStdoutReader(stdout, child = this.child) {
@@ -564,11 +688,14 @@ class MediaAgentManager extends EventEmitter {
     if (payload.event) {
       this.emit('event', payload);
       if (payload.event === 'agent-ready') {
+        const readiness = this.startupReadiness;
+        if (readiness && readiness.child === this.child) {
+          this.startupReadiness = null;
+          clearTimeout(readiness.timeoutId);
+          readiness.resolve();
+        }
         this.updateStatus({
-          state: 'running',
           available: true,
-          running: true,
-          reason: 'agent-ready',
           agent: payload.params || null
         });
       }
@@ -596,14 +723,17 @@ class MediaAgentManager extends EventEmitter {
     request.resolve(payload.result);
   }
 
-  rejectAllPending(error) {
-    for (const request of this.pendingRequests.values()) {
+  rejectAllPending(error, child = null) {
+    for (const [id, request] of this.pendingRequests) {
+      if (child && request.child !== child) {
+        continue;
+      }
       if (request.timeoutId) {
         clearTimeout(request.timeoutId);
       }
       request.reject(error);
+      this.pendingRequests.delete(id);
     }
-    this.pendingRequests.clear();
   }
 
   updateStatus(patch) {

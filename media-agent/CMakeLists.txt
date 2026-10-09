@@ -86,6 +86,7 @@ add_executable(vds-media-agent
   src/video_access_unit.cpp
   src/wasapi_backend.cpp
   src/wgc_capture.cpp
+  src/wgc_capability_probe.cpp
 )
 
 set(VDS_MEDIA_AGENT_FFMPEG_ROOT "" CACHE PATH "FFmpeg SDK root that contains include/ and lib/")
@@ -204,6 +205,15 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
     target_include_directories(vds-win32-owned-process-tests PRIVATE src)
     add_test(NAME vds-win32-owned-process-tests COMMAND vds-win32-owned-process-tests)
     set_tests_properties(vds-win32-owned-process-tests PROPERTIES TIMEOUT 30)
+    add_executable(vds-probe-process-tests
+      tests/probe_process_tests.cpp src/process_runner.cpp src/string_utils.cpp src/json_protocol.cpp)
+    target_include_directories(vds-probe-process-tests PRIVATE src)
+    add_test(NAME vds-probe-process-tests COMMAND vds-probe-process-tests)
+    set_tests_properties(vds-probe-process-tests PROPERTIES TIMEOUT 30)
+    add_test(NAME vds-media-agent-capability-probe-tests COMMAND vds-probe-process-tests
+      --agent-path "$<TARGET_FILE:vds-media-agent>")
+    set_tests_properties(vds-media-agent-capability-probe-tests PROPERTIES
+      TIMEOUT 40 ENVIRONMENT "PATH=${VDS_MEDIA_AGENT_FFMPEG_ROOT}/bin;$ENV{PATH}")
   endif()
   foreach(playback_policy_test IN ITEMS native_playback_scheduler relay_media_timing host_media_clock)
     string(REPLACE "_" "-" playback_policy_target "vds-${playback_policy_test}-tests")
@@ -264,6 +274,9 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
     set_tests_properties(vds-nat-traversal-e2e PROPERTIES TIMEOUT 75)
   endif()
   add_executable(vds-media-agent-tests
+    src/agent_events.cpp
+    src/agent_diagnostics.cpp
+    src/time_utils.cpp
     tests/media_agent_unit_tests.cpp
     src/ffmpeg_probe.cpp
     src/host_pipeline.cpp
@@ -361,7 +374,7 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
     )
     set_tests_properties(vds-media-agent-rpc-lifecycle-tests PROPERTIES
       ENVIRONMENT "PATH=${VDS_MEDIA_AGENT_FFMPEG_ROOT}/bin;$ENV{PATH}"
-      TIMEOUT 45
+      TIMEOUT 120
     )
   endif()
 endif()
