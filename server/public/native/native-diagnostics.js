@@ -406,6 +406,8 @@
         `avgMemcpyUs: ${formatDiagnosticValue(mediaBinding.avgSourceMemcpyUs || 0)}`,
         `avgReadbackUs: ${formatDiagnosticValue(mediaBinding.avgSourceTotalReadbackUs || 0)}`,
         `surfaceRunning: ${formatDiagnosticValue(surface.running)}`,
+        `surfaceReason: ${formatDiagnosticValue(surface.reason)}`,
+        `surfaceLastError: ${formatDiagnosticValue(surface.lastError)}`,
         `surfaceRenderedFrames: ${formatDiagnosticValue(surface.decodedFramesRendered || 0)}`,
         `surfaceFrameStddevMs: ${formatDiagnosticValue(surface.frameIntervalStddevMs)}`,
         `encoder: ${formatDiagnosticValue(hostPipeline.selectedVideoEncoder || mediaBinding.videoEncoderBackend)}`,

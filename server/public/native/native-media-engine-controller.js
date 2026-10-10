@@ -57,6 +57,11 @@
       if (!status || status.running !== false || status.state === 'starting') {
         return false;
       }
+      // did-finish-load can deliver the initial availability snapshot after
+      // ensureStarted has begun. Idle is not an exit from that startup.
+      if (!started && status.state === 'idle' && status.reason !== 'stopped') {
+        return false;
+      }
       started = false;
       lifecycleGeneration += 1;
       return true;

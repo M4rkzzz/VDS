@@ -48,6 +48,23 @@ std::string format_wgc_stage_error(const std::string& stage, const std::string& 
 }
 
 #ifdef _WIN32
+// The preview/sender may be the process's only MTA worker. Keep the MTA alive
+// across worker shutdown/recreation: C++/WinRT caches activation factories, and
+// a last-worker apartment rundown otherwise invalidates those cached objects.
+class ProcessMtaLifetime {
+ public:
+  ProcessMtaLifetime() { winrt::check_hresult(CoIncrementMTAUsage(&cookie_)); }
+  ~ProcessMtaLifetime() {
+    winrt::clear_factory_cache();
+    CoDecrementMTAUsage(cookie_);
+  }
+  ProcessMtaLifetime(const ProcessMtaLifetime&) = delete;
+  ProcessMtaLifetime& operator=(const ProcessMtaLifetime&) = delete;
+
+ private:
+  CO_MTA_USAGE_COOKIE cookie_ = nullptr;
+};
+
 // COM apartments belong to threads, not capture objects. A source can be
 // created by the RPC thread and later closed by a preview worker.
 class ThreadWinrtApartment {
@@ -59,6 +76,7 @@ class ThreadWinrtApartment {
 };
 
 void ensure_thread_winrt_apartment() {
+  static ProcessMtaLifetime process_mta;
   thread_local ThreadWinrtApartment apartment;
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "screenshare-relay",
-  "version": "1.7.7",
+  "version": "1.7.8",
   "description": "Multi-viewer screen sharing with cascade relay (蜈蚣法) - Electron Edition",
   "main": "desktop/main.js",
   "engines": {
@@ -28,6 +28,7 @@
     "build": "electron-builder",
     "build:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/build-media-agent.ps1 -Configuration Release",
     "smoke:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/smoke-media-agent.ps1",
+    "smoke:host-preview": "node scripts/test-native-host-preview.js",
     "test:media-agent": "powershell -ExecutionPolicy Bypass -File scripts/test-media-agent.ps1 -Configuration Release",
     "test:server": "node scripts/test-server-core.js && node scripts/test-server-static.js",
     "test:server-revival": "node scripts/test-server-revival.js",

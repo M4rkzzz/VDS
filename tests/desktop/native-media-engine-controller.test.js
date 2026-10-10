@@ -105,6 +105,35 @@ test('the starting status does not invalidate the current startup', async () => 
   assert.equal(c.isStarted(), true);
 });
 
+test('late initial idle snapshot does not invalidate startup or capability discovery', async () => {
+  const pending = deferred();
+  const capabilities = deferred();
+  const entered = deferred();
+  const c = controller({
+    start: () => pending.promise,
+    getCapabilities: () => { entered.resolve(); return capabilities.promise; }
+  });
+  const start = c.ensureStarted();
+  assert.equal(c.handleStatus({ state: 'idle', running: false, reason: 'ready-to-start' }), false);
+  pending.resolve({ available: true, running: true });
+  await entered.promise;
+  assert.equal(c.handleStatus({ state: 'idle', running: false, reason: 'not-started' }), false);
+  capabilities.resolve({ ready: true });
+  assert.equal((await start).running, true);
+  assert.equal(c.isStarted(), true);
+});
+
+test('explicit stop during startup still supersedes late readiness', async () => {
+  const pending = deferred();
+  const c = controller({ start: () => pending.promise });
+  const start = c.ensureStarted();
+  const rejected = assert.rejects(start, /start-superseded/);
+  assert.equal(c.handleStatus({ state: 'idle', running: false, reason: 'stopped' }), true);
+  pending.resolve({ available: true, running: true });
+  await rejected;
+  assert.equal(c.isStarted(), false);
+});
+
 test('installed native overrides retry startup without rebinding UI or caching the failed bootstrap', async () => {
   const bootstrapFailed = deferred();
   let starts = 0;

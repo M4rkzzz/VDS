@@ -17,11 +17,6 @@ void require(bool value, const std::string& message) {
 int main() {
   HWND window = nullptr;
   try {
-    const auto probe = probe_wgc_capture_backend();
-    if (!probe.available) {
-      std::cout << "SKIP: " << probe.reason << '\n';
-      return 77;
-    }
     window = CreateWindowExW(0, L"STATIC", L"VDS owned WGC lifecycle fixture",
       WS_OVERLAPPEDWINDOW, 0, 0, 128, 128, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     require(window != nullptr, "test window creation failed");
@@ -31,6 +26,35 @@ int main() {
     config.target_kind = "window";
     config.window_handle = std::to_string(reinterpret_cast<std::uintptr_t>(window));
     config.frame_rate = 30;
+    // Match the agent: capability probing occurs in another process, so this
+    // RPC/UI thread has not pinned an MTA before the first preview worker.
+    for (int iteration = 0; iteration < 8; ++iteration) {
+      auto worker = std::async(std::launch::async, [config]() {
+        const auto probe = probe_wgc_capture_backend();
+        if (!probe.available) return false;
+        std::string error;
+        auto source = create_wgc_frame_source(config, &error);
+        require(source != nullptr, "standalone worker source creation: " + error);
+        WgcFrameCpuBuffer frame;
+        require(source->wait_for_frame_bgra(2000, &frame, &error), "standalone worker readback: " + error);
+        require(frame.width > 0 && frame.height > 0 && !frame.bgra.empty(), "empty standalone worker frame");
+        source->close();
+        return true;
+      });
+      while (worker.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
+        MSG message;
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+          TranslateMessage(&message);
+          DispatchMessageW(&message);
+        }
+      }
+      if (!worker.get()) {
+        DestroyWindow(window);
+        std::cout << "SKIP: WGC unavailable\n";
+        return 77;
+      }
+    }
+    require(probe_wgc_capture_backend().available, "support probe after standalone worker shutdown failed");
     for (int iteration = 0; iteration < 8; ++iteration) {
       std::string error;
       auto missing = config;
@@ -67,7 +91,7 @@ int main() {
         "main thread lost its MTA after cross-thread close");
     }
     DestroyWindow(window);
-    std::cout << "WGC cross-thread close, worker recreation and owned-window frames: 8 cycles passed\n";
+    std::cout << "WGC standalone worker recreation: 8 cycles; cross-thread close/readback: 8 cycles passed\n";
     return 0;
   } catch (const std::exception& error) {
     if (window) DestroyWindow(window);

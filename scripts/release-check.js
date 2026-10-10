@@ -232,6 +232,7 @@ async function main() {
     validateNativeRuntime();
     run('node', ['--test', 'scripts/test-native-runtime-integrity.js']);
     run('node', ['scripts/test-native-nat-contract.js', path.join(projectRoot, 'runtime', 'media-agent', 'vds-media-agent.exe')]);
+    run('node', ['scripts/test-native-host-preview.js']);
   }
   run('npm', ['audit', '--omit=dev']);
   run('npm', ['--prefix', 'server', 'audit', '--omit=dev']);
