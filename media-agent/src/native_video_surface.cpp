@@ -255,59 +255,6 @@ bool should_use_overlay_popup(const NativeEmbeddedSurfaceLayout& layout) {
   return layout.embedded;
 }
 
-void activate_owner_window_for_popup(HWND hwnd) {
-  if (!hwnd || !IsWindow(hwnd)) {
-    return;
-  }
-
-  HWND owner = GetWindow(hwnd, GW_OWNER);
-  if (!owner) {
-    owner = reinterpret_cast<HWND>(GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT));
-  }
-  if (!owner || !IsWindow(owner)) {
-    return;
-  }
-
-  HWND root_owner = GetAncestor(owner, GA_ROOTOWNER);
-  if (root_owner && IsWindow(root_owner)) {
-    owner = root_owner;
-  }
-
-  const DWORD current_thread_id = GetCurrentThreadId();
-  const DWORD owner_thread_id = GetWindowThreadProcessId(owner, nullptr);
-  HWND foreground_window = GetForegroundWindow();
-  const DWORD foreground_thread_id = foreground_window
-    ? GetWindowThreadProcessId(foreground_window, nullptr)
-    : 0;
-  const bool attached_owner_thread =
-    owner_thread_id != 0 &&
-    owner_thread_id != current_thread_id &&
-    AttachThreadInput(current_thread_id, owner_thread_id, TRUE) != FALSE;
-  const bool attached_foreground_thread =
-    foreground_thread_id != 0 &&
-    foreground_thread_id != current_thread_id &&
-    foreground_thread_id != owner_thread_id &&
-    AttachThreadInput(current_thread_id, foreground_thread_id, TRUE) != FALSE;
-
-  if (IsIconic(owner)) {
-    ShowWindowAsync(owner, SW_RESTORE);
-  } else {
-    ShowWindowAsync(owner, SW_SHOW);
-  }
-  SetWindowPos(owner, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-  BringWindowToTop(owner);
-  SetForegroundWindow(owner);
-  SetActiveWindow(owner);
-  SetFocus(owner);
-
-  if (attached_foreground_thread) {
-    AttachThreadInput(current_thread_id, foreground_thread_id, FALSE);
-  }
-  if (attached_owner_thread) {
-    AttachThreadInput(current_thread_id, owner_thread_id, FALSE);
-  }
-}
-
 bool is_render_widget_window_class(const std::string& class_name) {
   const std::string normalized = to_lower_ascii(class_name);
   return normalized.rfind("chrome_renderwidgethosthwnd", 0) == 0;
@@ -889,13 +836,13 @@ class NativeVideoSurface::Impl {
       case WM_NCHITTEST:
         return HTCLIENT;
       case WM_MOUSEACTIVATE:
-        activate_owner_window_for_popup(hwnd);
-        return MA_NOACTIVATEANDEAT;
+        // The embedded surface must not synchronously activate its Electron
+        // owner; cross-thread owner windows can share an input queue implicitly.
+        return MA_NOACTIVATE;
       case WM_LBUTTONDOWN:
       case WM_MBUTTONDOWN:
       case WM_RBUTTONDOWN:
       case WM_XBUTTONDOWN:
-        activate_owner_window_for_popup(hwnd);
         return 0;
       case kFrameAvailableMessage:
         self->frame_drain_pending_.store(false, std::memory_order_release);

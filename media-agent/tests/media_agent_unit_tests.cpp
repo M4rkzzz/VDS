@@ -127,6 +127,17 @@ void test_host_pipeline_selection() {
   const std::string keyframe_command = build_ffmpeg_peer_video_sender_command(ffmpeg, keyframe_pipeline, keyframe_plan);
   expect_true(keyframe_command.find(" -g 30") != std::string::npos, "0.5s keyframe policy maps to half-second GOP");
   expect_true(keyframe_command.find("n_forced*0.5") != std::string::npos, "0.5s keyframe policy maps force_key_frames");
+  // A forced I picture need not be a random-access IDR. Late viewers and
+  // reference-chain recovery require the latter, beyond the very first frame.
+  for (const std::string encoder : {"h264_amf", "hevc_amf", "h264_nvenc", "hevc_nvenc"}) {
+    keyframe_pipeline.selected_video_encoder = encoder;
+    keyframe_pipeline.requested_video_codec = encoder.find("hevc") == 0 ? "h265" : "h264";
+    keyframe_plan.codec_path = keyframe_pipeline.requested_video_codec;
+    const std::string command = build_ffmpeg_peer_video_sender_command(ffmpeg, keyframe_pipeline, keyframe_plan);
+    const std::string flag = encoder.find("amf") != std::string::npos ? " -forced_idr 1" : " -forced-idr 1";
+    expect_true(command.find(flag) != std::string::npos, "hardware forced keyframes must be random-access IDR");
+    expect_true(command.find(" -g 30") != std::string::npos, "IDR recovery preserves selected GOP policy");
+  }
 }
 
 void test_surface_target() {

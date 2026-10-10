@@ -1,11 +1,14 @@
-// Real local media path: FFmpeg -> OBS SRT ingest -> native DataChannel -> web app.
+// Real local media path: OBS SRT or WGC -> native DataChannel -> web app.
 // Run with Node; the launcher creates a hidden Electron process and cleans it up.
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
-const reportPath = path.join(root, 'tmp', 'local-playback-e2e-result.json');
+const captureSource = process.argv.includes('--wgc') ? 'wgc' : (process.env.VDS_PLAYBACK_E2E_SOURCE || 'obs');
+if (!['obs', 'wgc'].includes(captureSource)) throw new Error('VDS_PLAYBACK_E2E_SOURCE must be obs or wgc');
+const isWgc = captureSource === 'wgc';
+const reportPath = path.join(root, 'tmp', isWgc ? 'wgc-playback-e2e-result.json' : 'local-playback-e2e-result.json');
 const runId = process.env.VDS_PLAYBACK_E2E_RUN_ID || `${Date.now()}-${process.pid}`;
 function integerOption(name, fallback, minimum, maximum) {
   const raw = process.env[`VDS_PLAYBACK_E2E_${name}`];
@@ -17,6 +20,7 @@ function integerOption(name, fallback, minimum, maximum) {
   return value;
 }
 const mediaOptions = {
+  captureSource,
   width: integerOption('WIDTH', 640, 64, 3840),
   height: integerOption('HEIGHT', 360, 64, 2160),
   frameRate: integerOption('FPS', 15, 5, 60),
@@ -38,7 +42,7 @@ if (!process.versions.electron) {
   delete env.ELECTRON_RUN_AS_NODE;
   env.VDS_PLAYBACK_E2E_RUN_ID = runId;
   saveReport({ ok: false, status: 'starting', stage: 'launch-electron' });
-  const child = spawn(require('electron'), [__filename], { env, windowsHide: true, stdio: 'inherit' });
+  const child = spawn(require('electron'), [__filename, ...(isWgc ? ['--wgc'] : [])], { env, windowsHide: true, stdio: 'inherit' });
   const deadline = setTimeout(() => {
     if (child.exitCode === null && child.pid) {
       const previous = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
@@ -138,7 +142,7 @@ async function runElectron() {
   const manifest = {
     protocol: 'vds-media-encoded-v1', protocolVersion: 1,
     mediaSessionId: 'local-playback-e2e', manifestVersion: 1,
-    sourceType: 'obs-ingest',
+    sourceType: isWgc ? 'native-capture' : 'obs-ingest',
     video: { codec: 'h264', payloadFormat: 'annexb', width: mediaOptions.width, height: mediaOptions.height, frameRate: mediaOptions.frameRate },
     audio: { codec: 'aac', payloadFormat: 'aac-adts', sampleRate: 48000, channels: 2 }
   };
@@ -295,9 +299,9 @@ async function runElectron() {
         const recoveredSource = previousSourceEpoch === null || (epoch === recoveryEpoch &&
           Number.isFinite(d?.webPlaybackMetrics?.video?.lastDecodedPtsUs));
         if (d && recoveredSource && d.playbackState === 'playing' &&
-          /^webcodecs-configured-/.test(d.videoDecoderState) && /^webcodecs-audio-configured-/.test(d.audioDecoderState) &&
+          /^webcodecs-configured-/.test(d.videoDecoderState) && (isWgc || /^webcodecs-audio-configured-/.test(d.audioDecoderState)) &&
           d.webDecodedVideoFrames >= recoveryBaseline.webDecodedVideoFrames + 12 &&
-          d.webDecodedAudioBlocks >= recoveryBaseline.webDecodedAudioBlocks + 12) return current;
+          (isWgc || d.webDecodedAudioBlocks >= recoveryBaseline.webDecodedAudioBlocks + 12)) return current;
         return false;
       });
     } catch (error) {
@@ -307,10 +311,10 @@ async function runElectron() {
       throw error;
     }
     phases.push({ label, ...latest });
-    assert.equal(latest.canvasHasColor, true, label + ':decoded canvas stays blank');
+    if (!isWgc) assert.equal(latest.canvasHasColor, true, label + ':decoded canvas stays blank');
     assert.equal(latest.diagnostics.playbackState, 'playing', label + ':playback state did not reach rendered video');
     assert.match(latest.diagnostics.videoDecoderState, /^webcodecs-configured-/, label + ':video decoder not configured');
-    assert.match(latest.diagnostics.audioDecoderState, /^webcodecs-audio-configured-/, label + ':audio decoder not configured');
+    if (!isWgc) assert.match(latest.diagnostics.audioDecoderState, /^webcodecs-audio-configured-/, label + ':audio decoder not configured');
     assert.doesNotMatch(latest.diagnostics.relayProtocolState, /^webcodecs/, label + ':decoder state overwrote connection/relay state');
     return latest.diagnostics;
   }
@@ -330,7 +334,7 @@ async function runElectron() {
       if (current.webDecodedVideoFrames > previous.webDecodedVideoFrames) videoAdvancedAt = Date.now();
       if (current.webDecodedAudioBlocks > previous.webDecodedAudioBlocks) audioAdvancedAt = Date.now();
       assert.ok(Date.now() - videoAdvancedAt < 3000, 'sustained video stalled for three seconds');
-      assert.ok(Date.now() - audioAdvancedAt < 3000, 'sustained audio stalled for three seconds');
+      if (!isWgc) assert.ok(Date.now() - audioAdvancedAt < 3000, 'sustained audio stalled for three seconds');
       if (Date.now() - sampledAt >= 1000) {
         sampledAt = Date.now();
         samples.push({ elapsedMs: sampledAt - startedAt, video: current.webDecodedVideoFrames,
@@ -350,7 +354,7 @@ async function runElectron() {
     assert.ok(videoIncrement >= Math.floor(mediaOptions.frameRate * durationMs / 1000 * 0.85), 'sustained playback video rate fell below 85% of source rate');
     // The fixture emits 48 kHz AAC with 1024 samples per access unit. Merely
     // checking that audio advances would miss losing half a normal PES burst.
-    assert.ok(audioIncrement >= Math.floor(48000 / 1024 * durationMs / 1000 * 0.9), 'sustained playback audio rate fell below 90% of the AAC source rate');
+    if (!isWgc) assert.ok(audioIncrement >= Math.floor(48000 / 1024 * durationMs / 1000 * 0.9), 'sustained playback audio rate fell below 90% of the AAC source rate');
     return latest.diagnostics;
   }
   async function freeUdpPort() {
@@ -374,30 +378,38 @@ async function runElectron() {
     await agent.start();
     nativeBinarySha256 = require('node:crypto').createHash('sha256').update(fs.readFileSync(agent.getStatus().binaryPath)).digest('hex').toUpperCase();
     assert.equal((await agent.invoke('getCapabilities')).transportReady, true);
-    const srtPort = await freeUdpPort();
+    let startFixture;
     step('native-host-start');
-    await agent.invoke('startHostSession', { mediaSessionId: manifest.mediaSessionId,
-      backend: 'obs-ingest', port: srtPort, codec: 'h264', width: mediaOptions.width,
-      height: mediaOptions.height, frameRate: mediaOptions.frameRate });
-    const ffmpegPath = process.env.VDS_FFMPEG_PATH || 'D:/project/publicresource/ffmpeg-master-latest-win64-gpl-shared/bin/ffmpeg.exe';
-    assert.ok(fs.existsSync(ffmpegPath), 'Set VDS_FFMPEG_PATH to an FFmpeg binary with libx264 and SRT support');
-    const startFixture = () => {
-      ffmpegExit = null;
-      ffmpeg = spawn(ffmpegPath, ['-hide_banner', '-loglevel', 'warning', '-nostdin',
-      '-re', '-f', 'lavfi', '-i', `testsrc2=size=${mediaOptions.width}x${mediaOptions.height}:rate=${mediaOptions.frameRate}`,
-      '-re', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
-      '-t', String(Math.ceil(runDeadlineMs / 1000) + 5), '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-      '-pix_fmt', 'yuv420p', '-profile:v', mediaOptions.bFrames ? 'main' : 'baseline',
-      '-g', String(mediaOptions.frameRate), '-bf', String(mediaOptions.bFrames),
-      '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '96k',
-      '-f', 'mpegts', `srt://127.0.0.1:${srtPort}?mode=caller&transtype=live&latency=120000`],
-    { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
-    ffmpeg.stderr.on('data', (data) => logs.push('[ffmpeg] ' + String(data).trim()));
-    ffmpeg.on('error', fail);
-    ffmpeg.on('exit', (code, signal) => { ffmpegExit = { code, signal }; });
-    };
-    startFixture();
-    await poll('obs-stream-running', () => obsState?.streamRunning);
+    if (isWgc) {
+      await agent.invoke('startHostSession', { mediaSessionId: manifest.mediaSessionId,
+        backend: 'native', captureKind: 'display', captureTargetId: 'screen:0:0', displayId: '0',
+        requestedCodec: 'h264', width: mediaOptions.width, height: mediaOptions.height,
+        frameRate: mediaOptions.frameRate, bitrateKbps: 10000 });
+    } else {
+      const srtPort = await freeUdpPort();
+      await agent.invoke('startHostSession', { mediaSessionId: manifest.mediaSessionId,
+        backend: 'obs-ingest', port: srtPort, codec: 'h264', width: mediaOptions.width,
+        height: mediaOptions.height, frameRate: mediaOptions.frameRate });
+      const ffmpegPath = process.env.VDS_FFMPEG_PATH || 'D:/project/publicresource/ffmpeg-master-latest-win64-gpl-shared/bin/ffmpeg.exe';
+      assert.ok(fs.existsSync(ffmpegPath), 'Set VDS_FFMPEG_PATH to an FFmpeg binary with libx264 and SRT support');
+      startFixture = () => {
+        ffmpegExit = null;
+        ffmpeg = spawn(ffmpegPath, ['-hide_banner', '-loglevel', 'warning', '-nostdin',
+        '-re', '-f', 'lavfi', '-i', `testsrc2=size=${mediaOptions.width}x${mediaOptions.height}:rate=${mediaOptions.frameRate}`,
+        '-re', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+        '-t', String(Math.ceil(runDeadlineMs / 1000) + 5), '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+        '-pix_fmt', 'yuv420p', '-profile:v', mediaOptions.bFrames ? 'main' : 'baseline',
+        '-g', String(mediaOptions.frameRate), '-bf', String(mediaOptions.bFrames),
+        '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-b:a', '96k',
+        '-f', 'mpegts', `srt://127.0.0.1:${srtPort}?mode=caller&transtype=live&latency=120000`],
+      { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+      ffmpeg.stderr.on('data', (data) => logs.push('[ffmpeg] ' + String(data).trim()));
+      ffmpeg.on('error', fail);
+      ffmpeg.on('exit', (code, signal) => { ffmpegExit = { code, signal }; });
+      };
+      startFixture();
+      await poll('obs-stream-running', () => obsState?.streamRunning);
+    }
     hostSocket = new WebSocket(`ws://127.0.0.1:${port}`);
     hostSocket.on('error', fail);
     await once(hostSocket, 'open');
@@ -467,69 +479,71 @@ async function runElectron() {
     await join();
     const initial = await waitForFrames('initial-playback');
     const sustained = await observeSustainedPlayback(initial);
-    await window.webContents.executeJavaScript("document.getElementById('leaveButton').click()");
-    await poll('room-leave', () => instance.rooms.get(room.roomId).viewers.length === 0);
-    await poll('playback-stopped', async () => (await snapshot()).diagnostics.playbackState === 'stopped', 3000);
-    await join();
-    await waitForFrames('leave-rejoin-playback', sustained);
-    await window.webContents.reload();
-    await once(window.webContents, 'did-finish-load');
-    await installCodecTrace(window);
-    await waitForFrames('reload-resume-playback');
-    assert.equal(window.isVisible(), false);
-    relayWindow = window;
-    const relaySnapshot = await snapshot();
-    window = new BrowserWindow({ show: false, width: 960, height: 640,
-      webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true,
-        backgroundThrottling: false, offscreen: true, partition: 'local-playback-e2e-downstream-' + process.pid } });
-    window.webContents.setFrameRate(60);
-    window.webContents.setAudioMuted(true);
-    windows.push(window);
-    window.webContents.on('console-message', (details) => {
-      if (details.level === 'error') consoleErrors.push(details.message);
-      if (mediaOptions.traceRendering && !details.message.includes('[diagnostics]')) {
-        logs.push('[web-downstream] ' + details.message);
+    if (!isWgc) {
+      await window.webContents.executeJavaScript("document.getElementById('leaveButton').click()");
+      await poll('room-leave', () => instance.rooms.get(room.roomId).viewers.length === 0);
+      await poll('playback-stopped', async () => (await snapshot()).diagnostics.playbackState === 'stopped', 3000);
+      await join();
+      await waitForFrames('leave-rejoin-playback', sustained);
+      await window.webContents.reload();
+      await once(window.webContents, 'did-finish-load');
+      await installCodecTrace(window);
+      await waitForFrames('reload-resume-playback');
+      assert.equal(window.isVisible(), false);
+      relayWindow = window;
+      const relaySnapshot = await snapshot();
+      window = new BrowserWindow({ show: false, width: 960, height: 640,
+        webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true,
+          backgroundThrottling: false, offscreen: true, partition: 'local-playback-e2e-downstream-' + process.pid } });
+      window.webContents.setFrameRate(60);
+      window.webContents.setAudioMuted(true);
+      windows.push(window);
+      window.webContents.on('console-message', (details) => {
+        if (details.level === 'error') consoleErrors.push(details.message);
+        if (mediaOptions.traceRendering && !details.message.includes('[diagnostics]')) {
+          logs.push('[web-downstream] ' + details.message);
+        }
+      });
+      window.webContents.on('render-process-gone', (_event, details) => fail(new Error('renderer-gone:' + details.reason)));
+      await window.loadURL(`http://127.0.0.1:${port}/vds_web/`);
+      await installCodecTrace(window);
+      await join();
+      const downstream = await waitForFrames('browser-relay-playback');
+      assert.equal(downstream.upstreamPeerId, relaySnapshot.diagnostics.clientId, 'second viewer bypassed browser relay');
+      assert.equal(downstream.reencodePathUsed, false);
+      // Restart the source on the same native and browser relay connections. The
+      // source input restarts while host PTS retains its common clock offset;
+      // a fresh epoch must separate old output.
+      for (let restart = 1; restart <= 2; restart += 1) {
+        const before = await snapshot();
+        const beforeEpoch = before.diagnostics.webPlaybackMetrics.sourceEpoch;
+        assert.ok(beforeEpoch, 'current sender omitted source epoch');
+        const peerGenerations = new Map(transportGenerations);
+        if (mediaOptions.traceRendering) {
+          await Promise.all([window, relayWindow].map(target => target.webContents.executeJavaScript('window.__vdsCodecTrace = []')));
+        }
+        step('obs-source-restart-' + restart);
+        const exited = once(ffmpeg, 'exit');
+        ffmpeg.kill();
+        await exited;
+        await poll('obs-source-disconnected-' + restart, () => obsState && !obsState.streamRunning);
+        startFixture();
+        await poll('obs-source-reconnected-' + restart, () => obsState?.streamRunning);
+        const resumed = await waitForFrames('same-peer-source-recovery-' + restart, before.diagnostics, beforeEpoch);
+        assert.equal(resumed.upstreamPeerId, before.diagnostics.upstreamPeerId, 'source restart rebuilt the downstream peer');
+        assert.notEqual(resumed.webPlaybackMetrics.sourceEpoch, beforeEpoch, 'source restart reused its retired output epoch');
+        assert.deepEqual(transportGenerations, peerGenerations, 'source restart rebuilt native transport');
+        assert.ok(resumed.webPlaybackMetrics.retiredSourceEpochs >= restart, 'old source epoch was not retired');
       }
-    });
-    window.webContents.on('render-process-gone', (_event, details) => fail(new Error('renderer-gone:' + details.reason)));
-    await window.loadURL(`http://127.0.0.1:${port}/vds_web/`);
-    await installCodecTrace(window);
-    await join();
-    const downstream = await waitForFrames('browser-relay-playback');
-    assert.equal(downstream.upstreamPeerId, relaySnapshot.diagnostics.clientId, 'second viewer bypassed browser relay');
-    assert.equal(downstream.reencodePathUsed, false);
-    // Restart the source on the same native and browser relay connections. The
-    // source input restarts while host PTS retains its common clock offset;
-    // a fresh epoch must separate old output.
-    for (let restart = 1; restart <= 2; restart += 1) {
-      const before = await snapshot();
-      const beforeEpoch = before.diagnostics.webPlaybackMetrics.sourceEpoch;
-      assert.ok(beforeEpoch, 'current sender omitted source epoch');
-      const peerGenerations = new Map(transportGenerations);
-      if (mediaOptions.traceRendering) {
-        await Promise.all([window, relayWindow].map(target => target.webContents.executeJavaScript('window.__vdsCodecTrace = []')));
-      }
-      step('obs-source-restart-' + restart);
-      const exited = once(ffmpeg, 'exit');
-      ffmpeg.kill();
-      await exited;
-      await poll('obs-source-disconnected-' + restart, () => obsState && !obsState.streamRunning);
-      startFixture();
-      await poll('obs-source-reconnected-' + restart, () => obsState?.streamRunning);
-      const resumed = await waitForFrames('same-peer-source-recovery-' + restart, before.diagnostics, beforeEpoch);
-      assert.equal(resumed.upstreamPeerId, before.diagnostics.upstreamPeerId, 'source restart rebuilt the downstream peer');
-      assert.notEqual(resumed.webPlaybackMetrics.sourceEpoch, beforeEpoch, 'source restart reused its retired output epoch');
-      assert.deepEqual(transportGenerations, peerGenerations, 'source restart rebuilt native transport');
-      assert.ok(resumed.webPlaybackMetrics.retiredSourceEpochs >= restart, 'old source epoch was not retired');
+      relayWindow.destroy();
+      const reassigned = await poll('relay-upstream-reassigned', async () => {
+        const current = await snapshot();
+        return current.diagnostics?.upstreamPeerId === hostId && current;
+      });
+      const recovered = await waitForFrames('relay-disconnect-recovery', reassigned.diagnostics);
+      assert.equal(recovered.upstreamPeerId, hostId, 'downstream did not recover on native host');
+      assert.equal(window.isVisible(), false);
     }
-    relayWindow.destroy();
-    const reassigned = await poll('relay-upstream-reassigned', async () => {
-      const current = await snapshot();
-      return current.diagnostics?.upstreamPeerId === hostId && current;
-    });
-    const recovered = await waitForFrames('relay-disconnect-recovery', reassigned.diagnostics);
-    assert.equal(recovered.upstreamPeerId, hostId, 'downstream did not recover on native host');
-    assert.equal(window.isVisible(), false);
   } catch (error) {
     exitCode = 1;
     fatalError = error;
@@ -564,7 +578,8 @@ async function runElectron() {
     clearTimeout(cleanupDeadline);
     const report = { ok: exitCode === 0 && !fatalError, status: 'completed', stage,
       error: fatalError?.message || null, progress,
-      path: 'FFmpeg synthetic H264/AAC -> loopback SRT -> native media agent libdatachannel -> real room server -> real web app WebCodecs',
+      path: isWgc ? 'Real WGC -> hardware-selected H264 -> native DataChannel -> room server -> WebCodecs'
+        : 'FFmpeg synthetic H264/AAC -> loopback SRT -> native DataChannel -> room server -> WebCodecs',
       electron: process.versions.electron, nativeBinarySha256, obsState, phases, nativeStats, warnings, consoleErrors, hostMessages,
       audioOutputMuted: true, ffmpegExit, nativeStopped: !agent.getStatus().running, logs: logs.slice(-40) };
     saveReport(report);

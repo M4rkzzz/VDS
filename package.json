@@ -1,6 +1,6 @@
 {
   "name": "screenshare-relay",
-  "version": "1.7.9",
+  "version": "1.7.10",
   "description": "Multi-viewer screen sharing with cascade relay (蜈蚣法) - Electron Edition",
   "main": "desktop/main.js",
   "engines": {
@@ -23,6 +23,7 @@
     "check:web-mobile-diagnostics": "node scripts/check-web-mobile-diagnostics.js --self-test",
     "check:web-mobile-code": "npm run check:vds-web && npm run test:vds-web && npm run check:web-mobile-diagnostics && npm run test:server",
     "test:vds-web": "node scripts/test-vds-web-protocol.js && node scripts/test-vds-web-frame-validation.js && node scripts/test-vds-web-player-lifecycle.js && node --test tests/web/*.test.js",
+    "verify:playback:wgc": "npm run build:vds-web && node scripts/test-local-playback-e2e.js --wgc",
     "verify:playback": "npm run build:vds-web && node scripts/test-vds-web-playback.js && node scripts/test-local-playback-e2e.js",
     "verify:nat": "node scripts/test-native-nat.js",
     "build": "electron-builder",

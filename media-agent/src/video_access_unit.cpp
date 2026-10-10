@@ -307,7 +307,10 @@ void AnnexBVideoAccessUnitParser::scan(
       if (!is_aud && !first_slice && !is_config) continue;
       discarding_ = false;
     }
-    if (access_unit_start_ == std::string::npos) {
+    // Some hardware streams already carry AUD when the muxer inserts another.
+    // An empty delimiter-only AU must not precede the actual IDR in the packet:
+    // WebCodecs checks the first AU, not any later IDR NAL in the same buffer.
+    if (access_unit_start_ == std::string::npos || (is_aud && !access_unit_has_media_)) {
       access_unit_start_ = offset;
     } else if (access_unit_has_vcl_ && (is_aud || first_slice || is_config)) {
       std::vector<std::uint8_t> unit(

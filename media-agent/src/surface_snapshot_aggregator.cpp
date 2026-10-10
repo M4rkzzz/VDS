@@ -21,7 +21,10 @@ std::string surface_session_stats_json(const AgentRuntimeState& runtime_state) {
       payload << ",";
     }
     first = false;
-    payload << surface_attachment_json(surface);
+    // Serialize a refreshed snapshot without mutating the registry during a
+    // const stats read. Peer surfaces otherwise keep their attachment-time count.
+    SurfaceAttachmentState snapshot = surface;
+    payload << surface_attachment_json(snapshot);
   });
   payload << "]";
   return payload.str();

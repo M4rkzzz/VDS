@@ -76,7 +76,7 @@ void append_video_encoder_runtime_flags(std::ostringstream& command, const HostP
     command
       << " -usage " << (tune == "zerolatency" ? "ultralowlatency" : "lowlatency")
       << " -quality " << amf_quality
-      << " -rc cbr -bf 0";
+      << " -rc cbr -bf 0 -forced_idr 1";
     return;
   }
 
@@ -87,7 +87,7 @@ void append_video_encoder_runtime_flags(std::ostringstream& command, const HostP
     if (tune == "zerolatency") {
       command << " -tune ull";
     }
-    command << " -rc cbr -bf 0";
+    command << " -rc cbr -bf 0 -forced-idr 1";
     return;
   }
 

@@ -78,6 +78,23 @@ void test_incremental_boundaries() {
   expect(units.size() == 1 && units[0] == picture, "multiple slices of a picture are kept together");
 }
 
+void test_duplicate_empty_delimiters() {
+  const Bytes picture = join(h264_aud, join(h264_config, h264_idr));
+  const Bytes stream = join(h264_aud, join(picture, h264_delta));
+  for (const size_t chunk_size : {size_t{1}, size_t{7}, stream.size()}) {
+    AnnexBVideoAccessUnitParser parser;
+    std::vector<Bytes> units;
+    for (size_t offset = 0; offset < stream.size(); offset += chunk_size) {
+      auto ready = parser.push("h264", stream.data() + offset, std::min(chunk_size, stream.size() - offset));
+      units.insert(units.end(), ready.begin(), ready.end());
+    }
+    auto tail = parser.push("h264", nullptr, 0, true);
+    units.insert(units.end(), tail.begin(), tail.end());
+    expect(units.size() == 2 && units[0] == picture && units[1] == h264_delta,
+      "duplicate empty AUD does not mask the real configuration and IDR or lose the next picture");
+  }
+}
+
 void test_large_legal_frame_and_linear_scan() {
   for (const auto& codec : {std::string("h264"), std::string("h265")}) {
     Bytes large = codec == "h264" ? join(h264_aud, h264_idr) : h265_idr;
@@ -120,6 +137,7 @@ void test_oversized_incomplete_au_recovers() {
 int main() {
   test_complete_packet_boundaries();
   test_incremental_boundaries();
+  test_duplicate_empty_delimiters();
   test_large_legal_frame_and_linear_scan();
   test_oversized_incomplete_au_recovers();
   std::cout << "video access unit checks: " << checks << ", failures: " << failures << '\n';

@@ -256,6 +256,12 @@ class OffscreenOwner {
       if (!window) return;
       MSG message{};
       while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (message.message == WM_APP + 59) {
+          paused_.store(true);
+          Sleep(static_cast<DWORD>(message.wParam));
+          paused_.store(false);
+          continue;
+        }
         TranslateMessage(&message);
         DispatchMessageW(&message);
       }
@@ -282,7 +288,14 @@ class OffscreenOwner {
     }
   }
   HWND handle() const { return handle_; }
+  void pause_messages() {
+    require(PostThreadMessageW(thread_id_, WM_APP + 59, 500, 0) != FALSE, "pause owned fixture message loop");
+    const auto deadline = SteadyClock::now() + std::chrono::seconds(1);
+    while (!paused_.load() && SteadyClock::now() < deadline) Sleep(1);
+    require(paused_.load(), "owned fixture entered its temporary busy state");
+  }
  private:
+  std::atomic<bool> paused_{false};
   HWND handle_ = nullptr;
   DWORD thread_id_ = 0;
   bool started_ = false;
@@ -718,6 +731,27 @@ int main() {
   std::cout << std::unitbuf;
   av_log_set_level(AV_LOG_ERROR);
   try {
+    {
+      SurfaceFixture fixture("input-owner-busy");
+      fixture.owner.pause_messages();
+      DWORD_PTR result = 0;
+      require(SendMessageTimeoutW(fixture.window, WM_MOUSEACTIVATE, 0, 0,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &result) != 0,
+        "native input must not synchronously wait for or attach the Electron owner's input queue");
+      require(!IsWindowVisible(fixture.owner.handle()), "clicking an inactive surface must not reveal a hidden owner");
+    }
+    {
+      SurfaceFixture fixture("input-visible-owner-busy");
+      ShowWindowAsync(fixture.owner.handle(), SW_SHOWNOACTIVATE);
+      const auto deadline = SteadyClock::now() + std::chrono::seconds(1);
+      while (!IsWindowVisible(fixture.owner.handle()) && SteadyClock::now() < deadline) Sleep(1);
+      require(IsWindowVisible(fixture.owner.handle()), "offscreen input owner is visible without activation");
+      fixture.owner.pause_messages();
+      DWORD_PTR result = 0;
+      require(SendMessageTimeoutW(fixture.window, WM_MOUSEACTIVATE, 0, 0,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &result) != 0,
+        "visible busy owner must not block the native mouse activation handler");
+    }
     const auto units = encode_h264(180);
     verify_encoded_fixture(units);
     test_real_b_frame_paint(units);
