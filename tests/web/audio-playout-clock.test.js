@@ -31,8 +31,10 @@ async function advancePlayout(h, milliseconds) {
   }
 }
 
-function harness() {
-  const h = { contexts: [], decoders: [], sources: [], chunks: [], drops: [], outputs: 0, released: 0, nowMs: 1000 };
+function harness(initialAudioState = 'running') {
+  // Playout tests use an allowed output device. Policy tests explicitly create
+  // a suspended/interrupted context rather than scheduling into one implicitly.
+  const h = { contexts: [], decoders: [], sources: [], chunks: [], drops: [], outputStates: [], outputs: 0, released: 0, buffers: 0, pcmCopies: 0, nowMs: 1000 };
   let timerId = 0;
   const timers = new Map();
   h.clock = {
@@ -60,7 +62,7 @@ function harness() {
   h.setSupport = (next) => { support = next; };
   h.data = (timestamp = 1000000, frames = 960) => ({
     timestamp, sampleRate: h.outputSampleRate || 48000, numberOfFrames: frames, numberOfChannels: 2,
-    copyTo: (target) => target.fill(0),
+    copyTo: (target) => { h.pcmCopies += 1; target.fill(0); },
     close() { h.released += 1; }
   });
   class AudioDecoder {
@@ -86,15 +88,20 @@ function harness() {
   class Context {
     constructor() {
       this.currentTime = 1;
-      this.state = 'suspended';
+      this.state = initialAudioState;
       this.destination = {};
       this.outputTimestamp = { contextTime: 0, performanceTime: 0 };
       h.contexts.push(this);
     }
-    async resume() { this.state = 'running'; }
+    async resume() {
+      if (h.resumeWait) await h.resumeWait;
+      this.state = 'running';
+      this.onstatechange?.();
+    }
     async close() { this.state = 'closed'; }
     getOutputTimestamp() { return this.outputTimestamp; }
     createBuffer(channels, frames, sampleRate) {
+      h.buffers += 1;
       return { duration: frames / sampleRate, getChannelData: () => new Float32Array(frames) };
     }
     createGain() { return { gain: { value: 1 }, connect() {} }; }
@@ -135,6 +142,7 @@ function harness() {
     return module.exports;
   }
   h.player = new (loadModule('webcodecs-audio-player').WebCodecsAudioPlayer)({
+    onOutputState: (state) => h.outputStates.push(state),
     onState() {}, onDecodedBlock: () => { h.outputs += 1; }, onDroppedBlock: (reason) => h.drops.push(reason)
   });
   h.push = (timestampUs = 1000000, codec = 'opus', sequence = timestampUs) => h.player.pushFrame({
@@ -144,6 +152,44 @@ function harness() {
   h.output = (ptsUs, frames) => h.decoders.at(-1).callbacks.output(h.data(ptsUs, frames));
   return h;
 }
+
+test('audio output is lazy and an interrupted context resumes on a later gesture', async () => {
+  const h = harness('suspended');
+  assert.equal(h.contexts.length, 0);
+  h.player.setVolume(0.5);
+  h.player.setFormat(48000, 2);
+  assert.equal(h.contexts.length, 0, 'volume and manifest setup must not create audio before a gesture or media');
+  await h.player.resume();
+  assert.equal(h.contexts.length, 1);
+  assert.equal(h.outputStates[0], 'suspended');
+  assert.equal(h.outputStates.at(-1), 'running');
+  const context = h.contexts[0];
+  context.state = 'interrupted';
+  context.onstatechange();
+  assert.equal(h.outputStates.at(-1), 'interrupted');
+  await h.player.resume();
+  assert.equal(context.state, 'running');
+  assert.equal(h.outputStates.at(-1), 'running');
+  h.player.close();
+});
+
+test('a blocked old audio unlock cannot publish running into a replacement context', async () => {
+  const h = harness('suspended');
+  const blocked = deferred();
+  h.resumeWait = blocked.promise;
+  const pending = h.player.resume();
+  assert.deepEqual(h.outputStates, ['suspended']);
+  h.player.close();
+  h.resumeWait = null;
+  await h.player.resume();
+  assert.equal(h.contexts.length, 2);
+  const count = h.outputStates.length;
+  blocked.resolve();
+  await pending;
+  assert.equal(h.outputStates.length, count, 'obsolete context state and resume completions must be ignored');
+  assert.equal(h.contexts[1].state, 'running');
+  h.player.close();
+});
 
 test('a user gesture stays unlocked, and volume, format and manual delay survive close', async () => {
   const h = harness();
@@ -186,12 +232,14 @@ test('the master clock maps source PTS to the device timestamp, including manual
 });
 
 test('missing, suspended, zero and invalid device timestamps fall back without a fabricated clock', async () => {
-  const h = harness();
+  const h = harness('suspended');
   await h.push();
   const context = h.contexts[0];
   context.outputTimestamp = { contextTime: 1.03, performanceTime: 5000 };
   assert.equal(h.player.getPlaybackClock(), null);
   await h.player.resume();
+  await h.push(1020000);
+  assert.notEqual(h.player.getPlaybackClock(), null, 'a fresh running packet establishes an actual clock');
   context.outputTimestamp = { contextTime: 0, performanceTime: 0 };
   assert.equal(h.player.getPlaybackClock(), null);
   context.outputTimestamp = { contextTime: 1.03, performanceTime: NaN };
@@ -454,14 +502,60 @@ test('changing delay or format cancels already scheduled sound and keeps the unl
   h.player.close();
 });
 
-test('a burst into a suspended context discards old reservations rather than accumulating seconds', async () => {
+test('suspended AAC and Opus release each block without allocating output, then resume from fresh media', async () => {
+  for (const codec of ['opus', 'aac']) {
+    const h = harness('suspended');
+    for (let index = 0; index < 50; index += 1) await h.push(1000000 + index * 20000, codec);
+    assert.equal(h.drops.length, 50);
+    assert.ok(h.drops.every((reason) => reason === 'web-audio-output-awaiting-gesture'));
+    assert.equal(h.buffers, 0);
+    assert.equal(h.pcmCopies, 0);
+    assert.equal(h.sources.length, 0);
+    assert.equal(h.released, 50);
+    assert.equal(h.player.getMetrics().scheduledSources, 0);
+    assert.equal(h.player.getMetrics().scheduledLeadMs, 0);
+    assert.equal(h.player.getMetrics().decoded, 0);
+    assert.equal(h.player.getMetrics().dropped, 50);
+    assert.equal(h.player.getMetrics().pendingCodecOutputs, 0);
+    assert.equal(h.player.getPlaybackClock(), null);
+    const decoder = h.decoders[0];
+    await h.player.resume();
+    assert.equal(h.sources.length, 0, 'a gesture must not replay blocked old packets');
+    await h.push(5000000, codec);
+    assert.equal(h.contexts.length, 1);
+    assert.equal(h.decoders.length, 1);
+    assert.equal(h.decoders[0], decoder);
+    assert.equal(h.sources.length, 1);
+    assert.equal(h.outputs, 1);
+    assert.equal(h.player.timelineAnchor.ptsUs, 5000000);
+    h.contexts[0].outputTimestamp = { contextTime: 1.025, performanceTime: 5000 };
+    assert.ok(Math.abs(h.player.getPlaybackClock().ptsUs - 5005000) < 0.001);
+    h.player.close();
+  }
+});
+
+test('interrupted output releases previous scheduling and preserves the decoder for fresh resumed audio', async () => {
   const h = harness();
-  for (let index = 0; index < 50; index += 1) await h.push(1000000 + index * 20000);
-  assert.ok(h.drops.includes('webcodecs-audio-playback-backlog-reset'));
-  assert.ok(h.sources.some((source) => source.stopped === 1));
-  assert.ok(h.player.nextPlaybackTime <= h.contexts[0].currentTime + 0.16 + 1e-8);
-  assert.ok(h.player.scheduledSources.size <= 8);
-  assert.equal(h.released, 50);
+  await h.push();
+  const decoder = h.decoders[0], context = h.contexts[0], source = h.sources[0];
+  context.state = 'interrupted';
+  context.onstatechange();
+  await h.push(1020000);
+  assert.equal(source.stopped, 1);
+  assert.equal(source.disconnected, 1);
+  assert.equal(h.player.getMetrics().scheduledSources, 0);
+  assert.equal(h.player.getMetrics().scheduledLeadMs, 0);
+  assert.equal(h.player.getPlaybackClock(), null);
+  assert.equal(h.buffers, 1);
+  assert.equal(h.sources.length, 1);
+  assert.equal(h.drops.at(-1), 'web-audio-output-awaiting-gesture');
+  await h.player.resume();
+  await h.push(1040000);
+  assert.equal(h.contexts.length, 1);
+  assert.equal(h.decoders[0], decoder);
+  assert.equal(h.decoders.length, 1);
+  assert.equal(h.sources.length, 2);
+  assert.equal(h.player.timelineAnchor.ptsUs, 1040000);
   h.player.close();
 });
 
@@ -1094,7 +1188,7 @@ test('the output safety budget rejects excess reservations while keeping its pla
 });
 
 test('real decodeQueueSize pauses submission and only the low-water dequeue event resumes it', async () => {
-  const h = harness();
+  const h = harness('suspended');
   h.holdDecode = true;
   for (let index = 0; index < 8; index += 1) await h.push(1000000 + index * 20000);
   let finished = false;
@@ -1118,7 +1212,7 @@ test('real decodeQueueSize pauses submission and only the low-water dequeue even
 });
 
 test('close settles a backpressure waiter, while an old dequeue/output cannot revive playback', async () => {
-  const h = harness();
+  const h = harness('suspended');
   h.holdDecode = true;
   for (let index = 0; index < 8; index += 1) await h.push(1000000 + index * 20000);
   const oldDecoder = h.decoders[0];
@@ -1129,6 +1223,7 @@ test('close settles a backpressure waiter, while an old dequeue/output cannot re
   assert.equal(h.clock.size, 0);
   await waiting;
   h.holdDecode = false;
+  await h.player.resume();
   await h.push(2000000);
   oldDecoder.decodeQueueSize = 0;
   oldDequeue();
@@ -1146,7 +1241,7 @@ test('close settles a backpressure waiter, while an old dequeue/output cannot re
 });
 
 test('a decoder that never dequeues times out after 160 ms and the next audio block recovers', async () => {
-  const h = harness();
+  const h = harness('suspended');
   h.holdDecode = true;
   for (let index = 0; index < 8; index += 1) await h.push(1000000 + index * 20000);
   const oldDecoder = h.decoders[0];
@@ -1164,6 +1259,7 @@ test('a decoder that never dequeues times out after 160 ms and the next audio bl
   assert.equal(h.player.getMetrics().pendingInputs, 0);
   assert.deepEqual(h.drops, ['webcodecs-audio-decode-backlog']);
   h.holdDecode = false;
+  await h.player.resume();
   await h.push(1180000);
   assert.equal(h.decoders.length, 2);
   assert.equal(h.outputs, 1);
@@ -1172,7 +1268,7 @@ test('a decoder that never dequeues times out after 160 ms and the next audio bl
 });
 
 test('format replacement cancels the saturated decoder watchdog before configuring the new one', async () => {
-  const h = harness();
+  const h = harness('suspended');
   h.holdDecode = true;
   for (let index = 0; index < 8; index += 1) await h.push(1000000 + index * 20000);
   const pending = h.push(1160000);
@@ -1181,6 +1277,7 @@ test('format replacement cancels the saturated decoder watchdog before configuri
   await pending;
   assert.equal(h.clock.size, 0);
   h.holdDecode = false;
+  await h.player.resume();
   await h.push(2000000);
   h.clock.advance(200);
   assert.equal(h.decoders[1].state, 'configured');

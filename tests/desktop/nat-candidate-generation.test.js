@@ -178,19 +178,41 @@ test('closing during create waits for its actual identity before issuing a close
   assert.equal(closes[0].transportGeneration, 'creating-transport');
 });
 
-test('a delayed old close cannot erase the replacement handle or its metadata', async () => {
+for (const generationAvailable of [true, false]) test(`replacement during native detach prevents an old close RPC (generation ${generationAvailable ? 'present' : 'absent'})`, async () => {
   const detached = deferred();
   const entered = deferred();
   const closes = [];
   const h = harness({ detachPeerMediaSource: async () => { entered.resolve(); await detached.promise; },
-    closePeer: async (request) => closes.push(request) });
+    closePeer: async (request) => closes.push(request),
+    ...(!generationAvailable ? { createPeer: async () => ({}) } : {}) });
   const old = await h.create();
   const closing = h.controller.closePeerConnection('peer');
   await entered.promise;
   const current = await h.create();
   detached.resolve();
   await closing;
+  assert.equal(old.closed, true);
+  assert.equal(current.closed, false);
   assert.equal(h.controller.getPeerHandle('peer'), current);
   assert.equal(h.metadata.get('peer').attemptId, current.attemptId);
-  assert.equal(closes[0].transportGeneration, old.transportGeneration);
+  assert.equal(closes.length, 0, 'a retired detach completion must not issue a close against its peer ID');
+});
+
+for (const generationAvailable of [true, false]) test(`an in-flight native close cannot erase replacement state (generation ${generationAvailable ? 'present' : 'absent'})`, async () => {
+  const closed = deferred();
+  const entered = deferred();
+  const closes = [];
+  const h = harness({ closePeer: async (request) => { closes.push(request); entered.resolve(); await closed.promise; },
+    ...(!generationAvailable ? { createPeer: async () => ({}) } : {}) });
+  const old = await h.create();
+  const closing = h.controller.closePeerConnection('peer', { clearRetryState: true });
+  await entered.promise;
+  const current = await h.create();
+  closed.resolve();
+  await closing;
+  assert.equal(closes.length, 1);
+  assert.equal(closes[0].transportGeneration || '', old.transportGeneration);
+  assert.equal(current.closed, false);
+  assert.equal(h.controller.getPeerHandle('peer'), current);
+  assert.equal(h.metadata.get('peer').attemptId, current.attemptId);
 });

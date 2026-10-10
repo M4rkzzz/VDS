@@ -984,6 +984,21 @@
       const roomId = context.roomId || roomSnapshot.roomId || '';
       const clientId = context.clientId || roomSnapshot.clientId || '';
       const sessionToken = context.sessionToken || roomSnapshot.sessionToken || '';
+
+      // Start retiring every old ICE attempt before any cleanup can yield. OBS
+      // keeps its listener and may reconnect while these native RPCs complete.
+      const peerIds = callOptional('getPeerIds') || [];
+      const peerClosures = (Array.isArray(peerIds) ? peerIds : []).map((peerId) => {
+        try {
+          return Promise.resolve(callOptional('closePeer', peerId, { clearRetryState: true })).catch(() => {});
+        } catch (_error) {
+          return Promise.resolve();
+        }
+      });
+      clearRoomState(reason, { clearObsFlags: true });
+      resetPlaybackState();
+      resetObsRoomUiWaitingForStream();
+
       try {
         if (roomId && clientId && typeof options.sendLeaveRoom === 'function') {
           await options.sendLeaveRoom({
@@ -995,10 +1010,9 @@
           });
         }
       } finally {
-        // OBS can reconnect to the same native listening session.
-        clearRoomState(reason, { clearObsFlags: true });
-        resetPlaybackState();
-        resetObsRoomUiWaitingForStream();
+        // Never clear UI/session state after yielding: it can now belong to a
+        // reconnected OBS stream or a replacement native capture session.
+        await Promise.all(peerClosures);
       }
     }
 

@@ -3,6 +3,7 @@ import { AdaptivePlaybackDelay, playbackNowMs } from './playback-policy';
 
 type AudioDiagnostics = {
   onState: (state: string) => void;
+  onOutputState?: (state: string) => void;
   onDecodedBlock: () => void;
   onDroppedBlock: (reason: string) => void;
 };
@@ -215,9 +216,10 @@ export class WebCodecsAudioPlayer {
 
   async resume(sampleRate = 48000): Promise<void> {
     const context = this.ensureContext(sampleRate);
-    if (context.state === 'suspended') {
+    if (['suspended', 'interrupted'].includes(context.state)) {
       await context.resume().catch(() => {});
     }
+    if (this.context === context) this.diagnostics.onOutputState?.(context.state);
   }
 
   resetMedia(): void {
@@ -548,6 +550,14 @@ export class WebCodecsAudioPlayer {
       const context = this.ensureContext(data.sampleRate);
       const duration = data.numberOfFrames / data.sampleRate;
       if (!Number.isFinite(duration) || duration <= 0) throw new Error('webcodecs-audio-output-invalid');
+      if (context.state !== 'running') {
+        // Browser policy or a device interruption cannot play these samples.
+        // Release earlier reservations and resume from fresh media after a
+        // gesture, without copying PCM or asking a blocked source to start.
+        this.resetScheduling(false);
+        this.dropBlock('web-audio-output-awaiting-gesture');
+        return;
+      }
       this.lastBlockDurationSeconds = duration;
       const ptsUs = sourcePtsUs ?? (Number.isFinite(data.timestamp) ? Math.max(0, data.timestamp) : this.lastEndPtsUs);
       const nowMs = playbackNowMs();
@@ -643,6 +653,11 @@ export class WebCodecsAudioPlayer {
       }
       this.context = new AudioContextCtor({ sampleRate });
       this.gainNode = null;
+      const context = this.context;
+      context.onstatechange = () => {
+        if (this.context === context) this.diagnostics.onOutputState?.(context.state);
+      };
+      this.diagnostics.onOutputState?.(context.state);
     }
     return this.context;
   }

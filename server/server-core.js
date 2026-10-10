@@ -579,6 +579,7 @@ function startServer(options = {}) {
 
       clearDisconnectTimer(room.host);
       const previousWs = room.host.ws;
+      const rebindRequired = previousWs !== ws;
       room.host.ws = ws;
       attachSocketMetadata(ws, room.id, data.clientId, 'host');
       retireSocket(previousWs, 'host-session-resumed', ws);
@@ -590,6 +591,9 @@ function startServer(options = {}) {
         viewerCount: room.viewers.length,
         mediaManifest: room.mediaManifest
       });
+      if (rebindRequired) {
+        restorePendingHostConnections(room, maxDownstreamsPerUpstream);
+      }
       return;
     }
 
@@ -1029,6 +1033,28 @@ function notifyHostToConnectViewer(room, viewer, reconnect) {
     viewerCount: room.viewers.length,
     reconnect
   });
+}
+
+function restorePendingHostConnections(room, maxDownstreamsPerUpstream) {
+  for (const viewer of room.viewers) {
+    if (!isSocketOpen(viewer.ws) || (viewer.mediaReady && viewer.relayEstablished)) {
+      continue;
+    }
+    const upstreamPeerId = getViewerUpstreamId(room, viewer);
+    if (!upstreamPeerId) {
+      // A retry during the host outage can leave no upstream. Re-select it and
+      // retain the normal viewer acknowledgement before requesting a new offer.
+      requestViewerReconnect(room, viewer, maxDownstreamsPerUpstream);
+    } else if (upstreamPeerId === room.host.clientId && !viewer.upstreamChangePending) {
+      if (viewer.needsChainReconnect) {
+        notifyReconnectTargets(room);
+      } else {
+        // The old host socket may have lost an initial request or offer.
+        viewer.connectRequestPending = false;
+        notifyHostToConnectViewer(room, viewer, true);
+      }
+    }
+  }
 }
 
 function requestViewerReconnect(room, viewer, maxDownstreamsPerUpstream = DEFAULT_MAX_DOWNSTREAMS_PER_UPSTREAM, failedUpstreamId = '') {

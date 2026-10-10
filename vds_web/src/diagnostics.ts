@@ -38,6 +38,7 @@ type DiagnosticsSnapshot = {
   playbackState: string;
   videoDecoderState?: string;
   audioDecoderState?: string;
+  audioOutputState?: string;
   playbackFailureReason?: string;
   webPlaybackMetrics?: WebPlaybackMetrics;
   h264PayloadFormat: string;

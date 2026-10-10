@@ -605,7 +605,7 @@ function testWebJoinPayloadIncludesMobileRelayCapabilities() {
   assert.match(source, /web-audio-payload-format-unsupported:\$\{audioPayloadFormat \|\| 'unknown'\}/);
   assert.match(source, /document\.addEventListener\('pointerdown', unlockAudioFromUserGesture/);
   assert.match(source, /document\.addEventListener\('touchend', unlockAudioFromUserGesture/);
-  assert.match(source, /function unlockAudioFromUserGesture\(\)/);
+  assert.match(source, /function unlockAudioFromUserGesture\(event\?: Event\): void/);
   assert.match(source, /document\.addEventListener\('visibilitychange', handleVisibilityChange\)/);
   assert.match(source, /window\.addEventListener\('pagehide', \(\) => handleMobilePageSuspended\('pagehide', true\)\)/);
   assert.match(source, /if \(document\.visibilityState === 'hidden'\) \{[\s\S]*?handleMobilePageSuspended\('visibility-hidden', false\);/);

@@ -269,6 +269,94 @@ async function testSameUpstreamStartsOneReconnect() {
   });
 }
 
+async function resumeHost(port, host, replacement) {
+  const peer = replacement || await connect(port, host.id);
+  peer.send({ type: 'resume-session', roomId: host.session.roomId, clientId: host.id,
+    role: 'host', sessionToken: host.session.sessionToken });
+  peer.session = await peer.take((message) => message.type === 'session-resumed');
+  return peer;
+}
+
+async function testHostResumeWakesViewerWithoutUpstream() {
+  await withServer(async (instance, port) => {
+    const host = await createHost(port);
+    const target = await join(port, host, 'target');
+    await host.take((message) => message.type === 'viewer-joined' && message.viewerId === target.id);
+    await ready(instance, target);
+    host.ws.close();
+    await until(() => !instance.rooms.get(host.session.roomId).host.ws, 'host signaling disconnected');
+    target.send({ type: 'viewer-reconnect-ready', roomId: host.session.roomId, clientId: target.id,
+      sessionToken: target.session.sessionToken, chainPosition: target.session.chainPosition });
+    await target.take((message) => message.code === 'upstream-capacity-unavailable');
+    assert.strictEqual(viewer(instance, target).upstreamPeerId, '');
+    assert.strictEqual(viewer(instance, target).needsChainReconnect, true);
+    const replacement = await resumeHost(port, host);
+    const changed = await target.take((message) => message.type === 'chain-reconnect');
+    assert.strictEqual(changed.upstreamPeerId, host.id);
+    assert.strictEqual(replacement.messages.filter((message) => message.type === 'viewer-joined').length, 0,
+      'a restored upstream must still wait for the viewer acknowledgement');
+    // A second host transport replacement must not bypass that acknowledgement.
+    const replacementAgain = await resumeHost(port, replacement);
+    assert.strictEqual(replacementAgain.messages.filter((message) => message.type === 'viewer-joined').length, 0);
+    target.send({ type: 'viewer-reconnect-ready', roomId: host.session.roomId, clientId: target.id,
+      sessionToken: target.session.sessionToken, chainPosition: changed.newChainPosition,
+      upstreamPeerId: changed.upstreamPeerId });
+    await replacementAgain.take((message) => message.type === 'viewer-joined' && message.viewerId === target.id && message.reconnect);
+    await exchange(replacementAgain, target, 'restored-host-upstream');
+    await ready(instance, target);
+    assert.strictEqual(viewer(instance, target).relayEstablished, true);
+  });
+}
+
+async function testHostResumeReplaysLostPendingRequestOnce() {
+  await withServer(async (instance, port) => {
+    const host = await createHost(port);
+    const target = await join(port, host, 'target');
+    await host.take((message) => message.type === 'viewer-joined' && message.viewerId === target.id);
+    assert.strictEqual(viewer(instance, target).connectRequestPending, true);
+    host.ws.close();
+    await until(() => !instance.rooms.get(host.session.roomId).host.ws, 'host signaling disconnected');
+    const replacement = await resumeHost(port, host);
+    await replacement.take((message) => message.type === 'viewer-joined' && message.viewerId === target.id && message.reconnect);
+    assert.strictEqual(viewer(instance, target).connectRequestPending, true);
+    await resumeHost(port, replacement, replacement);
+    await delay(30);
+    assert.strictEqual(replacement.messages.filter((message) => message.type === 'viewer-joined').length, 0,
+      'repeating a resume on the same authoritative socket must not replay the request');
+    await exchange(replacement, target, 'replayed-host-request');
+    await ready(instance, target);
+  });
+}
+
+async function testHostResumePreservesReadyAndRelayConnections() {
+  await withServer(async (instance, port) => {
+    const host = await createHost(port);
+    const relay = await join(port, host, 'relay');
+    await host.take((message) => message.type === 'viewer-joined' && message.viewerId === relay.id);
+    await ready(instance, relay);
+    const target = await join(port, host, 'target');
+    await relay.take((message) => message.type === 'connect-to-next' && message.nextViewerId === target.id);
+    assert.strictEqual(viewer(instance, target).upstreamPeerId, relay.id);
+    host.ws.close();
+    await until(() => !instance.rooms.get(host.session.roomId).host.ws, 'host signaling disconnected');
+    const replacement = await resumeHost(port, host);
+    await resumeHost(port, replacement, replacement);
+    await delay(30);
+    assert.strictEqual(viewer(instance, relay).mediaReady, true);
+    assert.strictEqual(viewer(instance, relay).relayEstablished, true);
+    assert.strictEqual(viewer(instance, relay).upstreamPeerId, host.id);
+    assert.strictEqual(viewer(instance, target).upstreamPeerId, relay.id);
+    assert.strictEqual(viewer(instance, target).connectRequestPending, true);
+    assert.strictEqual(replacement.messages.filter((message) => message.type === 'viewer-joined').length, 0,
+      'host signaling recovery must leave established media peers alone');
+    assert.strictEqual(relay.messages.filter((message) => message.type === 'connect-to-next').length, 0,
+      'a pending request on an available relay must not be rebuilt');
+    assert.strictEqual(target.messages.filter((message) => message.type === 'chain-reconnect').length, 0);
+    await exchange(relay, target, 'preserved-relay-request');
+    await ready(instance, target);
+  }, { maxDownstreamsPerUpstream: 1 });
+}
+
 const tests = {
   'limit1-resume': () => testConfiguredLimit(1, 'resume'),
   'limit1-join': () => testConfiguredLimit(1, 'join'),
@@ -281,7 +369,10 @@ const tests = {
   'fresh-page': testFreshPageJoinRebuildsMedia,
   'changed-upstream': () => testChangedUpstreamWaitsForAcknowledgement(),
   'changed-to-relay': () => testChangedUpstreamWaitsForAcknowledgement(true),
-  'same-upstream': testSameUpstreamStartsOneReconnect
+  'same-upstream': testSameUpstreamStartsOneReconnect,
+  'host-resume-no-upstream': testHostResumeWakesViewerWithoutUpstream,
+  'host-resume-pending': testHostResumeReplaysLostPendingRequestOnce,
+  'host-resume-preserves-media': testHostResumePreservesReadyAndRelayConnections
 };
 
 async function main() {

@@ -16,9 +16,15 @@ const mode = process.argv.includes('--prebuild')
     : 'postbuild';
 
 function run(name, args) {
+  const env = { ...process.env };
+  if (process.platform === 'win32' && /^powershell(?:\.exe)?$/i.test(path.basename(name))) {
+    // Windows PowerShell must resolve its own modules when launched from pwsh.
+    for (const key of Object.keys(env)) if (key.toLowerCase() === 'psmodulepath') delete env[key];
+  }
   const display = [name].concat(args).join(' ');
   console.log(`\n$ ${display}`);
   const result = spawnSync(name, args, {
+    env,
     cwd: projectRoot,
     stdio: 'inherit',
     shell: process.platform === 'win32' && name === 'npm'
@@ -164,13 +170,13 @@ function validateUnreleasedSection() {
   const planPath = path.join(projectRoot, 'MEDIA_REFACTOR_PLAN.md');
   ensureFile(planPath);
   const plan = fs.readFileSync(planPath, 'utf8');
-  const sectionMatch = /## 2\. 未发布改动记录([\s\S]*?)## 3\./.exec(plan);
+  const sectionMatch = /## 2\. (?:未发布改动记录|近期改动与发布记录)([\s\S]*?)## 3\./.exec(plan);
 
   if (!sectionMatch) {
-    throw new Error('MEDIA_REFACTOR_PLAN.md is missing section "## 2. 未发布改动记录"');
+    throw new Error('MEDIA_REFACTOR_PLAN.md is missing its recent change section');
   }
-  if (!/当前未发布改动：[\s\S]*?\n- /.test(sectionMatch[1])) {
-    throw new Error('MEDIA_REFACTOR_PLAN.md has no unreleased change entries');
+  if (!/(?:当前未发布改动|近期版本)：[\s\S]*?\n- /.test(sectionMatch[1])) {
+    throw new Error('MEDIA_REFACTOR_PLAN.md has no recent change entries');
   }
 }
 

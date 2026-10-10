@@ -272,6 +272,7 @@ for (const kind of ['video', 'audio']) {
     await flushMicrotasks();
     assert.equal(h[`${kind}Decoders`].length, 0);
     h.session.close();
+    if (kind === 'audio') await h.session.resumeAudio();
     h.session.start();
     h.setProbe(kind, async () => ({ supported: true }));
     h.accept(2, true, kind);
@@ -381,7 +382,7 @@ test('production upstream recovery preserves running audio context while actual 
   class Peer { close() { closedPeers++; } }
   const filename = path.resolve(sourceDirectory, 'main.ts');
   const parsed = ts.createSourceFile(filename, fs.readFileSync(filename, 'utf8'), ts.ScriptTarget.ES2022, true);
-  const names = ['requestUpstreamRecovery', 'ensureUpstreamPeer', 'handleChainReconnect', 'resetLocalViewerSession'];
+  const names = ['requestUpstreamRecovery', 'waitForUpstreamOffer', 'ensureUpstreamPeer', 'handleChainReconnect', 'resetLocalViewerSession'];
   const declarations = parsed.statements.filter((node) => ts.isFunctionDeclaration(node) && names.includes(node.name?.text));
   assert.equal(declarations.length, names.length);
   const prelude = `

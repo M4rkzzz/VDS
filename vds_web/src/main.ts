@@ -33,6 +33,7 @@ const diagnostics = new DiagnosticsStore(capability, clientId);
 const signaling = new VdsWebSignaling();
 const upstreamRecovery = new UpstreamRecovery();
 let upstreamRecoveryAttempts = 0;
+let audioOutputState = '';
 
 let serverConfig: { iceServers: RTCIceServer[]; version?: string } = { iceServers: [] };
 let session: SessionState | null = readStoredSession(clientId);
@@ -118,17 +119,7 @@ const playback = new EncodedMediaPlaybackSession(dataChannelCanvas, {
   onMetrics: (metrics) => diagnostics.update({ webPlaybackMetrics: metrics }),
   onKeyframeNeeded: () => requestUpstreamKeyframe(),
   onSourceChanged: () => handlePlaybackSourceChanged(),
-  onState: (state) => {
-    diagnostics.update({
-      playbackState: state,
-      ...(state === 'stopped' || state === 'waiting-media' ? {
-        videoDecoderState: undefined,
-        audioDecoderState: undefined,
-        playbackFailureReason: undefined
-      } : {})
-    });
-    if (state === 'waiting-media') waitingMessage.classList.remove('hidden');
-  },
+  onState: handlePlaybackState,
   video: {
     onState: (state) => {
       logVdsWebInfo(`[vds-web][webcodecs-state] ${state}`);
@@ -162,18 +153,22 @@ const playback = new EncodedMediaPlaybackSession(dataChannelCanvas, {
     }
   },
   audio: {
+    onOutputState: handleAudioOutputState,
     onState: (state) => {
       logVdsWebInfo(`[vds-web][webcodecs-audio-state] ${state}`);
       diagnostics.update({ audioDecoderState: state });
     },
     onDecodedBlock: () => diagnostics.incrementCounter('webDecodedAudioBlocks'),
     onDroppedBlock: (reason) => {
+      diagnostics.incrementCounter('webDroppedAudioBlocks');
+      // Waiting for a browser gesture is an output policy state, not a decode
+      // failure; its separate hint leaves video and connection status intact.
+      if (reason === 'web-audio-output-awaiting-gesture') return;
       const now = performance.now();
       if (now - lastAudioDropLogAt >= 250) {
         lastAudioDropLogAt = now;
         logVdsWebInfo(`[vds-web][webcodecs-audio-drop] ${reason}`);
       }
-      diagnostics.incrementCounter('webDroppedAudioBlocks');
       diagnostics.update({ playbackFailureReason: reason });
     }
   }
@@ -291,7 +286,9 @@ async function joinRoom(roomId: string): Promise<void> {
   startJoinAckTimer(joinSeq);
   try {
     setStatus('连接信令中');
-    await playback.resumeAudio();
+    // A suspended AudioContext may wait indefinitely for a browser gesture.
+    // Begin its unlock in this gesture, without delaying signaling or video.
+    unlockAudioFromUserGesture();
     if (joinSeq !== joinAttemptSeq || !joinPending) {
       return;
     }
@@ -365,6 +362,7 @@ async function handleSignal(message: SignalMessage): Promise<void> {
       break;
     case 'host-disconnected':
       resetLocalViewerSession();
+      diagnostics.update({ relayProtocolState: 'host-disconnected', relayFailureReason: 'host-disconnected' });
       setError('主持端已断开。');
       break;
     case 'error':
@@ -424,10 +422,7 @@ function handleJoined(message: SignalMessage): void {
   restoringStoredSession = false;
   viewerReadySent = false;
   upstreamRecoveryAttempts = 0;
-  const joinedSession = session;
-  upstreamRecovery.start((reason) => {
-    if (session === joinedSession) requestUpstreamRecovery(null, joinedSession.upstreamPeerId || joinedSession.hostId || '', reason);
-  });
+  waitForUpstreamOffer();
   joinCard.classList.add('hidden');
   leaveButton.classList.remove('hidden');
   viewerRoomId.textContent = session.roomId || '-';
@@ -500,7 +495,7 @@ async function handleOffer(message: SignalMessage): Promise<void> {
     relayFailureReason: undefined,
     lastError: undefined
   });
-  setStatus('观看中');
+  if (diagnostics.getSnapshot().playbackState !== 'playing') setStatus('连接上游中');
 }
 
 async function handleAnswer(message: SignalMessage): Promise<void> {
@@ -639,6 +634,7 @@ async function handleChainReconnect(message: SignalMessage): Promise<void> {
   playback.resetMedia();
   upstreamPc?.close();
   upstreamPc = null;
+  upstreamMediaChannel = null;
   if (previousUpstreamPeerId) {
     pendingIceCandidates.delete(previousUpstreamPeerId);
     removePeerDiagnostics(previousUpstreamPeerId);
@@ -666,6 +662,7 @@ async function handleChainReconnect(message: SignalMessage): Promise<void> {
     lastError: undefined
   });
   setStatus('等待上游重连');
+  waitForUpstreamOffer();
 
   signaling.send({
     type: 'viewer-reconnect-ready',
@@ -673,6 +670,15 @@ async function handleChainReconnect(message: SignalMessage): Promise<void> {
     clientId,
     sessionToken: session.sessionToken,
     chainPosition: nextChainPosition
+  });
+}
+
+function waitForUpstreamOffer(): void {
+  const expectedSession = session;
+  if (!expectedSession) return;
+  const peerId = expectedSession.upstreamPeerId || expectedSession.hostId || '';
+  upstreamRecovery.start((reason) => {
+    if (session === expectedSession && upstreamPc === null) requestUpstreamRecovery(null, peerId, reason);
   });
 }
 
@@ -729,6 +735,7 @@ function requestUpstreamRecovery(pc: RTCPeerConnection | null, peerId: string, r
   if (!session || pc !== upstreamPc || !isCurrentUpstreamPeer(peerId)) return;
   upstreamRecovery.stop();
   upstreamPc = null;
+  upstreamMediaChannel = null;
   pc?.close();
   upstreamEdgeAttemptId = null;
   pendingIceCandidates.delete(peerId);
@@ -737,11 +744,13 @@ function requestUpstreamRecovery(pc: RTCPeerConnection | null, peerId: string, r
   lastVideoKeyframeForRelay = null;
   lastBootstrapFrameId = '';
   if (++upstreamRecoveryAttempts > 3) {
+    leaveCurrentRoom();
     setError('上游连接恢复失败，请重新加入房间。');
     return;
   }
   diagnostics.update({ relayProtocolState: 'upstream-reconnecting', relayFailureReason: reason });
   setStatus('上游连接中断，正在重连');
+  waitForUpstreamOffer();
   try {
     signaling.send({
       type: 'viewer-reconnect-ready',
@@ -752,6 +761,7 @@ function requestUpstreamRecovery(pc: RTCPeerConnection | null, peerId: string, r
       failedUpstreamPeerId: peerId === session.hostId ? undefined : peerId
     });
   } catch (error) {
+    leaveCurrentRoom();
     setError(errorToMessage(error));
   }
 }
@@ -904,7 +914,6 @@ function attachInboundDataChannel(channel: RTCDataChannel, peerId: string): void
           return;
         }
         channel.send(JSON.stringify(helloAckMessage(getCurrentManifest())));
-        upstreamRecovery.mediaReady();
         diagnostics.update({ relayProtocolState: 'datachannel-ready' });
         maybeSendViewerReady();
       }
@@ -1355,8 +1364,26 @@ function restoreWatchingStatusAfterRelay(): void {
   }
   const snapshot = diagnostics.getSnapshot();
   if (!snapshot.lastError) {
-    setStatus(snapshot.encodedFramesReceived > 0 || snapshot.webDecodedVideoFrames > 0 ? '观看中' : '等待上游');
+    setStatus(snapshot.playbackState === 'playing' ? '观看中' : snapshot.playbackState === 'decoding' ? '解码中' : '等待上游');
   }
+}
+
+function handlePlaybackState(state: 'stopped' | 'waiting-media' | 'decoding' | 'playing'): void {
+  diagnostics.update({
+    playbackState: state,
+    ...(state === 'stopped' || state === 'waiting-media' ? {
+      videoDecoderState: undefined,
+      audioDecoderState: undefined,
+      playbackFailureReason: undefined
+    } : {})
+  });
+  if (state === 'waiting-media') waitingMessage.classList.remove('hidden');
+  // SDP and channel hello acknowledge transport only. Keep the existing connect
+  // recovery timer until the first video frame is actually presented.
+  if (session && state === 'playing') upstreamRecovery.mediaReady();
+  if (!session || downstreamDataChannelReady || downstreamRelayForwarding) return;
+  if (state === 'playing') setStatus('观看中');
+  else if (state === 'decoding') setStatus('解码中');
 }
 
 function canSendDataChannelMessage(dropReason: string): boolean {
@@ -1442,8 +1469,17 @@ function renderCapability(report: CapabilityReport): void {
   diagnostics.update({ capability: report, status });
 }
 
-function unlockAudioFromUserGesture(): void {
+function unlockAudioFromUserGesture(event?: Event): void {
+  if (!event?.isTrusted && !navigator.userActivation?.isActive) return;
   void playback.resumeAudio().catch(() => {});
+}
+
+function handleAudioOutputState(state: string): void {
+  audioOutputState = state;
+  diagnostics.update({ audioOutputState: state });
+  const waitingForGesture = state === 'suspended' || state === 'interrupted';
+  muteButton.setAttribute('title', waitingForGesture ? '点击画面开启声音' : Number(playerVolumeInput.value) <= 0 ? '取消静音' : '静音');
+  if (session) setStatus(diagnostics.getSnapshot().status);
 }
 
 function setJoinPending(pending: boolean): void {
@@ -1510,7 +1546,8 @@ function renderDiagnostics(): void {
 
 function setStatus(text: string): void {
   statusBadge.textContent = text.startsWith('P2P：') ? text : `P2P：${text}`;
-  statusText.textContent = text;
+  statusText.textContent = session && (audioOutputState === 'suspended' || audioOutputState === 'interrupted')
+    ? `${text} · 点击画面开启声音` : text;
   diagnostics.update({ status: text });
 }
 
@@ -1883,7 +1920,7 @@ function errorToMessage(error: unknown): string {
 
 function toConsoleJson(value: unknown): string {
   try {
-    return JSON.stringify(value);
+    return JSON.stringify(value, (key, item) => key === 'sessionToken' ? '[redacted]' : item);
   } catch {
     return String(value);
   }

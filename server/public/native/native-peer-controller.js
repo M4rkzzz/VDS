@@ -2029,6 +2029,9 @@
       if (options.mediaEngine && typeof options.mediaEngine.detachPeerMediaSource === 'function') {
         await options.mediaEngine.detachPeerMediaSource({ peerId, ...identity }).catch(() => {});
       }
+      // Detach may yield to a reconnect using the same peer ID. In particular,
+      // an older agent can omit transportGeneration, so never close by ID then.
+      if (getPeerHandle(peerId) !== currentHandle) return null;
       if (options.mediaEngine && typeof options.mediaEngine.closePeer === 'function') {
         await options.mediaEngine.closePeer({ peerId, ...identity }).catch(() => {});
       }

@@ -178,6 +178,59 @@ test('OBS teardown skips leave before a room exists and clears local state on se
   assert.equal(failing.calls.waitingResets, 1);
 });
 
+test('an OBS reconnect can create a room while the previous leave is still pending', async () => {
+  const left = deferred();
+  const closed = deferred();
+  const retiredPeers = [];
+  let streamActive = false;
+  let roomPending = false;
+  const harness = createHarness({
+    sendLeaveRoom: () => left.promise,
+    getPeerIds: () => ['old-viewer-1', 'old-viewer-2'],
+    closePeer: (peerId) => { retiredPeers.push(peerId); return closed.promise; },
+    setObsIngestStreamActive: (active) => { streamActive = active; },
+    setObsRoomCreatePending: (pending) => { roomPending = pending; }
+  });
+  harness.state.room = { role: 'host', roomId: 'OLDROOM', clientId: 'HOST1', sessionToken: 'OLDTOKEN' };
+  const teardown = harness.controller.teardownObsHostRoom({ reason: 'obs-ingest-ended' });
+
+  // Retire the old room and its ICE attempts before awaiting network/native cleanup.
+  assert.equal(harness.state.room, null);
+  assert.deepEqual(retiredPeers, ['old-viewer-1', 'old-viewer-2']);
+  assert.equal(harness.calls.waitingResets, 1);
+
+  harness.controller.applyMediaStateUpdate({ state: 'obs-stream-running', obsIngest: { streamRunning: true } });
+  roomPending = true;
+  harness.state.room = { role: 'host', roomId: 'NEWROOM', clientId: 'HOST1', sessionToken: 'NEWTOKEN' };
+  left.resolve(true);
+  closed.resolve();
+  await teardown;
+
+  assert.equal(harness.state.room.roomId, 'NEWROOM');
+  assert.equal(streamActive, true);
+  assert.equal(roomPending, true);
+  assert.equal(harness.state.running, true);
+  assert.equal(harness.calls.waitingResets, 1);
+  assert.equal(harness.calls.stops, 0);
+});
+
+test('an obsolete OBS leave rejection cannot reset a replacement capture session', async () => {
+  const left = deferred();
+  const harness = createHarness({ sendLeaveRoom: () => left.promise });
+  harness.state.room = { role: 'host', roomId: 'OLDROOM', clientId: 'HOST1', sessionToken: 'OLDTOKEN' };
+  const teardown = harness.controller.teardownObsHostRoom();
+  const rejected = assert.rejects(teardown, /obsolete leave failed/);
+  harness.state.mediaSessionId = 'replacement-media';
+  harness.state.running = true;
+  harness.state.room = { role: 'host', roomId: 'NEWROOM', clientId: 'HOST1', sessionToken: 'NEWTOKEN' };
+  left.reject(new Error('obsolete leave failed'));
+  await rejected;
+  assert.equal(harness.state.room.roomId, 'NEWROOM');
+  assert.equal(harness.state.mediaSessionId, 'replacement-media');
+  assert.equal(harness.state.running, true);
+  assert.equal(harness.calls.waitingResets, 1);
+});
+
 test('selecting a new capture after peer attach failure drains the old owner before a new session id', async () => {
   const order = [];
   let activeId = '';
