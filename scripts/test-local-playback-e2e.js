@@ -31,7 +31,7 @@ const mediaOptions = {
   traceRendering: process.env.VDS_PLAYBACK_E2E_TRACE === '1'
 };
 if (mediaOptions.width % 2 || mediaOptions.height % 2) throw new Error('YUV420 fixture dimensions must be even');
-const runDeadlineMs = mediaOptions.sustainedMs + 90000;
+const runDeadlineMs = mediaOptions.sustainedMs * (isWgc ? 2 : 1) + 90000;
 function saveReport(report) {
   fs.mkdirSync(path.dirname(reportPath), { recursive: true });
   fs.writeFileSync(reportPath, JSON.stringify({ runId, mediaOptions, updatedAt: new Date().toISOString(), ...report }, null, 2));
@@ -318,8 +318,8 @@ async function runElectron() {
     assert.doesNotMatch(latest.diagnostics.relayProtocolState, /^webcodecs/, label + ':decoder state overwrote connection/relay state');
     return latest.diagnostics;
   }
-  async function observeSustainedPlayback(baseline) {
-    step('sustained-playback');
+  async function observeSustainedPlayback(baseline, label = 'sustained-playback') {
+    step(label);
     const startedAt = Date.now();
     let previous = baseline;
     let latest;
@@ -349,7 +349,7 @@ async function runElectron() {
     const videoIncrement = latest.diagnostics.webDecodedVideoFrames - baseline.webDecodedVideoFrames;
     const audioIncrement = latest.diagnostics.webDecodedAudioBlocks - baseline.webDecodedAudioBlocks;
     const durationMs = Date.now() - startedAt;
-    phases.push({ label: 'sustained-playback', durationMs, videoIncrement, audioIncrement,
+    phases.push({ label, durationMs, videoIncrement, audioIncrement,
       presentedVideoRate: videoIncrement * 1000 / durationMs, samples, ...latest });
     assert.ok(videoIncrement >= Math.floor(mediaOptions.frameRate * durationMs / 1000 * 0.85), 'sustained playback video rate fell below 85% of source rate');
     // The fixture emits 48 kHz AAC with 1024 samples per access unit. Merely
@@ -479,7 +479,8 @@ async function runElectron() {
     await join();
     const initial = await waitForFrames('initial-playback');
     const sustained = await observeSustainedPlayback(initial);
-    if (!isWgc) {
+    // Exercise room and browser relay recovery with both real source paths.
+    {
       await window.webContents.executeJavaScript("document.getElementById('leaveButton').click()");
       await poll('room-leave', () => instance.rooms.get(room.roomId).viewers.length === 0);
       await poll('playback-stopped', async () => (await snapshot()).diagnostics.playbackState === 'stopped', 3000);
@@ -514,7 +515,7 @@ async function runElectron() {
       // Restart the source on the same native and browser relay connections. The
       // source input restarts while host PTS retains its common clock offset;
       // a fresh epoch must separate old output.
-      for (let restart = 1; restart <= 2; restart += 1) {
+      for (let restart = 1; !isWgc && restart <= 2; restart += 1) {
         const before = await snapshot();
         const beforeEpoch = before.diagnostics.webPlaybackMetrics.sourceEpoch;
         assert.ok(beforeEpoch, 'current sender omitted source epoch');
@@ -542,6 +543,7 @@ async function runElectron() {
       });
       const recovered = await waitForFrames('relay-disconnect-recovery', reassigned.diagnostics);
       assert.equal(recovered.upstreamPeerId, hostId, 'downstream did not recover on native host');
+      if (isWgc) await observeSustainedPlayback(recovered, 'recovered-sustained-playback');
       assert.equal(window.isVisible(), false);
     }
   } catch (error) {
