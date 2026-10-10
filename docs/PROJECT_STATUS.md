@@ -1,6 +1,6 @@
 # VDS 项目现状报告
 
-## 2026-10-10 远端 ICE 格式修复（1.7.9 待发布）
+## 2026-10-10 远端 ICE 格式修复（1.7.9 已发布）
 
 1.7.8 原生启动正常后，接收远端候选报 `IPC_INVALID_ARGUMENT: media-engine-add-remote-ice-candidate.candidate`。根因是信令中的 RTCIceCandidateInit 对象原样传给要求 candidate 字符串的原生 IPC，C++ RPC 同样读取独立 candidate 与 sdpMid 字符串。现在在原生调用前拆出候选文本与媒体标识，并保留 transportGeneration；没有放宽 IPC 校验、旧代次隔离或 relay 禁止规则。
 
@@ -10,6 +10,11 @@
 
 最终安装包 235,413,800 字节，SHA256 `db4ca9417680bf7ef8a70c30a99db9826dabf3604ca5d4ea29d6a3996fffdba7`；42 个源文件与 ASAR 精确一致、原生 EXE/增强 ICE DLL 与运行时一致，发布后门禁通过。更新仍使用既有离线签名，纯 P2P、六位一次性房号、免管理令牌和媒体运行能力保持。
 
+
+
+发布源码 `bf5f0b2` 对应不可变 `v1.7.9`，已推送 [GitHub Release](https://github.com/M4rkzzz/VDS/releases/tag/v1.7.9)，四份资产大小及 GitHub SHA256 与最终构建一致。默认 HTTPS 更新源已切到 1.7.9，原始清单签名、地图哈希、头尾 206 Range、旧 1.7.8 更新识别和新版本认证基线均通过。真实 NsisUpdater 公网 1.7.8→1.7.9 差分使用 6 次 Range，安装包数据 930,136 字节，地图 476,744 字节，合计 1,406,880 字节；没有全包请求，重组完整哈希一致，没有执行安装或更改用户缓存。
+
+本轮仅发布桌面：NAS 信令/Web 仍为 1.7.7，全部七个容器 ID、启动时间、运行状态和重启计数一致，21 份旧版本化资产哈希不变，证书/FRP 未动。备份为 `/vol1/1000/docker/vds/ops/release-1.7.9-before`，暂存与核验记录为 `/vol1/1000/docker/vds/releases/1.7.9`。客户端需更新到 1.7.9 才能使用此次原生 ICE 格式修复。
 
 ## 2026-10-10 原生预览重开修复（1.7.8 已发布）
 
