@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
+const { createIpcBoundary } = require('../../desktop/ipc-boundary');
 
 const source = fs.readFileSync(path.resolve(__dirname, '../../server/public/native/native-peer-controller.js'), 'utf8');
 const candidate = (ufrag = '', predicted = false) => ({
@@ -23,13 +24,24 @@ function harness(overrides = {}) {
   const calls = [];
   const sent = [];
   let generation = 0;
+  const entryUrl = 'file:///D:/project/videosharing/server/public/index.html';
+  const mainFrame = { url: entryUrl };
+  const webContents = { mainFrame, isDestroyed: () => false };
+  const event = { sender: webContents, senderFrame: mainFrame };
+  let receiveCandidate;
+  createIpcBoundary({ getWindow: () => ({ webContents }), entryUrl }).handle({
+    handle(_channel, handler) { receiveCandidate = handler; }
+  }, 'media-engine-add-remote-ice-candidate', (_event, request) => {
+    calls.push(request);
+  });
   const controller = context.window.VDS.nativePeer.createController({
     isHost: () => true,
     getPeerMeta: (id) => metadata.get(id),
     setPeerMeta: (id, value) => metadata.set(id, value),
     mediaEngine: {
       createPeer: async () => ({ peerTransport: { transportGeneration: `transport-${++generation}` } }),
-      addRemoteIceCandidate: async (request) => calls.push(request),
+      // Electron structured-clones renderer values before the actual IPC gate.
+      addRemoteIceCandidate: async (request) => receiveCandidate(event, structuredClone(request)),
       ...overrides
     },
     roomClient: { sendSignal: (message) => sent.push(message) }
@@ -41,6 +53,37 @@ function harness(overrides = {}) {
   }
   return { controller, metadata, calls, sent, create };
 }
+
+test('RTC and native string candidates cross the real IPC gate with their media identifier', async () => {
+  const h = harness();
+  const handle = await h.create();
+  handle.remoteDescription = description('current-ufrag');
+  const rtc = { ...candidate('current-ufrag'), sdpMid: 'data', sdpMLineIndex: 2,
+    usernameFragment: 'current-ufrag' };
+  assert.equal((await h.controller.finalizeRemoteIceCandidate('peer', rtc, handle.attemptId)).action, 'apply');
+  const native = rtc.candidate.replace('45001', '45002');
+  assert.equal((await h.controller.finalizeRemoteIceCandidate('peer', native, handle.attemptId)).action, 'apply');
+  assert.deepEqual(h.calls, [
+    { peerId: 'peer', candidate: rtc.candidate, sdpMid: 'data', sdpMLineIndex: 2, transportGeneration: 'transport-1' },
+    { peerId: 'peer', candidate: native, sdpMid: '', sdpMLineIndex: 0, transportGeneration: 'transport-1' }
+  ]);
+});
+
+test('queued RTC candidates cross the IPC gate after SDP; relay and end markers never reach it', async () => {
+  const h = harness();
+  const rtc = { ...candidate('current-ufrag'), sdpMid: null, sdpMLineIndex: null };
+  await h.controller.finalizeRemoteIceCandidate('peer', rtc, null);
+  const handle = await h.create();
+  handle.remoteDescription = description('current-ufrag');
+  await h.controller.flushQueuedRemoteCandidates('peer', handle);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].candidate, rtc.candidate);
+  assert.equal(h.calls[0].sdpMid, '');
+  for (const ignored of [null, { candidate: '' }, { ...rtc, candidate: rtc.candidate.replace('typ srflx', 'typ relay') }]) {
+    await h.controller.finalizeRemoteIceCandidate('peer', ignored, handle.attemptId);
+  }
+  assert.equal(h.calls.length, 1);
+});
 
 test('queued predictions retain ICE credentials and cannot cross a remote SDP generation', async () => {
   const h = harness();

@@ -1,5 +1,16 @@
 # VDS 项目现状报告
 
+## 2026-10-10 远端 ICE 格式修复（1.7.9 待发布）
+
+1.7.8 原生启动正常后，接收远端候选报 `IPC_INVALID_ARGUMENT: media-engine-add-remote-ice-candidate.candidate`。根因是信令中的 RTCIceCandidateInit 对象原样传给要求 candidate 字符串的原生 IPC，C++ RPC 同样读取独立 candidate 与 sdpMid 字符串。现在在原生调用前拆出候选文本与媒体标识，并保留 transportGeneration；没有放宽 IPC 校验、旧代次隔离或 relay 禁止规则。
+
+原候选测试只模拟 mediaEngine 调用，漏掉真实参数校验。现将实际 IPC boundary 接入该测试的普通路径，使用 structuredClone 模拟 Electron 数据传递，覆盖 RTC/原生字符串、sdpMid/sdpMLineIndex、SDP 前排队、空结束标记、relay 过滤及已有 ICE 代次回归。针对性测试 30/30；完整门禁桌面 268/268、Web 164/164、原生 26/26、八轮真实预览、签名与生产依赖审计通过。
+
+使用独立配置和自有本地连接，在正式 1.7.8 打包程序中实际复现相同 IPC 错误；同一烟测在最终 1.7.9 包建立三轮浏览器→桌面原生 DataChannel，每轮 4 个浏览器候选和 5 个原生候选，连接与通道打开均成功。候选实际经过 renderer controller、preload、主进程 IPC 和 media-agent，而非直调原生代理。另完成三轮实际界面开播、嵌入式真实预览、停止重开（10/10/11 帧），没有初始化异常，正常退出且自有进程残留为零。这里只证明本机互操作恢复，不代替跨运营商实机验收。
+
+最终安装包 235,413,800 字节，SHA256 `db4ca9417680bf7ef8a70c30a99db9826dabf3604ca5d4ea29d6a3996fffdba7`；42 个源文件与 ASAR 精确一致、原生 EXE/增强 ICE DLL 与运行时一致，发布后门禁通过。更新仍使用既有离线签名，纯 P2P、六位一次性房号、免管理令牌和媒体运行能力保持。
+
+
 ## 2026-10-10 原生预览重开修复（1.7.8 已发布）
 
 用户的 1.7.7 日志和截图出现 `native-media-engine-start-superseded`，另一次日志显示共享计划已验证但预览不可用。已确认两个独立缺口：界面首次加载发送的 idle 可在原生启动期间到达，错误推进生命周期代次；原生能力探测已移到子进程后，预览或发送 worker 可能是主进程唯一的 MTA 线程，其退出后缓存的 WinRT 工厂在下一轮 support-check 触发访问冲突。

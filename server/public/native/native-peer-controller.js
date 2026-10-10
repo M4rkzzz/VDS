@@ -1877,14 +1877,19 @@
         throw new Error('native-peer-media-engine-unavailable');
       }
 
+      // Signaling uses RTCIceCandidateInit; the native RPC takes the candidate
+      // line and media identifier as separate string fields.
+      const normalized = normalizeIceCandidate(candidate);
       logNativeStep('addRemoteIceCandidate:request', {
         peerId,
-        candidateLength: candidate ? String(candidate).length : 0
+        candidateLength: normalized ? normalized.candidate.length : 0
       });
       await ensurePeerReady(peerId, handle);
       await options.mediaEngine.addRemoteIceCandidate({
         peerId,
-        candidate,
+        candidate: normalized ? normalized.candidate : '',
+        sdpMid: normalized ? normalized.sdpMid : '',
+        sdpMLineIndex: normalized ? normalized.sdpMLineIndex : 0,
         ...(handle.transportGeneration ? { transportGeneration: handle.transportGeneration } : {})
       });
       logNativeStep('addRemoteIceCandidate:applied', { peerId });
