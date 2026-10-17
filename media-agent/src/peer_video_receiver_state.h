@@ -56,6 +56,10 @@ struct PeerVideoReceiverRuntime {
   std::uint64_t dropped_decoded_frames = 0;
   std::uint64_t dropped_encoded_frames = 0;
   std::uint64_t reference_chain_resets = 0;
+  std::uint64_t decoder_rebuilds = 0;
+  std::uint64_t hardware_fallbacks = 0;
+  std::string decoder_backend = "none";
+  std::string last_decoder_failure;
   std::uint64_t decode_late_frames = 0;
   std::uint64_t presentation_late_frames = 0;
   double max_decode_lateness_ms = 0.0;

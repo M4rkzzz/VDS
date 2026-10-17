@@ -305,12 +305,14 @@ class OffscreenOwner {
 };
 
 struct SurfaceFixture {
-  explicit SurfaceFixture(const std::string& name, unsigned int source_frame_rate = 0) {
+  explicit SurfaceFixture(const std::string& name, unsigned int source_frame_rate = 0,
+      std::function<int(const char*, bool)> decoder_fault = {}) {
     NativeVideoSurfaceConfig config;
     config.surface_id = name;
     config.window_title = "VDS native playback integration " + name;
     config.codec = "h264";
     config.frame_rate = source_frame_rate;
+    config.decoder_fault = std::move(decoder_fault);
     config.layout.embedded = true;
     config.layout.visible = false;
     std::ostringstream owner_handle;
@@ -434,6 +436,58 @@ void assert_closed(SurfaceFixture& fixture, const EncodedAccessUnit& unit) {
   require(later.decoded_frames == closed.decoded_frames && later.painted_frames == closed.painted_frames,
     "closed native surface must not decode or paint after shutdown");
   fixture.surface->close("integration-close-again");
+}
+
+void test_decoder_recovery(const std::string& stage, int injected_error) {
+  std::atomic<bool> armed{false};
+  std::atomic<unsigned int> injected{0};
+  SurfaceFixture fixture("decoder-recovery-" + stage + std::to_string(injected_error), kFps,
+    [&](const char* operation, bool) {
+      if (stage == operation && armed.exchange(false)) {
+        injected.fetch_add(1);
+        return injected_error;
+      }
+      return 0;
+    });
+  const auto initial_backend = fixture.surface->snapshot().decoder_backend;
+  if (stage == "transfer" && initial_backend == "software") {
+    std::cout << "hardware transfer injection unavailable on this machine (software decode); send/receive recovery still tested\n";
+    return;
+  }
+  const auto units = encode_h264(90, kFps, 0);
+  submit_paced(fixture, units, 18, "same-recovery-source");
+  const auto before = fixture.surface->snapshot();
+  require(before.painted_frames >= 12, "recovery starts from actively painted video");
+  const auto requests_before = fixture.keyframe_requests.load();
+  // Subsequent IDRs deliberately omit SPS/PPS. Recovery must retain the
+  // parameter sets from the current source, without a source/peer restart.
+  std::vector<EncodedAccessUnit> tail(units.begin() + 18, units.begin() + 78);
+  for (auto& unit : tail) {
+    if (unit.keyframe) {
+      unit = split_parameter_sets(unit).second;
+      unit.configuration = false;
+    }
+  }
+  armed.store(true);
+  submit_paced(fixture, tail, tail.size(), "same-recovery-source", 19);
+  const auto after = fixture.surface->snapshot();
+  require(injected.load() == 1, "exactly one decoder fault must be injected");
+  require(after.running && after.decoder_ready && !after.needs_keyframe,
+    "decoder must recover within the same surface: " + describe(after));
+  require(after.painted_frames >= before.painted_frames + 35,
+    "recovered decoder must sustain new real GDI paints, not freeze on an old frame: " + describe(after));
+  require(after.reference_chain_resets > before.reference_chain_resets &&
+      fixture.keyframe_requests.load() > requests_before, "fault must reset reference state and request a new keyframe");
+  const bool invalid_data = injected_error == AVERROR_INVALIDDATA;
+  require(after.decoder_rebuilds == (invalid_data ? 0u : 1u), "bad packets must not rebuild healthy devices");
+  const bool expect_fallback = !invalid_data && initial_backend != "software";
+  require(after.hardware_fallbacks == (expect_fallback ? 1u : 0u), "hardware must fall back exactly once on device failure");
+  require(after.decoder_backend == (expect_fallback ? "software" : initial_backend), "unexpected decoder backend after recovery");
+  require(after.last_error.empty() && after.last_decoder_failure.find(stage + ":") == 0,
+    "successful rendering clears the active error but preserves the failure diagnosis");
+  std::cout << "decoder recovery " << stage << ": " << initial_backend << " -> " << after.decoder_backend
+    << ", painted " << before.painted_frames << " -> " << after.painted_frames << '\n';
+  assert_closed(fixture, units.front());
 }
 
 void test_real_b_frame_paint(const std::vector<EncodedAccessUnit>& units) {
@@ -758,6 +812,10 @@ int main() {
     test_separate_configuration(units);
     test_burst_reference_recovery(units);
     test_active_close_and_reopen(units);
+    test_decoder_recovery("send", AVERROR(EIO));
+    test_decoder_recovery("receive", AVERROR_EXTERNAL);
+    test_decoder_recovery("transfer", AVERROR(EIO));
+    test_decoder_recovery("receive", AVERROR_INVALIDDATA);
     test_continuous_60fps_and_network_steps();
     test_real_1080p60_synchronized_pes_bursts();
     std::cout << "native playback surface integration passed: real H264/B-frame decode, separate CONFIG/IDR bootstrap, hidden-window GDI paints, bounded burst recovery, concurrent close/reopen, sustained 60fps and same-epoch network steps.\n"

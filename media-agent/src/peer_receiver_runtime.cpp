@@ -59,6 +59,10 @@ void refresh_peer_video_receiver_runtime(PeerVideoReceiverRuntime& runtime) {
   runtime.dropped_decoded_frames = snapshot.dropped_decoded_frames;
   runtime.dropped_encoded_frames = snapshot.dropped_encoded_frames;
   runtime.reference_chain_resets = snapshot.reference_chain_resets;
+  runtime.decoder_rebuilds = snapshot.decoder_rebuilds;
+  runtime.hardware_fallbacks = snapshot.hardware_fallbacks;
+  runtime.decoder_backend = snapshot.decoder_backend;
+  runtime.last_decoder_failure = snapshot.last_decoder_failure;
   runtime.decode_late_frames = snapshot.decode_late_frames;
   runtime.presentation_late_frames = snapshot.presentation_late_frames;
   runtime.max_decode_lateness_ms = snapshot.max_decode_lateness_ms;
@@ -113,6 +117,10 @@ std::string peer_video_receiver_runtime_json(
     << ",\"droppedDecodedFrames\":" << runtime->dropped_decoded_frames
     << ",\"droppedEncodedFrames\":" << runtime->dropped_encoded_frames
     << ",\"referenceChainResets\":" << runtime->reference_chain_resets
+    << ",\"decoderRebuilds\":" << runtime->decoder_rebuilds
+    << ",\"hardwareFallbacks\":" << runtime->hardware_fallbacks
+    << ",\"decoderBackend\":\"" << vds::media_agent::json_escape(runtime->decoder_backend) << "\""
+    << ",\"lastDecoderFailure\":\"" << vds::media_agent::json_escape(runtime->last_decoder_failure) << "\""
     << ",\"decodeLateFrames\":" << runtime->decode_late_frames
     << ",\"presentationLateFrames\":" << runtime->presentation_late_frames
     << ",\"maxDecodeLatenessMs\":" << runtime->max_decode_lateness_ms

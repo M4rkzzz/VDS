@@ -17,6 +17,10 @@ struct NativeVideoSurfaceConfig {
   unsigned int frame_rate = 0;
   NativeEmbeddedSurfaceLayout layout;
   std::function<void(const std::string&)> on_keyframe_needed;
+#ifdef VDS_NATIVE_SURFACE_TESTING
+  // Only compiled into the integration-test executable, never the agent ABI.
+  std::function<int(const char*, bool)> decoder_fault;
+#endif
 };
 
 struct NativeVideoSurfaceSnapshot {
@@ -29,6 +33,10 @@ struct NativeVideoSurfaceSnapshot {
   std::uint64_t dropped_decoded_frames = 0;
   std::uint64_t dropped_encoded_frames = 0;
   std::uint64_t reference_chain_resets = 0;
+  std::uint64_t decoder_rebuilds = 0;
+  std::uint64_t hardware_fallbacks = 0;
+  std::string decoder_backend = "none";
+  std::string last_decoder_failure;
   std::uint64_t decode_late_frames = 0;
   std::uint64_t presentation_late_frames = 0;
   double max_decode_lateness_ms = 0.0;

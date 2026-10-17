@@ -326,12 +326,13 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
       src/string_utils.cpp
     )
     target_include_directories(vds-native-playback-surface-tests PRIVATE src "${VDS_MEDIA_AGENT_FFMPEG_ROOT}/include")
+    target_compile_definitions(vds-native-playback-surface-tests PRIVATE VDS_NATIVE_SURFACE_TESTING)
     target_link_libraries(vds-native-playback-surface-tests PRIVATE
       "${VDS_MEDIA_AGENT_AVCODEC_LIBRARY}" "${VDS_MEDIA_AGENT_AVUTIL_LIBRARY}"
       "${VDS_MEDIA_AGENT_SWSCALE_LIBRARY}" "${VDS_MEDIA_AGENT_SWRESAMPLE_LIBRARY}" User32 Gdi32 Winmm)
     add_test(NAME vds-native-playback-surface-tests COMMAND vds-native-playback-surface-tests)
     set_tests_properties(vds-native-playback-surface-tests PROPERTIES
-      ENVIRONMENT "PATH=${VDS_MEDIA_AGENT_FFMPEG_ROOT}/bin;$ENV{PATH}" TIMEOUT 30)
+      ENVIRONMENT "PATH=${VDS_MEDIA_AGENT_FFMPEG_ROOT}/bin;$ENV{PATH}" TIMEOUT 60)
     add_executable(vds-viewer-audio-clock-tests
       tests/viewer_audio_clock_tests.cpp
       src/media_audio.cpp

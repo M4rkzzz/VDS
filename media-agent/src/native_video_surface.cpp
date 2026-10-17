@@ -1590,7 +1590,7 @@ class NativeVideoSurface::Impl {
         if (!entry.frame.codec.empty() && entry.frame.codec != active_codec_) {
           pending_frames_.clear();
           playback_scheduler_.reset();
-          cached_decoder_config_.clear();
+          if (!active_codec_.empty()) cached_decoder_config_.clear();
           pending_nonvcl_prefix_.clear();
           if (!open_decoder(entry.frame.codec)) {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1667,12 +1667,16 @@ class NativeVideoSurface::Impl {
       AVFrame* frame_to_present = selected->frame.get();
       if (hw_pixel_format_ != AV_PIX_FMT_NONE && frame_to_present->format == hw_pixel_format_) {
         av_frame_unref(transfer_frame_);
-        const int result = av_hwframe_transfer_data(transfer_frame_, frame_to_present, 0);
+        int result = 0;
+#ifdef VDS_NATIVE_SURFACE_TESTING
+        if (config_.decoder_fault) result = config_.decoder_fault("transfer", true);
+#endif
+        if (result == 0) result = av_hwframe_transfer_data(transfer_frame_, frame_to_present, 0);
         if (result < 0) {
-          std::lock_guard<std::mutex> lock(mutex_);
-          snapshot_.last_error = ffmpeg_error_string(result);
-          snapshot_.reason = "native-decoder-transfer-failed";
-          return wake;
+          // Release the selected GPU frame before disposing its device.
+          selected.reset();
+          recover_decoder("transfer", result, true);
+          return std::nullopt;
         }
         transfer_frame_->sample_aspect_ratio = frame_to_present->sample_aspect_ratio;
         frame_to_present = transfer_frame_;
@@ -1713,9 +1717,10 @@ class NativeVideoSurface::Impl {
   }
 
   bool open_decoder(const std::string& codec_name) {
+    // codec_name may reference active_codec_, which cleanup_decoder clears.
+    const std::string normalized_codec = to_lower_ascii(codec_name.empty() ? "h264" : codec_name);
     cleanup_decoder();
 
-    const std::string normalized_codec = to_lower_ascii(codec_name.empty() ? "h264" : codec_name);
     const AVCodecID codec_id = codec_id_from_name(normalized_codec);
     const AVCodec* codec = avcodec_find_decoder(codec_id);
     if (!codec) {
@@ -1723,21 +1728,23 @@ class NativeVideoSurface::Impl {
       return false;
     }
 
-    AVCodecContext* context = avcodec_alloc_context3(codec);
-    if (!context) {
+    auto allocate_context = [&]() {
+      codec_context_ = avcodec_alloc_context3(codec);
+      if (!codec_context_) return false;
+      codec_context_->opaque = this;
+      // Slice parallelism does not add whole-frame decode latency.
+      codec_context_->thread_count = (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS) != 0 ? 2 : 1;
+      codec_context_->thread_type = (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS) != 0 ? FF_THREAD_SLICE : 0;
+      codec_context_->pkt_timebase = AVRational{1, 1000000};
+      return true;
+    };
+    if (!allocate_context()) {
       fail_or_update("native-decoder-context-allocation-failed", normalized_codec);
       return false;
     }
 
-    codec_context_ = context;
-    codec_context_->opaque = this;
-    // Frame threading can hold several whole frames before output. Prefer
-    // slice parallelism, which does not add a frame-order playback backlog.
-    codec_context_->thread_count = (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS) != 0 ? 2 : 1;
-    codec_context_->thread_type = (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS) != 0 ? FF_THREAD_SLICE : 0;
-    codec_context_->pkt_timebase = AVRational{1, 1000000};
-
     hw_pixel_format_ = AV_PIX_FMT_NONE;
+    std::string backend = "software";
 
     static constexpr AVHWDeviceType preferred_hw_types[] = {
       AV_HWDEVICE_TYPE_D3D11VA,
@@ -1745,6 +1752,7 @@ class NativeVideoSurface::Impl {
     };
 
     for (const AVHWDeviceType device_type : preferred_hw_types) {
+      if (software_fallback_) break;
       AVPixelFormat hw_pixel_format = AV_PIX_FMT_NONE;
       if (!codec_supports_hw_device(codec, device_type, &hw_pixel_format)) {
         continue;
@@ -1756,19 +1764,24 @@ class NativeVideoSurface::Impl {
         continue;
       }
 
-      codec_context_->hw_device_ctx = av_buffer_ref(device_ref);
-      av_buffer_unref(&device_ref);
+      codec_context_->hw_device_ctx = device_ref;
       codec_context_->get_format = &NativeVideoSurface::Impl::ffmpeg_get_format;
       hw_pixel_format_ = hw_pixel_format;
       codec_context_->thread_count = 1;
+      backend = av_hwdevice_get_type_name(device_type);
       break;
     }
 
     int open_result = avcodec_open2(codec_context_, codec, nullptr);
     if (open_result < 0 && hw_pixel_format_ != AV_PIX_FMT_NONE) {
-      av_buffer_unref(&codec_context_->hw_device_ctx);
-      codec_context_->get_format = nullptr;
+      // A failed open may leave codec-private state: never reuse that context.
+      avcodec_free_context(&codec_context_);
       hw_pixel_format_ = AV_PIX_FMT_NONE;
+      backend = "software";
+      if (!allocate_context()) {
+        fail_or_update("native-decoder-context-allocation-failed", normalized_codec);
+        return false;
+      }
       open_result = avcodec_open2(codec_context_, codec, nullptr);
     }
 
@@ -1790,11 +1803,53 @@ class NativeVideoSurface::Impl {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       snapshot_.codec_path = normalized_codec;
+      snapshot_.decoder_backend = backend;
       snapshot_.decoder_ready = true;
       snapshot_.last_error.clear();
       snapshot_.reason = "native-decoder-ready";
     }
     return true;
+  }
+
+  void recover_decoder(const char* stage, int error, bool device_failure = false) {
+    // All FFmpeg resources belong to this decode thread. Keep the surface,
+    // source epoch, cached parameter sets and transport while replacing them.
+    const std::string codec = active_codec_;
+    const bool hardware_failure = hw_pixel_format_ != AV_PIX_FMT_NONE &&
+      (device_failure || error != AVERROR_INVALIDDATA);
+    const bool rebuild = hardware_failure || error != AVERROR_INVALIDDATA;
+    const auto discarded_decoded = pending_frames_.size();
+    pending_frames_.clear();
+    pending_nonvcl_prefix_.clear();
+    playback_scheduler_.reset();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot_.dropped_encoded_frames += frame_queue_.size();
+      snapshot_.dropped_decoded_frames += discarded_decoded;
+      snapshot_.reference_chain_resets += 1;
+      frame_queue_.reset();
+      snapshot_.pending_encoded_frames = 0;
+      snapshot_.pending_decoded_frames = 0;
+      snapshot_.needs_keyframe = true;
+      snapshot_.decoder_ready = false;
+    }
+    if (hardware_failure) software_fallback_ = true;
+    const bool ready = rebuild ? open_decoder(codec) : codec_context_ != nullptr;
+    if (!rebuild && codec_context_) avcodec_flush_buffers(codec_context_);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot_.decoder_rebuilds += rebuild ? 1 : 0;
+      snapshot_.hardware_fallbacks += hardware_failure ? 1 : 0;
+      snapshot_.decoder_ready = ready;
+      snapshot_.last_decoder_failure = std::string(stage) + ":" + ffmpeg_error_string(error);
+      if (ready) {
+        snapshot_.last_error = snapshot_.last_decoder_failure;
+        snapshot_.reason = hardware_failure ? "native-decoder-software-recovery" : "native-decoder-reference-recovery";
+      } else {
+        snapshot_.last_error = snapshot_.last_decoder_failure + "; reopen:" + snapshot_.last_error;
+        snapshot_.reason = "native-decoder-reopen-failed";
+      }
+    }
   }
 
   void cleanup_decoder() {
@@ -1872,27 +1927,27 @@ class NativeVideoSurface::Impl {
       ? static_cast<std::int64_t>(entry.timing.timestamp_us) : AV_NOPTS_VALUE;
     packet.dts = AV_NOPTS_VALUE;
 
-    const int send_result = avcodec_send_packet(codec_context_, &packet);
+    int send_result = 0;
+#ifdef VDS_NATIVE_SURFACE_TESTING
+    if (config_.decoder_fault) send_result = config_.decoder_fault("send", hw_pixel_format_ != AV_PIX_FMT_NONE);
+#endif
+    if (send_result == 0) send_result = avcodec_send_packet(codec_context_, &packet);
     if (send_result < 0) {
-      pending_frames_.clear();
-      avcodec_flush_buffers(codec_context_);
-      std::lock_guard<std::mutex> lock(mutex_);
-      frame_queue_.reset();
-      snapshot_.needs_keyframe = true;
-      snapshot_.last_error = ffmpeg_error_string(send_result);
-      snapshot_.reason = "native-decoder-send-failed";
+      recover_decoder("send", send_result);
       return;
     }
 
     while (true) {
-      const int receive_result = avcodec_receive_frame(codec_context_, decoded_frame_);
+      int receive_result = 0;
+#ifdef VDS_NATIVE_SURFACE_TESTING
+      if (config_.decoder_fault) receive_result = config_.decoder_fault("receive", hw_pixel_format_ != AV_PIX_FMT_NONE);
+#endif
+      if (receive_result == 0) receive_result = avcodec_receive_frame(codec_context_, decoded_frame_);
       if (receive_result == AVERROR(EAGAIN) || receive_result == AVERROR_EOF) {
         return;
       }
       if (receive_result < 0) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        snapshot_.last_error = ffmpeg_error_string(receive_result);
-        snapshot_.reason = "native-decoder-receive-failed";
+        recover_decoder("receive", receive_result);
         return;
       }
 
@@ -2112,6 +2167,9 @@ class NativeVideoSurface::Impl {
   AVFrame* transfer_frame_ = nullptr;
   SwsContext* sws_context_ = nullptr;
   AVPixelFormat hw_pixel_format_ = AV_PIX_FMT_NONE;
+  // Keep a working fallback for this surface instead of flapping back onto a
+  // failed device every IDR. A newly attached surface probes hardware again.
+  bool software_fallback_ = false;
   std::string active_codec_;
   NativePlaybackScheduler playback_scheduler_;
   std::deque<PendingFrame> pending_frames_;
