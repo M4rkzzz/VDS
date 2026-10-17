@@ -272,6 +272,8 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
     vds_copy_enhanced_ice_runtime(vds-nat-traversal-e2e)
     add_test(NAME vds-nat-traversal-e2e COMMAND vds-nat-traversal-e2e)
     set_tests_properties(vds-nat-traversal-e2e PROPERTIES TIMEOUT 75)
+    add_test(NAME vds-random-nat-invalid-ice COMMAND vds-nat-traversal-e2e --random-invalid)
+    set_tests_properties(vds-random-nat-invalid-ice PROPERTIES TIMEOUT 25)
   endif()
   add_executable(vds-media-agent-tests
     src/agent_events.cpp

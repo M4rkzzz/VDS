@@ -1,3 +1,17 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -17,6 +17,11 @@
+ option(ENABLE_LOCALHOST_ADDRESS "List localhost addresses in candidates" OFF)
+ option(ENABLE_LOCAL_ADDRESS_TRANSLATION "Translate local addresses to localhost" OFF)
+ 
++set(VDS_NAT_PREDICTION_INCLUDE_DIR "" CACHE PATH "VDS header-only NAT predictor directory")
++if(NOT EXISTS "${VDS_NAT_PREDICTION_INCLUDE_DIR}/nat_port_prediction.h")
++  message(FATAL_ERROR "VDS NAT prediction header is required")
++endif()
++include_directories("${VDS_NAT_PREDICTION_INCLUDE_DIR}")
+ set(CMAKE_C_STANDARD 11)
+ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+ set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
 --- a/include/juice/juice.h
 +++ b/include/juice/juice.h
 @@ -48,7 +48,14 @@
@@ -16,7 +30,7 @@
  
  typedef struct juice_agent juice_agent_t;
  
-@@ -115,6 +122,11 @@
+@@ -115,6 +122,12 @@
  	juice_cb_recv_t cb_recv;
  
  	void *user_ptr;
@@ -25,54 +39,13 @@
 +	juice_stun_server_t stun_servers[JUICE_VDS_MAX_STUN_SERVERS];
 +	int stun_servers_count;
 +	bool enable_port_prediction;
++	bool enable_multi_socket_punch;
  
  } juice_config_t;
  
---- a/src/agent.h
-+++ b/src/agent.h
-@@ -18,6 +18,7 @@
- #include "thread.h"
- #include "timestamp.h"
- #include "turn.h"
-+#include "nat_port_prediction.h"
- 
- #include <stdbool.h>
- #include <stdint.h>
-@@ -61,7 +62,7 @@
- #define TURN_REFRESH_PERIOD (TURN_LIFETIME - 60000) // msecs (lifetime - 1 min)
- 
- // Max STUN and TURN server entries
--#define MAX_SERVER_ENTRIES_COUNT 2 // max STUN server entries
-+#define MAX_SERVER_ENTRIES_COUNT 8 // Four STUN targets, up to IPv4/IPv6 per target
- #define MAX_RELAY_ENTRIES_COUNT 2  // max TURN server entries
- 
- // Max TURN redirections for ALTERNATE-SERVER mechanism
-@@ -116,6 +117,8 @@
- 	timediff_t retransmission_timeout;
- 	int retransmissions;
- 	bool transaction_id_expired;
-+	uint32_t vds_first_send_sequence;
-+	bool vds_mapping_observed;
- 
- 	// TURN
- 	agent_turn_state_t *turn;
-@@ -146,6 +149,13 @@
- 	timestamp_t pac_timestamp; // Patiently Awaiting Connectivity timer
- 	timestamp_t nomination_timestamp;
- 	bool gathering_done;
-+	uint32_t vds_send_sequence;
-+	uint32_t vds_current_probe_index;
-+	vds_nat_port_observation vds_observations[VDS_NAT_MAX_OBSERVATIONS];
-+	size_t vds_observation_count;
-+	timestamp_t vds_prediction_deadline;
-+	timestamp_t vds_remote_sampling_grace_until;
-+	bool vds_prediction_emitted;
- 
- 	conn_registry_t *registry;
- 	int conn_index;
 --- a/src/agent.c
 +++ b/src/agent.c
-@@ -38,6 +38,110 @@
+@@ -38,6 +38,112 @@
  #define BUFFER_SIZE 4096
  #define DEFAULT_MAX_RECORDS_COUNT 8
  
@@ -99,8 +72,10 @@
 +		char buffer[BUFFER_SIZE];
 +		int length = ice_generate_candidate_sdp(candidate, buffer, sizeof(buffer));
 +		if (length < 0) continue;
-+		int extra = snprintf(buffer + length, sizeof(buffer) - length, " vds-probe-count %u",
-+		                     (unsigned int)agent->vds_observation_count);
++		int extra = snprintf(buffer + length, sizeof(buffer) - length, " vds-probe-count %u vds-punch %u vds-nat-mode %d",
++		                     (unsigned int)agent->vds_observation_count,
++                         agent->config.enable_multi_socket_punch ? 1u : 0u,
++                         (int)vds_nat_classify_ports(agent->vds_observations, agent->vds_observation_count, NULL));
 +		if (extra < 0 || (size_t)extra >= sizeof(buffer) - length) continue;
 +		candidate->vds_emitted = true;
 +		if (agent->config.cb_candidate)
@@ -183,7 +158,7 @@
  static char *alloc_string_copy(const char *orig, bool *alloc_failed) {
  	if (!orig)
  		return NULL;
-@@ -96,6 +200,14 @@
+@@ -96,6 +202,15 @@
  	agent->config.concurrency_mode = config->concurrency_mode;
  	agent->config.stun_server_host = alloc_string_copy(config->stun_server_host, &alloc_failed);
  	agent->config.stun_server_port = config->stun_server_port;
@@ -191,6 +166,7 @@
 +		goto error;
 +	agent->config.stun_servers_count = config->stun_servers_count;
 +	agent->config.enable_port_prediction = config->enable_port_prediction;
++	agent->config.enable_multi_socket_punch = config->enable_multi_socket_punch;
 +	for (int i = 0; i < config->stun_servers_count; ++i) {
 +		agent->config.stun_servers[i].host = alloc_string_copy(config->stun_servers[i].host, &alloc_failed);
 +		agent->config.stun_servers[i].port = config->stun_servers[i].port;
@@ -198,7 +174,20 @@
  	agent->config.bind_address = alloc_string_copy(config->bind_address, &alloc_failed);
  	agent->config.local_port_range_begin = config->local_port_range_begin;
  	agent->config.local_port_range_end = config->local_port_range_end;
-@@ -176,6 +288,8 @@
+@@ -161,9 +276,9 @@
+ 		thread_join(agent->resolver_thread, NULL);
+ 	}
+ 
+-	if (agent->conn_impl) {
+-		conn_destroy(agent);
+-	}
++	if (agent->conn_impl) conn_destroy(agent);
++	free(agent->vds_punch);
++	agent->vds_punch = NULL;
+ 
+ 	// Free credentials in entries
+ 	for (int i = 0; i < agent->entries_count; ++i) {
+@@ -176,6 +291,8 @@
  
  	// Free strings in config
  	free((void *)agent->config.stun_server_host);
@@ -207,7 +196,7 @@
  	for (int i = 0; i < agent->config.turn_servers_count; ++i) {
  		juice_turn_server_t *turn_server = agent->config.turn_servers + i;
  		free((void *)turn_server->host);
-@@ -196,6 +310,10 @@
+@@ -196,6 +313,10 @@
  static bool has_nonnumeric_server_hostnames(const juice_config_t *config) {
  	if (config->stun_server_host && !addr_is_numeric_hostname(config->stun_server_host))
  		return true;
@@ -218,7 +207,7 @@
  
  	for (int i = 0; i < config->turn_servers_count; ++i) {
  		juice_turn_server_t *turn_server = config->turn_servers + i;
-@@ -293,6 +411,8 @@
+@@ -293,6 +414,8 @@
  		}
  	}
  
@@ -227,7 +216,7 @@
  	ice_sort_candidates(&agent->local);
  
  	for (int i = 0; i < agent->entries_count; ++i)
-@@ -440,50 +560,39 @@
+@@ -440,50 +563,39 @@
  		}
  	}
  
@@ -309,7 +298,35 @@
  
  	agent_update_gathering_done(agent);
  	conn_unlock(agent);
-@@ -909,9 +1018,32 @@
+@@ -680,7 +792,7 @@
+ 		return ret;
+ 	}
+ 
+-	return agent_direct_send(agent, &selected_entry->record, data, size, ds);
++	return conn_send_on(agent, selected_entry->vds_socket, &selected_entry->record, data, size, ds);
+ }
+ 
+ int agent_direct_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
+@@ -775,7 +887,9 @@
+ }
+ 
+ int agent_conn_update(juice_agent_t *agent, timestamp_t *next_timestamp) {
+-	return agent_bookkeeping(agent, next_timestamp);
++	int ret = agent_bookkeeping(agent, next_timestamp);
++	vds_punch_update(agent, next_timestamp);
++	return ret;
+ }
+ 
+ int agent_conn_recv(juice_agent_t *agent, char *buf, size_t len, const addr_record_t *src) {
+@@ -862,6 +976,7 @@
+ 	entry->state = AGENT_STUN_ENTRY_STATE_IDLE;
+ 	entry->mode = AGENT_MODE_UNKNOWN;
+ 	entry->pair = pair;
++	entry->vds_socket = pair->vds_socket;
+ 	entry->record = pair->remote->resolved;
+ 	entry->relay_entry = relay_entry;
+ 	juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
+@@ -909,9 +1024,32 @@
  	if (agent->state == JUICE_STATE_DISCONNECTED || agent->state == JUICE_STATE_GATHERING)
  		return 0;
  
@@ -342,7 +359,7 @@
  		if (entry->state == AGENT_STUN_ENTRY_STATE_PENDING) { // STUN transmission or retransmission
  			if (entry->next_transmission > now)
  				continue;
-@@ -1104,6 +1236,14 @@
+@@ -1104,6 +1242,14 @@
  		pending_count = 0;
  	}
  
@@ -357,10 +374,30 @@
  	// Cancel entries of frozen pairs
  	for (int i = 0; i < agent->entries_count; ++i) {
  		agent_stun_entry_t *entry = agent->entries + i;
-@@ -1386,6 +1526,14 @@
- 			JLOG_WARN("Missing integrity in STUN Binding message from remote peer, ignoring");
+@@ -1351,6 +1497,7 @@
+ 			JLOG_WARN("STUN message verification failed");
  			return -1;
  		}
++		vds_punch_accept(agent, msg, src);
+ 		if (agent_add_remote_reflexive_candidate(agent, ICE_CANDIDATE_TYPE_PEER_REFLEXIVE,
+ 		                                         msg->priority, src)) {
+ 			JLOG_WARN("Failed to add remote peer reflexive candidate from STUN message");
+@@ -1361,8 +1508,8 @@
+ 	if (STUN_IS_RESPONSE(msg->msg_class)) {
+ 		JLOG_VERBOSE("STUN message is a response, looking for transaction ID");
+ 		entry = agent_find_entry_from_transaction_id(agent, msg->transaction_id);
+-		if (!entry) {
+-			JLOG_DEBUG("No STUN entry matching transaction ID, ignoring");
++		if (!entry || entry->vds_socket != agent->vds_rx_socket) {
++			JLOG_DEBUG("No STUN entry matching transaction ID/socket, ignoring");
+ 			return -1;
+ 		}
+ 	} else {
+@@ -1385,6 +1532,14 @@
+ 		    (msg->msg_class == STUN_CLASS_REQUEST || msg->msg_class == STUN_CLASS_RESP_SUCCESS)) {
+ 			JLOG_WARN("Missing integrity in STUN Binding message from remote peer, ignoring");
+ 			return -1;
++		}
 +		if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER && STUN_IS_RESPONSE(msg->msg_class)) {
 +			if (relayed || !addr_record_is_equal(src, &entry->record, true) ||
 +			    entry->state == AGENT_STUN_ENTRY_STATE_FAILED ||
@@ -368,11 +405,10 @@
 +			if (msg->msg_class == STUN_CLASS_RESP_SUCCESS &&
 +			    (!msg->mapped.len || addr_is_any((const struct sockaddr *)&msg->mapped.addr) ||
 +			     !addr_get_port((const struct sockaddr *)&msg->mapped.addr))) return -1;
-+		}
+ 		}
  		return agent_process_stun_binding(agent, msg, entry, src, relayed);
  
- 	case STUN_METHOD_ALLOCATE:
-@@ -1546,6 +1694,17 @@
+@@ -1546,6 +1701,17 @@
  			ice_candidate_type_t type = (entry->type == AGENT_STUN_ENTRY_TYPE_CHECK)
  			                                ? ICE_CANDIDATE_TYPE_PEER_REFLEXIVE
  			                                : ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE;
@@ -390,7 +426,7 @@
  			if (agent_add_local_reflexive_candidate(agent, type, &msg->mapped)) {
  				JLOG_WARN("Failed to add local peer reflexive candidate from STUN mapped address");
  			}
-@@ -1592,6 +1751,8 @@
+@@ -1592,6 +1758,8 @@
  				pair->nominated = true;
  			}
  		} else if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER) {
@@ -399,10 +435,12 @@
  			agent_update_gathering_done(agent);
  		}
  		break;
-@@ -1775,6 +1936,10 @@
+@@ -1774,7 +1942,11 @@
+ 	}
  
  	// Direct send
- 	int ret = agent_direct_send(agent, &entry->record, buffer, size, 0);
+-	int ret = agent_direct_send(agent, &entry->record, buffer, size, 0);
++	int ret = conn_send_on(agent, entry->vds_socket, &entry->record, buffer, size, 0);
 +	// IPv6 does not consume an IPv4 NAT mapping. Commit only successful IPv4 sends.
 +	if (ret >= 0 && entry->record.addr.ss_family == AF_INET &&
 +	    !entry->vds_first_send_sequence)
@@ -410,7 +448,7 @@
  	if (ret < 0) {
  		if (ret == -SENETUNREACH)
  			JLOG_INFO("STUN binding failed: Network unreachable");
-@@ -2315,6 +2480,8 @@
+@@ -2315,6 +2487,8 @@
  		JLOG_ERROR("Failed to create reflexive candidate");
  		return -1;
  	}
@@ -419,7 +457,7 @@
  	if (candidate.type == ICE_CANDIDATE_TYPE_PEER_REFLEXIVE &&
  	    ice_candidates_count(&agent->local, ICE_CANDIDATE_TYPE_PEER_REFLEXIVE) >=
  	        MAX_PEER_REFLEXIVE_CANDIDATES_COUNT) {
-@@ -2334,8 +2501,12 @@
+@@ -2334,8 +2508,12 @@
  	}
  	JLOG_DEBUG("Gathered reflexive candidate: %s", buffer);
  
@@ -433,7 +471,25 @@
  
  	return 0;
  }
-@@ -2484,6 +2655,14 @@
+@@ -2392,6 +2570,9 @@
+ 
+ int agent_add_candidate_pair(juice_agent_t *agent, ice_candidate_t *local, // local may be NULL
+                              ice_candidate_t *remote) {
++    return agent_add_candidate_pair_on(agent, local, remote, 0);
++}
++int agent_add_candidate_pair_on(juice_agent_t *agent, ice_candidate_t *local, ice_candidate_t *remote, int socket_index) {
+ 	ice_candidate_pair_t pair;
+ 	bool is_controlling = agent->mode == AGENT_MODE_CONTROLLING;
+ 	if (ice_create_candidate_pair(local, remote, is_controlling, &pair)) {
+@@ -2428,6 +2609,7 @@
+ 
+ 	JLOG_VERBOSE("Adding new candidate pair, priority=%" PRIu64, pair.priority);
+ 
++	pair.vds_socket = socket_index;
+ 	// Add pair
+ 	ice_candidate_pair_t *pos = agent->candidate_pairs + agent->candidate_pairs_count;
+ 	*pos = pair;
+@@ -2484,6 +2666,14 @@
  }
  
  int agent_add_candidate_pairs_for_remote(juice_agent_t *agent, ice_candidate_t *remote) {
@@ -448,7 +504,7 @@
  	// Here is the trick: local non-relayed candidates are undifferentiated for sending.
  	// Therefore, we don't need to match remote candidates with local ones.
  	if (agent_add_candidate_pair(agent, NULL, remote))
-@@ -2608,6 +2787,7 @@
+@@ -2608,6 +2798,7 @@
  			return;
  		}
  	}
@@ -456,36 +512,501 @@
  	if (!agent->gathering_done) {
  		JLOG_INFO("Candidate gathering done");
  		agent->local.finished = true;
---- a/src/ice.h
-+++ b/src/ice.h
-@@ -17,7 +17,7 @@
+@@ -2681,7 +2872,7 @@
+                                                  const addr_record_t *relayed) {
+ 	agent_stun_entry_t *selected_entry = atomic_load(&agent->selected_entry);
+ 
+-	if (selected_entry && selected_entry->pair && selected_entry->pair->nominated) {
++	if (selected_entry && selected_entry->vds_socket == agent->vds_rx_socket && selected_entry->pair && selected_entry->pair->nominated) {
+ 		// As an optimization, try to match the nominated entry first
+ 		if (relayed) {
+ 			if (entry_is_relayed(selected_entry) &&
+@@ -2714,7 +2905,7 @@
+ 		ice_candidate_pair_t *matching_pair = NULL;
+ 		for (int i = 0; i < agent->candidate_pairs_count; ++i) {
+ 			ice_candidate_pair_t *pair = agent->ordered_pairs[i];
+-			if (!pair_is_relayed(pair) &&
++			if (pair->vds_socket == agent->vds_rx_socket && !pair_is_relayed(pair) &&
+ 			    addr_record_is_equal(&pair->remote->resolved, record, true)) {
+ 				matching_pair = pair;
+ 				break;
+@@ -2735,7 +2926,7 @@
+ 		// Try to match entries directly
+ 		for (int i = 0; i < agent->entries_count; ++i) {
+ 			agent_stun_entry_t *entry = agent->entries + i;
+-			if (!entry_is_relayed(entry) && addr_record_is_equal(&entry->record, record, true)) {
++			if (entry->vds_socket == agent->vds_rx_socket && !entry_is_relayed(entry) && addr_record_is_equal(&entry->record, record, true)) {
+ 				JLOG_DEBUG("STUN entry %d matching incoming address", i);
+ 				return entry;
+ 			}
+@@ -2791,3 +2982,180 @@
+ 	(void)agent;
+ #endif
+ }
++
++/* VDS random-NAT exploration: temporary sockets share this agent's credentials,
++ * roles and nomination. A probe never becomes a media path without ICE. */
++typedef struct vds_probe {
++ addr_record_t target;
++ uint8_t transaction[STUN_TRANSACTION_ID_SIZE];
++ int socket_index;
++ bool sent;
++} vds_probe_t;
++struct vds_punch_state {
++ timestamp_t deadline, next_send;
++ unsigned cursor, round, count;
++ uint16_t lookup[4096];
++ vds_probe_t probes[VDS_NAT_PUNCH_SOCKETS * VDS_NAT_PUNCH_TARGETS];
++};
++static unsigned vds_probe_hash(const uint8_t *transaction) {
++ uint32_t hash = 2166136261u;
++ for (unsigned i = 0; i < STUN_TRANSACTION_ID_SIZE; ++i) hash = (hash ^ transaction[i]) * 16777619u;
++ return hash & 4095u;
++}
++static void vds_punch_finish(juice_agent_t *agent) {
++ int keep = agent->state != JUICE_STATE_FAILED && agent->selected_pair ? agent->selected_pair->vds_socket : 0;
++ if (agent->vds_punch) JLOG_INFO("VDS random punch finished, selected_socket=%d", keep);
++ for (int i = 0; i < agent->entries_count; ++i) {
++  agent_stun_entry_t *entry = agent->entries + i;
++  if (entry->vds_socket && entry->vds_socket != keep) {
++   entry->state = AGENT_STUN_ENTRY_STATE_CANCELLED;
++   if (entry->pair) entry->pair->state = ICE_CANDIDATE_PAIR_STATE_FROZEN;
++  }
++ }
++ conn_close_punch_sockets(agent, keep);
++ free(agent->vds_punch); agent->vds_punch = NULL;
++ agent->vds_punch_done = true;
++}
++void vds_punch_update(juice_agent_t *agent, timestamp_t *next_timestamp) {
++ if (!agent->config.enable_multi_socket_punch || agent->vds_punch_done || !agent->conn_impl) return;
++ timestamp_t now = current_timestamp();
++ if (agent->state == JUICE_STATE_FAILED || agent->state == JUICE_STATE_COMPLETED ||
++     (agent->selected_pair && agent->selected_pair->nominated)) {
++  vds_punch_finish(agent); return;
++ }
++ if (!agent->vds_punch) {
++  if (!agent->vds_prediction_emitted || agent->vds_observation_count < 3 ||
++      !*agent->remote.ice_ufrag || !*agent->remote.ice_pwd || agent->mode == AGENT_MODE_UNKNOWN) return;
++  ice_candidate_t *anchor = NULL;
++  const vds_nat_mapping_behavior local_mode = vds_nat_classify_ports(agent->vds_observations, agent->vds_observation_count, NULL);
++  const bool local_unknown = local_mode == VDS_NAT_MAPPING_UNKNOWN;
++  for (int i = 0; i < agent->remote.candidates_count; ++i) {
++   ice_candidate_t *candidate = agent->remote.candidates + i;
++   if (candidate->type == ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE && !candidate->vds_predicted &&
++       candidate->transport == ICE_CANDIDATE_TRANSPORT_UDP && candidate->resolved.addr.ss_family == AF_INET &&
++       candidate->vds_punch && !strcmp(candidate->vds_ufrag, agent->remote.ice_ufrag) &&
++       candidate->vds_nat_mode >= 0 && candidate->vds_nat_mode <= 2 &&
++       (local_unknown || candidate->vds_nat_mode == VDS_NAT_MAPPING_UNKNOWN)) { anchor = candidate; break; }
++  }
++  if (!anchor) return;
++  if (!agent->vds_punch_start) agent->vds_punch_start = now + 500;
++  if (now < agent->vds_punch_start) {
++   if (*next_timestamp > agent->vds_punch_start) *next_timestamp = agent->vds_punch_start;
++   return;
++  }
++  if (agent->selected_pair) return; // ordinary ICE already has a usable path
++  struct vds_punch_state *state = calloc(1, sizeof(*state));
++  if (!state) { agent->vds_punch_done = true; return; }
++  uint16_t ports[VDS_NAT_PUNCH_TARGETS]; uint32_t seed;
++  juice_random(&seed, sizeof(seed));
++  uint16_t port = addr_get_port((const struct sockaddr *)&anchor->resolved.addr);
++  size_t count = 0;
++  /* Stable peers need only their confirmed endpoint. For a linear peer,
++   * preserve signaled prediction order before adding genuine endpoints. */
++  for (int pass = 0; pass < 2; ++pass) {
++   for (int i = 0; i < agent->remote.candidates_count && count < VDS_NAT_PUNCH_TARGETS; ++i) {
++    const ice_candidate_t *candidate = agent->remote.candidates + i;
++    if (candidate->type != ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE ||
++        candidate->resolved.addr.ss_family != AF_INET ||
++        !addr_record_is_equal(&candidate->resolved, &anchor->resolved, false) ||
++        candidate->vds_predicted != (pass == 0) ||
++        (candidate->vds_predicted && anchor->vds_nat_mode != VDS_NAT_MAPPING_SEQUENTIAL)) continue;
++    uint16_t observed = addr_get_port((const struct sockaddr *)&candidate->resolved.addr);
++    size_t j; for (j = 0; j < count && ports[j] != observed; ++j) {}
++    if (j == count && observed) ports[count++] = observed;
++   }
++  }
++  if (anchor->vds_nat_mode == VDS_NAT_MAPPING_UNKNOWN) {
++   uint16_t random_ports[VDS_NAT_PUNCH_TARGETS];
++   size_t random_count = vds_nat_random_ports(port, seed, random_ports, VDS_NAT_PUNCH_TARGETS);
++   for (size_t i = 0; i < random_count && count < VDS_NAT_PUNCH_TARGETS; ++i) {
++    size_t j; for (j = 0; j < count && ports[j] != random_ports[i]; ++j) {}
++    if (j == count) ports[count++] = random_ports[i];
++   }
++  }
++  if (!count) { free(state); agent->vds_punch_done = true; return; }
++  unsigned first_socket = local_mode == VDS_NAT_MAPPING_ENDPOINT_INDEPENDENT ? 0 : 1;
++  unsigned last_socket = first_socket ? VDS_NAT_PUNCH_SOCKETS : 0;
++  if (first_socket && !conn_open_punch_sockets(agent)) { free(state); agent->vds_punch_done = true; return; }
++  for (size_t target = 0; target < count; ++target) {
++   for (unsigned socket = first_socket; socket <= last_socket; ++socket) {
++    unsigned index = state->count++;
++    vds_probe_t *probe = state->probes + index;
++    probe->target = anchor->resolved;
++    ((struct sockaddr_in *)&probe->target.addr)->sin_port = htons(ports[target]);
++    probe->socket_index = socket;
++    juice_random(probe->transaction, STUN_TRANSACTION_ID_SIZE);
++    unsigned slot = vds_probe_hash(probe->transaction);
++    while (state->lookup[slot]) slot = (slot + 1) & 4095u;
++    state->lookup[slot] = (uint16_t)(index + 1);
++   }
++  }
++  state->deadline = now + 5000; state->next_send = now;
++  agent->vds_punch = state;
++  JLOG_INFO("VDS random punch started, local_mode=%d remote_mode=%d sockets=%u targets=%u", (int)local_mode, anchor->vds_nat_mode, last_socket - first_socket + 1, (unsigned)count);
++ }
++ struct vds_punch_state *state = agent->vds_punch;
++ if (now >= state->deadline) { vds_punch_finish(agent); return; }
++ if (!agent->selected_pair && now >= state->next_send && state->round < 2) {
++  for (unsigned batch = 0; batch < 32 && state->cursor < state->count; ++batch) {
++   vds_probe_t *probe = state->probes + state->cursor++;
++   agent_stun_entry_t entry; memset(&entry, 0, sizeof(entry));
++   entry.type = AGENT_STUN_ENTRY_TYPE_CHECK; entry.record = probe->target;
++   entry.vds_socket = probe->socket_index;
++   memcpy(entry.transaction_id, probe->transaction, STUN_TRANSACTION_ID_SIZE);
++   if (!agent_send_stun_binding(agent, &entry, STUN_CLASS_REQUEST, 0, NULL, NULL)) probe->sent = true;
++  }
++  state->next_send = now + 20;
++  if (state->cursor == state->count) { state->cursor = 0; ++state->round; state->next_send = now + 250; }
++ }
++ timestamp_t wake = state->round < 2 && !agent->selected_pair ? state->next_send : state->deadline;
++ if (*next_timestamp > wake) *next_timestamp = wake;
++}
++/* Called only after standard STUN short-term integrity verification. */
++void vds_punch_accept(juice_agent_t *agent, const stun_message_t *msg, const addr_record_t *src) {
++ if (src->socktype != SOCK_DGRAM || !*agent->remote.ice_ufrag || msg->msg_method != STUN_METHOD_BINDING) return;
++ const vds_probe_t *probe = NULL;
++ if (msg->msg_class == STUN_CLASS_RESP_SUCCESS && agent->vds_punch) {
++  unsigned slot = vds_probe_hash(msg->transaction_id);
++  while (agent->vds_punch->lookup[slot]) {
++   unsigned index = agent->vds_punch->lookup[slot] - 1;
++   const vds_probe_t *candidate = agent->vds_punch->probes + index;
++   if (!memcmp(candidate->transaction, msg->transaction_id, STUN_TRANSACTION_ID_SIZE)) {
++    if (candidate->sent && candidate->socket_index == agent->vds_rx_socket &&
++        addr_record_is_equal(&candidate->target, src, true)) probe = candidate;
++    break;
++   }
++   slot = (slot + 1) & 4095u;
++  }
++ }
++ if (!probe && msg->msg_class != STUN_CLASS_REQUEST) return;
++ if (!agent->vds_rx_socket && !probe) return;
++ ice_candidate_t *remote = ice_find_candidate_from_addr(&agent->remote, src, ICE_CANDIDATE_TYPE_UNKNOWN);
++ if (!remote) {
++  uint32_t priority = msg->priority ? msg->priority : ice_compute_priority(ICE_CANDIDATE_TYPE_PEER_REFLEXIVE, src->addr.ss_family, 1, 0, false);
++  if (agent_add_remote_reflexive_candidate(agent, ICE_CANDIDATE_TYPE_PEER_REFLEXIVE, priority, src)) return;
++  remote = ice_find_candidate_from_addr(&agent->remote, src, ICE_CANDIDATE_TYPE_UNKNOWN);
++ }
++ if (!remote) return;
++ ice_candidate_pair_t *pair = NULL;
++ for (int i = 0; i < agent->candidate_pairs_count; ++i) {
++  ice_candidate_pair_t *candidate = agent->candidate_pairs + i;
++  if (candidate->vds_socket == agent->vds_rx_socket && candidate->remote == remote) { pair = candidate; break; }
++ }
++ if (!pair) {
++  int index = agent->candidate_pairs_count;
++  if (agent_add_candidate_pair_on(agent, NULL, remote, agent->vds_rx_socket)) return;
++  if (index == agent->candidate_pairs_count) return;
++  pair = agent->candidate_pairs + index;
++ }
++ if (probe && pair->state != ICE_CANDIDATE_PAIR_STATE_SUCCEEDED) {
++  for (int i = 0; i < agent->entries_count; ++i) {
++   agent_stun_entry_t *entry = agent->entries + i;
++   if (entry->pair == pair) {
++    memcpy(entry->transaction_id, probe->transaction, STUN_TRANSACTION_ID_SIZE);
++    entry->mode = agent->mode; entry->state = AGENT_STUN_ENTRY_STATE_PENDING;
++    break;
++   }
++  }
++ }
++}
+--- a/src/agent.h
++++ b/src/agent.h
+@@ -18,6 +18,7 @@
+ #include "thread.h"
+ #include "timestamp.h"
+ #include "turn.h"
++#include "nat_port_prediction.h"
+ 
  #include <stdbool.h>
  #include <stdint.h>
+@@ -61,7 +62,7 @@
+ #define TURN_REFRESH_PERIOD (TURN_LIFETIME - 60000) // msecs (lifetime - 1 min)
  
--#define ICE_MAX_CANDIDATES_COUNT 20 // ~ 500B * 20 = 10KB
-+#define ICE_MAX_CANDIDATES_COUNT 128 // Bounded VDS enhanced ICE candidate capacity
+ // Max STUN and TURN server entries
+-#define MAX_SERVER_ENTRIES_COUNT 2 // max STUN server entries
++#define MAX_SERVER_ENTRIES_COUNT 8 // Four STUN targets, up to IPv4/IPv6 per target
+ #define MAX_RELAY_ENTRIES_COUNT 2  // max TURN server entries
  
- #define ICE_CANDIDATE_PENALTY_TCP 50
+ // Max TURN redirections for ALTERNATE-SERVER mechanism
+@@ -106,6 +107,7 @@
  
-@@ -52,6 +52,11 @@
- 	char hostname[256 + 1];
- 	char service[32 + 1];
- 	addr_record_t resolved;
-+	bool vds_predicted;
-+	bool vds_emitted;
-+	int vds_nat_step;
-+	uint32_t vds_probe_index;
-+	char vds_ufrag[257];
- } ice_candidate_t;
+ typedef struct agent_stun_entry {
+ 	agent_stun_entry_type_t type;
++	int vds_socket;
+ 	agent_stun_entry_state_t state;
+ 	agent_mode_t mode;
+ 	ice_candidate_pair_t *pair;
+@@ -116,6 +118,8 @@
+ 	timediff_t retransmission_timeout;
+ 	int retransmissions;
+ 	bool transaction_id_expired;
++	uint32_t vds_first_send_sequence;
++	bool vds_mapping_observed;
  
- typedef struct ice_description {
+ 	// TURN
+ 	agent_turn_state_t *turn;
+@@ -124,6 +128,7 @@
+ 
+ } agent_stun_entry_t;
+ 
++struct vds_punch_state;
+ struct juice_agent {
+ 	juice_config_t config;
+ 	juice_state_t state;
+@@ -146,6 +151,17 @@
+ 	timestamp_t pac_timestamp; // Patiently Awaiting Connectivity timer
+ 	timestamp_t nomination_timestamp;
+ 	bool gathering_done;
++	uint32_t vds_send_sequence;
++	uint32_t vds_current_probe_index;
++	vds_nat_port_observation vds_observations[VDS_NAT_MAX_OBSERVATIONS];
++	size_t vds_observation_count;
++	timestamp_t vds_prediction_deadline;
++	timestamp_t vds_remote_sampling_grace_until;
++	bool vds_prediction_emitted;
++	int vds_rx_socket;
++	bool vds_punch_done;
++	timestamp_t vds_punch_start;
++	struct vds_punch_state *vds_punch;
+ 
+ 	conn_registry_t *registry;
+ 	int conn_index;
+@@ -228,6 +244,10 @@
+ int agent_add_candidate_pairs_for_remote(juice_agent_t *agent, ice_candidate_t *remote);
+ int agent_unfreeze_candidate_pair(juice_agent_t *agent, ice_candidate_pair_t *pair);
+ 
++int agent_add_candidate_pair_on(juice_agent_t *agent, ice_candidate_t *local, ice_candidate_t *remote, int socket_index);
++void vds_punch_update(juice_agent_t *agent, timestamp_t *next_timestamp);
++void vds_punch_accept(juice_agent_t *agent, const stun_message_t *msg, const addr_record_t *src);
++
+ void agent_arm_keepalive(juice_agent_t *agent, agent_stun_entry_t *entry);
+ void agent_arm_transmission(juice_agent_t *agent, agent_stun_entry_t *entry, timediff_t delay);
+ void agent_update_pac_timer(juice_agent_t *agent);
+--- a/src/conn.c
++++ b/src/conn.c
+@@ -314,3 +314,17 @@
+ 	mutex_unlock(&entry->mutex);
+ 	return 0;
+ }
++
++/* Extra sockets remain part of one ICE agent and one nomination state. */
++int conn_send_on(juice_agent_t *agent, int index, const addr_record_t *dst, const char *data, size_t size, int ds) {
++ if (!index) return conn_send(agent, dst, data, size, ds);
++ if (agent->config.concurrency_mode != JUICE_CONCURRENCY_MODE_POLL) return -1;
++ return conn_poll_send_on(agent, index, dst, data, size, ds);
++}
++int conn_open_punch_sockets(juice_agent_t *agent) {
++ if (agent->config.concurrency_mode != JUICE_CONCURRENCY_MODE_POLL) return 0;
++ return conn_poll_open_punch_sockets(agent);
++}
++void conn_close_punch_sockets(juice_agent_t *agent, int keep) {
++ if (agent->config.concurrency_mode == JUICE_CONCURRENCY_MODE_POLL) conn_poll_close_punch_sockets(agent, keep);
++}
+--- a/src/conn.h
++++ b/src/conn.h
+@@ -62,6 +62,9 @@
+ int conn_interrupt(juice_agent_t *agent);
+ int conn_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
+               int ds);
++int conn_send_on(juice_agent_t *agent, int socket_index, const addr_record_t *dst, const char *data, size_t size, int ds);
++int conn_open_punch_sockets(juice_agent_t *agent);
++void conn_close_punch_sockets(juice_agent_t *agent, int keep);
+ void conn_tcp_connect(juice_agent_t *agent, const addr_record_t *dst);
+ int conn_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size);
+ 
+--- a/src/conn_poll.c
++++ b/src/conn_poll.c
+@@ -13,6 +13,7 @@
+ #include "tcp.h"
+ #include "thread.h"
+ #include "udp.h"
++#include "nat_port_prediction.h"
+ 
+ #include <assert.h>
+ #include <string.h>
+@@ -35,6 +36,8 @@
+ 	conn_registry_t *registry;
+ 	conn_state_t state;
+ 	socket_t udp_sock;
++	socket_t vds_sockets[VDS_NAT_PUNCH_SOCKETS];
++	unsigned vds_revision;
+ 	socket_t tcp_sock;
+ 	tcp_ice_write_context_t tcp_ice_write_context;
+ 	tcp_ice_read_context_t tcp_ice_read_context;
+@@ -155,6 +158,8 @@
+ 		}
+ 
+ 		size++;
++		for (unsigned slot = 0; slot < VDS_NAT_PUNCH_SOCKETS; ++slot)
++			if (conn_impl->vds_sockets[slot] != INVALID_SOCKET) ++size;
+ 		if (conn_impl->tcp_sock != INVALID_SOCKET) {
+ 			size++;
+ 		}
+@@ -203,6 +208,12 @@
+ 		udp_pfd->fd = conn_impl->udp_sock;
+ 		udp_pfd->events = POLLIN;
+ 		i++;
++        for (unsigned slot = 0; slot < VDS_NAT_PUNCH_SOCKETS; ++slot) {
++            if (conn_impl->vds_sockets[slot] == INVALID_SOCKET) continue;
++            pfds->pfds[i].fd = conn_impl->vds_sockets[slot];
++            pfds->pfds[i].events = POLLIN;
++            ++i;
++        }
+ 
+ 		if (conn_impl->tcp_sock != INVALID_SOCKET) {
+ 			struct pollfd *tcp_pfd = pfds->pfds + i;
+@@ -235,19 +246,20 @@
+ 		return;
+ 	}
+ 
+-	if (pfd->revents & POLLERR) {
++	if ((pfd->revents & POLLERR) && !agent->vds_rx_socket) {
+ 		JLOG_WARN("UDP socket error");
+ 		agent_conn_fail(agent);
+ 		conn_impl->state = CONN_STATE_FINISHED;
+ 	}
+ 
+-	if (pfd->revents & POLLIN) {
++	if (pfd->revents & (POLLIN | (agent->vds_rx_socket ? POLLERR : 0))) {
++		// Drain auxiliary ICMP errors instead of spinning or failing the ordinary ICE path.
+ 		char buffer[BUFFER_SIZE];
+ 		addr_record_t src;
+ 		int ret = 0;
+ 		int left = 1000; // limit for fairness between sockets
+ 		while (left--) {
+-			if ((ret = conn_poll_recv_udp(conn_impl->udp_sock, buffer, BUFFER_SIZE,
++			if ((ret = conn_poll_recv_udp(pfd->fd, buffer, BUFFER_SIZE,
+ 							&src)) <= 0) {
+ 				break;
+ 			}
+@@ -265,6 +277,7 @@
+ 		if (ret == -SEAGAIN || ret == -SEWOULDBLOCK) {
+ 			JLOG_VERBOSE("No more datagrams to receive");
+ 		} else {
++            if (agent->vds_rx_socket) return;
+ 			agent_conn_fail(agent);
+ 			conn_impl->state = CONN_STATE_FINISHED;
+ 			return;
+@@ -470,8 +483,25 @@
+ 		if (udp_pfd->fd != conn_impl->udp_sock)
+ 			break;
+ 
+-		conn_poll_process_udp(agent, udp_pfd);
+-		i++;
++        unsigned revision = conn_impl->vds_revision;
++        agent->vds_rx_socket = 0;
++        conn_poll_process_udp(agent, udp_pfd);
++        ++i;
++        if (revision != conn_impl->vds_revision || conn_impl->state == CONN_STATE_FINISHED) {
++            mutex_unlock(&registry->mutex); return 0;
++        }
++        for (unsigned slot = 0; slot < VDS_NAT_PUNCH_SOCKETS; ++slot) {
++            if (conn_impl->vds_sockets[slot] == INVALID_SOCKET) continue;
++            if (i >= pfds->size || pfds->pfds[i].fd != conn_impl->vds_sockets[slot]) {
++                mutex_unlock(&registry->mutex); return 0;
++            }
++            agent->vds_rx_socket = (int)slot + 1;
++            conn_poll_process_udp(agent, pfds->pfds + i++);
++            agent->vds_rx_socket = 0;
++            if (revision != conn_impl->vds_revision || conn_impl->state == CONN_STATE_FINISHED) {
++                mutex_unlock(&registry->mutex); return 0;
++            }
++        }
+ 
+ 		if (conn_impl->tcp_sock == INVALID_SOCKET)
+ 			continue;
+@@ -532,6 +562,7 @@
+ 		return -1;
+ 	}
+ 
++	for (unsigned slot = 0; slot < VDS_NAT_PUNCH_SOCKETS; ++slot) conn_impl->vds_sockets[slot] = INVALID_SOCKET;
+ 	conn_impl->udp_sock = udp_create_socket(config);
+ 	if (conn_impl->udp_sock == INVALID_SOCKET) {
+ 		JLOG_ERROR("UDP socket creation failed");
+@@ -555,6 +586,7 @@
+ 
+ 	conn_poll_interrupt(agent);
+ 
++	conn_poll_close_punch_sockets(agent, -1);
+ 	mutex_destroy(&conn_impl->send_mutex);
+ 	closesocket(conn_impl->udp_sock);
+ 	closesocket(conn_impl->tcp_sock);
+@@ -672,3 +704,42 @@
+ 
+ 	return udp_get_addrs(conn_impl->udp_sock, records, size);
+ }
++
++int conn_poll_open_punch_sockets(juice_agent_t *agent) {
++ conn_impl_t *impl = agent->conn_impl;
++ udp_socket_config_t config = {agent->config.bind_address, agent->config.local_port_range_begin, agent->config.local_port_range_end};
++ int opened = 0;
++ mutex_lock(&impl->send_mutex);
++ for (unsigned i = 0; i < VDS_NAT_PUNCH_SOCKETS; ++i) {
++  if (impl->vds_sockets[i] == INVALID_SOCKET) impl->vds_sockets[i] = udp_create_socket(&config);
++  if (impl->vds_sockets[i] != INVALID_SOCKET) ++opened;
++ }
++ ++impl->vds_revision;
++ mutex_unlock(&impl->send_mutex);
++ return opened;
++}
++void conn_poll_close_punch_sockets(juice_agent_t *agent, int keep) {
++ conn_impl_t *impl = agent->conn_impl;
++ mutex_lock(&impl->send_mutex);
++ for (unsigned i = 0; i < VDS_NAT_PUNCH_SOCKETS; ++i) {
++  if ((int)i + 1 != keep && impl->vds_sockets[i] != INVALID_SOCKET) {
++   closesocket(impl->vds_sockets[i]); impl->vds_sockets[i] = INVALID_SOCKET;
++   ++impl->vds_revision;
++  }
++ }
++ mutex_unlock(&impl->send_mutex);
++}
++int conn_poll_send_on(juice_agent_t *agent, int index, const addr_record_t *dst, const char *data, size_t size, int ds) {
++ conn_impl_t *impl = agent->conn_impl;
++ if (index < 1 || index > (int)VDS_NAT_PUNCH_SOCKETS || dst->socktype != SOCK_DGRAM) return -1;
++ mutex_lock(&impl->send_mutex);
++ socket_t socket = impl->vds_sockets[index - 1];
++ int ret = -1;
++ if (socket != INVALID_SOCKET) {
++  if (ds) udp_set_diffserv(socket, ds);
++  ret = udp_sendto(socket, data, size, dst);
++  if (ret < 0) ret = -sockerrno;
++ }
++ mutex_unlock(&impl->send_mutex);
++ return ret;
++}
+--- a/src/conn_poll.h
++++ b/src/conn_poll.h
+@@ -30,4 +30,8 @@
+ void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst);
+ int conn_poll_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size);
+ 
++int conn_poll_send_on(juice_agent_t *agent, int index, const addr_record_t *dst, const char *data, size_t size, int ds);
++int conn_poll_open_punch_sockets(juice_agent_t *agent);
++void conn_poll_close_punch_sockets(juice_agent_t *agent, int keep);
++
+ #endif
 --- a/src/ice.c
 +++ b/src/ice.c
-@@ -111,6 +111,18 @@
+@@ -111,6 +111,22 @@
  		return ICE_PARSE_IGNORED;
  	}
  
-+	const char *ext = strstr(line, " vds-predicted ");
++	const char *ext = strstr(line, " vds-punch ");
++	if (ext) { unsigned value = 0; if (sscanf(ext, " vds-punch %u", &value) == 1 && value == 1) candidate->vds_punch = true; }
++	ext = strstr(line, " vds-nat-mode ");
++	if (ext) sscanf(ext, " vds-nat-mode %d", &candidate->vds_nat_mode);
++	ext = strstr(line, " vds-predicted ");
 +	if (ext) {
 +		unsigned int predicted = 0;
 +		if (sscanf(ext, " vds-predicted %u", &predicted) == 1 && predicted == 1)
@@ -500,7 +1021,7 @@
  	return 0;
  }
  
-@@ -238,6 +250,13 @@
+@@ -238,6 +254,13 @@
  	if (candidate->type == ICE_CANDIDATE_TYPE_UNKNOWN)
  		return -1;
  
@@ -514,7 +1035,7 @@
  	if (description->candidates_count >= ICE_MAX_CANDIDATES_COUNT) {
  		JLOG_WARN("Description already has the maximum number of candidates");
  		return -1;
-@@ -370,10 +389,27 @@
+@@ -370,10 +393,27 @@
  			return -1;
  	}
  
@@ -546,17 +1067,36 @@
  }
  
  int ice_create_candidate_pair(ice_candidate_t *local, ice_candidate_t *remote, bool is_controlling,
---- a/CMakeLists.txt
-+++ b/CMakeLists.txt
-@@ -17,6 +17,11 @@
- option(ENABLE_LOCALHOST_ADDRESS "List localhost addresses in candidates" OFF)
- option(ENABLE_LOCAL_ADDRESS_TRANSLATION "Translate local addresses to localhost" OFF)
+--- a/src/ice.h
++++ b/src/ice.h
+@@ -17,7 +17,7 @@
+ #include <stdbool.h>
+ #include <stdint.h>
  
-+set(VDS_NAT_PREDICTION_INCLUDE_DIR "" CACHE PATH "VDS header-only NAT predictor directory")
-+if(NOT EXISTS "${VDS_NAT_PREDICTION_INCLUDE_DIR}/nat_port_prediction.h")
-+  message(FATAL_ERROR "VDS NAT prediction header is required")
-+endif()
-+include_directories("${VDS_NAT_PREDICTION_INCLUDE_DIR}")
- set(CMAKE_C_STANDARD 11)
- set(CMAKE_POSITION_INDEPENDENT_CODE ON)
- set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
+-#define ICE_MAX_CANDIDATES_COUNT 20 // ~ 500B * 20 = 10KB
++#define ICE_MAX_CANDIDATES_COUNT 128 // Bounded VDS enhanced ICE candidate capacity
+ 
+ #define ICE_CANDIDATE_PENALTY_TCP 50
+ 
+@@ -52,6 +52,13 @@
+ 	char hostname[256 + 1];
+ 	char service[32 + 1];
+ 	addr_record_t resolved;
++	bool vds_punch;
++	int vds_nat_mode;
++	bool vds_predicted;
++	bool vds_emitted;
++	int vds_nat_step;
++	uint32_t vds_probe_index;
++	char vds_ufrag[257];
+ } ice_candidate_t;
+ 
+ typedef struct ice_description {
+@@ -75,6 +82,7 @@
+ 	ice_candidate_t *remote;
+ 	uint64_t priority;
+ 	ice_candidate_pair_state_t state;
++	int vds_socket;
+ 	bool nominated;
+ 	bool nomination_requested;
+ 	tcp_state_t tcp_state;

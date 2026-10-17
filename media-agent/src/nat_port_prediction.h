@@ -197,4 +197,30 @@ static inline size_t vds_nat_neighbor_ports(
   return used;
 }
 
+/* Connection-only exploration resources, never media rate or session limits. */
+#define VDS_NAT_PUNCH_SOCKETS 16u
+#define VDS_NAT_PUNCH_TARGETS 100u
+
+/* Unknown mapping: sample the observed allocation block and the wider user-port
+ * space. These are hypotheses, never advertised as verified mappings. */
+static inline size_t vds_nat_random_ports(uint16_t anchor, uint32_t seed,
+    uint16_t* output, size_t capacity) {
+  size_t used = 0;
+  unsigned attempts = 0;
+  uint32_t state = seed ? seed : 0x9e3779b9u;
+  if (!output) return 0;
+  if (capacity > VDS_NAT_PUNCH_TARGETS) capacity = VDS_NAT_PUNCH_TARGETS;
+  while (used < capacity && attempts++ < 4096) {
+    size_t i;
+    int port;
+    state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+    port = anchor >= 1024 && used < capacity * 3 / 4
+      ? (anchor & 0xff00u) + (state & 255u) : 1024 + state % (65536u - 1024u);
+    if (port < 1024 || port == anchor) continue;
+    for (i = 0; i < used && output[i] != port; ++i) {}
+    if (i == used) output[used++] = (uint16_t)port;
+  }
+  return used;
+}
+
 #endif /* VDS_NAT_PORT_PREDICTION_H */

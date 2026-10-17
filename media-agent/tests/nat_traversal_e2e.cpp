@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -95,7 +96,7 @@ std::uint16_t availableInternalPort() {
   return ntohs(reservation.bound.sin_port);
 }
 
-enum class MappingPattern { Sequential, Noisy, NearbyAfterNoisySamples, OutsidePredictionBudget };
+enum class MappingPattern { Sequential, Noisy, NearbyAfterNoisySamples, OutsidePredictionBudget, Random };
 
 struct FixtureSnapshot {
   std::array<std::set<unsigned>, 2> internalPorts;
@@ -103,20 +104,27 @@ struct FixtureSnapshot {
   std::array<std::set<unsigned>, 2> checkedExternalPorts;
   std::array<unsigned, 2> mappingCount{};
   unsigned internalDatagrams = 0;
+  std::array<unsigned, 2> primaryInternalPorts{};
   unsigned stunRequests = 0;
   unsigned publicDatagrams = 0;
   unsigned forwardedDatagrams = 0;
   unsigned unmappedDrops = 0;
   unsigned filteringDrops = 0;
+  unsigned corruptedPackets = 0;
   unsigned outOfPoolDrops = 0;
 };
 
 class VirtualNat {
  public:
-  static constexpr unsigned kPortPool = 128;
+  static constexpr unsigned kPortPool = 256;
   static constexpr unsigned kAllocationStart = 8;
-  explicit VirtualNat(MappingPattern pattern, bool firstIndependentFiltering = false)
-      : pattern_(pattern), independentFiltering_{firstIndependentFiltering, false} {
+  explicit VirtualNat(MappingPattern pattern, bool firstIndependentFiltering = false, unsigned seed = 1, bool corrupt = false, bool stableFirst = false)
+      : stable_first_(stableFirst), corrupt_(corrupt), pattern_(pattern), independentFiltering_{firstIndependentFiltering, false} {
+    for (unsigned side = 0; side < 2; ++side) {
+      for (unsigned i = 0; i < kPortPool; ++i) randomSlots_[side][i] = i;
+      std::mt19937 random(seed * 31 + side);
+      std::shuffle(randomSlots_[side].begin(), randomSlots_[side].end(), random);
+    }
     internal_[0] = address("127.0.0.1", availableInternalPort());
     do { internal_[1] = address("127.0.0.1", availableInternalPort()); }
     while (internal_[1].sin_port == internal_[0].sin_port);
@@ -125,7 +133,8 @@ class VirtualNat {
     // Bind the entire finite pool so an unmapped predicted port can receive a
     // packet and be dropped. Receiving never invents a destination mapping.
     for (unsigned attempt = 0; attempt < 100; ++attempt) {
-      const unsigned base = 30000 + ((GetCurrentProcessId() * 13 + attempt * 137) % 20000);
+      const unsigned rawBase = 30000 + ((GetCurrentProcessId() * 13 + attempt * 137) % 20000);
+      const unsigned base = pattern_ == MappingPattern::Random ? rawBase / 256 * 256 : rawBase;
       try {
         for (unsigned side = 0; side < 2; ++side) {
           const std::string host = side == 0 ? "127.0.0.2" : "127.0.0.3";
@@ -141,6 +150,10 @@ class VirtualNat {
       }
     }
     require(basePort_ != 0, "could not bind finite virtual NAT port pool");
+    if (pattern_ == MappingPattern::Random) {
+      internal_[0].sin_addr = address("127.0.0.10", 0).sin_addr;
+      internal_[1].sin_addr = address("127.0.0.11", 0).sin_addr;
+    }
     worker_ = std::thread([this] { run(); });
   }
   ~VirtualNat() {
@@ -165,6 +178,12 @@ class VirtualNat {
     return port >= basePort_ && port < basePort_ + kPortPool &&
            mappings_[side][port - basePort_].has_value();
   }
+  unsigned mappingOwner(unsigned side, unsigned port) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (port < basePort_ || port >= basePort_ + kPortPool) return 0;
+    const auto& entry = mappings_[side][port - basePort_];
+    return entry ? ntohs(entry->internal.sin_port) : 0;
+  }
   std::string mappingTrace() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::ostringstream output;
@@ -178,9 +197,11 @@ class VirtualNat {
   }
 
  private:
-  struct Mapping { sockaddr_in remote{}; };
+  struct Mapping { sockaddr_in remote{}; sockaddr_in internal{}; std::set<std::string> allowed; };
   int internalSide(const sockaddr_in& source) const {
-    for (unsigned side = 0; side < 2; ++side) if (sameAddress(source, internal_[side])) return side;
+    for (unsigned side = 0; side < 2; ++side) if (pattern_ == MappingPattern::Random
+        ? source.sin_addr.s_addr == internal_[side].sin_addr.s_addr
+        : sameAddress(source, internal_[side])) return side;
     return -1;
   }
   std::optional<std::pair<unsigned, unsigned>> externalSource(const sockaddr_in& source) const {
@@ -194,12 +215,16 @@ class VirtualNat {
     }
     return std::nullopt;
   }
-  std::optional<unsigned> createMapping(unsigned side, const sockaddr_in& remote) {
-    const auto key = addressKey(remote);
+  std::optional<unsigned> createMapping(unsigned side, const sockaddr_in& remote, const sockaddr_in& internal) {
+    const auto key = addressKey(internal) + (stable_first_ && side == 0 ? "" : "/" + addressKey(remote));
     const auto found = byDestination_[side].find(key);
-    if (found != byDestination_[side].end()) return found->second;
-    const unsigned sequence = nextMapping_[side]++;
+    if (found != byDestination_[side].end()) { mappings_[side][found->second]->allowed.insert(addressKey(remote)); return found->second; }
+    const unsigned sequence = nextMapping_[side];
     unsigned slot = kAllocationStart + sequence;
+    if (pattern_ == MappingPattern::Random) {
+      if (sequence >= kPortPool) { ++stats_.outOfPoolDrops; return std::nullopt; }
+      slot = randomSlots_[side][sequence];
+    }
     if (pattern_ == MappingPattern::Noisy || pattern_ == MappingPattern::NearbyAfterNoisySamples) {
       static constexpr unsigned initial[] = {0, 7, 2, 11};
       slot = kAllocationStart + (sequence < 4 ? initial[sequence] :
@@ -211,7 +236,8 @@ class VirtualNat {
       ++stats_.outOfPoolDrops;
       return std::nullopt;
     }
-    mappings_[side][slot] = Mapping{remote};
+    mappings_[side][slot] = Mapping{remote, internal, {addressKey(remote)}};
+    ++nextMapping_[side];
     byDestination_[side].emplace(key, slot);
     return slot;
   }
@@ -225,8 +251,9 @@ class VirtualNat {
         data[4] != 0x21 || data[5] != 0x12 || data[6] != 0xa4 || data[7] != 0x42) return;
     observeInternal(static_cast<unsigned>(side), source);
     ++stats_.stunRequests;
+    if (!stats_.primaryInternalPorts[side]) stats_.primaryInternalPorts[side] = ntohs(source.sin_port);
     stats_.sampledTargets[side].insert(endpoint);
-    const auto slot = createMapping(static_cast<unsigned>(side), stun_[endpoint]->bound);
+    const auto slot = createMapping(static_cast<unsigned>(side), stun_[endpoint]->bound, source);
     if (!slot) return;
     std::array<unsigned char, 32> response{};
     response[0] = 1; response[1] = 1; response[3] = 12;
@@ -250,7 +277,7 @@ class VirtualNat {
       // Outgoing NAT mapping must be allocated even when the destination public
       // port does not exist. This models the port consumption of failed checks.
       const auto slot = createMapping(static_cast<unsigned>(outgoingSide),
-                                      external_[destinationSide][destinationSlot]->bound);
+                                      external_[destinationSide][destinationSlot]->bound, source);
       if (slot) external_[outgoingSide][*slot]->send(data, size,
                          external_[destinationSide][destinationSlot]->bound);
       return;
@@ -260,14 +287,19 @@ class VirtualNat {
     ++stats_.publicDatagrams;
     const auto& destination = mappings_[destinationSide][destinationSlot];
     if (!destination) { ++stats_.unmappedDrops; return; }
-    if (!independentFiltering_[destinationSide] && !sameAddress(destination->remote, source)) {
+    if (!independentFiltering_[destinationSide] && !destination->allowed.count(addressKey(source))) {
       ++stats_.filteringDrops;
       return;
     }
     // Forward from the original source public socket, preserving the source
     // that the real ICE stack observes. The destination is the real agent UDP
     // socket; DTLS/SCTP and ICE authentication are never decoded or synthesized.
-    external_[outgoing->first][outgoing->second]->send(data, size, internal_[destinationSide]);
+    if (corrupt_ && size > 20 && (data[0] & 0xc0) == 0 && data[4] == 0x21) {
+      std::vector<unsigned char> invalid(data, data + size);
+      invalid.back() ^= 1;
+      external_[outgoing->first][outgoing->second]->send(invalid.data(), size, destination->internal);
+      ++stats_.corruptedPackets;
+    } else external_[outgoing->first][outgoing->second]->send(data, size, destination->internal);
     ++stats_.forwardedDatagrams;
   }
   void drain(UdpSocket& socket, const std::function<void(const unsigned char*, int, const sockaddr_in&)>& handle) {
@@ -308,6 +340,9 @@ class VirtualNat {
     }
   }
 
+  std::array<std::array<unsigned, kPortPool>, 2> randomSlots_{};
+  bool stable_first_ = false;
+  bool corrupt_ = false;
   MappingPattern pattern_;
   std::array<bool, 2> independentFiltering_{};
   std::array<sockaddr_in, 2> internal_{};
@@ -350,6 +385,8 @@ struct ScenarioResult {
   unsigned predictions = 0;
   unsigned linearPredictions = 0;
   std::array<unsigned, 2> checkedPredictions{};
+  std::array<unsigned, 2> selectedInternalPorts{};
+  unsigned selectedAuxiliarySockets = 0;
   unsigned candidates = 0;
   std::array<std::string, 2> selectedLocal;
   std::array<std::string, 2> selectedRemote;
@@ -365,8 +402,9 @@ struct Cleanup {
 
 ScenarioResult runScenario(const std::string& name, MappingPattern pattern, unsigned stunCount,
                            bool expectConnected, bool independentFiltering = false,
-                           bool exchangePredictions = true, bool delayedPrediction = false) {
-  VirtualNat fixture(pattern, independentFiltering);
+                           bool exchangePredictions = true, bool delayedPrediction = false,
+                           bool multiSocket = false, unsigned seed = 1, bool observeResult = false, bool corrupt = false, bool stableFirst = false) {
+  VirtualNat fixture(pattern, independentFiltering, seed, corrupt, stableFirst);
   Signaling signaling;
   std::array<std::shared_ptr<rtc::PeerConnection>, 2> peers;
   rtc::binary payload(4096);
@@ -374,10 +412,17 @@ ScenarioResult runScenario(const std::string& name, MappingPattern pattern, unsi
     payload[index] = static_cast<std::byte>((index * 37 + 11) & 255);
   for (unsigned side = 0; side < 2; ++side) {
     rtc::Configuration config;
-    config.bindAddress = "127.0.0.1";
+    config.bindAddress = pattern == MappingPattern::Random
+      ? (side == 0 ? "127.0.0.10" : "127.0.0.11") : "127.0.0.1";
+#if defined(RTC_VDS_MULTISOCKET_ICE)
+    config.enableIceMultiSocket = multiSocket;
+#else
+    require(!multiSocket, "multi socket backend not compiled");
+#endif
     config.enableIceTcp = false;
     config.portRangeBegin = fixture.internalPort(side);
     config.portRangeEnd = fixture.internalPort(side);
+    if (pattern == MappingPattern::Random) config.portRangeBegin = config.portRangeEnd = 0;
     for (unsigned index = 0; index < stunCount; ++index)
       config.iceServers.emplace_back("127.0.0.1", fixture.stunPort(index));
     peers[side] = std::make_shared<rtc::PeerConnection>(config);
@@ -459,7 +504,7 @@ ScenarioResult runScenario(const std::string& name, MappingPattern pattern, unsi
         for (auto candidate : set) {
           ++result.candidates;
           candidate.resolve();
-          require(candidate.port() && fixture.listensAtPort(*candidate.port()),
+          require(candidate.port() && (pattern == MappingPattern::Random || fixture.listensAtPort(*candidate.port())),
                   name + ": an emitted remote candidate port bypasses the virtual NAT listener pool");
           if (candidate.candidate().find("vds-predicted 1") != std::string::npos) {
             ++result.predictions;
@@ -472,7 +517,7 @@ ScenarioResult runScenario(const std::string& name, MappingPattern pattern, unsi
             predictedCandidatePorts[side].insert(*candidate.port());
           } else { ++realSamples; }
         }
-        require(realSamples == stunCount,
+        require((stableFirst && side == 0) ? realSamples == 1 : realSamples == stunCount,
                 name + ": gathering completed before the confirmed STUN candidates were emitted");
       }
       // Interleave both endpoints' candidates to let both real ICE agents punch
@@ -508,14 +553,14 @@ ScenarioResult runScenario(const std::string& name, MappingPattern pattern, unsi
   }
   result.connected = signaling.received && signaling.echoed;
   require(candidatesExchanged, name + ": gathering/signaling never completed");
-  if (result.connected != expectConnected) {
+  if (!observeResult && result.connected != expectConnected) {
     std::cerr << "TRACE " << name << fixture.mappingTrace() << std::endl;
     std::lock_guard<std::mutex> lock(signaling.mutex);
     for (unsigned side = 0; side < 2; ++side)
       for (const auto& candidate : signaling.candidates[side])
         std::cerr << "candidate " << side << " " << candidate.candidate() << std::endl;
   }
-  require(result.connected == expectConnected, name + ": unexpected real DataChannel result");
+  require(observeResult || result.connected == expectConnected, name + ": unexpected real DataChannel result");
   if (result.connected) {
     for (unsigned side = 0; side < 2; ++side) {
       rtc::Candidate local, remote;
@@ -526,10 +571,39 @@ ScenarioResult runScenario(const std::string& name, MappingPattern pattern, unsi
       require(remote.address() && *remote.address() == (side == 0 ? "127.0.0.3" : "127.0.0.2") &&
               remote.port() && fixture.hasMapping(1 - side, *remote.port()),
               name + ": selected pair did not use an actual external NAT mapping");
+      local.resolve();
+      if (pattern == MappingPattern::Random && local.port()) {
+        auto owner = fixture.mappingOwner(side, *local.port());
+        require(owner != 0, name + ": selected local socket has no real NAT mapping");
+        result.selectedInternalPorts[side] = owner;
+        result.selectedAuxiliarySockets += owner != fixture.snapshot().primaryInternalPorts[side];
+      }
       result.selectedLocal[side] = local.candidate();
       result.selectedRemote[side] = remote.candidate();
     }
-    require(result.predictions > 0, name + ": connected without predicted candidates");
+    require(pattern == MappingPattern::Random || result.predictions > 0, name + ": connected without predicted candidates");
+  }
+  if (multiSocket && result.connected) {
+    // The ordinary path may legitimately win, especially for stable/random peers.
+    // Matrix acceptance below still requires a verified auxiliary winner.
+    const auto until = std::chrono::steady_clock::now() + 7s;
+    while (std::chrono::steady_clock::now() < until) {
+      signaling.echoed = false;
+      channel->send(payload);
+      auto reply = std::chrono::steady_clock::now() + 1s;
+      while (!signaling.echoed && std::chrono::steady_clock::now() < reply) std::this_thread::sleep_for(5ms);
+      require(signaling.echoed, "selected auxiliary socket stopped carrying DTLS/SCTP data or consent failed");
+      std::this_thread::sleep_for(100ms);
+    }
+  }
+  if (multiSocket && result.connected) {
+    const auto running = fixture.snapshot();
+    for (unsigned side = 0; side < 2; ++side) {
+      for (unsigned port : running.internalPorts[side]) {
+        if (port == running.primaryInternalPorts[side] || port == result.selectedInternalPorts[side]) continue;
+        UdpSocket released(address(side ? "127.0.0.11" : "127.0.0.10", static_cast<std::uint16_t>(port)));
+      }
+    }
   }
   if (pattern == MappingPattern::OutsidePredictionBudget) {
     const auto exhausted = fixture.snapshot();
@@ -554,16 +628,24 @@ ScenarioResult runScenario(const std::string& name, MappingPattern pattern, unsi
   for (unsigned side = 0; side < 2; ++side) {
     for (const unsigned target : result.fixture.checkedExternalPorts[side])
       if (predictedCandidatePorts[1 - side].count(target)) ++result.checkedPredictions[side];
-    require(result.fixture.internalPorts[side].size() == 1 &&
-            *result.fixture.internalPorts[side].begin() == fixture.internalPort(side),
+    require((pattern == MappingPattern::Random && (multiSocket || result.fixture.internalPorts[side].size() == 1)) ||
+            (result.fixture.internalPorts[side].size() == 1 &&
+             *result.fixture.internalPorts[side].begin() == fixture.internalPort(side)),
             name + ": STUN and ICE did not share the real agent UDP source port");
     require(result.fixture.sampledTargets[side].size() == stunCount,
             name + ": did not sample every configured STUN target");
     require(result.fixture.mappingCount[side] <= VirtualNat::kPortPool,
             name + ": exceeded finite mapping budget");
   }
+  if (pattern == MappingPattern::Random) {
+    for (unsigned side = 0; side < 2; ++side)
+      for (unsigned port : result.fixture.internalPorts[side]) {
+        UdpSocket released(address(side ? "127.0.0.11" : "127.0.0.10", static_cast<std::uint16_t>(port)));
+      }
+  }
+  if (corrupt) require(result.fixture.corruptedPackets > 0 && !result.connected, "invalid ICE probes bypassed authentication");
   require(result.predictions <= 32, name + ": exceeded 16 predictions per endpoint");
-  require(result.fixture.internalDatagrams < 4000, name + ": unbounded ICE packet budget");
+  require(result.fixture.internalDatagrams < (multiSocket ? 12000u : 4000u), name + ": unbounded ICE packet budget");
   peers[0]->resetCallbacks();
   peers[1]->resetCallbacks();
   {
@@ -579,6 +661,8 @@ void printResult(const ScenarioResult& result) {
             << ",\"linearPredictions\":" << result.linearPredictions
             << ",\"checkedPredictedPorts\":[" << result.checkedPredictions[0]
             << "," << result.checkedPredictions[1] << "]"
+            << ",\"auxiliaryWinners\":" << result.selectedAuxiliarySockets
+            << ",\"internalSockets\":[" << result.fixture.internalPorts[0].size() << "," << result.fixture.internalPorts[1].size() << "]"
             << ",\"candidates\":" << result.candidates
             << ",\"stunRequests\":" << result.fixture.stunRequests
             << ",\"internalDatagrams\":" << result.fixture.internalDatagrams
@@ -645,10 +729,37 @@ void testBackendPredictionLimit() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
     Winsock winsock;
     rtc::InitLogger(rtc::LogLevel::Warning);
+    if (argc > 1 && std::string(argv[1]) == "--random-invalid") {
+      printResult(runScenario("random-invalid-ice-no-false-connect", MappingPattern::Random,
+        4, false, true, true, false, true, 1, false, true));
+      return 0;
+    }
+    if (argc > 1 && std::string(argv[1]).find("--random") == 0) {
+      const bool multi = std::string(argv[1]) == "--random-multi";
+      if (multi) printResult(runScenario("stable-to-random-exact-filtering", MappingPattern::Random,
+        4, true, false, true, false, true, 7, false, false, true));
+      unsigned connected = 0, auxiliaryWinners = 0;
+      for (unsigned seed = 1; seed <= 6; ++seed) {
+        auto result = runScenario("random-nat-seed-" + std::to_string(seed),
+          MappingPattern::Random, 4, multi, false, true, false, multi, seed, multi);
+        connected += result.connected;
+        auxiliaryWinners += result.selectedAuxiliarySockets;
+        if (multi) for (const auto& ports : result.fixture.internalPorts)
+          require(ports.size() > 1, "random strategy never used additional real UDP sockets");
+        printResult(result);
+      }
+      std::cout << "RANDOM-NAT " << (multi ? "multi" : "single") << " connected=" << connected << "/6" << std::endl;
+      if (multi) {
+        require(connected >= 2, "random multi socket did not improve finite NAT reachability");
+        require(auxiliaryWinners > 0, "matrix never selected an auxiliary socket for real DTLS/SCTP");
+      }
+      return 0;
+    }
+
     // Both endpoints have destination-dependent mapping. Endpoint A permits
     // incoming traffic from any source on existing mappings, B filters by the
     // exact endpoint to which its mapping was opened. Host candidates are never

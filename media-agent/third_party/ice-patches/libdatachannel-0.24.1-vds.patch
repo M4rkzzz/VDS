@@ -1,47 +1,3 @@
---- a/src/impl/icetransport.cpp
-+++ b/src/impl/icetransport.cpp
-@@ -97,21 +97,21 @@
- 		jconfig.concurrency_mode = JUICE_CONCURRENCY_MODE_POLL;
- 	}
- 
--	// Randomize servers order
-+	// VDS preserves selected-primary order and probes all configured STUN targets.
- 	std::vector<IceServer> servers = config.iceServers;
--	std::shuffle(servers.begin(), servers.end(), utils::random_engine());
--
--	// Pick a STUN server
- 	for (auto &server : servers) {
--		if (!server.hostname.empty() && server.type == IceServer::Type::Stun) {
--			if (server.port == 0)
--				server.port = 3478; // STUN UDP port
--			PLOG_INFO << "Using STUN server \"" << server.hostname << ":" << server.port << "\"";
-+		if (server.hostname.empty() || server.type != IceServer::Type::Stun) continue;
-+		if (!server.port) server.port = 3478;
-+		if (!jconfig.stun_server_host) {
- 			jconfig.stun_server_host = server.hostname.c_str();
- 			jconfig.stun_server_port = server.port;
--			break;
- 		}
--	}
-+		if (jconfig.stun_servers_count >= JUICE_VDS_MAX_STUN_SERVERS) break;
-+		juice_stun_server_t &target = jconfig.stun_servers[jconfig.stun_servers_count++];
-+		target.host = server.hostname.c_str();
-+		target.port = server.port;
-+	}
-+	jconfig.enable_port_prediction = true;
- 
- 	// Bind address
- 	if (config.bindAddress) {
---- a/include/rtc/configuration.hpp
-+++ b/include/rtc/configuration.hpp
-@@ -8,6 +8,7 @@
- 
- #ifndef RTC_ICE_CONFIGURATION_H
- #define RTC_ICE_CONFIGURATION_H
-+#define RTC_VDS_ENHANCED_ICE 1
- 
- #include "common.hpp"
- 
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -301,7 +301,7 @@
@@ -81,6 +37,60 @@
  		target_compile_definitions(datachannel PRIVATE RTC_SYSTEM_JUICE=1)
  		target_compile_definitions(datachannel-static PRIVATE RTC_SYSTEM_JUICE=1)
  		target_link_libraries(datachannel PRIVATE LibJuice::LibJuice)
+--- a/include/rtc/configuration.hpp
++++ b/include/rtc/configuration.hpp
+@@ -8,6 +8,8 @@
+ 
+ #ifndef RTC_ICE_CONFIGURATION_H
+ #define RTC_ICE_CONFIGURATION_H
++#define RTC_VDS_ENHANCED_ICE 1
++#define RTC_VDS_MULTISOCKET_ICE 1
+ 
+ #include "common.hpp"
+ 
+@@ -64,6 +66,7 @@
+ enum class TransportPolicy { All = RTC_TRANSPORT_POLICY_ALL, Relay = RTC_TRANSPORT_POLICY_RELAY };
+ 
+ struct RTC_CPP_EXPORT Configuration {
++	bool enableIceMultiSocket = true;
+ 	// ICE settings
+ 	std::vector<IceServer> iceServers;
+ 	optional<ProxyServer> proxyServer; // libnice only
+--- a/src/impl/icetransport.cpp
++++ b/src/impl/icetransport.cpp
+@@ -97,21 +97,22 @@
+ 		jconfig.concurrency_mode = JUICE_CONCURRENCY_MODE_POLL;
+ 	}
+ 
+-	// Randomize servers order
++	// VDS preserves selected-primary order and probes all configured STUN targets.
+ 	std::vector<IceServer> servers = config.iceServers;
+-	std::shuffle(servers.begin(), servers.end(), utils::random_engine());
+-
+-	// Pick a STUN server
+ 	for (auto &server : servers) {
+-		if (!server.hostname.empty() && server.type == IceServer::Type::Stun) {
+-			if (server.port == 0)
+-				server.port = 3478; // STUN UDP port
+-			PLOG_INFO << "Using STUN server \"" << server.hostname << ":" << server.port << "\"";
++		if (server.hostname.empty() || server.type != IceServer::Type::Stun) continue;
++		if (!server.port) server.port = 3478;
++		if (!jconfig.stun_server_host) {
+ 			jconfig.stun_server_host = server.hostname.c_str();
+ 			jconfig.stun_server_port = server.port;
+-			break;
+ 		}
+-	}
++		if (jconfig.stun_servers_count >= JUICE_VDS_MAX_STUN_SERVERS) break;
++		juice_stun_server_t &target = jconfig.stun_servers[jconfig.stun_servers_count++];
++		target.host = server.hostname.c_str();
++		target.port = server.port;
++	}
++	jconfig.enable_port_prediction = true;
++	jconfig.enable_multi_socket_punch = config.enableIceMultiSocket;
+ 
+ 	// Bind address
+ 	if (config.bindAddress) {
 --- a/src/impl/peerconnection.cpp
 +++ b/src/impl/peerconnection.cpp
 @@ -1149,6 +1149,7 @@

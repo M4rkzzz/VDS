@@ -652,6 +652,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       std::to_string(g_next_transport_generation.fetch_add(1));
 #ifdef VDS_MEDIA_AGENT_ENHANCED_ICE
     snapshot.nat_traversal_enabled = true;
+#ifdef RTC_VDS_MULTISOCKET_ICE
+    snapshot.multi_socket_nat_enabled = true;
+#endif
 #endif
     snapshot.encoded_media_data_channel_requested = encoded_media_data_channel_requested;
     if (encoded_media_data_channel_requested) {
@@ -667,6 +670,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 
     rtc::Configuration config;
     config.enableIceTcp = true;
+#ifdef RTC_VDS_MULTISOCKET_ICE
+    config.enableIceMultiSocket = true;
+#endif
     config.disableAutoNegotiation = true;
     for (const auto& server : snapshot.stun_servers) {
       // The upstream URI constructor splits at the first colon, including
@@ -2783,6 +2789,7 @@ std::string peer_transport_snapshot_json(const PeerTransportSnapshot& snapshot) 
     << ",\"remoteCandidateCount\":" << snapshot.remote_candidate_count
     << ",\"remoteDescriptionSet\":" << (snapshot.remote_description_set ? "true" : "false")
     << ",\"natTraversalEnabled\":" << (snapshot.nat_traversal_enabled ? "true" : "false")
+    << ",\"multiSocketNatEnabled\":" << (snapshot.multi_socket_nat_enabled ? "true" : "false")
     << ",\"natProbeObservations\":" << snapshot.nat_probe_observations
     << ",\"natPortStep\":" << snapshot.nat_port_step
     << ",\"predictedLocalCandidates\":" << snapshot.predicted_local_candidates

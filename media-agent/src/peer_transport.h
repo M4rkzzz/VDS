@@ -29,6 +29,7 @@ struct PeerTransportSnapshot {
   int predicted_local_candidates = 0;
   int predicted_remote_candidates = 0;
   bool nat_traversal_enabled = false;
+  bool multi_socket_nat_enabled = false;
   std::uint64_t video_frames_sent = 0;
   std::uint64_t audio_frames_sent = 0;
   std::uint64_t remote_video_frames_received = 0;

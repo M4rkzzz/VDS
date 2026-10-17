@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <set>
 #include <vector>
 
 namespace {
@@ -209,7 +210,24 @@ void test_shared_carrier_address_boundaries() {
 }
 } // namespace
 
+static void test_random_exploration_policy() {
+  for (const auto anchor : {53u, 1024u, 42001u, 65535u}) {
+    std::array<std::uint16_t, 100> ports{};
+    auto count = vds_nat_random_ports(static_cast<std::uint16_t>(anchor), 12345u, ports.data(), ports.size());
+    expect(count == ports.size(), "random exploration fills its connection-only plan at boundary anchors");
+    std::set<std::uint16_t> unique(ports.begin(), ports.begin() + count);
+    expect(unique.size() == count && !unique.count(static_cast<std::uint16_t>(anchor)), "random hypotheses are unique and exclude their anchor");
+    expect(*unique.begin() >= 1024, "random hypotheses never wrap into low/zero ports");
+    if (anchor >= 1024) {
+      expect(std::any_of(ports.begin(), ports.end(), [&](auto port) { return (port & 0xff00u) != (anchor & 0xff00u); }),
+             "random exploration includes the wider port space, not only a near-port scan");
+    }
+  }
+  expect(vds_nat_random_ports(42000, 0, nullptr, 100) == 0, "absent random output is rejected");
+}
+
 int main() {
+  test_random_exploration_policy();
   test_shared_carrier_address_boundaries();
   test_linear_and_reply_order();
   test_mapping_classification();
