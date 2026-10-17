@@ -106,6 +106,7 @@ void emit_peer_video_sender_breadcrumb(const std::string& step) {
 
 void reset_peer_media_binding_sender_metrics(PeerMediaBindingState& binding) {
   binding.source_frames_captured = 0;
+  binding.source_frames_repeated = 0;
   binding.avg_source_copy_resource_us = 0;
   binding.avg_source_map_us = 0;
   binding.avg_source_memcpy_us = 0;
@@ -417,6 +418,7 @@ bool start_peer_video_sender(
 
       std::shared_ptr<WgcFrameSource> wgc_source;
       bool placeholder_mode_active = use_window_restore_placeholder;
+      bool recovering_source = false;
       bool refresh_pending = false;
       std::int64_t next_placeholder_deadline_us = -1;
       const int placeholder_width = std::max(1, source_frame_width);
@@ -434,6 +436,9 @@ bool start_peer_video_sender(
       WgcFrameReadbackSampler readback_sampler(runtime->frame_interval_us, source_frame_width, source_frame_height);
       WgcFrameCpuBuffer frame;
       std::string frame_error;
+      bool have_frame = false;
+      std::int64_t next_encoder_deadline_us = -1;
+      std::uint64_t last_frame_timestamp_us = 0;
 
       if (use_window_restore_placeholder) {
 #ifdef _WIN32
@@ -514,9 +519,9 @@ bool start_peer_video_sender(
         if (!wgc_source) {
           wgc_source = try_create_wgc_source();
           if (!wgc_source) {
-            if (placeholder_mode_active) {
+            if (placeholder_mode_active || recovering_source) {
               sleep_until_steady_us(
-                current_time_micros_steady() + 250000,
+                current_time_micros_steady() + (recovering_source ? 1500000 : 250000),
                 &runtime->stop_requested
               );
               continue;
@@ -525,19 +530,42 @@ bool start_peer_video_sender(
           }
           next_placeholder_deadline_us = -1;
           readback_sampler.reset();
+          have_frame = false;
+          next_encoder_deadline_us = -1;
           placeholder_mode_active = false;
+          recovering_source = false;
         }
 
-        if (!wgc_source->wait_for_frame_bgra(250, &frame, &frame_error, &readback_sampler)) {
+        const auto remaining_us = next_encoder_deadline_us - current_time_micros_steady();
+        const int frame_wait_ms = have_frame
+          ? static_cast<int>(std::min<std::int64_t>(250, std::max<std::int64_t>(1, (remaining_us + 999) / 1000)))
+          : 250;
+        bool repeated_frame = false;
+        if (!wgc_source->wait_for_frame_bgra(frame_wait_ms, &frame, &frame_error, &readback_sampler)) {
           if (runtime->stop_requested.load()) {
             break;
           }
-          if (frame_error == "wgc-frame-timeout" || frame_error == "wgc-frame-pool-recreated" ||
+          if (frame_error == "wgc-frame-timeout" && have_frame) {
+            // WGC is change-driven. Keep the encoder's configured cadence on a
+            // static desktop using retained pixels, with no extra GPU readback.
+            repeated_frame = true;
+          } else if (frame_error == "wgc-frame-timeout" || frame_error == "wgc-frame-pool-recreated" ||
               frame_error == "wgc-frame-skipped") {
             continue;
+          } else {
+            update_runtime_state("peer-video-source-frame-failed", frame_error, false);
+            if (frame_error == "wgc-source-closed" || frame_error == "wgc-frame-output-missing") {
+              break;
+            }
+            // A lost D3D device/readback failure must not permanently close the
+            // encoder pipe. Recreate capture on its owning thread, as preview does.
+            wgc_source->close();
+            wgc_source.reset();
+            recovering_source = true;
+            have_frame = false;
+            sleep_until_steady_us(current_time_micros_steady() + 250000, &runtime->stop_requested);
+            continue;
           }
-          update_runtime_state("peer-video-source-frame-failed", frame_error, false);
-          break;
         }
 
         const bool frame_geometry_changed =
@@ -560,7 +588,7 @@ bool start_peer_video_sender(
           continue;
         }
 
-        {
+        if (!repeated_frame) {
           std::lock_guard<std::mutex> lock(runtime->mutex);
           runtime->source_frames_captured += 1;
           runtime->source_copy_resource_us_total += frame.copy_resource_us;
@@ -569,10 +597,26 @@ bool start_peer_video_sender(
           runtime->source_total_readback_us_total += frame.total_readback_us;
         }
 
-        if (!write_bgra_frame(frame.bgra, vds::media_agent::host_media_system_relative_timestamp_us(
-          runtime->source_clock, frame.timestamp_100ns))) {
+        if (next_encoder_deadline_us > 0 &&
+            !sleep_until_steady_us(next_encoder_deadline_us, &runtime->stop_requested)) {
           break;
         }
+        const auto timestamp_us = repeated_frame
+          ? vds::media_agent::host_media_now_us(runtime->source_clock)
+          : vds::media_agent::host_media_system_relative_timestamp_us(runtime->source_clock, frame.timestamp_100ns);
+        last_frame_timestamp_us = std::max(timestamp_us, last_frame_timestamp_us + 1);
+        if (!write_bgra_frame(frame.bgra, last_frame_timestamp_us)) {
+          break;
+        }
+        if (repeated_frame) {
+          std::lock_guard<std::mutex> lock(runtime->mutex);
+          ++runtime->source_frames_repeated;
+        }
+        have_frame = true;
+        const auto after_write_us = current_time_micros_steady();
+        next_encoder_deadline_us = next_encoder_deadline_us > 0
+          ? std::max(next_encoder_deadline_us + static_cast<std::int64_t>(runtime->frame_interval_us), after_write_us)
+          : after_write_us + static_cast<std::int64_t>(runtime->frame_interval_us);
         update_runtime_state("peer-video-sender-running", "", true);
       }
 
@@ -785,6 +829,7 @@ bool start_peer_video_sender(
   set_peer_transport_keyframe_request_handler(transport_session,
     vds::media_agent::make_peer_video_sender_keyframe_request_handler(runtime));
   peer.media_binding.source_frames_captured = 0;
+  peer.media_binding.source_frames_repeated = 0;
   peer.media_binding.avg_source_copy_resource_us = 0;
   peer.media_binding.avg_source_map_us = 0;
   peer.media_binding.avg_source_memcpy_us = 0;
@@ -842,6 +887,7 @@ void refresh_peer_media_binding(PeerState& peer) {
   }
 #endif
   peer.media_binding.source_frames_captured = runtime.source_frames_captured;
+  peer.media_binding.source_frames_repeated = runtime.source_frames_repeated;
   if (runtime.source_frames_captured > 0) {
     peer.media_binding.avg_source_copy_resource_us =
       runtime.source_copy_resource_us_total / runtime.source_frames_captured;

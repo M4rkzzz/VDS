@@ -23,6 +23,7 @@
 struct PeerVideoSenderRuntime {
   bool running = false;
   unsigned long long source_frames_captured = 0;
+  unsigned long long source_frames_repeated = 0;
   unsigned long long source_copy_resource_us_total = 0;
   unsigned long long source_map_us_total = 0;
   unsigned long long source_memcpy_us_total = 0;

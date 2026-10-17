@@ -19,6 +19,7 @@ struct PeerMediaBindingState {
   std::string reason = "peer-media-not-attached";
   std::string last_error;
   unsigned long long source_frames_captured = 0;
+  unsigned long long source_frames_repeated = 0;
   unsigned long long avg_source_copy_resource_us = 0;
   unsigned long long avg_source_map_us = 0;
   unsigned long long avg_source_memcpy_us = 0;

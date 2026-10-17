@@ -149,7 +149,9 @@ class ViewerAudioDeviceClock {
       return {};
     }
     const auto elapsed_frames = static_cast<std::uint64_t>(now_us - last_observation_us_) * 48 / 1000;
-    const auto position = device_frames_ + elapsed_frames;
+    // Some devices repeat a coarse position before catching up. A fresh report
+    // must not undo progress that was already exposed to the video scheduler.
+    const auto position = std::max(device_frames_ + elapsed_frames, last_estimated_frame_);
     if (position >= written_frames_) { return {}; }
     for (const auto& segment : segments_) {
       if (position >= segment.begin_frame && position < segment.begin_frame + segment.frames) {
@@ -158,6 +160,7 @@ class ViewerAudioDeviceClock {
         if (segment.timing.timestamp_us > std::numeric_limits<std::uint64_t>::max() - offset_us) {
           return {};
         }
+        last_estimated_frame_ = position;
         return {true, segment.timing.timestamp_us + offset_us, segment.timing.source_id};
       }
     }
@@ -173,6 +176,7 @@ class ViewerAudioDeviceClock {
   std::deque<Segment> segments_;
   std::uint64_t written_frames_ = 0;
   std::uint64_t device_frames_ = 0;
+  mutable std::uint64_t last_estimated_frame_ = 0;
   std::uint64_t raw_wrap_ = 0;
   std::uint32_t last_raw_ = 0;
   std::int64_t last_observation_us_ = 0;

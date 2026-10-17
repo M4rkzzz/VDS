@@ -550,7 +550,8 @@ class WgcFrameSource::Impl {
     }
 
     if (error) {
-      *error = "wgc-frame-timeout";
+      *error = device_ && FAILED(device_->GetDeviceRemovedReason())
+        ? "wgc-device-lost" : "wgc-frame-timeout";
     }
     return false;
 #else

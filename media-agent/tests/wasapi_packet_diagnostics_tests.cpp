@@ -44,6 +44,59 @@ int main() {
   std::cout << "WASAPI packet diagnostics require Windows\n";
   return 0;
 #else
+  expect(recoverable_capture_failure(AUDCLNT_E_DEVICE_INVALIDATED) &&
+      recoverable_capture_failure(AUDCLNT_E_RESOURCES_INVALIDATED) &&
+      recoverable_capture_failure(AUDCLNT_E_SERVICE_NOT_RUNNING),
+    "device and service outages are recoverable");
+  expect(!recoverable_capture_failure(E_ACCESSDENIED) && !recoverable_capture_failure(E_INVALIDARG),
+    "permission and configuration failures do not enter a retry loop");
+  {
+    WasapiRuntime recovering;
+    unsigned int attempts = 0;
+    supervise_capture(recovering, [&](bool& started) {
+      ++attempts;
+      started = true;
+      return attempts == 1 ? AUDCLNT_E_DEVICE_INVALIDATED : S_OK;
+    });
+    expect(attempts == 2, "an established capture reopens after device invalidation");
+  }
+  {
+    WasapiRuntime initial_failure;
+    unsigned int attempts = 0;
+    supervise_capture(initial_failure, [&](bool&) {
+      ++attempts;
+      return AUDCLNT_E_DEVICE_INVALIDATED;
+    });
+    expect(attempts == 1, "initial start failures remain visible to the caller");
+  }
+  {
+    WasapiRuntime stopping;
+    std::atomic<unsigned int> attempts{0};
+    std::thread worker([&]() {
+      supervise_capture(stopping, [&](bool& started) {
+        {
+          std::lock_guard<std::mutex> lock(stopping.mutex);
+          ++attempts;
+          stopping.start_cv.notify_all();
+        }
+        started = true;
+        return AUDCLNT_E_SERVICE_NOT_RUNNING;
+      });
+    });
+    {
+      std::unique_lock<std::mutex> lock(stopping.mutex);
+      const bool entered = stopping.start_cv.wait_for(lock, std::chrono::seconds(1), [&]() {
+        return attempts.load() > 0;
+      });
+      expect(entered, "recovery cancellation test reaches an established capture failure");
+      stopping.stop_requested = true;
+      stopping.stop_cv.notify_all();
+    }
+    const auto stopped_at = std::chrono::steady_clock::now();
+    worker.join();
+    expect(attempts == 1 && std::chrono::steady_clock::now() - stopped_at < std::chrono::milliseconds(200),
+      "stop interrupts recovery backoff and prevents reopening");
+  }
   char* original = nullptr;
   std::size_t original_length = 0;
   _dupenv_s(&original, &original_length, "VDS_VERBOSE_MEDIA_LOGS");

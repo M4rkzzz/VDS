@@ -75,6 +75,27 @@ void test_timing_policy() {
 }
 
 void test_device_clock() {
+  {
+    ViewerAudioDeviceClock clock;
+    clock.record_write(4800, timing(0));
+    clock.observe(0, ViewerAudioPositionUnit::Samples, 0);
+    clock.observe(480, ViewerAudioPositionUnit::Samples, 10000);
+    const auto first = clock.estimate(19000);
+    clock.observe(480, ViewerAudioPositionUnit::Samples, 20000);
+    const auto repeated = clock.estimate(20000);
+    clock.observe(720, ViewerAudioPositionUnit::Samples, 21000);
+    const auto advanced = clock.estimate(21000);
+    check(first.valid && repeated.valid && advanced.valid &&
+      repeated.timestamp_us >= first.timestamp_us && advanced.timestamp_us >= repeated.timestamp_us,
+      "coarse device reports cannot rewind an already interpolated audio clock");
+    clock.observe(1440, ViewerAudioPositionUnit::Samples, 30000);
+    check(clock.estimate(30000).timestamp_us == 30000, "device catches up without accumulating clock drift");
+    clock.reset();
+    clock.record_write(4800, timing(0, "new-source"));
+    clock.observe(0, ViewerAudioPositionUnit::Samples, 40000);
+    clock.observe(480, ViewerAudioPositionUnit::Samples, 50000);
+    check(clock.estimate(50000).timestamp_us == 10000, "source reset clears the interpolation floor");
+  }
   for (const auto unit : {ViewerAudioPositionUnit::Samples, ViewerAudioPositionUnit::Bytes,
                           ViewerAudioPositionUnit::Milliseconds}) {
     ViewerAudioDeviceClock clock;

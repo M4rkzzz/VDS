@@ -212,6 +212,7 @@ class ActivationCompletionHandler final : public IActivateAudioInterfaceCompleti
 struct WasapiRuntime {
   std::mutex mutex;
   std::condition_variable start_cv;
+  std::condition_variable stop_cv;
   std::thread worker;
   bool stop_requested = false;
   bool start_completed = false;
@@ -469,20 +470,20 @@ void record_runtime_failure(
   set_start_complete(state);
 }
 
-void capture_worker_main(DWORD pid, const std::string process_name) {
+HRESULT capture_worker_once(DWORD pid, const std::string& process_name, bool& has_started) {
   WasapiRuntime& state = runtime();
   const WasapiProbeResult probe = probe_wasapi_backend();
   ScopedCoInitialize com(COINIT_APARTMENTTHREADED);
   if (!com.ok()) {
     record_runtime_failure(state, probe, "native-wasapi-com-initialization-failed", hresult_to_string(com.result));
-    return;
+    return com.result;
   }
 
   ComPtr<IAudioClient> audio_client;
   const HRESULT activate_result = activate_process_loopback_audio_client(pid, audio_client);
   if (FAILED(activate_result)) {
     record_runtime_failure(state, probe, "native-wasapi-session-start-failed", hresult_to_string(activate_result));
-    return;
+    return activate_result;
   }
 
   ComPtr<IAudioCaptureClient> capture_client;
@@ -496,7 +497,7 @@ void capture_worker_main(DWORD pid, const std::string process_name) {
   const HRESULT init_result = initialize_capture_client(audio_client.Get(), capture_client, sample_ready_event, configured_status);
   if (FAILED(init_result)) {
     record_runtime_failure(state, probe, "native-wasapi-session-start-failed", hresult_to_string(init_result));
-    return;
+    return init_result;
   }
 
   const HRESULT start_result = audio_client->Start();
@@ -505,12 +506,15 @@ void capture_worker_main(DWORD pid, const std::string process_name) {
       CloseHandle(sample_ready_event);
     }
     record_runtime_failure(state, probe, "native-wasapi-session-start-failed", hresult_to_string(start_result));
-    return;
+    return start_result;
   }
 
   {
     std::lock_guard<std::mutex> lock(state.mutex);
+    configured_status.packets_captured = state.status.packets_captured;
+    configured_status.frames_captured = state.status.frames_captured;
     state.status = configured_status;
+    has_started = true;
     state.status.running = true;
     state.status.capture_active = true;
     state.status.last_error.clear();
@@ -519,6 +523,7 @@ void capture_worker_main(DWORD pid, const std::string process_name) {
   }
 
   bool runtime_failed = false;
+  HRESULT failure = S_OK;
   std::string runtime_error;
   while (true) {
     {
@@ -531,7 +536,8 @@ void capture_worker_main(DWORD pid, const std::string process_name) {
     const DWORD wait_result = WaitForSingleObject(sample_ready_event, 100);
     if (wait_result != WAIT_OBJECT_0 && wait_result != WAIT_TIMEOUT) {
       runtime_failed = true;
-      runtime_error = hresult_to_string(HRESULT_FROM_WIN32(GetLastError()));
+      failure = HRESULT_FROM_WIN32(GetLastError());
+      runtime_error = hresult_to_string(failure);
       break;
     }
 
@@ -540,6 +546,7 @@ void capture_worker_main(DWORD pid, const std::string process_name) {
       const HRESULT next_packet_result = capture_client->GetNextPacketSize(&next_packet_frames);
       if (FAILED(next_packet_result)) {
         runtime_failed = true;
+        failure = next_packet_result;
         runtime_error = hresult_to_string(next_packet_result);
         break;
       }
@@ -562,6 +569,7 @@ void capture_worker_main(DWORD pid, const std::string process_name) {
       );
       if (FAILED(get_buffer_result)) {
         runtime_failed = true;
+        failure = get_buffer_result;
         runtime_error = hresult_to_string(get_buffer_result);
         break;
       }
@@ -588,6 +596,7 @@ void capture_worker_main(DWORD pid, const std::string process_name) {
       const HRESULT release_result = capture_client->ReleaseBuffer(frames_available);
       if (FAILED(release_result)) {
         runtime_failed = true;
+        failure = release_result;
         runtime_error = hresult_to_string(release_result);
         break;
       }
@@ -619,6 +628,42 @@ void capture_worker_main(DWORD pid, const std::string process_name) {
     }
     set_start_complete(state);
   }
+  return failure;
+}
+
+bool recoverable_capture_failure(HRESULT result) {
+  return result == AUDCLNT_E_DEVICE_INVALIDATED ||
+    result == AUDCLNT_E_RESOURCES_INVALIDATED || result == AUDCLNT_E_SERVICE_NOT_RUNNING;
+}
+
+// Retry on the same worker and with the same process selection. Device outages
+// must not tear down the room, encoder subscribers, or the video capture side.
+template <typename CaptureAttempt>
+void supervise_capture(WasapiRuntime& state, CaptureAttempt attempt) {
+  bool has_started = false;
+  unsigned int delay_ms = 250;
+  while (true) {
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      if (state.stop_requested) { return; }
+    }
+    const HRESULT result = attempt(has_started);
+    if (SUCCEEDED(result) || !has_started || !recoverable_capture_failure(result)) { return; }
+    std::unique_lock<std::mutex> lock(state.mutex);
+    if (state.stop_requested) { return; }
+    state.status.reason = "native-wasapi-recovering";
+    state.status.last_error = hresult_to_string(result);
+    if (state.stop_cv.wait_for(lock, std::chrono::milliseconds(delay_ms), [&]() {
+          return state.stop_requested;
+        })) { return; }
+    delay_ms = (std::min)(delay_ms * 2, 2000u);
+  }
+}
+
+void capture_worker_main(DWORD pid, const std::string process_name) {
+  supervise_capture(runtime(), [&](bool& has_started) {
+    return capture_worker_once(pid, process_name, has_started);
+  });
 }
 
 WasapiSessionStatus snapshot_status_locked(WasapiRuntime& state, const WasapiProbeResult& probe) {
@@ -826,6 +871,7 @@ WasapiSessionStatus stop_wasapi_process_loopback_session() {
   {
     std::lock_guard<std::mutex> lock(state.mutex);
     state.stop_requested = true;
+    state.stop_cv.notify_all();
   }
 
   if (state.worker.joinable()) {
