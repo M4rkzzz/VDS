@@ -61,6 +61,10 @@ void refresh_peer_video_receiver_runtime(PeerVideoReceiverRuntime& runtime) {
   runtime.reference_chain_resets = snapshot.reference_chain_resets;
   runtime.decoder_rebuilds = snapshot.decoder_rebuilds;
   runtime.hardware_fallbacks = snapshot.hardware_fallbacks;
+  runtime.gpu_presented_frames = snapshot.gpu_presented_frames;
+  runtime.cpu_readback_frames = snapshot.cpu_readback_frames;
+  runtime.gpu_present_fallbacks = snapshot.gpu_present_fallbacks;
+  runtime.last_present_failure = snapshot.last_present_failure;
   runtime.decoder_backend = snapshot.decoder_backend;
   runtime.last_decoder_failure = snapshot.last_decoder_failure;
   runtime.decode_late_frames = snapshot.decode_late_frames;
@@ -119,6 +123,10 @@ std::string peer_video_receiver_runtime_json(
     << ",\"referenceChainResets\":" << runtime->reference_chain_resets
     << ",\"decoderRebuilds\":" << runtime->decoder_rebuilds
     << ",\"hardwareFallbacks\":" << runtime->hardware_fallbacks
+    << ",\"gpuPresentedFrames\":" << runtime->gpu_presented_frames
+    << ",\"cpuReadbackFrames\":" << runtime->cpu_readback_frames
+    << ",\"gpuPresentFallbacks\":" << runtime->gpu_present_fallbacks
+    << ",\"lastPresentFailure\":\"" << vds::media_agent::json_escape(runtime->last_present_failure) << "\""
     << ",\"decoderBackend\":\"" << vds::media_agent::json_escape(runtime->decoder_backend) << "\""
     << ",\"lastDecoderFailure\":\"" << vds::media_agent::json_escape(runtime->last_decoder_failure) << "\""
     << ",\"decodeLateFrames\":" << runtime->decode_late_frames

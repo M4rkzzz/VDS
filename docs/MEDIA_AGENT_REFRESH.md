@@ -14,7 +14,23 @@
 
 采集侧：WGC 获取窗口/显示器帧，复用 CPU BGRA 缓冲，在回读前按源节奏筛选；FFmpeg 硬件编码输出 Annex-B 访问单元，原生 DataChannel 分片发送。WASAPI 进程回环经本地回调送入音频编码与分发，逐包 JSON/base64 默认关闭。OBS 是另一个采集入口。
 
-播放侧：压缩帧重排、引用链恢复及关键帧请求 → FFmpeg 解码 → 有界待呈现帧队列 → 源时间戳/音频设备时钟驱动的调度 → Win32 GDI 呈现。可用时采用 D3D11VA/DXVA2 硬解，但随后仍需 CPU 回读和像素转换；目前还不是 GPU 纹理直接呈现的 SwapChain。网页侧保持 WebCodecs 独立播放器。
+播放侧：压缩帧重排、引用链恢复及关键帧请求 → FFmpeg 解码 → 有界待呈现帧队列 → 源时间戳/音频设备时钟驱动的调度。D3D11VA 的 SDR/NV12 渐进帧现在直接经 Video Processor → SwapChain 呈现；其他格式、DXVA2、软件解码或 GPU 呈现失败走 CPU 转换/GDI 兼容路径。网页侧保持 WebCodecs 独立播放器。
+
+## 第三轮：D3D11 解码纹理直接呈现
+
+新增独立模块 `native_d3d11_presenter`，在现有原生窗口线程工作，不新增线程或媒体定时器。正常 D3D11VA/NV12 路径将已解码 AVFrame 的所有权移交给最新待绘制图像，保留纹理引用直到提交 Video Processor，直接在 GPU 完成色彩转换、缩放和黑边。没有 `av_hwframe_transfer_data`、CPU BGRA 缓冲或 swscale 转换。只保留最新待绘制图像，仍沿用原有时间戳/音频时钟调度；重复 WM_PAINT 不重复处理同一帧，窗口尺寸变化时才重绘旧帧。
+
+SwapChain 使用独立的无激活、鼠标穿透子窗口，避免 Flip 模型和 GDI 在同一个 HWND 上交替绘制；参见 [Microsoft Flip Model 文档](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/for-best-performance--use-dxgi-flip-model)。优先 flip-discard，再尝试 flip-sequential；硬件不支持或运行期呈现失败则销毁 GPU 子窗口，继续 GDI。视频处理器和 FFmpeg 共用解码设备及其锁，Present 在锁外执行；采用非阻塞 Present 和最多一个排队帧，输入/输出描述使用相同源帧率，不做帧率转换或增加 FPS 上限。
+
+本轮接管的是已覆盖的 SDR/NV12、BT.601/BT.709 渐进内容。HDR、10-bit、其他色彩空间和隔行内容保留原路径，未宣称 HDR 色调映射或跨显卡直传完成。新增诊断 `gpuPresentedFrames`、`cpuReadbackFrames`、`gpuPresentFallbacks`、`lastPresentFailure`，可区分真正走了 GPU 路径还是兼容回退。
+
+真实 H264 硬解后的 GPU 输出像素测试覆盖变化画面、黑边、尺寸变化、重复重绘去重；测试专用回读验证 Video Processor 的输出纹理，不编入生产 agent。注入呈现失败后自动拆除子窗口并恢复 GDI，保留健康硬解器；另验证 GPU 正在呈现时解码器失败能回退软件解码继续绘制。测试没有切换系统显示设置或重置用户显卡。
+
+最终源码 Electron + runtime 的本地 WGC/P2P 两轮十秒观看均使用 `ffmpeg-d3d11-video-processor-swapchain`，GPU 呈现计数分别 15→298、13→295；CPU 回读为零，无呈现回退。离开重进、UI 脚本点击和主进程 IPC 通过，自建进程正常退出且无残留。窗口隐藏，因此不把 Present 成功计数当作物理显示器可见帧、端到端延迟或 VSync 测量。正式安装包尚未更新。
+
+最终 Release 构建、架构检查、原生 CTest 27/27（126.48 秒）通过。GPU 输出测试检查了 72 次变化像素，呈现失败后 GDI 连续处理 35 帧；重复重绘去重和尺寸变化通过。同一组 280 帧 1080p60 输入、相同 AAC/PES 批次和单次新帧重绘条件下，GDI 路径绘制 253 帧、CPU 回读 271 次、进程累计 CPU 时间 1453.12ms；GPU 路径成功 Present 272 帧、CPU 回读 0 次、进程累计 CPU 时间 187.50ms。此为单机单轮的隐藏 32×24 输出窗口测试，编码准备不计入、播放与测试泵计入，未测 GPU 利用率或全屏呈现，不将该比值推广为通用性能提升。最初每 500µs 强制重绘旧 GDI 图像会夸大差距，最终数据已排除这种夹具偏差。
+
+日志为 `tmp/gpu-present-native-final.log`、`tmp/gpu-present-final-detail.log` 和 `tmp/gpu-present-desktop-smoke.log`。最终 runtime EXE 与构建产物 SHA256 一致：`0a8b3dc1bf115b4ddc2b89f9ac0025322469e00728861b5dbb87293e9d128fa7`。本轮不涉及发布安装包或改动 NAS 服务。
 
 ## 第二轮：播放解码器故障恢复
 
@@ -32,7 +48,7 @@
 
 本轮源码 Electron + runtime 的本地 WGC/P2P 原生观看两轮十秒烟测通过，绘制计数分别 13→303、12→298；离开重进、UI 脚本点击与主进程 IPC 正常，自建进程全部正常退出。窗口隐藏，仍采用上一轮的 UI 过渡等待替换，未替换媒体链路。正式安装包仍为 1.7.10，本次源码改进尚未作为新版本发布。
 
-“超过参考实现”需要同机同场景比较首次出帧时间、故障恢复时间、延迟分位数与 CPU/GPU 占用。本轮证明恢复能力补齐，不宣称整体性能超过 GameViewer；GPU 直出呈现和编码器设备重建仍待后续实现。
+“超过参考实现”需要同机同场景比较首次出帧时间、故障恢复时间、延迟分位数与 CPU/GPU 占用。第二轮证明恢复能力补齐，不宣称整体性能超过 GameViewer；第三轮 GPU 呈现进度见上，编码器设备重建仍待后续实现。
 
 ## 本轮改动
 
@@ -53,4 +69,4 @@ Release 构建与最终 runtime 的 EXE 哈希一致；最终完整原生 CTest 
 
 WASAPI 恢复控制流使用故障注入覆盖设备错误、首次失败、成功重开和停止取消；没有切换用户默认音频设备、停止系统音频服务或重置显卡。显卡重置若同时杀死硬件编码器，仍需编码器层恢复，不能将仅采集源恢复宣称为整条 GPU 链路已验收。
 
-完整 GPU 直出 SwapChain、跨适配器纹理传输及采集/编码共享是后续独立改造项，本轮不宣称完成 GameViewer 全栈替换。新增的退避和短期探测预算只约束异常恢复或建连工作，不是媒体运行配额。
+跨适配器纹理传输、HDR/10-bit GPU 呈现及采集/编码共享是后续独立改造项，不宣称完成 GameViewer 全栈替换。新增的退避和短期探测预算只约束异常恢复或建连工作，不是媒体运行配额。

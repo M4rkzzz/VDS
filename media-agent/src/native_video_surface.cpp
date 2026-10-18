@@ -25,6 +25,7 @@
 #include "video_access_unit.h"
 #include "video_bootstrap_helpers.h"
 #include "viewer_audio_playback.h"
+#include "native_d3d11_presenter.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -764,10 +765,12 @@ class NativeVideoSurface::Impl {
     MediaFrameTiming timing;
   };
   struct RenderedImage {
+    std::unique_ptr<AVFrame, FrameDeleter> gpu_frame;
     std::vector<std::uint8_t> bytes;
     int width = 0;
     int height = 0;
     AVRational sample_aspect_ratio{1, 1};
+    AVRational frame_rate{1, 1};
     std::uint64_t serial = 0;
     std::int64_t due_us = 0;
   };
@@ -937,6 +940,7 @@ class NativeVideoSurface::Impl {
     }
     frame_available_.notify_all();
     if (decode_worker_.joinable()) decode_worker_.join();
+    gpu_presenter_.reset();
     cleanup_back_buffer();
     image_pool_ = {};
     destroy_window();
@@ -1421,15 +1425,57 @@ class NativeVideoSurface::Impl {
 
     const int client_width = client_rect.right - client_rect.left;
     const int client_height = client_rect.bottom - client_rect.top;
-    ensure_back_buffer(hdc, client_width, client_height);
-    HDC target_dc = back_buffer_dc_ && back_buffer_bitmap_ ? back_buffer_dc_ : hdc;
-    FillRect(target_dc, &client_rect, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-
     std::shared_ptr<const RenderedImage> image;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       image = latest_image_;
     }
+    if (image && image->gpu_frame) {
+      if (gpu_disabled_.load(std::memory_order_acquire)) {
+        EndPaint(hwnd, &paint_struct);
+        return;
+      }
+      // DWM retains the swapchain image. Expose/paint messages must not submit
+      // the same video frame repeatedly; resizing still redraws that frame.
+      if (image->serial == last_painted_serial_ && client_width == gpu_width_ && client_height == gpu_height_) {
+        EndPaint(hwnd, &paint_struct);
+        return;
+      }
+      int aspect_width = image->width, aspect_height = image->height;
+      get_display_aspect_dimensions(image->width, image->height, image->sample_aspect_ratio, &aspect_width, &aspect_height);
+      const RECT rect = fit_rect_with_aspect(aspect_width, aspect_height, client_width, client_height);
+      std::string error;
+#ifdef VDS_NATIVE_SURFACE_TESTING
+      gpu_presenter_.inspect_output = config_.inspect_gpu_output;
+      const bool injected_failure = config_.fail_gpu_present && config_.fail_gpu_present();
+      auto result = injected_failure ? NativeD3D11Presenter::Result::Failed :
+#else
+      auto result =
+#endif
+        gpu_presenter_.present(hwnd, image->gpu_frame.get(), client_width, client_height,
+          rect.left, rect.top, rect.right, rect.bottom, image->frame_rate.num, image->frame_rate.den, error);
+      if (result == NativeD3D11Presenter::Result::Failed) {
+        gpu_presenter_.reset();
+        gpu_disabled_.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_.gpu_present_fallbacks += 1;
+        snapshot_.last_present_failure = error.empty() ? "injected-gpu-present-failure" : error;
+      }
+      EndPaint(hwnd, &paint_struct);
+      if (result == NativeD3D11Presenter::Result::Presented) {
+        gpu_width_ = client_width;
+        gpu_height_ = client_height;
+        record_painted_frame(*image, true);
+      }
+      return;
+    }
+    // Flip presentation uses its own child HWND. Tear it down before GDI
+    // paints the parent, including when the decoder changes pixel format.
+    gpu_presenter_.reset();
+    gpu_width_ = gpu_height_ = 0;
+    ensure_back_buffer(hdc, client_width, client_height);
+    HDC target_dc = back_buffer_dc_ && back_buffer_bitmap_ ? back_buffer_dc_ : hdc;
+    FillRect(target_dc, &client_rect, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
     const int local_width = image ? image->width : 0;
     const int local_height = image ? image->height : 0;
     bool drew_image = false;
@@ -1478,13 +1524,19 @@ class NativeVideoSurface::Impl {
     }
 
     EndPaint(hwnd, &paint_struct);
-    if (drew_image && image && image->serial != last_painted_serial_) {
-      last_painted_serial_ = image->serial;
+    if (drew_image && image) record_painted_frame(*image, false);
+  }
+
+  void record_painted_frame(const RenderedImage& image, bool gpu) {
+    if (image.serial != last_painted_serial_) {
+      last_painted_serial_ = image.serial;
       const auto now_us = current_time_micros_steady();
       std::lock_guard<std::mutex> lock(mutex_);
       snapshot_.painted_frames += 1;
+      snapshot_.gpu_presented_frames += gpu ? 1 : 0;
+      snapshot_.implementation = gpu ? "ffmpeg-d3d11-video-processor-swapchain" : "ffmpeg-win32-gdi-surface";
       snapshot_.decoded_frames_rendered = snapshot_.painted_frames;
-      const auto lateness_us = std::max<std::int64_t>(0, now_us - image->due_us);
+      const auto lateness_us = std::max<std::int64_t>(0, now_us - image.due_us);
       if (lateness_us > 2000) snapshot_.presentation_late_frames += 1;
       snapshot_.max_presentation_lateness_ms = std::max(snapshot_.max_presentation_lateness_ms,
         static_cast<double>(lateness_us) / 1000.0);
@@ -1665,6 +1717,14 @@ class NativeVideoSurface::Impl {
     }
     if (selected) {
       AVFrame* frame_to_present = selected->frame.get();
+      bool allow_gpu = !gpu_disabled_.load(std::memory_order_acquire);
+#ifdef VDS_NATIVE_SURFACE_TESTING
+      allow_gpu = allow_gpu && !config_.force_gdi;
+#endif
+      if (allow_gpu && NativeD3D11Presenter::supports(frame_to_present)) {
+        publish_gpu_frame(std::move(selected->frame), selected_due_us);
+        return wake;
+      }
       if (hw_pixel_format_ != AV_PIX_FMT_NONE && frame_to_present->format == hw_pixel_format_) {
         av_frame_unref(transfer_frame_);
         int result = 0;
@@ -1677,6 +1737,10 @@ class NativeVideoSurface::Impl {
           selected.reset();
           recover_decoder("transfer", result, true);
           return std::nullopt;
+        }
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          snapshot_.cpu_readback_frames += 1;
         }
         transfer_frame_->sample_aspect_ratio = frame_to_present->sample_aspect_ratio;
         frame_to_present = transfer_frame_;
@@ -2028,6 +2092,25 @@ class NativeVideoSurface::Impl {
     }
   }
 
+  void publish_gpu_frame(std::unique_ptr<AVFrame, FrameDeleter> frame, std::int64_t due_us) {
+    auto image = std::make_shared<RenderedImage>();
+    image->width = frame->width;
+    image->height = frame->height;
+    image->sample_aspect_ratio = frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0
+      ? frame->sample_aspect_ratio : codec_context_->sample_aspect_ratio;
+    image->frame_rate = codec_context_->framerate;
+    image->serial = ++render_serial_;
+    image->due_us = due_us;
+    image->gpu_frame = std::move(frame);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_image_ = std::move(image);
+      snapshot_.last_error.clear();
+      snapshot_.reason = "native-gpu-frame-ready-for-present";
+    }
+    request_frame_drain();
+  }
+
   void present_frame(AVFrame* frame, std::int64_t due_us) {
     if (!frame || frame->width <= 0 || frame->height <= 0) {
       return;
@@ -2149,6 +2232,9 @@ class NativeVideoSurface::Impl {
 #ifdef _WIN32
   std::atomic<HWND> window_handle_ { nullptr };
   std::atomic<bool> frame_drain_pending_ { false };
+  std::atomic<bool> gpu_disabled_ { false };
+  NativeD3D11Presenter gpu_presenter_;
+  int gpu_width_ = 0, gpu_height_ = 0;
   OverlayAnchorState overlay_anchor_{};
   HWINEVENTHOOK owner_move_hook_ = nullptr;
   HWND owner_move_hook_owner_ = nullptr;

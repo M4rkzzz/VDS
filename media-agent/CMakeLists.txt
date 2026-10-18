@@ -44,6 +44,7 @@ add_executable(vds-media-agent
   src/native_live_preview.cpp
   src/native_surface_layout.cpp
   src/native_video_surface.cpp
+  src/native_d3d11_presenter.cpp
   src/obs_ingest_media.cpp
   src/obs_ingest_session.cpp
   src/obs_ingest_state.cpp
@@ -319,6 +320,7 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
     add_executable(vds-native-playback-surface-tests
       tests/native_playback_surface_tests.cpp
       src/native_video_surface.cpp
+      src/native_d3d11_presenter.cpp
       src/video_access_unit.cpp
       src/time_utils.cpp
       src/viewer_audio_playback.cpp
@@ -329,7 +331,7 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
     target_compile_definitions(vds-native-playback-surface-tests PRIVATE VDS_NATIVE_SURFACE_TESTING)
     target_link_libraries(vds-native-playback-surface-tests PRIVATE
       "${VDS_MEDIA_AGENT_AVCODEC_LIBRARY}" "${VDS_MEDIA_AGENT_AVUTIL_LIBRARY}"
-      "${VDS_MEDIA_AGENT_SWSCALE_LIBRARY}" "${VDS_MEDIA_AGENT_SWRESAMPLE_LIBRARY}" User32 Gdi32 Winmm)
+      "${VDS_MEDIA_AGENT_SWSCALE_LIBRARY}" "${VDS_MEDIA_AGENT_SWRESAMPLE_LIBRARY}" User32 Gdi32 Winmm D3D11 Dxgi)
     add_test(NAME vds-native-playback-surface-tests COMMAND vds-native-playback-surface-tests)
     set_tests_properties(vds-native-playback-surface-tests PROPERTIES
       ENVIRONMENT "PATH=${VDS_MEDIA_AGENT_FFMPEG_ROOT}/bin;$ENV{PATH}" TIMEOUT 60)

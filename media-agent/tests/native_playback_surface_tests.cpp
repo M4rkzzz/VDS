@@ -19,6 +19,8 @@
 #endif
 #include <windows.h>
 #include <mmsystem.h>
+#include <d3d11.h>
+#include <wrl/client.h>
 
 #include "media_audio.h"
 #include "native_video_surface.h"
@@ -306,13 +308,15 @@ class OffscreenOwner {
 
 struct SurfaceFixture {
   explicit SurfaceFixture(const std::string& name, unsigned int source_frame_rate = 0,
-      std::function<int(const char*, bool)> decoder_fault = {}) {
+      std::function<int(const char*, bool)> decoder_fault = {},
+      std::function<void(NativeVideoSurfaceConfig&)> customize = {}) {
     NativeVideoSurfaceConfig config;
     config.surface_id = name;
     config.window_title = "VDS native playback integration " + name;
     config.codec = "h264";
     config.frame_rate = source_frame_rate;
     config.decoder_fault = std::move(decoder_fault);
+    config.force_gdi = true;
     config.layout.embedded = true;
     config.layout.visible = false;
     std::ostringstream owner_handle;
@@ -323,6 +327,7 @@ struct SurfaceFixture {
     config.layout.width = 32;
     config.layout.height = 24;
     config.on_keyframe_needed = [this](const std::string&) { keyframe_requests.fetch_add(1); };
+    if (customize) customize(config);
     std::string error;
     surface = create_native_video_surface(config, &error);
     require(surface && error.empty(), "start real native video surface: " + error);
@@ -438,7 +443,86 @@ void assert_closed(SurfaceFixture& fixture, const EncodedAccessUnit& unit) {
   fixture.surface->close("integration-close-again");
 }
 
-void test_decoder_recovery(const std::string& stage, int injected_error) {
+void test_gpu_presentation() {
+  using Microsoft::WRL::ComPtr;
+  std::atomic<bool> fail_present{false};
+  std::atomic<unsigned int> inspected{0}, changed{0};
+  std::atomic<bool> pixels_valid{true};
+  std::uint32_t previous_pixel = 0;
+  SurfaceFixture fixture("gpu-present", kFps, {}, [&](NativeVideoSurfaceConfig& config) {
+    config.force_gdi = false;
+    config.fail_gpu_present = [&] { return fail_present.exchange(false); };
+    config.inspect_gpu_output = [&](void* raw_device, void* raw_resource) {
+      // Test-only readback validates the actual video-processor output, not
+      // just HRESULTs. This callback is absent from the production agent.
+      auto* device = static_cast<ID3D11Device*>(raw_device);
+      ComPtr<ID3D11Texture2D> output, staging;
+      auto* resource = static_cast<ID3D11Resource*>(raw_resource);
+      if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&output)))) { pixels_valid.store(false); return; }
+      D3D11_TEXTURE2D_DESC desc{};
+      output->GetDesc(&desc);
+      desc.Usage = D3D11_USAGE_STAGING;
+      desc.BindFlags = desc.MiscFlags = 0;
+      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (FAILED(device->CreateTexture2D(&desc, nullptr, &staging))) { pixels_valid.store(false); return; }
+      ComPtr<ID3D11DeviceContext> context;
+      device->GetImmediateContext(&context);
+      context->CopyResource(staging.Get(), output.Get());
+      D3D11_MAPPED_SUBRESOURCE mapped{};
+      if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) { pixels_valid.store(false); return; }
+      auto pixel = [&](UINT x, UINT y) {
+        return *reinterpret_cast<const std::uint32_t*>(static_cast<const std::uint8_t*>(mapped.pData) + y * mapped.RowPitch + x * 4);
+      };
+      const auto corner = pixel(0, 0) & 0x00ffffffu;
+      const auto center = pixel(desc.Width / 2, desc.Height / 2) & 0x00ffffffu;
+      if (corner != 0 || center == 0) pixels_valid.store(false);
+      if (center != previous_pixel) changed.fetch_add(1);
+      previous_pixel = center;
+      inspected.fetch_add(1);
+      context->Unmap(staging.Get(), 0);
+    };
+  });
+  if (fixture.surface->snapshot().decoder_backend != "d3d11va") {
+    std::cout << "D3D11 GPU presentation unavailable on this machine; GDI coverage remains active\n";
+    return;
+  }
+  // Square output forces black bars, then resize to a second aspect ratio.
+  SetWindowPos(fixture.window, nullptr, -32000, -32000, 160, 160, SWP_NOZORDER | SWP_NOACTIVATE);
+  const auto units = encode_h264(120, kFps, 0);
+  submit_paced(fixture, units, 36, "gpu-source");
+  const auto first = fixture.surface->snapshot();
+  require(inspected.load() >= 24 && changed.load() >= 12 && pixels_valid.load(),
+    "GPU output must contain changing video pixels and black bars, failure=" + first.last_present_failure);
+  require(first.gpu_present_fallbacks == 0 && first.cpu_readback_frames == 0,
+    "supported D3D11 playback must avoid CPU readback: " + first.last_present_failure);
+  const auto checks_before_repaint = inspected.load();
+  for (int repeat = 0; repeat < 30; ++repeat) pump_hidden_paint(fixture);
+  require(inspected.load() <= checks_before_repaint + 2,
+    "repainting an unchanged window must not repeatedly process/present the same GPU frame");
+  SetWindowPos(fixture.window, nullptr, -32000, -32000, 240, 192, SWP_NOZORDER | SWP_NOACTIVATE);
+  std::vector<EncodedAccessUnit> tail(units.begin() + 36, units.begin() + 72);
+  submit_paced(fixture, tail, tail.size(), "gpu-source", 37);
+  const auto resized = fixture.surface->snapshot();
+  require(inspected.load() >= 54 && pixels_valid.load() && resized.gpu_present_fallbacks == 0 &&
+      resized.cpu_readback_frames == 0, "GPU resize must preserve the direct path and pixels: " + resized.last_present_failure);
+  require(FindWindowExW(fixture.window, nullptr, L"VDSD3D11VideoWindow", nullptr) != nullptr,
+    "flip presentation must own a separate child HWND");
+  fail_present.store(true);
+  tail.assign(units.begin() + 72, units.begin() + 108);
+  submit_paced(fixture, tail, tail.size(), "gpu-source", 73);
+  const auto fallback = fixture.surface->snapshot();
+  require(fallback.gpu_present_fallbacks == 1 && fallback.cpu_readback_frames >= 24 &&
+      fallback.painted_frames >= resized.painted_frames + 24, "GPU presentation failure must continue through GDI");
+  require(!FindWindowExW(fixture.window, nullptr, L"VDSD3D11VideoWindow", nullptr), "fallback must release the GPU child window");
+  require(fallback.decoder_rebuilds == 0 && fallback.hardware_fallbacks == 0,
+    "a presentation failure must not unnecessarily replace a healthy decoder");
+  std::cout << "gpu output: inspected=" << inspected.load() << ", changing=" << changed.load()
+    << ", presented=" << resized.gpu_presented_frames << ", CPU-readback-before-fallback=" << resized.cpu_readback_frames
+    << ", GDI-fallback-frames=" << fallback.cpu_readback_frames << '\n';
+  assert_closed(fixture, units.front());
+}
+
+void test_decoder_recovery(const std::string& stage, int injected_error, bool gpu = false) {
   std::atomic<bool> armed{false};
   std::atomic<unsigned int> injected{0};
   SurfaceFixture fixture("decoder-recovery-" + stage + std::to_string(injected_error), kFps,
@@ -448,7 +532,7 @@ void test_decoder_recovery(const std::string& stage, int injected_error) {
         return injected_error;
       }
       return 0;
-    });
+    }, [&](NativeVideoSurfaceConfig& config) { config.force_gdi = !gpu; });
   const auto initial_backend = fixture.surface->snapshot().decoder_backend;
   if (stage == "transfer" && initial_backend == "software") {
     std::cout << "hardware transfer injection unavailable on this machine (software decode); send/receive recovery still tested\n";
@@ -693,7 +777,7 @@ std::vector<std::vector<std::uint8_t>> encode_aac_fixture() {
   return packets;
 }
 
-void test_real_1080p60_synchronized_pes_bursts() {
+void test_real_1080p60_synchronized_pes_bursts(bool gpu = false) {
   const auto units = encode_h264(280, 60, 0, 1920, 1080);
   verify_encoded_fixture(units, false);
   const auto aac = encode_aac_fixture();
@@ -714,7 +798,16 @@ void test_real_1080p60_synchronized_pes_bursts() {
   set_viewer_audio_software_volume(0.0f);
   set_viewer_audio_delay_ms(0);
   const auto audio_before = get_viewer_audio_playback_snapshot();
-  SurfaceFixture fixture("1080p60-common-av-pes-burst", 60);
+  SurfaceFixture fixture(gpu ? "1080p60-gpu-pes-burst" : "1080p60-common-av-pes-burst", 60, {},
+    [&](NativeVideoSurfaceConfig& config) { config.force_gdi = !gpu; });
+  const bool direct_supported = fixture.surface->snapshot().decoder_backend == "d3d11va";
+  auto cpu_millis = [] {
+    FILETIME created{}, exited{}, kernel{}, user{};
+    require(GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user) != FALSE, "read test process CPU time");
+    auto ticks = [](const FILETIME& value) { return (static_cast<std::uint64_t>(value.dwHighDateTime) << 32) | value.dwLowDateTime; };
+    return static_cast<double>(ticks(kernel) + ticks(user)) / 10000.0;
+  };
+  const auto cpu_before = cpu_millis();
   const auto began = SteadyClock::now();
   HighResolutionWaiter waiter;
   unsigned int audio_active_batches = 0;
@@ -729,7 +822,13 @@ void test_real_1080p60_synchronized_pes_bursts() {
   };
   auto pump_until = [&](SteadyClock::time_point deadline) {
     while (SteadyClock::now() < deadline) {
-      pump_hidden_paint(fixture);
+      // Hidden-window tests need explicit paints, but repainting the same GDI
+      // image every 500us would bias the CPU comparison against the old path.
+      // Emulate the normal one-paint-per-published-frame workload here.
+      const auto reason = fixture.surface->snapshot().reason;
+      if (reason == "native-frame-ready-for-paint" || reason == "native-gpu-frame-ready-for-present") {
+        pump_hidden_paint(fixture);
+      }
       inspect();
       waiter.wait_for(std::min(std::chrono::duration_cast<std::chrono::microseconds>(deadline - SteadyClock::now()),
         std::chrono::microseconds(500)));
@@ -762,6 +861,11 @@ void test_real_1080p60_synchronized_pes_bursts() {
   pump_until(SteadyClock::now() + std::chrono::milliseconds(400));
   const auto stats = fixture.surface->snapshot();
   const auto audio_after = get_viewer_audio_playback_snapshot();
+  const auto cpu_elapsed = cpu_millis() - cpu_before;
+  if (gpu && direct_supported) {
+    require(stats.gpu_presented_frames >= 252 && stats.cpu_readback_frames == 0 && stats.gpu_present_fallbacks == 0,
+      "1080p60 GPU path must sustain real presents without CPU readback: " + stats.last_present_failure);
+  }
   require(audio_active_batches >= 18, "audio master must actually be active throughout the PES-burst trial");
   require(stats.decoded_frames == 280 && stats.dropped_encoded_frames == 0 && stats.reference_chain_resets == 0 &&
     !stats.needs_keyframe && stats.last_error.empty(), "normal synchronized PES batches must preserve every H264 reference: " + describe(stats));
@@ -773,9 +877,11 @@ void test_real_1080p60_synchronized_pes_bursts() {
     std::lock_guard<std::mutex> lock(receiver->mutex);
     require(receiver->dispatched_audio_blocks == 220, "all 220 real AAC packets must decode through the existing worker");
   }
-  std::cout << "1080p60-common-av-pes-burst: painted=" << stats.painted_frames << "/280, active-audio-batches="
+  std::cout << (gpu ? "1080p60-gpu-pes-burst: painted=" : "1080p60-common-av-pes-burst: painted=") << stats.painted_frames << "/280, active-audio-batches="
     << audio_active_batches << "/20, audio-decoded=220/220, peak-encoded=" << peak_encoded << ", peak-ready=" << peak_ready
-    << ", longest-14-AU-ingress-ms=" << static_cast<double>(longest_batch_submit_us) / 1000.0 << ", " << describe(stats) << '\n';
+    << ", longest-14-AU-ingress-ms=" << static_cast<double>(longest_batch_submit_us) / 1000.0
+    << ", process-cpu-ms=" << cpu_elapsed << ", CPU-readbacks=" << stats.cpu_readback_frames
+    << ", GPU-presents=" << stats.gpu_presented_frames << ", " << describe(stats) << '\n';
   assert_closed(fixture, units.front());
 }
 
@@ -812,14 +918,17 @@ int main() {
     test_separate_configuration(units);
     test_burst_reference_recovery(units);
     test_active_close_and_reopen(units);
+    test_gpu_presentation();
     test_decoder_recovery("send", AVERROR(EIO));
     test_decoder_recovery("receive", AVERROR_EXTERNAL);
     test_decoder_recovery("transfer", AVERROR(EIO));
     test_decoder_recovery("receive", AVERROR_INVALIDDATA);
+    test_decoder_recovery("send", AVERROR(EIO), true);
     test_continuous_60fps_and_network_steps();
     test_real_1080p60_synchronized_pes_bursts();
+    test_real_1080p60_synchronized_pes_bursts(true);
     std::cout << "native playback surface integration passed: real H264/B-frame decode, separate CONFIG/IDR bootstrap, hidden-window GDI paints, bounded burst recovery, concurrent close/reopen, sustained 60fps and same-epoch network steps.\n"
-      << "This verifies software/GDI submission; physical display visibility, VSync and audible playback were not measured.\n";
+      << "This verifies GDI and D3D11 submissions and GPU output pixels; physical display visibility, VSync and audible playback were not measured.\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "native playback surface integration FAILED: " << error.what() << '\n';

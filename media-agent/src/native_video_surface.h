@@ -20,6 +20,9 @@ struct NativeVideoSurfaceConfig {
 #ifdef VDS_NATIVE_SURFACE_TESTING
   // Only compiled into the integration-test executable, never the agent ABI.
   std::function<int(const char*, bool)> decoder_fault;
+  bool force_gdi = false;
+  std::function<bool()> fail_gpu_present;
+  std::function<void(void*, void*)> inspect_gpu_output;
 #endif
 };
 
@@ -35,6 +38,10 @@ struct NativeVideoSurfaceSnapshot {
   std::uint64_t reference_chain_resets = 0;
   std::uint64_t decoder_rebuilds = 0;
   std::uint64_t hardware_fallbacks = 0;
+  std::uint64_t gpu_presented_frames = 0;
+  std::uint64_t cpu_readback_frames = 0;
+  std::uint64_t gpu_present_fallbacks = 0;
+  std::string last_present_failure;
   std::string decoder_backend = "none";
   std::string last_decoder_failure;
   std::uint64_t decode_late_frames = 0;
