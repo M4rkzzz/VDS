@@ -24,6 +24,9 @@ async function sampleLivePreview(previousFrames = 0) {
 
 async function main() {
   assert.equal(process.platform, 'win32', 'Native WGC preview smoke requires Windows');
+  const user32 = require('koffi').load('user32.dll');
+  const findWindow = user32.func('void * __stdcall FindWindowW(str16 className, str16 title)');
+  const isVisible = user32.func('bool __stdcall IsWindowVisible(void *hwnd)');
   await manager.start();
   const cycles = [];
   for (let cycle = 0; cycle < 8; cycle++) {
@@ -37,6 +40,9 @@ async function main() {
       embedded: false, visible: false, width: 320, height: 180
     });
     const first = await sampleLivePreview();
+    const previewWindow = findWindow('VDSNativeLivePreviewWindow', first.windowTitle);
+    assert.ok(previewWindow, 'owned native preview window exists');
+    assert.equal(isVisible(previewWindow), false, 'visible:false must keep standalone preview hidden');
     const sustained = await sampleLivePreview(first.decodedFramesRendered);
     cycles.push({ cycle, firstFrames: first.decodedFramesRendered,
       sustainedFrames: sustained.decodedFramesRendered, reason: sustained.reason });

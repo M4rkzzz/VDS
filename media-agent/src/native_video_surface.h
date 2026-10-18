@@ -27,6 +27,9 @@ struct NativeVideoSurfaceConfig {
 };
 
 struct NativeVideoSurfaceSnapshot {
+#ifdef VDS_NATIVE_SURFACE_TESTING
+  bool paint_pending = false;
+#endif
   bool attached = false;
   bool running = false;
   bool decoder_ready = false;

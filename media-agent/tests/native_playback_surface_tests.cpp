@@ -507,17 +507,27 @@ void test_gpu_presentation() {
       resized.cpu_readback_frames == 0, "GPU resize must preserve the direct path and pixels: " + resized.last_present_failure);
   require(FindWindowExW(fixture.window, nullptr, L"VDSD3D11VideoWindow", nullptr) != nullptr,
     "flip presentation must own a separate child HWND");
+  // A sender can restart at a different coded size without replacing the
+  // viewer window. Exercise decoder textures and processor reconfiguration.
+  const auto changed_source = encode_h264(72, kFps, 0, 320, 180);
+  const auto checks_before_source_change = inspected.load();
+  submit_paced(fixture, changed_source, 36, "gpu-source-resized");
+  const auto reconfigured = fixture.surface->snapshot();
+  require(inspected.load() >= checks_before_source_change + 24 && pixels_valid.load() &&
+      reconfigured.gpu_presented_frames >= resized.gpu_presented_frames + 24 &&
+      reconfigured.gpu_present_fallbacks == 0 && reconfigured.cpu_readback_frames == 0,
+    "coded-size change must keep GPU pixels advancing without CPU fallback: " + reconfigured.last_present_failure);
   fail_present.store(true);
-  tail.assign(units.begin() + 72, units.begin() + 108);
-  submit_paced(fixture, tail, tail.size(), "gpu-source", 73);
+  tail.assign(changed_source.begin() + 36, changed_source.end());
+  submit_paced(fixture, tail, tail.size(), "gpu-source-resized", 37);
   const auto fallback = fixture.surface->snapshot();
   require(fallback.gpu_present_fallbacks == 1 && fallback.cpu_readback_frames >= 24 &&
-      fallback.painted_frames >= resized.painted_frames + 24, "GPU presentation failure must continue through GDI");
+      fallback.painted_frames >= reconfigured.painted_frames + 24, "GPU presentation failure must continue through GDI");
   require(!FindWindowExW(fixture.window, nullptr, L"VDSD3D11VideoWindow", nullptr), "fallback must release the GPU child window");
   require(fallback.decoder_rebuilds == 0 && fallback.hardware_fallbacks == 0,
     "a presentation failure must not unnecessarily replace a healthy decoder");
   std::cout << "gpu output: inspected=" << inspected.load() << ", changing=" << changed.load()
-    << ", presented=" << resized.gpu_presented_frames << ", CPU-readback-before-fallback=" << resized.cpu_readback_frames
+    << ", presented=" << reconfigured.gpu_presented_frames << ", CPU-readback-before-fallback=" << reconfigured.cpu_readback_frames
     << ", GDI-fallback-frames=" << fallback.cpu_readback_frames << '\n';
   assert_closed(fixture, units.front());
 }
@@ -814,6 +824,7 @@ void test_real_1080p60_synchronized_pes_bursts(bool gpu = false) {
   unsigned int peak_encoded = 0;
   unsigned int peak_ready = 0;
   std::uint64_t longest_batch_submit_us = 0;
+  unsigned int pending_with_rendered_reason = 0;
   auto inspect = [&]() {
     const auto stats = fixture.surface->snapshot();
     inspect_queue_bounds(stats);
@@ -825,8 +836,11 @@ void test_real_1080p60_synchronized_pes_bursts(bool gpu = false) {
       // Hidden-window tests need explicit paints, but repainting the same GDI
       // image every 500us would bias the CPU comparison against the old path.
       // Emulate the normal one-paint-per-published-frame workload here.
-      const auto reason = fixture.surface->snapshot().reason;
-      if (reason == "native-frame-ready-for-paint" || reason == "native-gpu-frame-ready-for-present") {
+      // A completed paint can overwrite the diagnostic reason after a newer
+      // image was published. Inspect serials, not the last diagnostic event.
+      const auto paint_state = fixture.surface->snapshot();
+      if (paint_state.paint_pending) {
+        if (paint_state.reason == "native-frame-rendered") ++pending_with_rendered_reason;
         pump_hidden_paint(fixture);
       }
       inspect();
@@ -881,6 +895,7 @@ void test_real_1080p60_synchronized_pes_bursts(bool gpu = false) {
     << audio_active_batches << "/20, audio-decoded=220/220, peak-encoded=" << peak_encoded << ", peak-ready=" << peak_ready
     << ", longest-14-AU-ingress-ms=" << static_cast<double>(longest_batch_submit_us) / 1000.0
     << ", process-cpu-ms=" << cpu_elapsed << ", CPU-readbacks=" << stats.cpu_readback_frames
+    << ", pending-with-rendered-reason=" << pending_with_rendered_reason
     << ", GPU-presents=" << stats.gpu_presented_frames << ", " << describe(stats) << '\n';
   assert_closed(fixture, units.front());
 }
@@ -891,6 +906,26 @@ int main() {
   std::cout << std::unitbuf;
   av_log_set_level(AV_LOG_ERROR);
   try {
+    {
+      SurfaceFixture fixture("standalone-hidden", 0, {}, [](NativeVideoSurfaceConfig& config) {
+        config.layout.embedded = false;
+        config.layout.visible = false;
+      });
+      SetWindowPos(fixture.window, nullptr, -32000, -32000, 32, 24, SWP_NOZORDER | SWP_NOACTIVATE);
+      NativeEmbeddedSurfaceLayout layout;
+      layout.embedded = false;
+      layout.visible = true;
+      std::string error;
+      require(fixture.surface->update_layout(layout, &error), "show standalone surface: " + error);
+      const auto deadline = SteadyClock::now() + std::chrono::seconds(1);
+      while (!IsWindowVisible(fixture.window) && SteadyClock::now() < deadline) Sleep(1);
+      require(IsWindowVisible(fixture.window), "standalone visible=true must be applied");
+      layout.visible = false;
+      require(fixture.surface->update_layout(layout, &error), "hide standalone surface: " + error);
+      const auto hide_deadline = SteadyClock::now() + std::chrono::seconds(1);
+      while (IsWindowVisible(fixture.window) && SteadyClock::now() < hide_deadline) Sleep(1);
+      require(!IsWindowVisible(fixture.window), "standalone visible=false must be applied");
+    }
     {
       SurfaceFixture fixture("input-owner-busy");
       fixture.owner.pause_messages();

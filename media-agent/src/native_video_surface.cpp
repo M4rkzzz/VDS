@@ -714,7 +714,13 @@ class NativeVideoSurface::Impl {
 
   NativeVideoSurfaceSnapshot snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
+#ifdef VDS_NATIVE_SURFACE_TESTING
+    auto result = snapshot_;
+    result.paint_pending = latest_image_ && latest_image_->serial != last_painted_serial_;
+    return result;
+#else
     return snapshot_;
+#endif
   }
 
   void stop(const std::string& reason) {
@@ -1153,8 +1159,8 @@ class NativeVideoSurface::Impl {
     const bool embedded = config_.layout.embedded;
     const bool overlay_popup = should_use_overlay_popup(config_.layout);
     const DWORD window_style = embedded
-      ? (overlay_popup ? (WS_POPUP | WS_VISIBLE) : (WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS))
-      : (WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+      ? (overlay_popup ? WS_POPUP : (WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS))
+      : WS_OVERLAPPEDWINDOW;
     const DWORD window_ex_style = embedded
       ? (overlay_popup ? (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) : WS_EX_NOPARENTNOTIFY)
       : 0;
@@ -1224,10 +1230,7 @@ class NativeVideoSurface::Impl {
       }
       refresh_owner_move_hook();
     } else {
-      ShowWindow(hwnd, embedded && config_.layout.visible ? SW_SHOWNA : SW_SHOW);
-      if (embedded && !config_.layout.visible) {
-        ShowWindow(hwnd, SW_HIDE);
-      }
+      ShowWindow(hwnd, config_.layout.visible ? SW_SHOWNOACTIVATE : SW_HIDE);
     }
     UpdateWindow(hwnd);
 
@@ -1258,6 +1261,7 @@ class NativeVideoSurface::Impl {
 
   bool apply_window_layout(HWND hwnd, const NativeEmbeddedSurfaceLayout& layout, std::string* error) {
     if (!layout.embedded) {
+      ShowWindowAsync(hwnd, layout.visible ? SW_SHOWNOACTIVATE : SW_HIDE);
       if (error) {
         error->clear();
       }
@@ -1529,9 +1533,9 @@ class NativeVideoSurface::Impl {
 
   void record_painted_frame(const RenderedImage& image, bool gpu) {
     if (image.serial != last_painted_serial_) {
-      last_painted_serial_ = image.serial;
       const auto now_us = current_time_micros_steady();
       std::lock_guard<std::mutex> lock(mutex_);
+      last_painted_serial_ = image.serial;
       snapshot_.painted_frames += 1;
       snapshot_.gpu_presented_frames += gpu ? 1 : 0;
       snapshot_.implementation = gpu ? "ffmpeg-d3d11-video-processor-swapchain" : "ffmpeg-win32-gdi-surface";

@@ -18,6 +18,8 @@
 
 ## 第三轮：D3D11 解码纹理直接呈现
 
+后续全模块审计修正了隐藏窗口夹具依赖诊断文字的绘制竞态，见 [审计报告](AUDIT_2026-10-18.md)。本节末的旧单轮 CPU 数字保留用于追溯，不再用于公平性能比较；GPU 直接呈现、输出像素及零 CPU 回读由修正后的回归继续验证。
+
 新增独立模块 `native_d3d11_presenter`，在现有原生窗口线程工作，不新增线程或媒体定时器。正常 D3D11VA/NV12 路径将已解码 AVFrame 的所有权移交给最新待绘制图像，保留纹理引用直到提交 Video Processor，直接在 GPU 完成色彩转换、缩放和黑边。没有 `av_hwframe_transfer_data`、CPU BGRA 缓冲或 swscale 转换。只保留最新待绘制图像，仍沿用原有时间戳/音频时钟调度；重复 WM_PAINT 不重复处理同一帧，窗口尺寸变化时才重绘旧帧。
 
 SwapChain 使用独立的无激活、鼠标穿透子窗口，避免 Flip 模型和 GDI 在同一个 HWND 上交替绘制；参见 [Microsoft Flip Model 文档](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/for-best-performance--use-dxgi-flip-model)。优先 flip-discard，再尝试 flip-sequential；硬件不支持或运行期呈现失败则销毁 GPU 子窗口，继续 GDI。视频处理器和 FFmpeg 共用解码设备及其锁，Present 在锁外执行；采用非阻塞 Present 和最多一个排队帧，输入/输出描述使用相同源帧率，不做帧率转换或增加 FPS 上限。

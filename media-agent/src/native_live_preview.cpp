@@ -1243,8 +1243,8 @@ class NativeLivePreview::Impl {
     const bool embedded = config_.layout.embedded;
     const bool overlay_popup = should_use_overlay_popup(config_.layout);
     const DWORD window_style = embedded
-      ? (overlay_popup ? (WS_POPUP | WS_VISIBLE) : (WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS))
-      : (WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+      ? (overlay_popup ? WS_POPUP : (WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS))
+      : WS_OVERLAPPEDWINDOW;
     const DWORD window_ex_style = embedded
       ? (overlay_popup ? (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) : WS_EX_NOPARENTNOTIFY)
       : 0;
@@ -1311,10 +1311,7 @@ class NativeLivePreview::Impl {
         ShowWindow(hwnd, SW_HIDE);
       }
     } else {
-      ShowWindow(hwnd, embedded && config_.layout.visible ? SW_SHOWNA : SW_SHOW);
-      if (embedded && !config_.layout.visible) {
-        ShowWindow(hwnd, SW_HIDE);
-      }
+      ShowWindow(hwnd, config_.layout.visible ? SW_SHOWNOACTIVATE : SW_HIDE);
     }
     UpdateWindow(hwnd);
 
@@ -1345,6 +1342,7 @@ class NativeLivePreview::Impl {
 
   bool apply_window_layout(HWND hwnd, const NativeEmbeddedSurfaceLayout& layout, std::string* error) {
     if (!layout.embedded) {
+      ShowWindowAsync(hwnd, layout.visible ? SW_SHOWNOACTIVATE : SW_HIDE);
       if (error) {
         error->clear();
       }
