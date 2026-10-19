@@ -8,6 +8,7 @@ const { MediaAgentManager } = require('../desktop/media-agent-manager');
 const manager = new MediaAgentManager({ logger: { log() {}, warn() {}, error() {} } });
 manager.resolveBinaryPath = () => path.resolve(__dirname, '../runtime/media-agent/vds-media-agent.exe');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+let stopStimulus;
 
 async function sampleLivePreview(previousFrames = 0) {
   const deadline = Date.now() + 12000;
@@ -24,6 +25,7 @@ async function sampleLivePreview(previousFrames = 0) {
 
 async function main() {
   assert.equal(process.platform, 'win32', 'Native WGC preview smoke requires Windows');
+  stopStimulus = require('../tests/fixtures/capture-stimulus').startCaptureStimulus();
   const user32 = require('koffi').load('user32.dll');
   const findWindow = user32.func('void * __stdcall FindWindowW(str16 className, str16 title)');
   const isVisible = user32.func('bool __stdcall IsWindowVisible(void *hwnd)');
@@ -53,6 +55,7 @@ async function main() {
 }
 
 main().catch(error => { console.error(error.message); process.exitCode = 1; }).finally(async () => {
+  if (stopStimulus) stopStimulus();
   await manager.stop();
   assert.equal(manager.child, null);
   assert.equal(manager.retiringChild, null);
