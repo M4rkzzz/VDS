@@ -378,7 +378,7 @@ test('production upstream recovery preserves running audio context while actual 
   h.acceptEpoch('old-source', 90); h.acceptEpoch('old-source', 90, true, 'audio'); await flushMicrotasks();
   const context = h.contexts[0]; const source = h.sources[0]; const oldDecoder = h.audioDecoders[0];
   let closedPeers = 0;
-  const currentPeer = { close() { closedPeers++; } };
+  const currentPeer = { connectionState: 'connected', close() { closedPeers++; } };
   class Peer { close() { closedPeers++; } }
   const filename = path.resolve(sourceDirectory, 'main.ts');
   const parsed = ts.createSourceFile(filename, fs.readFileSync(filename, 'utf8'), ts.ScriptTarget.ES2022, true);
@@ -408,10 +408,13 @@ test('production upstream recovery preserves running audio context while actual 
     joinCard: element(), leaveButton: element(), viewerRoomId: element(), chainPositionText: element(), waitingMessage: element()
   };
   const flow = new Function(...Object.keys(globals), `${code}\nreturn {
+    preserve: () => { const original = session; handleChainReconnect({ preserveMedia: true, upstreamPeerId: 'host', newChainPosition: 0 }); return { sameSession: original === session, position: session.chainPosition }; },
     recover: () => requestUpstreamRecovery(upstreamPc, 'host', 'upstream-failed'),
     reconnect: () => ensureUpstreamPeer(session.upstreamPeerId),
     rebind: () => handleChainReconnect({ upstreamPeerId: 'next-host', newChainPosition: 2 }), leave: resetLocalViewerSession
   };`)(...Object.values(globals));
+  assert.deepEqual(flow.preserve(), { sameSession: true, position: 0 });
+  assert.equal(closedPeers, 0); assert.equal(source.stopped, 0); assert.equal(oldDecoder.state, 'configured');
   flow.recover();
   assert.equal(context.state, 'running'); assert.equal(source.stopped, 1); assert.equal(source.disconnected, 1);
   assert.equal(oldDecoder.state, 'closed'); assert.equal(closedPeers, 1);

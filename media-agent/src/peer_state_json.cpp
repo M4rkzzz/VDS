@@ -61,12 +61,18 @@ std::string peer_media_binding_json(const PeerMediaBindingState& state) {
   std::ostringstream payload;
   payload
     << "{\"sourceFramesCaptured\":" << state.source_frames_captured
+    << ",\"attached\":" << (state.attached ? "true" : "false")
+    << ",\"active\":" << (state.active ? "true" : "false")
     << ",\"sourceFramesRepeated\":" << state.source_frames_repeated
     << ",\"avgSourceCopyResourceUs\":" << state.avg_source_copy_resource_us
     << ",\"avgSourceMapUs\":" << state.avg_source_map_us
     << ",\"avgSourceMemcpyUs\":" << state.avg_source_memcpy_us
     << ",\"avgSourceTotalReadbackUs\":" << state.avg_source_total_readback_us
     << ",\"framesSent\":" << state.frames_sent
+    << ",\"producerId\":" << state.producer_id
+    << ",\"producerProcessId\":" << state.producer_process_id
+    << ",\"producerSubscribers\":" << state.producer_subscribers
+    << ",\"recoveryPending\":" << (state.recovery_pending ? "true" : "false")
     << ",\"width\":" << state.width
     << ",\"height\":" << state.height
     << ",\"frameRate\":" << state.frame_rate

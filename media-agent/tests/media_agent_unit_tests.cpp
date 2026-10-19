@@ -208,7 +208,7 @@ void test_peer_stun_config() {
   for (const std::string& server : {
       "", "stun:", "turn:relay.example.com:3478", "turns:relay.example.com:5349",
       "relay:relay.example.com:3478", "stun://example.com:3478", "stun:user@example.com",
-      "stun:example.com/path", "stun:example.com?transport=tcp", "stun:example.com#relay",
+      "stun:example.com/path", "stun:example.com?transport=tls", "stun:example.com#relay",
       "stun:example.com:0", "stun:example.com:65536", "stun:example.com:abc",
       "stun:example.com:", "stun:bad..example.com", "stun:-bad.example.com",
       "stun:example.com\n", "stun:[:::]:3478", "stun:2001:db8::1"}) {

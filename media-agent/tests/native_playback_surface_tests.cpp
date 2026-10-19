@@ -446,12 +446,14 @@ void assert_closed(SurfaceFixture& fixture, const EncodedAccessUnit& unit) {
 void test_gpu_presentation() {
   using Microsoft::WRL::ComPtr;
   std::atomic<bool> fail_present{false};
+  std::atomic<bool> defer_present{false};
   std::atomic<unsigned int> inspected{0}, changed{0};
   std::atomic<bool> pixels_valid{true};
   std::uint32_t previous_pixel = 0;
   SurfaceFixture fixture("gpu-present", kFps, {}, [&](NativeVideoSurfaceConfig& config) {
     config.force_gdi = false;
     config.fail_gpu_present = [&] { return fail_present.exchange(false); };
+    config.defer_gpu_present = [&] { return defer_present.load(); };
     config.inspect_gpu_output = [&](void* raw_device, void* raw_resource) {
       // Test-only readback validates the actual video-processor output, not
       // just HRESULTs. This callback is absent from the production agent.
@@ -526,9 +528,33 @@ void test_gpu_presentation() {
   require(!FindWindowExW(fixture.window, nullptr, L"VDSD3D11VideoWindow", nullptr), "fallback must release the GPU child window");
   require(fallback.decoder_rebuilds == 0 && fallback.hardware_fallbacks == 0,
     "a presentation failure must not unnecessarily replace a healthy decoder");
+  const auto recovery_units = encode_h264(96, kFps, 0, 320, 180);
+  submit_paced(fixture, recovery_units, recovery_units.size(), "gpu-recovery");
+  const auto recovered = fixture.surface->snapshot();
+  require(recovered.gpu_presented_frames >= fallback.gpu_presented_frames + 24 &&
+      recovered.gpu_present_fallbacks == 1 && recovered.decoder_rebuilds == 0 && pixels_valid.load(),
+    "same surface must recover GPU presentation after a transient failure without rebuilding its decoder");
+  require(FindWindowExW(fixture.window, nullptr, L"VDSD3D11VideoWindow", nullptr),
+    "recovered GPU path recreates its child window");
+  defer_present.store(true);
+  submit_paced(fixture, changed_source, 12, "gpu-deferred-static");
+  const auto deferred = fixture.surface->snapshot();
+  require(deferred.paint_pending, "temporarily busy presenter retains the last pending frame");
+  DWORD_PTR response = 0;
+  require(SendMessageTimeoutW(fixture.window, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &response),
+    "waiting for presentation must continue servicing window messages");
+  defer_present.store(false);
+  const auto static_deadline = SteadyClock::now() + std::chrono::seconds(2);
+  // No more input frames and no synthetic WM_PAINT: the production message
+  // loop must retry the final skipped image itself.
+  while (fixture.surface->snapshot().gpu_presented_frames == deferred.gpu_presented_frames &&
+      SteadyClock::now() < static_deadline) Sleep(5);
+  require(fixture.surface->snapshot().gpu_presented_frames > deferred.gpu_presented_frames,
+    "last skipped GPU frame must eventually present without another input frame");
   std::cout << "gpu output: inspected=" << inspected.load() << ", changing=" << changed.load()
     << ", presented=" << reconfigured.gpu_presented_frames << ", CPU-readback-before-fallback=" << reconfigured.cpu_readback_frames
-    << ", GDI-fallback-frames=" << fallback.cpu_readback_frames << '\n';
+    << ", GDI-fallback-frames=" << fallback.cpu_readback_frames
+    << ", recovered-GPU-frames=" << recovered.gpu_presented_frames - fallback.gpu_presented_frames << '\n';
   assert_closed(fixture, units.front());
 }
 

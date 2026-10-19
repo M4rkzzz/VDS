@@ -5,6 +5,17 @@ const { buildPcpMapRequest, parsePcpMapResponse } = require('../../desktop/pcp-p
 const nonce = Buffer.from('000102030405060708090a0b', 'hex');
 const options = { clientAddress: '192.0.2.10', internalPort: 50000, lifetimeSeconds: 180, nonce };
 
+test('TCP MAP uses protocol 6 and cannot accept an otherwise identical UDP response', () => {
+  const tcp = { ...options, transport: 'tcp' };
+  const request = buildPcpMapRequest(tcp);
+  assert.equal(request[36], 6);
+  const response = routerResponse(request);
+  assert.equal(parsePcpMapResponse(response, tcp).externalPort, 55000);
+  response[36] = 17;
+  assert.throws(() => parsePcpMapResponse(response, tcp), { code: 'PCP_PROTOCOL_MISMATCH' });
+  assert.throws(() => buildPcpMapRequest({ ...tcp, transport: 'sctp' }), { code: 'PCP_INVALID_TRANSPORT' });
+});
+
 function routerResponse(request) {
   const response = Buffer.alloc(60);
   response[0] = 2;
@@ -86,4 +97,19 @@ test('invalid request addresses, nonce, ports, and lifetime fail before a UDP re
   assert.throws(() => buildPcpMapRequest({ ...options, externalPort: 65536 }), { code: 'PCP_INVALID_PORT' });
   assert.throws(() => buildPcpMapRequest({ ...options, nonce: Buffer.alloc(11) }), { code: 'PCP_INVALID_NONCE' });
   assert.throws(() => buildPcpMapRequest({ ...options, lifetimeSeconds: -1 }), { code: 'PCP_INVALID_LIFETIME' });
+});
+
+test('renewal suggests the assigned endpoint and deletion uses zero external fields with the same nonce', () => {
+  const renewal = buildPcpMapRequest({ ...options, externalPort: 55000, externalAddress: '198.51.100.5' });
+  assert.equal(renewal.readUInt16BE(42), 55000);
+  assert.equal(renewal.subarray(44).toString('hex'), '00000000000000000000ffffc6336405');
+  const deletion = buildPcpMapRequest({ ...options, lifetimeSeconds: 0, externalPort: 55000, externalAddress: '198.51.100.5' });
+  assert.equal(deletion.readUInt16BE(42), 0);
+  assert.ok(deletion.subarray(44).every((byte) => byte === 0));
+  assert.ok(deletion.subarray(24, 36).equals(nonce));
+  const response = routerResponse(deletion); response.writeUInt32BE(0, 4); response.fill(0, 42, 60);
+  assert.equal(parsePcpMapResponse(response, { ...options, lifetimeSeconds: 0 }).lifetimeSeconds, 0);
+  assert.throws(() => parsePcpMapResponse(response, options), { code: 'PCP_MAPPING_EXPIRED' });
+  response.writeUInt32BE(180, 4);
+  assert.throws(() => parsePcpMapResponse(response, { ...options, lifetimeSeconds: 0 }), { code: 'PCP_DELETE_NOT_CONFIRMED' });
 });

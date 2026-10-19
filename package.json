@@ -1,6 +1,6 @@
 {
   "name": "screenshare-relay",
-  "version": "1.7.10",
+  "version": "1.7.11",
   "description": "Multi-viewer screen sharing with cascade relay (蜈蚣法) - Electron Edition",
   "main": "desktop/main.js",
   "engines": {
@@ -24,6 +24,7 @@
     "check:web-mobile-code": "npm run check:vds-web && npm run test:vds-web && npm run check:web-mobile-diagnostics && npm run test:server",
     "test:vds-web": "node scripts/test-vds-web-protocol.js && node scripts/test-vds-web-frame-validation.js && node scripts/test-vds-web-player-lifecycle.js && node --test tests/web/*.test.js",
     "verify:playback:wgc": "npm run build:vds-web && node scripts/test-local-playback-e2e.js --wgc",
+    "verify:playback:tcp": "npm run build:vds-web && node scripts/test-local-playback-e2e.js --wgc --native-tcp && node scripts/test-local-playback-e2e.js --wgc --native-tcp-mapped",
     "verify:playback": "npm run build:vds-web && node scripts/test-vds-web-playback.js && node scripts/test-local-playback-e2e.js",
     "verify:nat": "node scripts/test-native-nat.js",
     "build": "electron-builder",
@@ -58,7 +59,8 @@
   "dependencies": {
     "electron-updater": "^6.8.9",
     "koffi": "^2.16.3",
-    "process-audio-capture": "^1.0.14"
+    "process-audio-capture": "^1.0.14",
+    "sax": "1.6.1"
   },
   "devDependencies": {
     "electron": "^42.11.11",

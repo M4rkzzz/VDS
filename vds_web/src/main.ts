@@ -630,6 +630,15 @@ async function handleChainReconnect(message: SignalMessage): Promise<void> {
   }
 
   const previousUpstreamPeerId = session.upstreamPeerId || '';
+  if (message.preserveMedia === true && nextUpstreamPeerId === previousUpstreamPeerId &&
+      upstreamPc?.connectionState === 'connected') {
+    // Keep the session identity captured by the live peer's event handlers.
+    session.chainPosition = nextChainPosition;
+    sessionStorage.setItem('vds-web-session', JSON.stringify(session));
+    chainPositionText.textContent = formatChainPosition(nextChainPosition);
+    diagnostics.update({ chainPosition: nextChainPosition });
+    return;
+  }
   upstreamRecovery.stop();
   playback.resetMedia();
   upstreamPc?.close();

@@ -71,6 +71,7 @@ int main() {
     "fresh bootstrap must not contain a cached old picture under the fresh picture's sequence");
 
   auto runtime = std::make_shared<PeerVideoSenderRuntime>();
+  runtime->running = true;
   runtime->source_clock = host_media_clock_snapshot();
   const auto keyframe_handler = make_peer_video_sender_keyframe_request_handler(runtime);
   require(!runtime->soft_refresh_requested.load(), "new encoder must not start with an unsolicited refresh");
@@ -82,7 +83,22 @@ int main() {
       runtime->soft_refresh_requested.load(),
     "waiting for a keyframe must preserve a separately requested geometry refresh");
   runtime->soft_refresh_requested.store(false);
+  runtime->running = false;
+  require(keyframe_handler("encoder-died-before-bootstrap") == "host-encoder-refresh-requested" &&
+      runtime->soft_refresh_requested.load(), "dead encoder must recover even before its first IDR");
+  runtime->running = true;
+  runtime->soft_refresh_requested.store(false);
   runtime->pending_video_bootstrap = false;
+  auto slow = std::make_shared<PeerVideoSubscriber>();
+  auto healthy = std::make_shared<PeerVideoSubscriber>();
+  slow->pending_bootstrap = healthy->pending_bootstrap = false;
+  runtime->subscribers["slow"] = slow;
+  runtime->subscribers["healthy"] = healthy;
+  auto shared_handler = make_peer_video_sender_keyframe_request_handler(runtime, slow);
+  require(shared_handler("reference-gap") == "host-encoder-awaiting-bootstrap" &&
+      slow->pending_bootstrap && !healthy->pending_bootstrap && !runtime->soft_refresh_requested.load(),
+    "one subscriber's loss must not restart a healthy shared producer");
+  runtime->subscribers.clear();
   require(keyframe_handler("viewer-reference-chain-gap") == "host-encoder-refresh-requested" &&
       runtime->soft_refresh_requested.load(),
     "a received keyframe request must actually schedule the host encoder refresh");
@@ -100,6 +116,30 @@ int main() {
   runtime.reset();
   require(keyframe_handler("late-request") == "host-encoder-unavailable",
     "the transport handler must not retain or reopen an expired encoder runtime");
+
+  WgcFrameSourceConfig config;
+  auto frames = std::make_shared<SharedCaptureFrames>();
+  register_shared_capture(config, frames);
+  auto writable = frames->acquire();
+  writable->bgra = {1, 2, 3, 4};
+  frames->publish(writable);
+  auto preview = find_shared_capture_frame(config);
+  require(preview == writable, "preview must reuse the capture buffer without copying pixels");
+  writable.reset();
+  auto next_buffer = frames->acquire();
+  require(next_buffer != preview, "capture must not overwrite a buffer still being painted");
+  next_buffer->bgra = {5, 6, 7, 8};
+  frames->publish(next_buffer);
+  require(preview->bgra[0] == 1, "published frames must remain immutable for concurrent preview");
+  auto other = config;
+  other.display_id = "different-display";
+  require(!find_shared_capture_frame(other), "preview must not reuse another capture target");
+  other = config; other.frame_rate *= 2;
+  require(!find_shared_capture_frame(other), "sharing must not reduce requested preview cadence");
+  preview.reset();
+  require(frames->acquire()->bgra[0] == 1, "released capture storage must be recycled");
+  frames->active.store(false);
+  require(!find_shared_capture_frame(config), "stopped producers must release previews to their fallback");
 
   std::cout << "host media source clock tests passed\n";
 }

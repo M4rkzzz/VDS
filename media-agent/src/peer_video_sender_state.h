@@ -9,9 +9,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_map>
 
 #include "host_media_clock.h"
 #include "media_frame_timing.h"
+#include "shared_capture_frames.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -19,6 +21,16 @@
 #endif
 #include <windows.h>
 #endif
+
+class PeerTransportSession;
+struct PeerVideoSubscriber {
+  std::shared_ptr<PeerTransportSession> transport;
+  std::string transport_generation;
+  bool pending_bootstrap = true;
+  unsigned long long frames_sent = 0;
+  std::string reason = "peer-video-sender-waiting-for-fresh-keyframe";
+  std::string last_error;
+};
 
 struct PeerVideoSenderRuntime {
   bool running = false;
@@ -44,6 +56,12 @@ struct PeerVideoSenderRuntime {
   std::vector<std::uint8_t> pending_video_annexb_bytes;
   std::vector<std::uint8_t> cached_video_decoder_config_au;
   bool pending_video_bootstrap = true;
+  // Control-thread membership; pump-thread state. Both protected by mutex.
+  std::unordered_map<std::string, std::shared_ptr<PeerVideoSubscriber>> subscribers;
+  std::string producer_key;
+  std::uint64_t producer_id = 0;
+  std::shared_ptr<vds::media_agent::SharedCaptureFrames> preview_frames;
+  std::atomic<bool> failure_notified { false };
   std::atomic<bool> soft_refresh_requested { false };
   std::atomic<bool> stop_requested { false };
 #ifdef _WIN32
@@ -61,17 +79,27 @@ struct PeerVideoSenderRuntime {
 namespace vds::media_agent {
 
 inline std::function<std::string(const std::string&)> make_peer_video_sender_keyframe_request_handler(
-  std::weak_ptr<PeerVideoSenderRuntime> weak_runtime) {
-  return [weak_runtime](const std::string&) -> std::string {
+  std::weak_ptr<PeerVideoSenderRuntime> weak_runtime,
+  std::weak_ptr<PeerVideoSubscriber> weak_subscriber = {}) {
+  return [weak_runtime, weak_subscriber](const std::string&) -> std::string {
     const auto runtime = weak_runtime.lock();
     if (!runtime || runtime->stop_requested.load(std::memory_order_acquire) ||
         runtime->source_clock.source_epoch != host_media_clock_snapshot().source_epoch) {
       return "host-encoder-unavailable";
     }
     std::lock_guard<std::mutex> lock(runtime->mutex);
+    if (runtime->running && !runtime->failure_notified.load() && runtime->subscribers.size() > 1) {
+      if (auto subscriber = weak_subscriber.lock()) {
+        // A loss/late join recovers at the next scheduled IDR without restarting
+        // the common encoder and interrupting healthy subscribers.
+        subscriber->pending_bootstrap = true;
+        return "host-encoder-awaiting-bootstrap";
+      }
+    }
     // The encoder is already waiting to deliver a complete fresh bootstrap.
     // Let it finish instead of repeatedly restarting before its first IDR.
-    if (runtime->pending_video_bootstrap) return "host-encoder-awaiting-bootstrap";
+    if (runtime->running && !runtime->failure_notified.load() && runtime->pending_video_bootstrap)
+      return "host-encoder-awaiting-bootstrap";
     runtime->soft_refresh_requested.store(true, std::memory_order_release);
     return "host-encoder-refresh-requested";
   };

@@ -1,6 +1,7 @@
 #include "peer_session_controller.h"
 
 #include <regex>
+#include <algorithm>
 #include "agent_diagnostics.h"
 #include "agent_events.h"
 #include "audio_session_state.h"
@@ -21,12 +22,14 @@
 #include "peer_refresh_pipeline.h"
 #include "peer_session_state.h"
 #include "peer_state_json.h"
+#include "peer_video_sender.h"
 #include "peer_transport.h"
 #include "peer_transport_session_factory.h"
 #include "relay_hub.h"
 #include "runtime_registry.h"
 #include "surface_session_controller.h"
 #include "viewer_audio_session.h"
+#include "time_utils.h"
 
 namespace vds::media_agent {
 namespace {
@@ -87,19 +90,38 @@ void refresh_all_host_video_senders_for_controller(AgentRuntimeState& runtime_st
 
   HostSessionState& host_session = active_host_session(runtime_state);
 
+  // Detach every subscriber of retiring producers before creating replacements.
+  // Otherwise each peer could create its own replacement, or rejoin the dying one.
+  std::vector<std::string> refresh_peers;
+  std::unordered_map<std::string, std::shared_ptr<PeerVideoSenderRuntime>> retiring;
+  for_each_mutable_peer_with_role(runtime_state, "host-downstream", [&](PeerState& peer) {
+    if (!peer.transport_session) return;
+    if (peer.media_binding.runtime && peer.media_binding.runtime->soft_refresh_requested.load())
+      peer.media_binding.recovery_pending = true;
+    if (peer.media_binding.recovery_pending && current_time_millis() >= peer.media_binding.recovery_retry_at_ms) {
+      refresh_peers.push_back(peer.peer_id);
+      retiring[peer.peer_id] = peer.media_binding.runtime;
+    }
+  });
+  if (refresh_peers.empty()) return;
+  const HostCapturePlan& refreshed_plan = revalidate_host_capture_plan(runtime_state, host_session);
+  if (!refreshed_plan.ready || !refreshed_plan.validated) return;
+  for_each_mutable_peer_with_role(runtime_state, "host-downstream", [&](PeerState& peer) {
+    if (std::find(refresh_peers.begin(), refresh_peers.end(), peer.peer_id) != refresh_peers.end())
+      stop_peer_video_sender(peer, "peer-media-producer-refresh", nullptr);
+  });
   for_each_mutable_peer_with_role(runtime_state, "host-downstream", [&](PeerState& peer) {
     if (!peer.transport_session) {
       return;
     }
-    if (!peer.media_binding.runtime || !peer.media_binding.runtime->soft_refresh_requested.load()) {
+    if (std::find(refresh_peers.begin(), refresh_peers.end(), peer.peer_id) == refresh_peers.end()) {
       return;
     }
 
-    const HostCapturePlan& capture_plan = revalidate_host_capture_plan(runtime_state, host_session);
-    if (!capture_plan.ready || !capture_plan.validated) {
-      peer.media_binding.reason = "peer-media-soft-refresh-waiting-for-valid-plan";
-      peer.media_binding.last_error = capture_plan.last_error;
-      return;
+    // All old pumps have joined now; retain the final cursor for every peer,
+    // including those detached before the last subscriber stopped the producer.
+    if (auto old = retiring[peer.peer_id]) {
+      peer.media_binding.next_video_sequence = old->next_video_sequence;
     }
     const ObsIngestSessionSnapshot obs_ingest =
       make_obs_ingest_session_snapshot(obs_ingest_session_snapshot(runtime_state));
@@ -115,10 +137,15 @@ void refresh_all_host_video_senders_for_controller(AgentRuntimeState& runtime_st
       peer.media_binding.active = false;
       peer.media_binding.reason = "peer-media-soft-refresh-failed";
       peer.media_binding.last_error = refresh_error;
+      peer.media_binding.recovery_retry_at_ms = current_time_millis() + peer.media_binding.recovery_retry_delay_ms;
+      peer.media_binding.recovery_retry_delay_ms = std::min(8000, peer.media_binding.recovery_retry_delay_ms * 2);
       emit_agent_breadcrumb(
         std::string("hostVideoSenderRefresh:failed peer=") + peer.peer_id +
         " error=" + refresh_error);
     } else {
+      peer.media_binding.recovery_pending = false;
+      peer.media_binding.recovery_retry_at_ms = 0;
+      peer.media_binding.recovery_retry_delay_ms = 1000;
       emit_agent_breadcrumb(std::string("hostVideoSenderRefresh:done peer=") + peer.peer_id);
     }
   });

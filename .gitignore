@@ -9,6 +9,9 @@ media-agent/build/
 server/updates/
 server/public/vds_web/
 tmp/
+# Local reverse-engineering tools, third-party artifacts and raw test evidence.
+# Publish VDS implementation and reviewed summaries under docs instead.
+REA/
 tools/**/bin/
 tools/**/obj/
 SKILL.md

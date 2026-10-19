@@ -2153,6 +2153,14 @@ function rebalanceViewerUpstreams(room, options = {}) {
       return;
     }
     const nextUpstreamId = selectViewerUpstream(room, index, limit, viewer.clientId, failedUpstreamId);
+    // Removing an earlier sibling changes chain indices, not this live media
+    // link. Keep its native subscription when the selected upstream is unchanged.
+    if (nextUpstreamId === currentUpstreamId && currentUpstreamId !== failedUpstreamId &&
+        viewer.mediaReady === true && isUpstreamCandidateReady(room, currentUpstreamId)) {
+      sendJson(viewer.ws, { type: 'chain-reconnect', preserveMedia: true,
+        newChainPosition: viewer.chainPosition, upstreamPeerId: currentUpstreamId, mediaManifest: room.mediaManifest });
+      return;
+    }
     markViewerForReconnect(viewer, nextUpstreamId);
   });
 }

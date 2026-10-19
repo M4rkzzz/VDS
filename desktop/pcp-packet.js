@@ -59,9 +59,10 @@ function decodeAddress(encoded) {
 
 // RFC 6887 sections 7.1 and 16.4: clientAddress must come from the socket
 // used to send the request, after connecting it to the selected PCP server.
-function buildPcpMapRequest({ clientAddress, internalPort, externalPort = 0, lifetimeSeconds, nonce }) {
+function buildPcpMapRequest({ clientAddress, internalPort, externalPort = 0, externalAddress, lifetimeSeconds, nonce, transport = 'udp' }) {
   checkPort(internalPort);
   checkPort(externalPort, true);
+  if (!['udp', 'tcp'].includes(transport)) throw packetError('PCP_INVALID_TRANSPORT');
   checkNonce(nonce);
   if (!Number.isInteger(lifetimeSeconds) || lifetimeSeconds < 0 || lifetimeSeconds > 0xffffffff) {
     throw packetError('PCP_INVALID_LIFETIME');
@@ -76,15 +77,22 @@ function buildPcpMapRequest({ clientAddress, internalPort, externalPort = 0, lif
   request.writeUInt32BE(lifetimeSeconds, 4);
   encoded.copy(request, 8);
   nonce.copy(request, 24);
-  request[36] = 17;
+  request[36] = transport === 'tcp' ? 6 : 17;
   request.writeUInt16BE(internalPort, 40);
-  request.writeUInt16BE(externalPort, 42);
+  request.writeUInt16BE(lifetimeSeconds === 0 ? 0 : externalPort, 42);
   // Section 5: an unspecified IPv4 external address is ::ffff:0.0.0.0.
-  if (family === 4) request.fill(0xff, 54, 56);
+  if (lifetimeSeconds !== 0) {
+    if (externalAddress) {
+      const external = encodeAddress(externalAddress);
+      if (external.family !== family) throw packetError('PCP_EXTERNAL_ADDRESS_FAMILY_MISMATCH');
+      external.encoded.copy(request, 44);
+    } else if (family === 4) request.fill(0xff, 54, 56);
+  }
   return request;
 }
 
-function parsePcpMapResponse(response, { nonce, internalPort }) {
+function parsePcpMapResponse(response, { nonce, internalPort, lifetimeSeconds, transport = 'udp' }) {
+  if (!['udp', 'tcp'].includes(transport)) throw packetError('PCP_INVALID_TRANSPORT');
   checkNonce(nonce);
   checkPort(internalPort);
   if (!Buffer.isBuffer(response) || response.length < 24 || response[0] !== 2 || response[1] !== 0x81) {
@@ -95,8 +103,14 @@ function parsePcpMapResponse(response, { nonce, internalPort }) {
   }
   if (response.length < 60) throw packetError('PCP_TRUNCATED_RESPONSE');
   if (!timingSafeEqual(response.subarray(24, 36), nonce)) throw packetError('PCP_NONCE_MISMATCH');
-  if (response[36] !== 17) throw packetError('PCP_PROTOCOL_MISMATCH');
+  if (response[36] !== (transport === 'tcp' ? 6 : 17)) throw packetError('PCP_PROTOCOL_MISMATCH');
   if (response.readUInt16BE(40) !== internalPort) throw packetError('PCP_INTERNAL_PORT_MISMATCH');
+  const grantedLifetime = response.readUInt32BE(4);
+  if (lifetimeSeconds === 0) {
+    if (grantedLifetime !== 0) throw packetError('PCP_DELETE_NOT_CONFIRMED');
+    return { protocol: 'pcp', internalPort, lifetimeSeconds: 0 };
+  }
+  if (grantedLifetime === 0) throw packetError('PCP_MAPPING_EXPIRED');
   const externalPort = response.readUInt16BE(42);
   checkPort(externalPort);
   const externalBytes = response.subarray(44, 60);
@@ -107,7 +121,7 @@ function parsePcpMapResponse(response, { nonce, internalPort }) {
     internalPort,
     externalPort,
     externalAddress,
-    lifetimeSeconds: response.readUInt32BE(4),
+    lifetimeSeconds: grantedLifetime,
     epochSeconds: response.readUInt32BE(8)
   };
 }

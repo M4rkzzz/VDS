@@ -4,7 +4,8 @@ const test = require('node:test');
 const fs = require('node:fs');
 const path = require('node:path');
 const ts = require('typescript');
-const { StunServerSelector, normalizeStunUrls, getStunServerPool } = require('../../desktop/stun-server-selector');
+const { StunServerSelector, normalizeStunUrls, getStunServerPool, getNativeStunServerPool } = require('../../desktop/stun-server-selector');
+const { prepareNativeStunConfiguration } = require('../../desktop/native-stun-discovery');
 
 async function stunFixture(reply) {
   const socket = dgram.createSocket('udp4');
@@ -72,6 +73,7 @@ test('only STUN URLs can reach native selection and unavailable STUN does not re
 });
 
 function createPeerIpcHandler(globals) {
+  globals = { prepareNativeStunConfiguration, nativeStunDiscovery: { resolve: async (pool) => pool }, ...globals };
   const source = ts.createSourceFile('main.js', fs.readFileSync(path.join(__dirname, '../../desktop/main.js'), 'utf8'), ts.ScriptTarget.ES2022, true);
   const call = source.statements.map((statement) => statement.expression).find((expression) =>
     expression && ts.isCallExpression(expression) && expression.expression.getText(source) === 'ipcBoundary.handle' &&
@@ -79,6 +81,37 @@ function createPeerIpcHandler(globals) {
   assert.ok(call, 'production createPeer IPC handler exists');
   return new Function(...Object.keys(globals), `return (${call.arguments[2].getText(source)});`)(...Object.values(globals));
 }
+
+test('TCP STUN survives the real IPC handler without displacing the four UDP probes', async () => {
+  const udp = [1, 2, 3, 4, 5, 6, 7, 8].map((n) => `stun:udp${n}.example:3478`);
+  const tcp = ['stun:[::1]:3478?transport=tcp', 'stun:tcp.example?transport=tcp'];
+  const servers = [{ urls: [...udp, ...tcp, 'turn:relay.example?transport=tcp'] }];
+  let received;
+  const handler = createPeerIpcHandler({
+    nativeStunSelector: { select: async () => ({ url: udp[2], reachable: true }) },
+    getNativeStunServerPool,
+    logMainProcessDebug: () => {},
+    invokeMediaEngine: async (_method, options) => { received = options; }
+  });
+  await handler(null, { peerId: 'mixed', iceServers: servers });
+  assert.deepEqual(received.stunServers, [udp[2], udp[0], udp[1], udp[3], ...tcp]);
+  assert.deepEqual(normalizeStunUrls([{ urls: [
+    'STUN:[::1]:03478?TRANSPORT=TCP', 'stun:udp.example?transport=udp',
+    'stun:udp.example', 'stun:bad.example?transport=tls',
+    'stun:bad.example?transport=tcp&transport=udp', 'stun:?transport=tcp'
+  ] }]), ['stun:[::1]:3478?transport=tcp', 'stun:udp.example']);
+});
+
+test('desktop never sends a UDP preflight to a TCP-only discovery endpoint', async () => {
+  const trap = await stunFixture((response) => response);
+  try {
+    const tcp = `${trap.url}?transport=tcp`;
+    assert.deepEqual(await new StunServerSelector({ timeoutMs: 50 }).select([{ urls: [tcp] }]),
+      { url: tcp, reachable: false });
+    await new Promise((resolve) => setTimeout(resolve, 70));
+    assert.equal(trap.received(), 0);
+  } finally { await trap.close(); }
+});
 
 test('native IPC receives the reachable primary followed by a bounded pure STUN pool', async () => {
   const servers = [{ urls: [
@@ -91,7 +124,7 @@ test('native IPC receives the reachable primary followed by a bounded pure STUN 
       assert.equal(received, servers);
       return { url: 'stun:third.example:3478', reachable: true };
     } },
-    getStunServerPool,
+    getNativeStunServerPool,
     logMainProcessDebug: () => {},
     invokeMediaEngine: async (method, options) => { invoked = { method, options }; return { ok: true }; }
   });
@@ -111,13 +144,44 @@ test('native IPC uses the existing server first four STUN defaults when no pool 
   let options;
   const handler = createPeerIpcHandler({
     nativeStunSelector: { select: async () => ({ url: defaults[1], reachable: true }) },
-    getStunServerPool,
+    getNativeStunServerPool,
     logMainProcessDebug: () => {},
     invokeMediaEngine: async (_method, received) => { options = received; }
   });
   await handler(null, { peerId: 'native-defaults' });
-  assert.deepEqual(options.stunServers, [defaults[1], defaults[0], defaults[2], defaults[3]]);
+  assert.deepEqual(options.stunServers, [defaults[1], defaults[0], defaults[2], defaults[3],
+    'stun:turn.cloudflare.com:3478?transport=tcp']);
   assert.equal(options.stunServer, defaults[1]);
   assert.equal('iceServers' in options, false);
   assert.deepEqual(getStunServerPool([{ urls: ['turn:blocked.example:3478'] }]), defaults);
+});
+
+test('normal signaling defaults activate native TCP discovery without mutating browser configuration', () => {
+  const urls = [...getStunServerPool(), 'stun:fifth.example:3478'];
+  const servers = [{ urls }];
+  assert.deepEqual(getNativeStunServerPool(servers, urls[2]),
+    [urls[2], urls[0], urls[1], urls[3], 'stun:turn.cloudflare.com:3478?transport=tcp']);
+  assert.equal(urls.length, 5);
+  assert.ok(!urls.some((url) => url.includes('transport=tcp')));
+  const explicit = [...servers, { urls: 'stun:my-tcp.example:3478?transport=tcp' }];
+  assert.deepEqual(getNativeStunServerPool(explicit, urls[0]),
+    [...urls.slice(0, 4), 'stun:my-tcp.example:3478?transport=tcp']);
+  assert.deepEqual(getNativeStunServerPool([{ urls: 'stun:private.example:3478' }]),
+    ['stun:private.example:3478']);
+});
+
+test('parallel discovery retains a reachable UDP primary beyond the initial four endpoints', async () => {
+  const urls = getStunServerPool().concat(['stun:fifth.example:3478', 'stun:sixth.example:3478']);
+  const reachable = urls[5];
+  let received;
+  const handler = createPeerIpcHandler({
+    nativeStunSelector: { select: async () => ({ url: reachable, reachable: true }) },
+    nativeStunDiscovery: { resolve: async (pool) => [...pool, 'stun:141.101.90.1:3478?transport=tcp'] },
+    getNativeStunServerPool, logMainProcessDebug: () => {},
+    invokeMediaEngine: async (_method, options) => { received = options; }
+  });
+  await handler(null, { peerId: 'late-primary', iceServers: [{ urls }] });
+  assert.equal(received.stunServer, reachable);
+  assert.deepEqual(received.stunServers.slice(0, 4), [reachable, ...urls.slice(0, 3)]);
+  assert.ok(received.stunServers.includes('stun:141.101.90.1:3478?transport=tcp'));
 });

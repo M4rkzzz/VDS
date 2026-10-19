@@ -95,9 +95,12 @@ class StunRequestJson {
     if (!take('[')) { return false; }
     if (take(']')) { return done(); }
     std::size_t count = 0;
+    std::vector<std::string> raw;
     do {
       std::string value;
-      if (++count > 4 || !string(&value) || !is_valid_peer_stun_server(value)) { return false; }
+      if (++count > 2 * kPeerStunServersPerTransport || !string(&value) || !is_valid_peer_stun_server(value)) { return false; }
+      raw.push_back(value);
+      if (!is_valid_peer_stun_pool(raw)) { return false; }
       if (std::find(values->begin(), values->end(), value) == values->end()) { values->push_back(value); }
       if (take(']')) { return done(); }
     } while (take(','));
@@ -238,27 +241,54 @@ bool valid_port_suffix(const std::string& suffix) {
 
 } // namespace
 
-bool is_valid_peer_stun_server(const std::string& server) {
-  if (server.size() <= 5 || server.size() > 256 || server.rfind("stun:", 0) != 0) {
-    return false;
+bool parse_peer_stun_endpoint(const std::string& server, PeerStunEndpoint* endpoint) {
+  if (endpoint) *endpoint = {};
+  if (server.size() <= 5 || server.size() > 256 || server.rfind("stun:", 0) != 0) return false;
+  PeerStunEndpoint parsed;
+  const std::size_t query = server.find('?');
+  if (query != std::string::npos) {
+    const std::string transport = server.substr(query);
+    if (transport != "?transport=tcp" && transport != "?transport=udp") return false;
+    parsed.tcp = transport == "?transport=tcp";
   }
-  const std::string authority = server.substr(5);
-  if (authority[0] == '[') {
-    const std::size_t close = authority.find(']');
-    if (close == std::string::npos || close <= 1) { return false; }
-    const std::string host = authority.substr(1, close - 1);
+  const std::string authority = server.substr(5, query == std::string::npos ? query : query - 5);
+  if (authority.empty()) return false;
+  std::string suffix;
+  if (authority.front() == '[') {
+    const auto close = authority.find(']');
+    if (close == std::string::npos || close <= 1) return false;
+    parsed.host = authority.substr(1, close - 1);
     in6_addr address{};
 #ifdef _WIN32
-    const bool valid_ip = InetPtonA(AF_INET6, host.c_str(), &address) == 1;
+    if (InetPtonA(AF_INET6, parsed.host.c_str(), &address) != 1) return false;
 #else
-    const bool valid_ip = inet_pton(AF_INET6, host.c_str(), &address) == 1;
+    if (inet_pton(AF_INET6, parsed.host.c_str(), &address) != 1) return false;
 #endif
-    return valid_ip && valid_port_suffix(authority.substr(close + 1));
+    suffix = authority.substr(close + 1);
+  } else {
+    const auto colon = authority.find(':');
+    parsed.host = authority.substr(0, colon);
+    if (!valid_dns_host(parsed.host)) return false;
+    if (colon != std::string::npos) suffix = authority.substr(colon);
   }
-  const std::size_t colon = authority.find(':');
-  const std::string host = authority.substr(0, colon);
-  return valid_dns_host(host) &&
-    (colon == std::string::npos || valid_port_suffix(authority.substr(colon)));
+  if (!valid_port_suffix(suffix)) return false;
+  if (!suffix.empty()) parsed.port = static_cast<std::uint16_t>(std::stoul(suffix.substr(1)));
+  if (endpoint) *endpoint = std::move(parsed);
+  return true;
+}
+
+bool is_valid_peer_stun_server(const std::string& server) {
+  return parse_peer_stun_endpoint(server, nullptr);
+}
+
+bool is_valid_peer_stun_pool(const std::vector<std::string>& servers) {
+  std::size_t counts[2] = {};
+  for (const auto& server : servers) {
+    PeerStunEndpoint endpoint;
+    if (!parse_peer_stun_endpoint(server, &endpoint) ||
+        ++counts[endpoint.tcp ? 1 : 0] > kPeerStunServersPerTransport) return false;
+  }
+  return true;
 }
 
 bool parse_peer_stun_server_request(const std::string& request_json, std::string* server) {

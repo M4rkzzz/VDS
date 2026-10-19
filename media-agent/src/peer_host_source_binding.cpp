@@ -126,6 +126,9 @@ bool attach_obs_ingest_media_binding(
     peer.transport.audio_track_configured == audio_enabled;
 
   if (already_attached) {
+    // Preserve producer failure and per-subscriber readiness in repeat attach.
+    refresh_peer_media_binding(peer);
+    if (peer.media_binding.runtime->soft_refresh_requested.load()) return true;
     relay_hub().register_subscriber(kObsIngestVirtualUpstreamPeerId, peer.peer_id, peer.transport_session, audio_enabled);
     install_obs_keyframe_request_handler(peer.transport_session);
     peer.transport = get_peer_transport_snapshot(peer.transport_session);
@@ -246,6 +249,7 @@ bool attach_native_host_video_media_binding(
       : (peer.transport.video_track_open
           ? "peer-media-attached"
           : "peer-video-sender-waiting-for-video-track-open");
+    refresh_peer_media_binding(peer);
     if (error) {
       error->clear();
     }

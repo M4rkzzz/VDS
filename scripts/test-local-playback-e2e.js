@@ -8,7 +8,11 @@ const root = path.resolve(__dirname, '..');
 const captureSource = process.argv.includes('--wgc') ? 'wgc' : (process.env.VDS_PLAYBACK_E2E_SOURCE || 'obs');
 if (!['obs', 'wgc'].includes(captureSource)) throw new Error('VDS_PLAYBACK_E2E_SOURCE must be obs or wgc');
 const isWgc = captureSource === 'wgc';
-const reportPath = path.join(root, 'tmp', isWgc ? 'wgc-playback-e2e-result.json' : 'local-playback-e2e-result.json');
+const sharedProducerTest = process.env.VDS_PLAYBACK_E2E_SHARED_PRODUCER === '1';
+if (sharedProducerTest && !isWgc) throw new Error('Shared producer smoke requires --wgc');
+const nativeMapped = process.argv.includes('--native-tcp-mapped') || process.env.VDS_PLAYBACK_E2E_NATIVE_MAPPED === '1';
+const nativeTcp = nativeMapped || process.argv.includes('--native-tcp') || process.env.VDS_PLAYBACK_E2E_NATIVE_TCP === '1';
+const reportPath = path.join(root, 'tmp', sharedProducerTest ? 'shared-producer-e2e-result.json' : nativeTcp ? (nativeMapped ? 'web-mapped-tcp-e2e-result.json' : 'web-native-tcp-e2e-result.json') : (isWgc ? 'wgc-playback-e2e-result.json' : 'local-playback-e2e-result.json'));
 const runId = process.env.VDS_PLAYBACK_E2E_RUN_ID || `${Date.now()}-${process.pid}`;
 function integerOption(name, fallback, minimum, maximum) {
   const raw = process.env[`VDS_PLAYBACK_E2E_${name}`];
@@ -21,6 +25,8 @@ function integerOption(name, fallback, minimum, maximum) {
 }
 const mediaOptions = {
   captureSource,
+  nativeTcp,
+  nativeMapped,
   width: integerOption('WIDTH', 640, 64, 3840),
   height: integerOption('HEIGHT', 360, 64, 2160),
   frameRate: integerOption('FPS', 15, 5, 60),
@@ -41,6 +47,8 @@ if (!process.versions.electron) {
   const env = { ...process.env };
   delete env.ELECTRON_RUN_AS_NODE;
   env.VDS_PLAYBACK_E2E_RUN_ID = runId;
+  env.VDS_PLAYBACK_E2E_NATIVE_TCP = nativeTcp ? '1' : '0';
+  env.VDS_PLAYBACK_E2E_NATIVE_MAPPED = nativeMapped ? '1' : '0';
   saveReport({ ok: false, status: 'starting', stage: 'launch-electron' });
   const child = spawn(require('electron'), [__filename, ...(isWgc ? ['--wgc'] : [])], { env, windowsHide: true, stdio: 'inherit' });
   const deadline = setTimeout(() => {
@@ -86,6 +94,56 @@ async function runElectron() {
   const phases = [];
   const windows = [];
   const hostMessages = [];
+  const transportAudit = { droppedUdp: 0, forwardedTcp: 0, droppedSdp: 0, mappedPublished: 0, originalTcpDropped: 0 };
+  let mappingRouter, mappingFunctions;
+  const mappingJobs = new Set(), mappingStarted = new Set(), mappedEndpoints = new Set();
+  const { NatMappingLeases } = require('../desktop/nat-mapping-leases');
+  const mappingLeases = new NatMappingLeases({ onError: (error) => fail(error) });
+  function filterSdp(sdp) {
+    if (!nativeTcp) return sdp;
+    return String(sdp).split(/\r?\n/).filter((line) => {
+      if (/^a=candidate:/i.test(line) && (nativeMapped || !/\sTCP\s/i.test(line))) { ++transportAudit.droppedSdp; return false; }
+      return true;
+    }).join('\r\n');
+  }
+  function allowCandidate(candidate) {
+    if (!nativeTcp) return true;
+    const text = typeof candidate === 'string' ? candidate : candidate?.candidate || '';
+    if (/\sTCP\s/i.test(text)) { ++transportAudit.forwardedTcp; return true; }
+    if (/\sUDP\s/i.test(text)) ++transportAudit.droppedUdp;
+    return false;
+  }
+  async function installTransportProbe(target) {
+    step('browser-transport-probe');
+    await target.loadURL('about:blank');
+    target.webContents.debugger.attach('1.3');
+    await target.webContents.debugger.sendCommand('Page.enable');
+    await target.webContents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: `
+      window.__vdsTransportPeers = [];
+      const NativePeer = window.RTCPeerConnection;
+      window.RTCPeerConnection = class extends NativePeer {
+        constructor(...args) { super(...args); window.__vdsTransportPeers.push(this); }
+      };
+    ` });
+  }
+  async function selectedTransports(target) {
+    return target.webContents.executeJavaScript(`(async () => {
+      const selected = [];
+      for (const pc of window.__vdsTransportPeers || []) {
+        if (pc.connectionState === 'closed') continue;
+        const stats = await pc.getStats();
+        for (const transport of stats.values()) {
+          if (transport.type !== 'transport' || !transport.selectedCandidatePairId) continue;
+          const pair = stats.get(transport.selectedCandidatePairId);
+          const local = stats.get(pair?.localCandidateId), remote = stats.get(pair?.remoteCandidateId);
+          selected.push({ local: { protocol: local?.protocol, candidateType: local?.candidateType },
+            remote: { protocol: remote?.protocol, candidateType: remote?.candidateType, address: remote?.address, port: remote?.port },
+            bytesSent: pair?.bytesSent, bytesReceived: pair?.bytesReceived });
+        }
+      }
+      return selected;
+    })()`);
+  }
   let instance;
   let window;
   let relayWindow;
@@ -112,6 +170,10 @@ async function runElectron() {
     },
     defaultInvokeTimeoutMs: 10000
   });
+  const { HostVideoRefreshWakeup } = require('../desktop/host-video-refresh-wakeup');
+  const refreshWakeup = new HostVideoRefreshWakeup({ isRunning: () => agent.getStatus().running,
+    invokeStats: () => agent.invoke('getStats'), onError: error => logs.push('[refresh] ' + error.message) });
+  const producerEvidence = [];
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
   app.commandLine.appendSwitch('disable-renderer-backgrounding');
   app.commandLine.appendSwitch('disable-background-timer-throttling');
@@ -156,7 +218,7 @@ async function runElectron() {
   const enqueue = (operation) => {
     signalOperations = signalOperations.then(operation).catch(fail);
   };
-  const addRemoteCandidate = (peerId, candidate) => agent.invoke('addRemoteIceCandidate', {
+  const addRemoteCandidate = (peerId, candidate) => !allowCandidate(candidate) ? Promise.resolve() : agent.invoke('addRemoteIceCandidate', {
     peerId, candidate: candidate.candidate, sdpMid: candidate.sdpMid || '0',
     ...(transportGenerations.get(peerId) ? { transportGeneration: transportGenerations.get(peerId) } : {})
   });
@@ -174,9 +236,35 @@ async function runElectron() {
       return;
     }
     if (params.transportGeneration && params.transportGeneration !== transportGenerations.get(peerId)) return;
-    sendHost({ ...params, type: params.type === 'candidate' ? 'ice-candidate' : params.type, mediaManifest: manifest });
+    if ((params.type === 'candidate' || params.type === 'ice-candidate') && !allowCandidate(params.candidate)) return;
+    if (nativeMapped && (params.type === 'candidate' || params.type === 'ice-candidate')) {
+      ++transportAudit.originalTcpDropped;
+      const text = typeof params.candidate === 'string' ? params.candidate : params.candidate?.candidate || '';
+      const fields = text.trim().split(/\s+/);
+      if (!/\btcptype\s+passive\b/i.test(text) || require('node:net').isIP(fields[4]) !== 4 || mappingStarted.has(peerId)) return;
+      mappingStarted.add(peerId);
+      const generation = transportGenerations.get(peerId);
+      const job = mappingFunctions.openP2PNatMappings({ peerId, transportGeneration: generation,
+        candidates: [{ candidate: text, sdpMid: params.candidate?.sdpMid || '0' }] }).then((result) => {
+        if (generation !== transportGenerations.get(peerId) || stopping) return;
+        assert.equal(result.ok, true, 'TCP mapping failed: ' + JSON.stringify(result));
+        assert.equal(result.protocol, 'pcp'); assert.equal(result.candidates.length, 1);
+        const candidate = result.candidates[0]; const mappedFields = candidate.candidate.split(/\s+/);
+        mappedEndpoints.add(mappedFields[4] + ':' + mappedFields[5]);
+        ++transportAudit.mappedPublished;
+        sendHost({ ...params, type: 'ice-candidate', candidate, mediaManifest: manifest });
+      }).catch(fail);
+      mappingJobs.add(job); job.finally(() => mappingJobs.delete(job));
+      return;
+    }
+    const filtered = { ...params };
+    if (filtered.sdp) filtered.sdp = typeof filtered.sdp === 'string' ? filterSdp(filtered.sdp) : { ...filtered.sdp, sdp: filterSdp(filtered.sdp.sdp) };
+    sendHost({ ...filtered, type: params.type === 'candidate' ? 'ice-candidate' : params.type, mediaManifest: manifest });
   };
   agent.on('event', ({ event, params }) => {
+    refreshWakeup.handleEvent({ event, params });
+    if (event === 'host-video-producer-failed') producerEvidence.push({ event, params, at: Date.now() });
+    if (nativeMapped) mappingLeases.handleEvent({ event, params });
     if (event === 'media-state' && params.obsIngest) obsState = params.obsIngest;
     if (event === 'warning') warnings.push(params);
     if (event === 'signal') {
@@ -310,6 +398,19 @@ async function runElectron() {
       phases.push({ label, failed: true, ...current, upstream });
       throw error;
     }
+    latest.selectedTransports = await selectedTransports(window);
+    assert.ok(latest.selectedTransports.length, label + ':missing selected candidate pair');
+    for (const pair of latest.selectedTransports) {
+      assert.notEqual(pair.local.candidateType, 'relay'); assert.notEqual(pair.remote.candidateType, 'relay');
+      if (nativeTcp && latest.diagnostics.upstreamPeerId === hostId) {
+        assert.equal(pair.local.protocol, 'tcp', label + ':native leg rescued by UDP');
+        assert.equal(pair.remote.protocol, 'tcp', label + ':remote native leg rescued by UDP');
+        if (nativeMapped) {
+          assert.equal(pair.remote.candidateType, 'srflx', label + ':unmapped host candidate rescued test');
+          assert.ok(mappedEndpoints.has(pair.remote.address + ':' + pair.remote.port), label + ':selected endpoint was not mapped');
+        }
+      }
+    }
     phases.push({ label, ...latest });
     if (!isWgc) assert.equal(latest.canvasHasColor, true, label + ':decoded canvas stays blank');
     assert.equal(latest.diagnostics.playbackState, 'playing', label + ':playback state did not reach rendered video');
@@ -369,9 +470,21 @@ async function runElectron() {
   try {
     step('electron-ready');
     await app.whenReady();
+    if (nativeMapped) {
+      step('mapping-router-start');
+      mappingRouter = await require('../tests/fixtures/tcp-mapping-router').tcpMappingRouter('pcp', { controlAddress: '0.0.0.0' });
+      const { buildPcpMapRequest, parsePcpMapResponse } = require('../desktop/pcp-packet');
+      mappingFunctions = require('../tests/fixtures/nat-main-functions').loadMappingFunctions({
+        dgram, crypto: require('node:crypto'), buildPcpMapRequest, parsePcpMapResponse,
+        natMappingLeases: mappingLeases, upnpPortMapper: mappingRouter.mapper,
+        resolveDefaultGatewayIpv4: async (localAddress) => localAddress,
+        sendToRenderer: () => fail(new Error('unchanged mapped endpoint unexpectedly changed')),
+        gatewayRequest: (request, address, _port, ...args) => request(address, mappingRouter.controlPort, ...args)
+      });
+    }
     step('server-listening');
-    instance = startServer({ port: 0, disconnectGraceMs: 2000, maxDownstreamsPerUpstream: 1,
-      publicDir: path.join(root, 'server/public') });
+    instance = startServer({ port: 0, disconnectGraceMs: 2000, maxDownstreamsPerUpstream: sharedProducerTest ? 2 : 1,
+      ...(nativeTcp ? { iceServers: [] } : {}), publicDir: path.join(root, 'server/public') });
     await once(instance.server, 'listening');
     const port = instance.server.address().port;
     step('native-agent-start');
@@ -415,7 +528,7 @@ async function runElectron() {
     await once(hostSocket, 'open');
     const created = once(hostSocket, 'message');
     hostSocket.send(JSON.stringify({ type: 'create-room', clientId: hostId, mediaManifest: manifest,
-      mediaCapabilities: { maxDirectDownstreams: 1 } }));
+      mediaCapabilities: { maxDirectDownstreams: sharedProducerTest ? 2 : 1 } }));
     room = JSON.parse(String((await created)[0]));
     assert.equal(room.type, 'room-created');
     hostSocket.on('message', (raw) => {
@@ -427,22 +540,34 @@ async function runElectron() {
         if (peers.has(message.viewerId)) await agent.invoke('closePeer', { peerId: message.viewerId,
           ...(transportGenerations.get(message.viewerId) ? { transportGeneration: transportGenerations.get(message.viewerId) } : {}) });
         peers.add(message.viewerId);
+        mappingStarted.delete(message.viewerId);
+        const leaseOwner = nativeMapped ? mappingLeases.beginCreate({ peerId: message.viewerId }) : null;
         transportGenerations.delete(message.viewerId);
         pendingNativeSignals.set(message.viewerId, []);
+        const wakeupTicket = refreshWakeup.beginCreate({ peerId: message.viewerId, role: 'host-downstream' });
         const peer = await agent.invoke('createPeer', { peerId: message.viewerId,
           role: 'host-downstream', initiator: true, encodedMediaDataChannel: true, mediaManifest: manifest });
         assert.equal(peer.transportReady, true);
         const generation = peer.transportGeneration || peer.peerTransport?.transportGeneration || peer.peer?.peerTransport?.transportGeneration;
         assert.ok(generation, 'native createPeer omitted transport identity');
         transportGenerations.set(message.viewerId, generation);
+        refreshWakeup.completeCreate(wakeupTicket, { peerId: message.viewerId, transportGeneration: generation });
+        if (nativeMapped) assert.equal(mappingLeases.completeCreate(leaseOwner, { peerId: message.viewerId, transportGeneration: generation }), true);
         const pending = pendingNativeSignals.get(message.viewerId) || [];
         pendingNativeSignals.delete(message.viewerId);
         for (const signal of pending) sendNativeSignal(signal);
       });
+      if (sharedProducerTest && message.type === 'viewer-left') enqueue(async () => {
+        const peerId = message.viewerId;
+        if (!peers.has(peerId)) return;
+        refreshWakeup.closePeer({ peerId });
+        await agent.invoke('closePeer', { peerId, transportGeneration: transportGenerations.get(peerId) });
+        peers.delete(peerId);
+      });
       if (message.type === 'answer') enqueue(async () => {
         const peerId = message.fromClientId;
         await agent.invoke('setRemoteDescription', {
-          peerId, type: message.sdp.type, sdp: message.sdp.sdp, mediaManifest: manifest,
+          peerId, type: message.sdp.type, sdp: filterSdp(message.sdp.sdp), mediaManifest: manifest,
           transportGeneration: transportGenerations.get(peerId)
         });
         remoteDescriptions.add(peerId);
@@ -467,6 +592,7 @@ async function runElectron() {
     window.webContents.setFrameRate(60);
     window.webContents.setAudioMuted(true);
     windows.push(window);
+    await installTransportProbe(window);
     window.webContents.on('console-message', (details) => {
       if (details.level === 'error') consoleErrors.push(details.message);
       if (mediaOptions.traceRendering && !details.message.includes('[diagnostics]')) {
@@ -474,11 +600,20 @@ async function runElectron() {
       }
     });
     window.webContents.on('render-process-gone', (_event, details) => fail(new Error('renderer-gone:' + details.reason)));
+    step('web-load');
     await window.loadURL(`http://127.0.0.1:${port}/vds_web/`);
     await installCodecTrace(window);
     await join();
     const initial = await waitForFrames('initial-playback');
     const sustained = await observeSustainedPlayback(initial);
+    if (sharedProducerTest) {
+      await agent.invoke('attachSurface', { surface: 'producer-preview', target: 'host-capture-preview', visible: false });
+      await poll('preview-reuses-producer', async () => {
+        const stats = await agent.invoke('getStats');
+        const surface = stats.surfaces.find(s => s.surface === 'producer-preview');
+        return surface?.implementation === 'shared-wgc-live-preview' && surface.decodedFramesRendered > 0;
+      });
+    }
     // Exercise room and browser relay recovery with both real source paths.
     {
       await window.webContents.executeJavaScript("document.getElementById('leaveButton').click()");
@@ -499,6 +634,7 @@ async function runElectron() {
       window.webContents.setFrameRate(60);
       window.webContents.setAudioMuted(true);
       windows.push(window);
+      await installTransportProbe(window);
       window.webContents.on('console-message', (details) => {
         if (details.level === 'error') consoleErrors.push(details.message);
         if (mediaOptions.traceRendering && !details.message.includes('[diagnostics]')) {
@@ -506,10 +642,73 @@ async function runElectron() {
         }
       });
       window.webContents.on('render-process-gone', (_event, details) => fail(new Error('renderer-gone:' + details.reason)));
+      step('web-load');
       await window.loadURL(`http://127.0.0.1:${port}/vds_web/`);
       await installCodecTrace(window);
+      if (sharedProducerTest) {
+        // This fixture explicitly exercises two native subscribers, not the
+        // server's preferred browser relay topology.
+        for (const viewer of instance.rooms.get(room.roomId).viewers)
+          viewer.mediaCapabilities.maxDirectDownstreams = 0;
+      }
       await join();
       const downstream = await waitForFrames('browser-relay-playback');
+      if (sharedProducerTest) {
+        assert.equal(downstream.upstreamPeerId, hostId);
+        const before = await agent.invoke('getStats');
+        const bindings = before.peers.filter(p => p.mediaBinding.producerId).map(p => p.mediaBinding);
+        assert.equal(bindings.length, 2);
+        assert.equal(bindings[0].producerId, bindings[1].producerId, 'same source/config started separate encoders');
+        assert.equal(bindings[0].producerSubscribers, 2);
+        assert.ok(bindings.every(b => b.active), 'open DataChannel must report active without RTP');
+        producerEvidence.push({ stage: 'two-subscribers', stats: before });
+        const generations = new Map(transportGenerations);
+        const beforeFirst = await snapshot(relayWindow);
+        const beforeSecond = await snapshot(window);
+        const killedPid = bindings[0].producerProcessId;
+        assert.ok(Number.isSafeInteger(killedPid) && killedPid > 0);
+        step('terminate-owned-encoder');
+        process.kill(killedPid);
+        // No stats polling here: only the production event wakeup can recover it.
+        const recovered = await waitForFrames('encoder-death-recovery', beforeSecond.diagnostics);
+        await poll('first-viewer-also-recovers', async () =>
+          (await snapshot(relayWindow)).diagnostics.webDecodedVideoFrames > beforeFirst.diagnostics.webDecodedVideoFrames + 10);
+        const after = await agent.invoke('getStats');
+        const nextBindings = after.peers.filter(p => p.mediaBinding.producerId).map(p => p.mediaBinding);
+        assert.notEqual(nextBindings[0].producerProcessId, killedPid);
+        assert.equal(nextBindings[0].producerId, nextBindings[1].producerId);
+        assert.deepEqual(transportGenerations, generations, 'encoder recovery must retain P2P connections');
+        assert.equal(recovered.webPlaybackMetrics.sourceEpoch, beforeSecond.diagnostics.webPlaybackMetrics.sourceEpoch);
+        producerEvidence.push({ stage: 'recovered', stats: after });
+        await observeSustainedPlayback(recovered, 'shared-recovered-sustained');
+        relayWindow.destroy();
+        await poll('one-subscriber-remains', async () => {
+          const stats = await agent.invoke('getStats');
+          const active = stats.peers.filter(p => p.mediaBinding.producerId);
+          if (active.length !== 1 || active[0].mediaBinding.producerSubscribers !== 1) return false;
+          assert.equal(active[0].mediaBinding.producerId, nextBindings[0].producerId);
+          producerEvidence.push({ stage: 'one-subscriber', stats }); return true;
+        });
+        const single = (await snapshot()).diagnostics;
+        await waitForFrames('remaining-viewer-continues', single);
+        // Preview detach/reattach must not stop or replace the shared encoder.
+        await agent.invoke('detachSurface', { surface: 'producer-preview' });
+        await agent.invoke('attachSurface', { surface: 'producer-preview', target: 'host-capture-preview', visible: false });
+        assert.equal((await agent.invoke('getStats')).peers.find(p => p.mediaBinding.producerId).mediaBinding.producerId, nextBindings[0].producerId);
+        const beforeLastLeave = (await snapshot()).diagnostics;
+        await window.webContents.executeJavaScript("document.getElementById('leaveButton').click()");
+        await poll('last-subscriber-releases-encoder', async () => (await agent.invoke('getStats')).peers.every(p => !p.mediaBinding.producerId));
+        await poll('preview-independent-fallback', async () => {
+          const stats = await agent.invoke('getStats');
+          const surface = stats.surfaces.find(s => s.surface === 'producer-preview');
+          if (surface?.implementation !== 'wgc-live-preview' || !surface.running) return false;
+          producerEvidence.push({ stage: 'preview-fallback', stats }); return true;
+        });
+        await join();
+        await waitForFrames('shared-last-leave-rejoin', beforeLastLeave);
+        await poll('preview-reuses-new-producer', async () => (await agent.invoke('getStats')).surfaces.some(s => s.implementation === 'shared-wgc-live-preview'));
+        return;
+      }
       assert.equal(downstream.upstreamPeerId, relaySnapshot.diagnostics.clientId, 'second viewer bypassed browser relay');
       assert.equal(downstream.reencodePathUsed, false);
       // Restart the source on the same native and browser relay connections. The
@@ -553,6 +752,7 @@ async function runElectron() {
     checkpoint();
   } finally {
     stopping = true;
+    refreshWakeup.dispose();
     clearTimeout(deadline);
     step('cleanup');
     const nativeStats = agent.getStatus().running
@@ -572,6 +772,16 @@ async function runElectron() {
       await exited;
     }
     await agent.stop();
+    await Promise.all([...mappingJobs]);
+    await mappingLeases.dispose();
+    const mappingSummary = mappingRouter ? { protocol: 'pcp', bytes: mappingRouter.bytes,
+      leasesRemaining: mappingRouter.entries.size, requests: mappingRouter.calls, errors: mappingRouter.errors.map(e => e.message) } : null;
+    if (mappingRouter) {
+      if (mappingSummary.leasesRemaining || mappingSummary.errors.length || mappingSummary.bytes < 65536) {
+        fatalError ||= new Error('mapped route/cleanup verification failed'); exitCode = 1;
+      }
+      await mappingRouter.stop();
+    }
     if (instance) {
       for (const client of instance.wss.clients) client.terminate();
       await new Promise((resolve) => instance.wss.close(resolve));
@@ -582,8 +792,8 @@ async function runElectron() {
       error: fatalError?.message || null, progress,
       path: isWgc ? 'Real WGC -> hardware-selected H264 -> native DataChannel -> room server -> WebCodecs'
         : 'FFmpeg synthetic H264/AAC -> loopback SRT -> native DataChannel -> room server -> WebCodecs',
-      electron: process.versions.electron, nativeBinarySha256, obsState, phases, nativeStats, warnings, consoleErrors, hostMessages,
-      audioOutputMuted: true, ffmpegExit, nativeStopped: !agent.getStatus().running, logs: logs.slice(-40) };
+      electron: process.versions.electron, nativeBinarySha256, producerEvidence, obsState, phases, nativeStats, warnings, consoleErrors, hostMessages,
+      transportAudit, mappingSummary, audioOutputMuted: true, ffmpegExit, nativeStopped: !agent.getStatus().running, logs: logs.slice(-40) };
     saveReport(report);
     console.log(JSON.stringify({ ok: report.ok, error: report.error, phases: phases.map(({ label, diagnostics }) => ({
       label, video: diagnostics?.webDecodedVideoFrames, audio: diagnostics?.webDecodedAudioBlocks,

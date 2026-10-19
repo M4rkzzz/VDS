@@ -39,16 +39,26 @@
  		target_link_libraries(datachannel PRIVATE LibJuice::LibJuice)
 --- a/include/rtc/configuration.hpp
 +++ b/include/rtc/configuration.hpp
-@@ -8,6 +8,8 @@
+@@ -8,6 +8,9 @@
  
  #ifndef RTC_ICE_CONFIGURATION_H
  #define RTC_ICE_CONFIGURATION_H
 +#define RTC_VDS_ENHANCED_ICE 1
 +#define RTC_VDS_MULTISOCKET_ICE 1
++#define RTC_VDS_TCP_STUN 1
  
  #include "common.hpp"
  
-@@ -64,6 +66,7 @@
+@@ -37,7 +40,7 @@
+ 	Type type;
+ 	string username;
+ 	string password;
+-	RelayType relayType;
++	RelayType relayType = RelayType::TurnUdp;
+ };
+ 
+ struct RTC_CPP_EXPORT ProxyServer {
+@@ -64,6 +67,7 @@
  enum class TransportPolicy { All = RTC_TRANSPORT_POLICY_ALL, Relay = RTC_TRANSPORT_POLICY_RELAY };
  
  struct RTC_CPP_EXPORT Configuration {
@@ -56,9 +66,160 @@
  	// ICE settings
  	std::vector<IceServer> iceServers;
  	optional<ProxyServer> proxyServer; // libnice only
+--- a/src/candidate.cpp
++++ b/src/candidate.cpp
+@@ -108,17 +108,18 @@
+ 	if (mTransportString == "UDP" || mTransportString == "udp") {
+ 		mTransportType = TransportType::Udp;
+ 	} else if (mTransportString == "TCP" || mTransportString == "tcp") {
+-		// Peek tail to find TCP type
++		// RFC 6544 places related address/port before tcptype. Walk complete
++		// name/value pairs rather than assuming it is the first attribute.
+ 		std::istringstream tiss(mTail);
+-		string tcptype_, tcptype;
+-		if (tiss >> tcptype_ >> tcptype && tcptype_ == "tcptype") {
+-			if (auto it = TcpTypeMap.find(tcptype); it != TcpTypeMap.end())
++		string name, value;
++		bool found = false;
++		mTransportType = TransportType::TcpUnknown;
++		while (tiss >> name >> value) {
++			if (name != "tcptype") continue;
++			if (found) { mTransportType = TransportType::TcpUnknown; break; }
++			found = true;
++			if (auto it = TcpTypeMap.find(value); it != TcpTypeMap.end())
+ 				mTransportType = it->second;
+-			else
+-				mTransportType = TransportType::TcpUnknown;
+-
+-		} else {
+-			mTransportType = TransportType::TcpUnknown;
+ 		}
+ 	} else {
+ 		mTransportType = TransportType::Unknown;
+--- a/src/impl/dtlstransport.cpp
++++ b/src/impl/dtlstransport.cpp
+@@ -116,13 +116,13 @@
+ 
+ void DtlsTransport::start() {
+ 	PLOG_DEBUG << "Starting DTLS transport";
+-	registerIncoming();
+ 	changeState(State::Connecting);
+ 
+ 	size_t mtu = mMtu.value_or(DEFAULT_MTU) - 8 - 40; // UDP/IPv6
+ 	gnutls_dtls_set_mtu(mSession, static_cast<unsigned int>(mtu));
+ 	PLOG_VERBOSE << "DTLS MTU set to " << mtu;
+ 
++	registerIncoming(); // replay only after state/MTU initialization
+ 	enqueueRecv(); // to initiate the handshake
+ }
+ 
+@@ -454,7 +454,6 @@
+ 
+ void DtlsTransport::start() {
+ 	PLOG_DEBUG << "Starting DTLS transport";
+-	registerIncoming();
+ 	changeState(State::Connecting);
+ 
+ 	{
+@@ -464,6 +463,7 @@
+ 		PLOG_VERBOSE << "DTLS MTU set to " << mtu;
+ 	}
+ 
++	registerIncoming(); // replay only after state/MTU initialization
+ 	enqueueRecv(); // to initiate the handshake
+ }
+ 
+@@ -840,7 +840,6 @@
+ 
+ void DtlsTransport::start() {
+ 	PLOG_DEBUG << "Starting DTLS transport";
+-	registerIncoming();
+ 	changeState(State::Connecting);
+ 
+ 	int ret, err;
+@@ -858,6 +857,7 @@
+ 
+ 	openssl::check_error(err, "Handshake failed");
+ 
++	registerIncoming(); // ICE may already hold the peer's first DTLS flight
+ 	handleTimeout();
+ }
+ 
+--- /dev/null
++++ b/src/impl/earlydtlscallback.hpp
+@@ -0,0 +1,60 @@
++/**
++ * VDS ICE-to-DTLS startup handoff. MPL-2.0, like the surrounding transport.
++ */
++#ifndef RTC_IMPL_EARLY_DTLS_CALLBACK_H
++#define RTC_IMPL_EARLY_DTLS_CALLBACK_H
++
++#include "message.hpp"
++#include "utils.hpp"
++#include <algorithm>
++#include <vector>
++
++namespace rtc::impl {
++
++// Reuse the existing callback's recursive mutex: registration, replay and live
++// delivery are serialized without adding a lock to the media hot path.
++class EarlyDtlsCallback final : public synchronized_callback<message_ptr> {
++public:
++    explicit EarlyDtlsCallback(bool enabled = false) : mWaiting(enabled) {}
++    using synchronized_callback<message_ptr>::operator=;
++
++private:
++    void set(message_callback func) override {
++        synchronized_callback<message_ptr>::set(std::move(func));
++        mWaiting = false; // unregister/stop must never re-arm startup buffering
++        auto pending = std::move(mPending);
++        mPending.clear();
++        mBytes = 0;
++        for (auto &message : pending) {
++            if (!callback) break;
++            synchronized_callback<message_ptr>::call(std::move(message));
++        }
++    }
++
++    bool call(message_ptr message) const override {
++        if (callback) return synchronized_callback<message_ptr>::call(std::move(message));
++        if (!mWaiting || !message || message->size() < 13) return false;
++        const auto *data = reinterpret_cast<const unsigned char *>(message->data());
++        // Only initial DTLS handshake records, never media or encrypted records.
++        // Certificate/fingerprint verification still belongs to the DTLS stack.
++        if (data[0] != 22 || data[1] != 0xfe || (data[2] != 0xfd && data[2] != 0xff) ||
++            data[3] != 0 || data[4] != 0) return false;
++        const size_t recordBytes = (size_t(data[11]) << 8) | data[12];
++        if (!recordBytes || recordBytes > message->size() - 13) return false;
++        for (const auto &saved : mPending)
++            if (saved->size() == message->size() && std::equal(saved->begin(), saved->end(), message->begin()))
++                return true;
++        // Bound only the pre-registration stash, not established transport traffic.
++        if (mPending.size() >= 16 || message->size() > 65536 - mBytes) return false;
++        mBytes += message->size();
++        mPending.push_back(std::move(message));
++        return true;
++    }
++
++    bool mWaiting;
++    mutable size_t mBytes = 0;
++    mutable std::vector<message_ptr> mPending;
++};
++
++} // namespace rtc::impl
++#endif
 --- a/src/impl/icetransport.cpp
 +++ b/src/impl/icetransport.cpp
-@@ -97,21 +97,22 @@
+@@ -49,7 +49,7 @@
+ IceTransport::IceTransport(const Configuration &config, candidate_callback candidateCallback,
+                            state_callback stateChangeCallback,
+                            gathering_state_callback gatheringStateChangeCallback)
+-    : Transport(nullptr, std::move(stateChangeCallback)), mRole(Description::Role::ActPass),
++    : Transport(nullptr, std::move(stateChangeCallback), true), mRole(Description::Role::ActPass),
+       mMid("0"), mGatheringState(GatheringState::New),
+       mCandidateCallback(std::move(candidateCallback)),
+       mGatheringStateChangeCallback(std::move(gatheringStateChangeCallback)),
+@@ -97,21 +97,27 @@
  		jconfig.concurrency_mode = JUICE_CONCURRENCY_MODE_POLL;
  	}
  
@@ -68,12 +229,14 @@
 -	std::shuffle(servers.begin(), servers.end(), utils::random_engine());
 -
 -	// Pick a STUN server
++	int stunTransportCount[2] = {};
  	for (auto &server : servers) {
 -		if (!server.hostname.empty() && server.type == IceServer::Type::Stun) {
 -			if (server.port == 0)
 -				server.port = 3478; // STUN UDP port
 -			PLOG_INFO << "Using STUN server \"" << server.hostname << ":" << server.port << "\"";
 +		if (server.hostname.empty() || server.type != IceServer::Type::Stun) continue;
++		if (server.relayType == IceServer::RelayType::TurnTls) throw std::invalid_argument("STUN TLS is not supported");
 +		if (!server.port) server.port = 3478;
 +		if (!jconfig.stun_server_host) {
  			jconfig.stun_server_host = server.hostname.c_str();
@@ -81,16 +244,36 @@
 -			break;
  		}
 -	}
-+		if (jconfig.stun_servers_count >= JUICE_VDS_MAX_STUN_SERVERS) break;
++		const bool tcp = server.relayType == IceServer::RelayType::TurnTcp;
++		if (stunTransportCount[tcp ? 1 : 0] >= JUICE_VDS_STUN_SERVERS_PER_TRANSPORT) continue;
++		++stunTransportCount[tcp ? 1 : 0];
 +		juice_stun_server_t &target = jconfig.stun_servers[jconfig.stun_servers_count++];
 +		target.host = server.hostname.c_str();
 +		target.port = server.port;
++		target.tcp = server.relayType == IceServer::RelayType::TurnTcp;
 +	}
 +	jconfig.enable_port_prediction = true;
 +	jconfig.enable_multi_socket_punch = config.enableIceMultiSocket;
  
  	// Bind address
  	if (config.bindAddress) {
+@@ -131,7 +137,7 @@
+ 		throw std::runtime_error("Failed to create the ICE agent");
+ 
+ 	// ICE-TCP
+-	juice_set_ice_tcp_mode(mAgent.get(), config.enableIceTcp ? JUICE_ICE_TCP_MODE_ACTIVE
++	juice_set_ice_tcp_mode(mAgent.get(), config.enableIceTcp ? JUICE_ICE_TCP_MODE_BOTH
+ 	                                                         : JUICE_ICE_TCP_MODE_NONE);
+ 
+ 	// Add TURN servers
+@@ -523,6 +529,7 @@
+ 
+ 	// Randomize order
+ 	std::vector<IceServer> servers = config.iceServers;
++	int stunTransportCount[2] = {};
+ 	std::shuffle(servers.begin(), servers.end(), utils::random_engine());
+ 
+ 	// Add one STUN server
 --- a/src/impl/peerconnection.cpp
 +++ b/src/impl/peerconnection.cpp
 @@ -1149,6 +1149,7 @@
@@ -125,3 +308,46 @@
  	} else {
  		// We might need a lookup, do it asynchronously
  		// We don't use the thread pool because we have no control on the timeout
+--- a/src/impl/transport.cpp
++++ b/src/impl/transport.cpp
+@@ -10,8 +10,9 @@
+ 
+ namespace rtc::impl {
+ 
+-Transport::Transport(shared_ptr<Transport> lower, state_callback callback)
+-    : mLower(std::move(lower)), mStateChangeCallback(std::move(callback)) {}
++Transport::Transport(shared_ptr<Transport> lower, state_callback callback, bool bufferEarlyDtls)
++    : mLower(std::move(lower)), mStateChangeCallback(std::move(callback)),
++      mRecvCallback(bufferEarlyDtls) {}
+ 
+ Transport::~Transport() {
+ 	unregisterIncoming();
+--- a/src/impl/transport.hpp
++++ b/src/impl/transport.hpp
+@@ -13,6 +13,7 @@
+ #include "init.hpp"
+ #include "internals.hpp"
+ #include "message.hpp"
++#include "earlydtlscallback.hpp"
+ 
+ #include <atomic>
+ #include <functional>
+@@ -25,7 +26,8 @@
+ 	enum class State { Disconnected, Connecting, Connected, Completed, Failed };
+ 	using state_callback = std::function<void(State state)>;
+ 
+-	Transport(shared_ptr<Transport> lower = nullptr, state_callback callback = nullptr);
++	Transport(shared_ptr<Transport> lower = nullptr, state_callback callback = nullptr,
++	          bool bufferEarlyDtls = false);
+ 	virtual ~Transport();
+ 
+ 	void registerIncoming();
+@@ -50,7 +52,7 @@
+ 
+ 	shared_ptr<Transport> mLower;
+ 	synchronized_callback<State> mStateChangeCallback;
+-	synchronized_callback<message_ptr> mRecvCallback;
++	EarlyDtlsCallback mRecvCallback;
+ 
+ 	std::atomic<State> mState = State::Disconnected;
+ };

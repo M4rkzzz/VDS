@@ -16,6 +16,8 @@
 #endif
 
 #include "agent_diagnostics.h"
+#include "agent_events.h"
+#include "json_protocol.h"
 #include "ffmpeg_probe_state.h"
 #include "host_capture_plan.h"
 #include "host_pipeline.h"
@@ -45,6 +47,49 @@ using vds::media_agent::video_access_unit_has_random_access_nal;
 using vds::media_agent::video_bootstrap_is_complete;
 
 constexpr auto kWgcSourceStartTimeout = std::chrono::seconds(15);
+
+// Accessed only by the serialized RPC owner. Entries never own a producer.
+std::unordered_map<std::string, std::weak_ptr<PeerVideoSenderRuntime>> shared_producers;
+std::atomic<std::uint64_t> next_producer_id { 1 };
+
+void subscribe_sender(PeerState& peer, const std::shared_ptr<PeerVideoSenderRuntime>& runtime) {
+  auto subscriber = std::make_shared<PeerVideoSubscriber>();
+  subscriber->transport = peer.transport_session;
+  subscriber->transport_generation = peer.transport.transport_generation;
+  {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    runtime->subscribers[peer.peer_id] = subscriber;
+  }
+  peer.media_binding.runtime = runtime;
+  set_peer_transport_keyframe_request_handler(peer.transport_session,
+    vds::media_agent::make_peer_video_sender_keyframe_request_handler(runtime, subscriber));
+}
+
+void request_failed_producer_refresh(const std::shared_ptr<PeerVideoSenderRuntime>& runtime) {
+  if (runtime->stop_requested.load() || runtime->failure_notified.exchange(true)) return;
+  runtime->soft_refresh_requested.store(true);
+  if (runtime->preview_frames) runtime->preview_frames->active.store(false);
+  std::vector<std::pair<std::string, std::string>> peers;
+  {
+    std::lock_guard<std::mutex> lock(runtime->mutex);
+    runtime->running = false;
+    for (const auto& entry : runtime->subscribers)
+      peers.emplace_back(entry.first, entry.second->transport_generation);
+  }
+  // Wake the existing desktop RPC owner; worker threads never rebuild peers.
+  for (const auto& peer : peers) {
+    emit_event("host-video-producer-failed", "{\"peerId\":\"" +
+      vds::media_agent::json_escape(peer.first) + "\",\"transportGeneration\":\"" +
+      vds::media_agent::json_escape(peer.second) + "\",\"producerId\":" +
+      std::to_string(runtime->producer_id) + "}");
+  }
+}
+
+bool video_transport_ready(const PeerTransportSnapshot& transport) {
+  return transport.connection_state == "connected" &&
+    ((transport.encoded_media_data_channel_requested || transport.encoded_media_data_channel_supported)
+      ? transport.encoded_media_data_channel_open : transport.video_track_open);
+}
 
 #ifdef _WIN32
 using vds::media_agent::format_windows_error;
@@ -105,6 +150,9 @@ void emit_peer_video_sender_breadcrumb(const std::string& step) {
 }
 
 void reset_peer_media_binding_sender_metrics(PeerMediaBindingState& binding) {
+  binding.producer_id = 0;
+  binding.producer_process_id = 0;
+  binding.producer_subscribers = 0;
   binding.source_frames_captured = 0;
   binding.source_frames_repeated = 0;
   binding.avg_source_copy_resource_us = 0;
@@ -183,7 +231,26 @@ bool start_peer_video_sender(
   }
   emit_peer_video_sender_breadcrumb(std::string("startPeerVideoSender:after-build-command peer=") + peer.peer_id);
 
+  const auto capture_config = build_wgc_frame_source_config(plan);
+  const auto producer_key = vds::media_agent::host_media_clock_snapshot().source_epoch + "\n" +
+    capture_config.target_kind + "\n" + capture_config.display_id + "\n" + capture_config.window_handle +
+    "\n" + plan.capture_backend + "\n" + command_line;
+  for (auto it = shared_producers.begin(); it != shared_producers.end();) {
+    if (it->second.expired()) it = shared_producers.erase(it); else ++it;
+  }
+  if (auto existing = shared_producers[producer_key].lock()) {
+    if (!existing->stop_requested.load() && !existing->soft_refresh_requested.load() &&
+        !existing->failure_notified.load()) {
+      subscribe_sender(peer, existing);
+      emit_peer_video_sender_breadcrumb("startPeerVideoSender:shared peer=" + peer.peer_id +
+        " producer=" + std::to_string(existing->producer_id));
+      return true;
+    }
+  }
+
   auto runtime = std::make_shared<PeerVideoSenderRuntime>();
+  runtime->producer_key = producer_key;
+  runtime->producer_id = next_producer_id.fetch_add(1);
   runtime->next_video_sequence = peer.media_binding.next_video_sequence;
   runtime->codec_path = normalize_video_codec(plan.codec_path, normalize_video_codec(pipeline.requested_video_codec));
   runtime->frame_interval_us = static_cast<unsigned long long>(
@@ -195,6 +262,10 @@ bool start_peer_video_sender(
   const bool use_wgc_source = plan.capture_backend == "wgc";
   runtime->uses_wgc_source = use_wgc_source;
   const WgcFrameSourceConfig wgc_source_config = build_wgc_frame_source_config(plan);
+  if (use_wgc_source) {
+    runtime->preview_frames = std::make_shared<vds::media_agent::SharedCaptureFrames>();
+    vds::media_agent::register_shared_capture(wgc_source_config, runtime->preview_frames);
+  }
   const bool use_window_restore_placeholder =
     use_wgc_source &&
     wgc_source_config.target_kind == "window" &&
@@ -311,6 +382,7 @@ bool start_peer_video_sender(
   runtime->stdin_write_handle = stdin_write;
   runtime->stdout_read_handle = stdout_read;
   runtime->reason = "peer-video-sender-running";
+  subscribe_sender(peer, runtime);
   emit_peer_video_sender_breadcrumb(
     std::string("startPeerVideoSender:after-create-process peer=") + peer.peer_id +
     " pid=" + std::to_string(static_cast<unsigned long>(process_info.dwProcessId)));
@@ -354,7 +426,7 @@ bool start_peer_video_sender(
         std::lock_guard<std::mutex> lock(runtime->mutex);
         runtime->reason = reason;
         runtime->last_error = last_error;
-        runtime->running = running;
+        runtime->running = running && !runtime->failure_notified.load();
       };
 
       const auto write_bgra_frame = [&](const std::vector<std::uint8_t>& bytes, std::uint64_t timestamp_us) -> bool {
@@ -382,6 +454,7 @@ bool start_peer_video_sender(
           );
           if (!wrote || chunk_written == 0) {
             update_runtime_state("peer-video-source-write-failed", format_windows_error(GetLastError()), false);
+            request_failed_producer_refresh(runtime);
             return false;
           }
           total_written += static_cast<std::size_t>(chunk_written);
@@ -434,7 +507,8 @@ bool start_peer_video_sender(
         return placeholder_frame;
       };
       WgcFrameReadbackSampler readback_sampler(runtime->frame_interval_us, source_frame_width, source_frame_height);
-      WgcFrameCpuBuffer frame;
+      auto retained_frame = runtime->preview_frames->acquire();
+      auto readback_frame = runtime->preview_frames->acquire();
       std::string frame_error;
       bool have_frame = false;
       std::int64_t next_encoder_deadline_us = -1;
@@ -541,7 +615,7 @@ bool start_peer_video_sender(
           ? static_cast<int>(std::min<std::int64_t>(250, std::max<std::int64_t>(1, (remaining_us + 999) / 1000)))
           : 250;
         bool repeated_frame = false;
-        if (!wgc_source->wait_for_frame_bgra(frame_wait_ms, &frame, &frame_error, &readback_sampler)) {
+        if (!wgc_source->wait_for_frame_bgra(frame_wait_ms, readback_frame.get(), &frame_error, &readback_sampler)) {
           if (runtime->stop_requested.load()) {
             break;
           }
@@ -568,6 +642,11 @@ bool start_peer_video_sender(
           }
         }
 
+        if (!repeated_frame) {
+          retained_frame = std::move(readback_frame);
+          readback_frame = runtime->preview_frames->acquire();
+        }
+        const auto& frame = *retained_frame;
         const bool frame_geometry_changed =
           frame.width != source_frame_width ||
           frame.height != source_frame_height ||
@@ -605,6 +684,7 @@ bool start_peer_video_sender(
           ? vds::media_agent::host_media_now_us(runtime->source_clock)
           : vds::media_agent::host_media_system_relative_timestamp_us(runtime->source_clock, frame.timestamp_100ns);
         last_frame_timestamp_us = std::max(timestamp_us, last_frame_timestamp_us + 1);
+        runtime->preview_frames->publish(retained_frame);
         if (!write_bgra_frame(frame.bgra, last_frame_timestamp_us)) {
           break;
         }
@@ -672,6 +752,8 @@ bool start_peer_video_sender(
         runtime->source_thread.join();
       }
       close_peer_video_sender_handles(*runtime);
+      peer.media_binding.runtime.reset();
+      set_peer_transport_keyframe_request_handler(peer.transport_session, {});
       if (error) {
         *error = source_start_error;
       }
@@ -681,7 +763,7 @@ bool start_peer_video_sender(
   }
 
   const std::shared_ptr<PeerTransportSession> transport_session = peer.transport_session;
-  runtime->pump_thread = std::thread([runtime, transport_session]() {
+  runtime->pump_thread = std::thread([runtime]() {
     std::vector<std::uint8_t> read_buffer(64 * 1024);
     const std::string codec_path = normalize_video_codec(runtime->codec_path);
     vds::media_agent::AnnexBVideoAccessUnitParser access_unit_parser;
@@ -725,77 +807,77 @@ bool start_peer_video_sender(
             codec_path, runtime->cached_video_decoder_config_au, config);
           if (merged != runtime->cached_video_decoder_config_au && !timing.keyframe) {
             runtime->pending_video_bootstrap = true;
+            for (auto& entry : runtime->subscribers) entry.second->pending_bootstrap = true;
           }
           runtime->cached_video_decoder_config_au = merged;
         }
         if (source_timing_lost) {
           runtime->pending_video_bootstrap = true;
           runtime->reason = "peer-video-sender-source-timing-overflow";
+          for (auto& entry : runtime->subscribers) entry.second->pending_bootstrap = true;
           return;
         }
       }
 
-      const auto readiness = get_peer_transport_media_readiness(transport_session);
-      const bool use_data_channel = readiness.use_encoded_data_channel;
-      if (!readiness.video_ready) {
-        std::lock_guard<std::mutex> lock(runtime->mutex);
-        runtime->pending_video_bootstrap = true;
-        runtime->reason = !readiness.connected
-          ? "peer-video-sender-waiting-for-peer-connected"
-          : (use_data_channel ? "peer-video-sender-waiting-for-datachannel-ready" : "peer-video-sender-waiting-for-video-track-open");
-        return;
-      }
-
-      std::vector<std::uint8_t> payload = access_unit;
+      std::vector<std::shared_ptr<PeerVideoSubscriber>> subscribers;
+      std::vector<std::uint8_t> bootstrap;
       {
         std::lock_guard<std::mutex> lock(runtime->mutex);
-        if (runtime->pending_video_bootstrap || timing.keyframe) {
-          // An old cached IDR followed by current P frames has a missing
-          // reference chain. Start only on this encoder's fresh IDR.
-          if (!timing.keyframe) {
-            runtime->reason = "peer-video-sender-waiting-for-fresh-keyframe";
-            return;
+        for (const auto& entry : runtime->subscribers) subscribers.push_back(entry.second);
+        if (timing.keyframe) bootstrap = vds::media_agent::merge_video_decoder_config(
+          codec_path, runtime->cached_video_decoder_config_au, access_unit);
+      }
+      const bool complete_bootstrap = timing.keyframe &&
+        vds::media_agent::video_decoder_config_is_complete(codec_path, bootstrap);
+      if (complete_bootstrap) {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        runtime->pending_video_bootstrap = false;
+      }
+      // Admission and reference-chain recovery remain local to each subscriber.
+      // Never hold the producer mutex while entering a transport.
+      for (const auto& subscriber : subscribers) {
+        const auto readiness = get_peer_transport_media_readiness(subscriber->transport);
+        {
+          std::lock_guard<std::mutex> lock(runtime->mutex);
+          if (!readiness.video_ready) {
+            subscriber->pending_bootstrap = true;
+            subscriber->reason = "peer-video-sender-waiting-for-transport";
+            continue;
           }
-          payload = vds::media_agent::merge_video_decoder_config(
-            codec_path, runtime->cached_video_decoder_config_au, access_unit);
-          if (!vds::media_agent::video_decoder_config_is_complete(codec_path, payload)) {
-            runtime->pending_video_bootstrap = true;
-            runtime->reason = "peer-video-sender-waiting-for-bootstrap";
-            return;
+          if ((subscriber->pending_bootstrap || timing.keyframe) && !complete_bootstrap) {
+            subscriber->reason = "peer-video-sender-waiting-for-fresh-keyframe";
+            continue;
           }
-          timing.config = video_access_unit_has_decoder_config_nal(codec_path, payload);
+        }
+        const auto& payload = complete_bootstrap ? bootstrap : access_unit;
+        std::string send_error;
+        bool sent;
+        if (readiness.use_encoded_data_channel) {
+          PeerEncodedMediaDataChannelFrame frame;
+          frame.stream_type = "video";
+          frame.codec = codec_path;
+          frame.payload_format = "annexb";
+          frame.timestamp_us = timing.timestamp_us;
+          frame.sequence = timing.sequence;
+          frame.source_epoch = runtime->source_clock.source_epoch;
+          frame.keyframe = timing.keyframe;
+          frame.config = complete_bootstrap || timing.config;
+          frame.payload = payload;
+          sent = send_peer_transport_encoded_media_frame(subscriber->transport, frame, &send_error);
+        } else {
+          sent = send_peer_transport_video_frame(subscriber->transport, payload, codec_path, timing.timestamp_us, &send_error);
+        }
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        subscriber->pending_bootstrap = !sent;
+        subscriber->last_error = send_error;
+        subscriber->reason = sent ? "peer-video-sender-running"
+          : "peer-video-sender-waiting-for-fresh-keyframe-after-send-failure";
+        if (sent) {
+          ++subscriber->frames_sent;
+          runtime->last_frame_sent_at_steady_us = current_time_micros_steady();
+          ++runtime->frames_sent;
         }
       }
-
-      std::string send_error;
-      bool sent = false;
-      if (use_data_channel) {
-        PeerEncodedMediaDataChannelFrame frame;
-        frame.stream_type = "video";
-        frame.codec = codec_path;
-        frame.payload_format = "annexb";
-        frame.timestamp_us = timing.timestamp_us;
-        frame.sequence = timing.sequence;
-        frame.source_epoch = runtime->source_clock.source_epoch;
-        frame.keyframe = timing.keyframe;
-        frame.config = timing.config;
-        frame.payload = std::move(payload);
-        sent = send_peer_transport_encoded_media_frame(transport_session, frame, &send_error);
-      } else {
-        sent = send_peer_transport_video_frame(transport_session, payload, codec_path, timing.timestamp_us, &send_error);
-      }
-      std::lock_guard<std::mutex> lock(runtime->mutex);
-      if (!sent) {
-        runtime->pending_video_bootstrap = true;
-        runtime->last_error = send_error;
-        runtime->reason = "peer-video-sender-waiting-for-fresh-keyframe-after-send-failure";
-        return;
-      }
-      runtime->pending_video_bootstrap = false;
-      runtime->last_frame_sent_at_steady_us = current_time_micros_steady();
-      ++runtime->frames_sent;
-      runtime->reason = "peer-video-sender-running";
-      runtime->last_error.clear();
     };
 
     while (!runtime->stop_requested.load()) {
@@ -818,16 +900,15 @@ bool start_peer_video_sender(
       }
     }
 
-    std::lock_guard<std::mutex> lock(runtime->mutex);
-    runtime->running = false;
-    if (runtime->reason == "peer-video-sender-running") {
+    {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      runtime->running = false;
       runtime->reason = "peer-video-sender-pipe-closed";
     }
+    request_failed_producer_refresh(runtime);
   });
 
-  peer.media_binding.runtime = runtime;
-  set_peer_transport_keyframe_request_handler(transport_session,
-    vds::media_agent::make_peer_video_sender_keyframe_request_handler(runtime));
+  shared_producers[producer_key] = runtime;
   peer.media_binding.source_frames_captured = 0;
   peer.media_binding.source_frames_repeated = 0;
   peer.media_binding.avg_source_copy_resource_us = 0;
@@ -861,24 +942,29 @@ void refresh_peer_media_binding(PeerState& peer) {
       reset_peer_media_binding_sender_metrics(peer.media_binding);
       peer.media_binding.frames_sent = relay_state.frames_sent;
       peer.media_binding.active =
-        peer.transport.connection_state == "connected" &&
-        peer.transport.video_track_open;
+        video_transport_ready(peer.transport);
       peer.media_binding.last_error = relay_state.last_error;
       if (!relay_state.reason.empty()) {
         peer.media_binding.reason = relay_state.reason;
       }
+    } else if (peer.role == "host-downstream") {
+      peer.media_binding.active = false;
     }
     return;
   }
 
   auto& runtime = *peer.media_binding.runtime;
   std::lock_guard<std::mutex> lock(runtime.mutex);
+  peer.media_binding.producer_id = runtime.producer_id;
+  peer.media_binding.producer_subscribers = static_cast<unsigned int>(runtime.subscribers.size());
 #ifdef _WIN32
+  peer.media_binding.producer_process_id = runtime.process_handle ? GetProcessId(runtime.process_handle) : 0;
   if (runtime.process_handle) {
     DWORD exit_code = STILL_ACTIVE;
     if (GetExitCodeProcess(runtime.process_handle, &exit_code)) {
       if (exit_code != STILL_ACTIVE) {
         runtime.running = false;
+        if (!runtime.stop_requested.load()) runtime.soft_refresh_requested.store(true);
         if (runtime.reason == "peer-video-sender-running") {
           runtime.reason = "peer-video-sender-exited";
         }
@@ -903,18 +989,19 @@ void refresh_peer_media_binding(PeerState& peer) {
     peer.media_binding.avg_source_memcpy_us = 0;
     peer.media_binding.avg_source_total_readback_us = 0;
   }
-  peer.media_binding.frames_sent = runtime.frames_sent;
+  const auto found = runtime.subscribers.find(peer.peer_id);
+  const auto subscriber = found != runtime.subscribers.end() ? found->second : nullptr;
+  peer.media_binding.frames_sent = subscriber ? subscriber->frames_sent : 0;
   peer.media_binding.active =
     runtime.running &&
-    peer.transport.connection_state == "connected" &&
-    peer.transport.video_track_open;
-  peer.media_binding.last_error = runtime.last_error;
-  if (!runtime.reason.empty()) {
-    peer.media_binding.reason = runtime.reason;
-  }
+    video_transport_ready(peer.transport);
+  peer.media_binding.last_error = !runtime.running || !subscriber ? runtime.last_error : subscriber->last_error;
+  peer.media_binding.reason = !runtime.running || !subscriber ? runtime.reason : subscriber->reason;
 }
 
 bool stop_peer_video_sender(PeerState& peer, const std::string& reason, std::string* error) {
+  if (reason != "peer-media-producer-refresh" && reason != "peer-media-reconfigure")
+    peer.media_binding.recovery_pending = false;
   set_peer_transport_keyframe_request_handler(peer.transport_session, {});
   emit_peer_video_sender_breadcrumb(
     std::string("stopPeerVideoSender:start peer=") +
@@ -934,10 +1021,21 @@ bool stop_peer_video_sender(PeerState& peer, const std::string& reason, std::str
 
   {
     std::lock_guard<std::mutex> lock(runtime->mutex);
+    runtime->subscribers.erase(peer.peer_id);
+    peer.media_binding.next_video_sequence = runtime->next_video_sequence;
+    if (!runtime->subscribers.empty()) {
+      reset_peer_media_binding_sender_metrics(peer.media_binding);
+      peer.media_binding.active = false;
+      peer.media_binding.reason = reason;
+      peer.media_binding.runtime.reset();
+      if (error) error->clear();
+      return true;
+    }
     runtime->reason = reason;
+    runtime->stop_requested.store(true);
+    if (runtime->preview_frames) runtime->preview_frames->active.store(false);
   }
 
-  runtime->stop_requested.store(true);
 
 #ifdef _WIN32
   if (runtime->process_handle) {

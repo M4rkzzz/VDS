@@ -259,6 +259,11 @@
         upstreamPeerId: nextUpstreamPeerId,
         chainPosition
       });
+      if (data && data.preserveMedia === true && alreadySwitchingToRequestedUpstream &&
+          currentUpstreamPeer.connectionState === 'connected') {
+        callOptional('setViewerJoinedUi', { roomId: getOptionValue('getCurrentRoomId', ''), chainPosition });
+        return;
+      }
       if (!alreadySwitchingToRequestedUpstream) {
         callOptional('markViewerChainReconnectPending');
       }
@@ -368,15 +373,15 @@
         if (!remoteOfferAppliedByController) {
           await nativePeerController.applyRecreatedRemoteOffer(fromId, pc, remoteDescription, remoteAttemptId, getCurrentMediaManifest(), 'upstream');
         }
-        if (!isHost()) {
-          await nativePeerController.attachViewerRemoteOfferSurface(fromId);
-        }
         const answerResult = await nativePeerController.flushQueuedAndCreateAnswer(fromId, pc, {
           roomId: getOptionValue('getCurrentRoomId', ''),
           timeoutMs: 15000
         });
         applyQueuedRemoteCandidateFlushResult(fromId, answerResult && answerResult.flushResult);
         if (!isHost()) {
+          // Native description handling has already generated the answer.
+          // Window/device initialization must not hold back ICE negotiation.
+          await nativePeerController.attachViewerRemoteOfferSurface(fromId, pc);
           callOptional('startViewerStatsPolling');
           if (viewerUpstreamSwitch.staleCleanupRequired) {
             closeStaleViewerUpstreamPeers(fromId);

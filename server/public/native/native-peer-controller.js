@@ -16,11 +16,12 @@
       disconnectTimerId: null,
       localCandidateCount: 0,
       localCandidateTypes: new Set(),
-      localHostUdpCandidates: [],
+      localMappableHostCandidates: [],
       remoteCandidateKeys: new Set(),
       restartAttempts: 0,
       restartInProgress: false,
       natMappingAttempted: false,
+      natMappingTimerId: null,
       natMappingInProgress: false,
       natMappingSuccess: false,
       natMappingStartedAt: null,
@@ -323,19 +324,20 @@
         typeMatch &&
         protocolMatch &&
         typeMatch[1].toLowerCase() === 'host' &&
-        protocolMatch[1].toLowerCase() === 'udp'
+        (protocolMatch[1].toLowerCase() === 'udp' ||
+          (protocolMatch[1].toLowerCase() === 'tcp' && /\btcptype\s+passive\b/i.test(candidateText)))
       ) {
         const key = JSON.stringify({
           candidate: candidateText,
           sdpMid: candidateObject.sdpMid || '',
           sdpMLineIndex: Number.isFinite(candidateObject.sdpMLineIndex) ? candidateObject.sdpMLineIndex : 0
         });
-        if (!Array.isArray(meta.localHostUdpCandidates)) {
-          meta.localHostUdpCandidates = [];
+        if (!Array.isArray(meta.localMappableHostCandidates)) {
+          meta.localMappableHostCandidates = [];
         }
-        const exists = meta.localHostUdpCandidates.some((entry) => entry && entry.key === key);
+        const exists = meta.localMappableHostCandidates.some((entry) => entry && entry.key === key);
         if (!exists) {
-          meta.localHostUdpCandidates.push({
+          meta.localMappableHostCandidates.push({
             key,
             candidate: {
               candidate: candidateText,
@@ -343,26 +345,41 @@
               sdpMLineIndex: Number.isFinite(candidateObject.sdpMLineIndex) ? candidateObject.sdpMLineIndex : 0
             }
           });
-          while (meta.localHostUdpCandidates.length > 16) {
-            meta.localHostUdpCandidates.shift();
+          while (meta.localMappableHostCandidates.length > 16) {
+            meta.localMappableHostCandidates.shift();
           }
         }
       }
+      scheduleEarlyNatMapping(peerId);
       return true;
     }
 
-    function getLocalHostUdpCandidates(peerId, limit) {
+    function getLocalMappableHostCandidates(peerId, limit) {
       const meta = getPeerMeta(peerId);
-      const candidates = Array.isArray(meta && meta.localHostUdpCandidates)
-        ? meta.localHostUdpCandidates
+      const candidates = Array.isArray(meta && meta.localMappableHostCandidates)
+        ? meta.localMappableHostCandidates
         : [];
       const maxCandidates = Number.isFinite(Number(limit)) && Number(limit) > 0
         ? Number(limit)
         : 4;
-      return candidates
+      const eligible = candidates
         .map((entry) => entry && entry.candidate)
-        .filter(Boolean)
-        .slice(0, maxCandidates);
+        .filter((candidate) => {
+          // Map UDP host sockets and actual TCP passive listeners on IPv4. IPv6 candidates remain in ICE,
+          // but must not crowd out the eligible interface or consume its attempt.
+          const fields = String(candidate && candidate.candidate || '').trim().split(/\s+/);
+          const octets = String(fields[4] || '').split('.');
+          return fields[2] && ['udp', 'tcp'].includes(fields[2].toLowerCase()) && octets.length === 4 &&
+            octets.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+        });
+      const udp = eligible.filter((candidate) => /\sudp\s/i.test(candidate.candidate));
+      const tcp = eligible.filter((candidate) => /\stcp\s/i.test(candidate.candidate));
+      const balanced = [];
+      for (let i = 0; i < Math.max(udp.length, tcp.length); ++i) {
+        if (udp[i]) balanced.push(udp[i]);
+        if (tcp[i]) balanced.push(tcp[i]);
+      }
+      return balanced.slice(0, maxCandidates);
     }
 
     function getCandidateTypeCounts(peerId) {
@@ -450,6 +467,31 @@
       }
     }
 
+    function clearEarlyNatMapping(peerId) {
+      const meta = getPeerMeta(peerId);
+      if (meta && meta.natMappingTimerId) {
+        clearTimeout(meta.natMappingTimerId);
+        meta.natMappingTimerId = null;
+      }
+    }
+
+    function scheduleEarlyNatMapping(peerId) {
+      const meta = getPeerMeta(peerId);
+      const handle = getPeerHandle(peerId);
+      if (!meta || !handle || handle.closed || meta.hasConnected || meta.natMappingTimerId ||
+          meta.natMappingAttempted || !getLocalMappableHostCandidates(peerId).length ||
+          !options.mediaEngine || typeof options.mediaEngine.openNatMapping !== 'function') return false;
+      // Give quick direct paths a head start, then race router assistance with
+      // the existing ICE checks. Neither mapping failure nor success ends ICE.
+      meta.natMappingTimerId = setTimeout(() => {
+        meta.natMappingTimerId = null;
+        if (getPeerMeta(peerId) !== meta || getPeerHandle(peerId) !== handle || handle.closed ||
+            meta.hasConnected || handle.connectionState === 'failed') return;
+        void attemptLastChanceNatMapping(peerId, 'ice-checking', { background: true, armWait: false });
+      }, 1500);
+      return true;
+    }
+
     function clearPeerDisconnectTimer(peerId) {
       const meta = getPeerMeta(peerId);
       if (meta && meta.disconnectTimerId) {
@@ -466,8 +508,10 @@
       const delayMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
         ? Number(timeoutMs)
         : 15000;
+      const handle = getPeerHandle(peerId);
       meta.connectTimeoutId = setTimeout(async () => {
         meta.connectTimeoutId = null;
+        if (getPeerMeta(peerId) !== meta || getPeerHandle(peerId) !== handle || (handle && handle.closed)) return;
         if (typeof onTimeout !== 'function') {
           return;
         }
@@ -485,11 +529,12 @@
         if (!decision || !decision.ready) {
           return;
         }
-        await finalizeP2pFailureWithNatMapping(
-          timeoutPeerId,
-          classifyConnectionFailure(decision.meta),
-          'connect-failfast'
-        );
+        // Native ICE owns its connectivity/consent deadlines. A renderer
+        // progress timer must not destroy an agent that is still probing.
+        logNativeStep('peer:ice-still-checking', { peerId: timeoutPeerId }, 'p2p');
+        await attemptLastChanceNatMapping(timeoutPeerId, 'ice-still-checking', {
+          background: true, armWait: false
+        });
       };
       return armPeerConnectTimeout(peerId, timeoutMs, onConnectFailfast);
     }
@@ -1122,7 +1167,7 @@
       if (!peerId || !meta || !handle) {
         return { started: false, peerId, handle, meta, reason: 'missing-peer-state' };
       }
-      if (handle.closed) {
+      if (handle.closed || handle.connectionState === 'failed' || handle.connectionState === 'closed') {
         return { started: false, peerId, handle, meta, reason: 'closed-handle' };
       }
       if (meta.hasConnected || handle.connectionState === 'connected') {
@@ -1132,6 +1177,8 @@
         return { started: false, peerId, handle, meta, reason: 'already-attempted' };
       }
 
+      const candidates = getLocalMappableHostCandidates(peerId, candidateLimit);
+      if (!candidates.length) return { started: false, peerId, handle, meta, reason: 'no-mappable-host-candidates' };
       meta.natMappingAttempted = true;
       meta.natMappingInProgress = true;
       meta.natMappingSuccess = false;
@@ -1149,7 +1196,7 @@
         peerId,
         handle,
         meta,
-        candidates: getLocalHostUdpCandidates(peerId, candidateLimit)
+        candidates
       };
     }
 
@@ -1216,7 +1263,8 @@
 
     async function attemptLastChanceNatMapping(peerId, reason, natOptions = {}) {
       const mappingHandle = getPeerHandle(peerId);
-      const isCurrentMapping = () => getPeerHandle(peerId) === mappingHandle && mappingHandle && !mappingHandle.closed;
+      const ownsMapping = () => getPeerHandle(peerId) === mappingHandle && mappingHandle && !mappingHandle.closed;
+      const isCurrentMapping = () => ownsMapping() && !['connected', 'failed', 'closed'].includes(mappingHandle.connectionState);
       const mediaEngine = options.mediaEngine || null;
       if (!mediaEngine || typeof mediaEngine.openNatMapping !== 'function') {
         return false;
@@ -1233,17 +1281,17 @@
         reason,
         candidateCount: candidates.length
       }, 'p2p');
-      if (typeof options.setP2pStateForPeer === 'function') {
+      if (!natOptions.background && typeof options.setP2pStateForPeer === 'function') {
         options.setP2pStateForPeer(peerId, 'nat-mapping');
       }
       const isHost = typeof options.isHost === 'function' ? Boolean(options.isHost()) : Boolean(options.isHost);
-      if (!isHost && typeof options.setViewerConnectionState === 'function') {
+      if (!natOptions.background && !isHost && typeof options.setViewerConnectionState === 'function') {
         options.setViewerConnectionState('纯 P2P 直连失败，正在尝试路由器端口映射...');
       }
 
       const timeoutMs = Number.isFinite(Number(natOptions.timeoutMs)) && Number(natOptions.timeoutMs) > 0
         ? Number(natOptions.timeoutMs)
-        : 6000;
+        : 14000;
       const setTimer = typeof window !== 'undefined' && typeof window.setTimeout === 'function'
         ? window.setTimeout.bind(window)
         : setTimeout;
@@ -1256,6 +1304,7 @@
         const result = await Promise.race([
           mediaEngine.openNatMapping({
             peerId,
+            transportGeneration: mappingHandle.transportGeneration,
             candidates,
             lifetimeSeconds: 180
           }),
@@ -1275,7 +1324,7 @@
         if (!result || !result.ok || !Array.isArray(result.candidates) || result.candidates.length === 0) {
           return false;
         }
-        sendNatMappedCandidatesAndArmWait(peerId, result.candidates, { roomId: natOptions.roomId });
+        sendNatMappedCandidatesAndArmWait(peerId, result.candidates, { roomId: natOptions.roomId, armWait: natOptions.armWait });
         return true;
       } catch (error) {
         if (!isCurrentMapping()) return false;
@@ -1287,7 +1336,7 @@
         return false;
       } finally {
         if (timeoutId !== null) clearTimer(timeoutId);
-        if (isCurrentMapping()) finishNatMappingAttempt(peerId);
+        if (ownsMapping()) finishNatMappingAttempt(peerId);
         if (typeof options.renderP2pDiagnosticReport === 'function') {
           options.renderP2pDiagnosticReport();
         }
@@ -1300,6 +1349,12 @@
         return prepared;
       }
       clearPeerConnectTimeout(peerId);
+      clearEarlyNatMapping(peerId);
+      // libdatachannel closes the ICE transport on terminal native failure;
+      // advertising a newly mapped port cannot revive that dead generation.
+      if (prepared.handle.connectionState === 'failed' || prepared.handle.connectionState === 'closed') {
+        return finalizeP2pConnectionFailureAndApply(peerId, reason, source);
+      }
       const fallbackStarted = await attemptLastChanceNatMapping(peerId, reason, {
         roomId: failureOptions.roomId
       });
@@ -1388,8 +1443,10 @@
         if (meta) {
           meta.hasConnected = true;
           meta.restartInProgress = false;
+          meta.natMappingInProgress = false;
         }
         clearPeerConnectTimeout(peerId);
+        clearEarlyNatMapping(peerId);
         clearPeerDisconnectTimer(peerId);
         clearPeerReconnect(peerId);
         return {
@@ -1470,6 +1527,10 @@
         handle.connectionState = 'closed';
         handle.iceConnectionState = 'closed';
         handle.closed = true;
+        clearPeerConnectTimeout(peerId);
+        clearEarlyNatMapping(peerId);
+        clearPeerDisconnectTimer(peerId);
+        if (meta) meta.natMappingInProgress = false;
         return { handled: true, peerId, state, handle, meta };
       }
 
@@ -1812,7 +1873,10 @@
       return { ...applied, flushQueuedCandidates: true, answerRequired: true };
     }
 
-    async function attachViewerRemoteOfferSurface(peerId) {
+    async function attachViewerRemoteOfferSurface(peerId, handle) {
+      if (handle && (handle.closed || getPeerHandle(peerId) !== handle)) {
+        throw new Error('native-peer-stale:' + peerId);
+      }
       if (options.surfaceController && typeof options.surfaceController.attachPeerVideoSurface === 'function') {
         return options.surfaceController.attachPeerVideoSurface(peerId);
       }
@@ -2169,6 +2233,9 @@
             options.deletePeerConnection(targetPeerId);
           }
         } else if (effect.type === 'deletePeerMeta') {
+          clearPeerConnectTimeout(targetPeerId);
+          clearEarlyNatMapping(targetPeerId);
+          clearPeerDisconnectTimer(targetPeerId);
           if (typeof options.deletePeerMeta === 'function') {
             options.deletePeerMeta(targetPeerId);
           }
@@ -2812,7 +2879,7 @@
       clearPendingRemoteCandidates,
       clearAllPendingRemoteCandidates,
       rememberLocalIceCandidate,
-      getLocalHostUdpCandidates,
+      getLocalMappableHostCandidates,
       getCandidateTypeCounts,
       buildPeerDiagnosticEntries,
       prepareOfferSignal,

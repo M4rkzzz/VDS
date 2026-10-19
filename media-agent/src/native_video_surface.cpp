@@ -928,16 +928,28 @@ class NativeVideoSurface::Impl {
     bool should_stop = false;
     MSG msg{};
     while (!should_stop) {
-      const BOOL message_result = GetMessageW(&msg, nullptr, 0, 0);
-      if (message_result <= 0) {
-        break;
+      HANDLE ready = gpu_paint_pending_ ? static_cast<HANDLE>(gpu_presenter_.wait_handle()) : nullptr;
+      const DWORD count = ready ? 1 : 0;
+      const DWORD result = MsgWaitForMultipleObjectsEx(count, ready ? &ready : nullptr,
+        gpu_paint_pending_ ? (ready ? 100 : 16) : INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+      if (result == WAIT_FAILED) break;
+      if ((count && result == WAIT_OBJECT_0) || (gpu_paint_pending_ && result == WAIT_TIMEOUT)) {
+        if (count && result == WAIT_OBJECT_0) gpu_presenter_.notify_ready();
+        // Retry the latest image even if the sender has gone static. No wait
+        // occurs inside WM_PAINT, and stop/input messages remain serviceable.
+        InvalidateRect(window_handle_.load(), nullptr, FALSE);
+        // UpdateWindow may suppress paint for a hidden/occluded surface. This
+        // is our own window thread, so explicitly dispatching WM_PAINT cannot
+        // wait on an Electron owner or attach input queues.
+        SendMessageW(window_handle_.load(), WM_PAINT, 0, 0);
       }
-
-      TranslateMessage(&msg);
-      DispatchMessageW(&msg);
-
+      for (unsigned batch = 0; batch < 32 && PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE); ++batch) {
+        if (msg.message == WM_QUIT) { should_stop = true; break; }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+      }
       std::lock_guard<std::mutex> lock(mutex_);
-      should_stop = stop_requested_;
+      should_stop = should_stop || stop_requested_;
     }
 
     {
@@ -1435,7 +1447,8 @@ class NativeVideoSurface::Impl {
       image = latest_image_;
     }
     if (image && image->gpu_frame) {
-      if (gpu_disabled_.load(std::memory_order_acquire)) {
+      gpu_paint_pending_ = false;
+      if (static_cast<std::uint64_t>(current_time_micros_steady()) < gpu_retry_at_us_.load(std::memory_order_acquire)) {
         EndPaint(hwnd, &paint_struct);
         return;
       }
@@ -1453,6 +1466,7 @@ class NativeVideoSurface::Impl {
       gpu_presenter_.inspect_output = config_.inspect_gpu_output;
       const bool injected_failure = config_.fail_gpu_present && config_.fail_gpu_present();
       auto result = injected_failure ? NativeD3D11Presenter::Result::Failed :
+        (config_.defer_gpu_present && config_.defer_gpu_present()) ? NativeD3D11Presenter::Result::Skipped :
 #else
       auto result =
 #endif
@@ -1460,22 +1474,26 @@ class NativeVideoSurface::Impl {
           rect.left, rect.top, rect.right, rect.bottom, image->frame_rate.num, image->frame_rate.den, error);
       if (result == NativeD3D11Presenter::Result::Failed) {
         gpu_presenter_.reset();
-        gpu_disabled_.store(true, std::memory_order_release);
+        const auto retry_delay = 2000000ull << std::min(gpu_failure_streak_++, 4u);
+        gpu_retry_at_us_.store(current_time_micros_steady() + retry_delay, std::memory_order_release);
         std::lock_guard<std::mutex> lock(mutex_);
         snapshot_.gpu_present_fallbacks += 1;
         snapshot_.last_present_failure = error.empty() ? "injected-gpu-present-failure" : error;
       }
       EndPaint(hwnd, &paint_struct);
       if (result == NativeD3D11Presenter::Result::Presented) {
+        gpu_failure_streak_ = 0;
         gpu_width_ = client_width;
         gpu_height_ = client_height;
         record_painted_frame(*image, true);
       }
+      gpu_paint_pending_ = result == NativeD3D11Presenter::Result::Skipped;
       return;
     }
     // Flip presentation uses its own child HWND. Tear it down before GDI
     // paints the parent, including when the decoder changes pixel format.
     gpu_presenter_.reset();
+    gpu_paint_pending_ = false;
     gpu_width_ = gpu_height_ = 0;
     ensure_back_buffer(hdc, client_width, client_height);
     HDC target_dc = back_buffer_dc_ && back_buffer_bitmap_ ? back_buffer_dc_ : hdc;
@@ -1721,7 +1739,7 @@ class NativeVideoSurface::Impl {
     }
     if (selected) {
       AVFrame* frame_to_present = selected->frame.get();
-      bool allow_gpu = !gpu_disabled_.load(std::memory_order_acquire);
+      bool allow_gpu = now_us >= gpu_retry_at_us_.load(std::memory_order_acquire);
 #ifdef VDS_NATIVE_SURFACE_TESTING
       allow_gpu = allow_gpu && !config_.force_gdi;
 #endif
@@ -1788,6 +1806,8 @@ class NativeVideoSurface::Impl {
     // codec_name may reference active_codec_, which cleanup_decoder clears.
     const std::string normalized_codec = to_lower_ascii(codec_name.empty() ? "h264" : codec_name);
     cleanup_decoder();
+    // A new decoder/device must not inherit the old presenter's cooldown.
+    gpu_retry_at_us_.store(0, std::memory_order_release);
 
     const AVCodecID codec_id = codec_id_from_name(normalized_codec);
     const AVCodec* codec = avcodec_find_decoder(codec_id);
@@ -2236,7 +2256,9 @@ class NativeVideoSurface::Impl {
 #ifdef _WIN32
   std::atomic<HWND> window_handle_ { nullptr };
   std::atomic<bool> frame_drain_pending_ { false };
-  std::atomic<bool> gpu_disabled_ { false };
+  std::atomic<std::uint64_t> gpu_retry_at_us_ { 0 };
+  unsigned gpu_failure_streak_ = 0; // window thread only
+  bool gpu_paint_pending_ = false; // window thread only
   NativeD3D11Presenter gpu_presenter_;
   int gpu_width_ = 0, gpu_height_ = 0;
   OverlayAnchorState overlay_anchor_{};

@@ -90,6 +90,16 @@ async function main() {
     const bounded = (await agent.invoke('getStats')).peers.find((item) => item.peerId === options.peerId).peerTransport;
     assert.equal(bounded.predictedRemoteCandidates, 16);
     assert.equal(bounded.remoteCandidateCount, 17, 'duplicate predictions do not consume budget or mutate counts');
+    // IPv4-only prediction validation must not reject ordinary IPv6 routes.
+    for (const type of ['host', 'srflx']) {
+      await agent.invoke('addRemoteIceCandidate', { ...candidateParams,
+        candidate: `candidate:ipv6-${type} 1 UDP 100 ::1 43000 typ ${type} ufrag ${ufrag}` });
+    }
+    await assert.rejects(agent.invoke('addRemoteIceCandidate', { ...candidateParams,
+      candidate: 'candidate:ipv6-stale 1 UDP 100 ::1 43001 typ host ufrag stale' }), /stale-candidate-ice-credentials/);
+    const dualStack = (await agent.invoke('getStats')).peers.find((item) => item.peerId === options.peerId).peerTransport;
+    assert.equal(dualStack.remoteCandidateCount, 19, 'ordinary IPv6 candidates cross the production RPC boundary');
+    assert.equal(dualStack.predictedRemoteCandidates, 16, 'IPv6 host/srflx do not consume prediction budget');
     await agent.invoke('closePeer', { peerId: 'nat-credential-source', transportGeneration: source.transportGeneration });
     await agent.invoke('closePeer', { peerId: options.peerId, transportGeneration: second.transportGeneration });
     assert.equal((await agent.invoke('getStats')).peers.length, 0);

@@ -271,3 +271,42 @@ test('failed wakeups do not retry or restart the native agent', async () => {
   assert.equal(h.errors.length, 1);
   assert.equal(h.scheduled.size, 0);
 });
+
+test('producer death wakes independently of remote keyframe sequence and rejects stale generations', async () => {
+  const h = harness();
+  h.register();
+  h.refresh(500);
+  const failed = (producerId, generation = 'g1') => h.wakeup.handleEvent({
+    event: 'host-video-producer-failed', params: { peerId: 'viewer', transportGeneration: generation, producerId }
+  });
+  assert.equal(failed(1), true);
+  assert.equal(failed(1), false);
+  assert.equal(failed(2, 'old'), false);
+  h.advance(500);
+  assert.equal(h.requests.length, 1);
+  h.requests[0].resolve({ peers: [{ peerId: 'viewer', peerTransport: { transportGeneration: 'g1' }, mediaBinding: { recoveryPending: true } }] });
+  await settle();
+  h.advance(500);
+  assert.equal(h.requests.length, 2, 'failed rebuild must retry through the serialized owner');
+  h.requests[1].resolve({ peers: [] });
+  await settle();
+  h.advance(5000);
+  assert.equal(h.requests.length, 2, 'successful recovery must end retries');
+  h.closed();
+  assert.equal(failed(2), false);
+});
+
+test('encoder death before create reply is replayed only for its authenticated generation', () => {
+  for (const generation of ['g1', 'old']) {
+    const h = harness();
+    const ticket = h.wakeup.beginCreate({ peerId: 'viewer', role: 'host-downstream' });
+    h.wakeup.handleEvent({ event: 'host-video-producer-failed', params: {
+      peerId: 'viewer', transportGeneration: generation, producerId: 1
+    } });
+    h.advance(500);
+    assert.equal(h.requests.length, 0);
+    h.wakeup.completeCreate(ticket, { peerId: 'viewer', transportGeneration: 'g1' });
+    h.advance(500);
+    assert.equal(h.requests.length, generation === 'g1' ? 1 : 0);
+  }
+});

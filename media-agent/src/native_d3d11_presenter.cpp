@@ -50,6 +50,9 @@ class NativeD3D11Presenter::Impl {
  public:
   ~Impl() { reset(); }
   void reset() {
+    if (latency_event) CloseHandle(latency_event);
+    latency_event = nullptr;
+    latency_ready = false;
     output.Reset();
     processor.Reset();
     enumerator.Reset();
@@ -115,7 +118,10 @@ class NativeD3D11Presenter::Impl {
     if (FAILED(hr)) return hr;
     factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
     ComPtr<IDXGISwapChain2> chain2;
-    if (SUCCEEDED(swapchain.As(&chain2))) chain2->SetMaximumFrameLatency(1);
+    if (SUCCEEDED(swapchain.As(&chain2))) {
+      chain2->SetMaximumFrameLatency(1);
+      latency_event = chain2->GetFrameLatencyWaitableObject();
+    }
     width = w;
     height = h;
     return S_OK;
@@ -170,6 +176,8 @@ class NativeD3D11Presenter::Impl {
   }
 
   HWND window = nullptr;
+  HANDLE latency_event = nullptr;
+  bool latency_ready = false;
   ComPtr<ID3D11Device> device;
   ComPtr<ID3D11VideoDevice> video_device;
   ComPtr<ID3D11VideoContext> video_context;
@@ -185,6 +193,10 @@ class NativeD3D11Presenter::Impl {
 NativeD3D11Presenter::NativeD3D11Presenter() : impl_(std::make_unique<Impl>()) {}
 NativeD3D11Presenter::~NativeD3D11Presenter() = default;
 void NativeD3D11Presenter::reset() { impl_->reset(); }
+void* NativeD3D11Presenter::wait_handle() const {
+  return impl_->latency_ready ? nullptr : impl_->latency_event;
+}
+void NativeD3D11Presenter::notify_ready() { impl_->latency_ready = true; }
 
 bool NativeD3D11Presenter::supports(const AVFrame* frame) {
   if (!frame || frame->format != AV_PIX_FMT_D3D11 || !frame->hw_frames_ctx || !frame->data[0]) return false;
@@ -207,6 +219,14 @@ NativeD3D11Presenter::Result NativeD3D11Presenter::present(void* parent, AVFrame
   if (impl_->device.Get() != hardware->device) {
     hr = impl_->initialize(static_cast<HWND>(parent), hardware->device, width, height);
     if (FAILED(hr)) { error = describe_failure("swapchain-create", hr); reset(); return Result::Failed; }
+  }
+  if (impl_->latency_event && !impl_->latency_ready) {
+    const DWORD result = WaitForSingleObject(impl_->latency_event, 0);
+    if (result == WAIT_TIMEOUT) return Result::Skipped;
+    if (result != WAIT_OBJECT_0) {
+      error = "swapchain-wait-failed"; reset(); return Result::Failed;
+    }
+    impl_->latency_ready = true;
   }
   {
     // FFmpeg decoding and video processing share the immediate context. Use
@@ -266,5 +286,6 @@ NativeD3D11Presenter::Result NativeD3D11Presenter::present(void* parent, AVFrame
   hr = impl_->swapchain->Present(0, present_flags);
   if (hr == DXGI_ERROR_WAS_STILL_DRAWING || hr == DXGI_STATUS_OCCLUDED) return Result::Skipped;
   if (FAILED(hr)) { error = describe_failure("swapchain-present", hr); reset(); return Result::Failed; }
+  impl_->latency_ready = false;
   return Result::Presented;
 }

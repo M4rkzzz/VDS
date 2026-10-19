@@ -54,7 +54,7 @@ PeerCreateRequestConfig configure_peer_create_request(
 
   if (!parse_peer_stun_servers_request(request_json, &config.stun_servers)) {
     config.error = error_peer_control_result(
-      "BAD_REQUEST", "stunServers must contain at most four distinct pure STUN URLs");
+      "BAD_REQUEST", "stunServers must contain at most four pure STUN URLs per transport");
     return config;
   }
   if (!config.stun_server.empty()) {
@@ -62,8 +62,8 @@ PeerCreateRequestConfig configure_peer_create_request(
       std::remove(config.stun_servers.begin(), config.stun_servers.end(), config.stun_server),
       config.stun_servers.end());
     config.stun_servers.insert(config.stun_servers.begin(), config.stun_server);
-    if (config.stun_servers.size() > 4) {
-      config.error = error_peer_control_result("BAD_REQUEST", "The selected STUN and STUN pool exceed four endpoints");
+    if (!is_valid_peer_stun_pool(config.stun_servers)) {
+      config.error = error_peer_control_result("BAD_REQUEST", "The selected STUN and STUN pool exceed four endpoints per transport");
       return config;
     }
   }

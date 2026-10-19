@@ -18,7 +18,7 @@ class HostVideoRefreshWakeup {
     if (!peerId || this.disposed) return null;
     this.forget(peerId);
     if (params.role !== 'host-downstream') return null;
-    const ticket = { peerId, generation: null, lastSequence: 0, closedGenerations: new Set() };
+    const ticket = { peerId, generation: null, lastSequence: 0, lastFailedProducer: 0, closedGenerations: new Set() };
     this.peers.set(peerId, ticket);
     return ticket;
   }
@@ -32,6 +32,11 @@ class HostVideoRefreshWakeup {
     }
     ticket.generation = generation;
     ticket.closedGenerations.clear();
+    if (ticket.pendingFailure) {
+      const pending = ticket.pendingFailure;
+      delete ticket.pendingFailure;
+      this.handleEvent(pending);
+    }
     return true;
   }
 
@@ -62,13 +67,22 @@ class HostVideoRefreshWakeup {
       if (!this.identifier(params.transportGeneration)) return false;
       return this.closePeer(params);
     }
-    if (event.event !== 'host-video-refresh-requested' || this.disposed || !this.isRunning()) return false;
+    const producerFailed = event.event === 'host-video-producer-failed';
+    if ((!producerFailed && event.event !== 'host-video-refresh-requested') || this.disposed || !this.isRunning()) return false;
     const peerId = this.identifier(params.peerId);
     const entry = this.peers.get(peerId);
-    const sequence = params.requestSequence;
+    const sequence = producerFailed ? params.producerId : params.requestSequence;
+    const sequenceField = producerFailed ? 'lastFailedProducer' : 'lastSequence';
+    if (producerFailed && entry && !entry.generation && this.identifier(params.transportGeneration) &&
+        !entry.closedGenerations.has(params.transportGeneration) && Number.isSafeInteger(sequence) && sequence > 0) {
+      // FFmpeg can exit before createPeer's reply. Replay only after the reply
+      // authenticates this transport generation, without losing the one-shot wake.
+      entry.pendingFailure = event;
+      return false;
+    }
     if (!entry || !entry.generation || entry.generation !== params.transportGeneration ||
-        !Number.isSafeInteger(sequence) || sequence <= entry.lastSequence || sequence < 1) return false;
-    entry.lastSequence = sequence;
+        !Number.isSafeInteger(sequence) || sequence <= entry[sequenceField] || sequence < 1) return false;
+    entry[sequenceField] = sequence;
     this.pending.set(peerId, entry);
     this.schedule();
     return true;
@@ -108,7 +122,14 @@ class HostVideoRefreshWakeup {
     } catch (error) {
       request = Promise.reject(error);
     }
-    Promise.resolve(request).catch((error) => {
+    Promise.resolve(request).then((stats) => {
+      if (this.flight !== flight || this.disposed || !this.isRunning()) return;
+      for (const peer of stats?.peers || []) {
+        const entry = this.peers.get(peer.peerId);
+        if (entry && peer.mediaBinding?.recoveryPending &&
+            peer.peerTransport?.transportGeneration === entry.generation) this.pending.set(peer.peerId, entry);
+      }
+    }).catch((error) => {
       if (this.flight === flight && !this.disposed) this.onError(error);
     }).finally(() => {
       if (this.flight !== flight) return;

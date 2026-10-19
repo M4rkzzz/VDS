@@ -66,7 +66,7 @@ bool isLoopback(const Endpoint& endpoint) {
 
 class UdpSocket {
  public:
-  explicit UdpSocket(bool ipv6 = false) : ipv6_(ipv6) {
+  explicit UdpSocket(bool ipv6 = false, unsigned bindPort = 0, uint32_t ipv4Host = INADDR_LOOPBACK) : ipv6_(ipv6) {
     const int family = ipv6 ? AF_INET6 : AF_INET;
     handle = socket(family, SOCK_DGRAM, IPPROTO_UDP);
     require(handle != INVALID_SOCKET, "fixture socket failed");
@@ -74,12 +74,14 @@ class UdpSocket {
     if (ipv6) {
       auto* address = reinterpret_cast<sockaddr_in6*>(&endpoint.address);
       address->sin6_family = AF_INET6;
+      address->sin6_port = htons(static_cast<u_short>(bindPort));
       address->sin6_addr = in6addr_loopback;
       endpoint.length = sizeof(*address);
     } else {
       auto* address = reinterpret_cast<sockaddr_in*>(&endpoint.address);
       address->sin_family = AF_INET;
-      address->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      address->sin_port = htons(static_cast<u_short>(bindPort));
+      address->sin_addr.s_addr = htonl(ipv4Host);
       endpoint.length = sizeof(*address);
     }
     if (bind(handle, reinterpret_cast<const sockaddr*>(&endpoint.address), endpoint.length) != 0) {
@@ -352,6 +354,12 @@ void runScenario(bool dualStack) {
   require(predictedPorts == std::vector<unsigned>{42003, 42004, 42005, 42006, 42007},
           name + ": incorrect sequential prediction ports");
   require(sawComplete, name + ": missing complete callback");
+  std::array<char, JUICE_MAX_SDP_STRING_LEN> exported{};
+  require(juice_get_local_description(agent.get(), exported.data(), exported.size()) == JUICE_ERR_SUCCESS,
+          name + ": local SDP export failed");
+  for (const auto& event : completed) if (serverReflexive(event))
+    require(std::string(exported.data()).find(event.candidate) != std::string::npos,
+            name + ": SDP export lost or changed the trickled candidate metadata");
   if (!dualStack) {
     const auto& request = *fixture.requests[3];
     fixture.servers[3]->send(success(request.transaction, 55000), request.source);
@@ -370,6 +378,108 @@ void runScenario(bool dualStack) {
             << ", candidates before complete, close stopped packets" << std::endl;
 }
 
+// A real hostname resolves to both bound loopback endpoints on the same port.
+// One endpoint silently drops all requests; the usable family's answer must not
+// wait for that endpoint to time out. No hosts-file changes or public DNS needed.
+void runHostnameBlackhole(bool respondingIpv6) {
+  const std::string name = respondingIpv6 ? "hostname-ipv4-blackhole" : "hostname-ipv6-blackhole";
+  Fixture fixture(true);
+  fixture.servers[1] = std::make_unique<UdpSocket>(true, fixture.servers[0]->port());
+  Events events;
+  juice_config_t config{};
+  config.concurrency_mode = JUICE_CONCURRENCY_MODE_POLL;
+  config.cb_candidate = &Events::candidateCallback;
+  config.cb_gathering_done = &Events::completeCallback;
+  config.user_ptr = &events;
+  config.enable_port_prediction = true;
+  config.stun_servers_count = 1;
+  config.stun_servers[0].host = "localhost";
+  config.stun_servers[0].port = static_cast<std::uint16_t>(fixture.servers[0]->port());
+  std::unique_ptr<juice_agent_t, decltype(&juice_destroy)> agent(juice_create(&config), &juice_destroy);
+  require(agent != nullptr, name + ": juice_create failed");
+  require(juice_gather_candidates(agent.get()) == JUICE_ERR_SUCCESS, name + ": gather failed");
+  auto deadline = std::chrono::steady_clock::now() + 1500ms;
+  while (fixture.firstRequestCount < 2 && std::chrono::steady_clock::now() < deadline) fixture.drain(20ms);
+  require(fixture.requests[0] && fixture.requests[1], name + ": hostname failed to probe both families");
+  require(!fixture.requests[2] && !fixture.requests[3], name + ": unexpected probe target");
+  require(portOf(fixture.requests[0]->source) == portOf(fixture.requests[1]->source),
+          name + ": hostname probes changed local UDP source port");
+  const unsigned index = respondingIpv6 ? 1 : 0;
+  const auto& request = *fixture.requests[index];
+  fixture.servers[index]->send(success(request.transaction, 44000,
+    respondingIpv6 ? "2001:db8::9" : "203.0.113.9", respondingIpv6), request.source);
+  deadline = std::chrono::steady_clock::now() + 3000ms;
+  std::vector<Event> received;
+  do {
+    fixture.drain(20ms);
+    received = events.snapshot();
+  } while (std::none_of(received.begin(), received.end(), serverReflexive) &&
+           std::chrono::steady_clock::now() < deadline);
+  const auto reflexive = std::find_if(received.begin(), received.end(), serverReflexive);
+  require(reflexive != received.end(), name + ": usable address blocked by silent family");
+  require(reflexive->candidate.find(respondingIpv6 ? "2001:db8::9" : "203.0.113.9") != std::string::npos,
+          name + ": wrong mapped address");
+  require(!events.complete, name + ": silent endpoint stopped being a pending probe");
+  const auto genuine = [](const Event& event) {
+    return serverReflexive(event) && event.candidate.find("vds-predicted 1") == std::string::npos;
+  };
+  require(std::count_if(received.begin(), received.end(), genuine) == 1,
+          name + ": invented an unanswered genuine mapping");
+  for (const auto& event : received) if (serverReflexive(event))
+    require(event.candidate.find(respondingIpv6 ? "2001:db8::9" : "203.0.113.9") != std::string::npos,
+            name + ": silent family emitted a mapped candidate");
+  agent.reset();
+  fixture.drain(50ms);
+  const unsigned packetsAtClose = fixture.packetCount;
+  fixture.drain(400ms);
+  require(fixture.packetCount == packetsAtClose, name + ": closed resolver transport kept probing");
+  std::cout << "PASS " << name << ": both families probed, usable candidate before dead-family timeout, same source port, close stopped packets\n";
+}
+
+void runDestinationDiversity(bool diverse) {
+  const std::string name = diverse ? "confirmed-distinct-stun-ips" : "same-ip-different-stun-ports";
+  Fixture fixture(false);
+  const std::array<const char*, 4> hosts{
+    "127.0.0.1", diverse ? "127.0.0.2" : "127.0.0.1",
+    diverse ? "127.0.0.3" : "127.0.0.1", "127.0.0.1"};
+  if (diverse) {
+    fixture.servers[1] = std::make_unique<UdpSocket>(false, 0, 0x7f000002u);
+    fixture.servers[2] = std::make_unique<UdpSocket>(false, 0, 0x7f000003u);
+  }
+  Events events;
+  juice_config_t config{};
+  config.bind_address = "127.0.0.1";
+  config.concurrency_mode = JUICE_CONCURRENCY_MODE_POLL;
+  config.cb_candidate = &Events::candidateCallback;
+  config.cb_gathering_done = &Events::completeCallback;
+  config.user_ptr = &events;
+  config.enable_port_prediction = true;
+  config.enable_multi_socket_punch = true;
+  config.stun_servers_count = 4;
+  for (unsigned i = 0; i < 4; ++i) {
+    config.stun_servers[i].host = hosts[i];
+    config.stun_servers[i].port = static_cast<uint16_t>(fixture.servers[i]->port());
+  }
+  std::unique_ptr<juice_agent_t, decltype(&juice_destroy)> agent(juice_create(&config), &juice_destroy);
+  require(agent && juice_gather_candidates(agent.get()) == JUICE_ERR_SUCCESS, name + ": gather failed");
+  auto deadline = std::chrono::steady_clock::now() + 1500ms;
+  while (fixture.firstRequestCount < 4 && std::chrono::steady_clock::now() < deadline) fixture.drain(20ms);
+  require(fixture.firstRequestCount == 4, name + ": missing actual probes");
+  for (unsigned i = 0; i < 4; ++i)
+    fixture.servers[i]->send(success(fixture.requests[i]->transaction, 45000), fixture.requests[i]->source);
+  deadline = std::chrono::steady_clock::now() + 1000ms;
+  while (!events.complete && std::chrono::steady_clock::now() < deadline) fixture.drain(20ms);
+  require(events.complete, name + ": gather incomplete");
+  const auto observed = events.snapshot();
+  require(std::count_if(observed.begin(), observed.end(), serverReflexive) == 1,
+          name + ": identical real mappings were not deduplicated");
+  for (const auto& event : observed) if (serverReflexive(event))
+    require(event.candidate.find(diverse ? "vds-nat-mode 1" : "vds-nat-mode 0") != std::string::npos &&
+            event.candidate.find("vds-probe-count 4") != std::string::npos,
+            name + ": classification ignored confirmed server IP diversity");
+  std::cout << "PASS " << name << ": four validated replies, one mapped endpoint, mode=" << (diverse ? 1 : 0) << '\n';
+}
+
 } // namespace
 
 int main() {
@@ -378,6 +488,10 @@ int main() {
     juice_set_log_level(JUICE_LOG_LEVEL_NONE);
     runScenario(false);
     runScenario(true);
+    runHostnameBlackhole(false);
+    runHostnameBlackhole(true);
+    runDestinationDiversity(false);
+    runDestinationDiversity(true);
     std::cout << "PASS native STUN packet validation, final failure/late response, IPv6 sampling separation" << std::endl;
     return 0;
   } catch (const std::exception& error) {

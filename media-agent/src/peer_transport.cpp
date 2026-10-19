@@ -32,6 +32,7 @@
 #endif
 #define RTC_ENABLE_MEDIA 1
 #include <rtc/rtc.hpp>
+#include "peer_stun_rtc.h"
 #include <rtc/h264rtpdepacketizer.hpp>
 #include <rtc/h264rtppacketizer.hpp>
 #include <rtc/h265rtpdepacketizer.hpp>
@@ -79,7 +80,8 @@ std::vector<std::string> default_ice_servers() {
     "stun:stun.cloudflare.com:3478",
     "stun:stun.linphone.org:3478",
     "stun:stun.freeswitch.org:3478",
-    "stun:stun.pjsip.org:3478"
+    "stun:stun.pjsip.org:3478",
+    "stun:turn.cloudflare.com:3478?transport=tcp"
   };
 }
 
@@ -675,22 +677,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
 #endif
     config.disableAutoNegotiation = true;
     for (const auto& server : snapshot.stun_servers) {
-      // The upstream URI constructor splits at the first colon, including
-      // inside bracketed IPv6. Use its STUN host/port constructor instead.
-      std::string host;
-      std::string service;
-      const std::string authority = server.substr(5);
-      if (authority.front() == '[') {
-        const std::size_t end = authority.find(']');
-        host = authority.substr(1, end - 1);
-        if (end + 1 < authority.size()) service = authority.substr(end + 2);
-      } else {
-        const std::size_t separator = authority.find(':');
-        host = authority.substr(0, separator);
-        if (separator != std::string::npos) service = authority.substr(separator + 1);
-      }
-      const auto port = static_cast<std::uint16_t>(service.empty() ? 3478 : std::stoi(service));
-      config.iceServers.emplace_back(host, port);
+      config.iceServers.push_back(vds::media_agent::make_peer_stun_ice_server(server));
     }
 
     pc = std::make_shared<rtc::PeerConnection>(config);
@@ -2290,9 +2277,7 @@ std::shared_ptr<PeerTransportSession> create_peer_transport_session(
     if (error) { *error = "invalid-stun-server"; }
     return nullptr;
   }
-  if (stun_servers.size() > 4 || std::any_of(stun_servers.begin(), stun_servers.end(), [](const std::string& server) {
-        return !vds::media_agent::is_valid_peer_stun_server(server);
-      })) {
+  if (!vds::media_agent::is_valid_peer_stun_pool(stun_servers)) {
     if (error) *error = "invalid-stun-pool";
     return nullptr;
   }

@@ -10,6 +10,10 @@ const DEFAULT_STUN_SERVERS = [
   'stun:stun.freeswitch.org:3478',
   'stun:stun.pjsip.org:3478'
 ];
+// Cloudflare documents Binding support on this endpoint. This is STUN only:
+// no TURN allocation, credentials or media traffic. Keep it native-only because
+// browser RTCIceServer parsing does not accept every native STUN transport URL.
+const CLOUDFLARE_TCP_STUN = 'stun:turn.cloudflare.com:3478?transport=tcp';
 const MAGIC_COOKIE = 0x2112a442;
 
 function normalizeStunUrls(servers) {
@@ -18,7 +22,7 @@ function normalizeStunUrls(servers) {
     for (const value of Array.isArray(server?.urls) ? server.urls : [server?.urls]) {
       const input = String(value || '').trim();
       // TURN and relay credentials never cross into the native transport.
-      const match = /^stun:(\[[\da-f:.]+\]|[a-z\d.-]+)(?::(\d+))?$/i.exec(input);
+      const match = /^stun:(\[[\da-f:.]+\]|[a-z\d.-]+)(?::(\d+))?(?:\?transport=(udp|tcp))?$/i.exec(input);
       if (!match || input.length > 256) continue;
       const host = match[1].toLowerCase();
       if (host.startsWith('[')) {
@@ -27,9 +31,10 @@ function normalizeStunUrls(servers) {
         !label || label.length > 63 || !/^[a-z\d](?:[a-z\d-]*[a-z\d])?$/i.test(label))) continue;
       const port = Number(match[2] || 3478);
       if (!Number.isInteger(port) || port < 1 || port > 65535) continue;
-      const url = `stun:${host}${match[2] ? `:${port}` : ''}`;
-      if (!urls.includes(url)) urls.push(url);
-      if (urls.length === 8) return urls;
+      const tcp = match[3]?.toLowerCase() === 'tcp';
+      const url = `stun:${host}${match[2] ? `:${port}` : ''}${tcp ? '?transport=tcp' : ''}`;
+      // Keep the existing UDP probe shortlist independently from TCP discovery.
+      if (!urls.includes(url) && urls.filter((entry) => entry.endsWith('?transport=tcp') === tcp).length < 8) urls.push(url);
     }
   }
   return urls;
@@ -38,6 +43,19 @@ function normalizeStunUrls(servers) {
 function getStunServerPool(servers) {
   const configured = normalizeStunUrls(servers);
   return configured.length ? configured : [...DEFAULT_STUN_SERVERS];
+}
+
+function getNativeStunServerPool(servers, primary) {
+  const configured = getStunServerPool(servers);
+  // Add the known TCP companion for our existing default provider. Explicit TCP
+  // pools and custom UDP-only providers keep their administrator's selection.
+  if (!configured.some((url) => url.endsWith('?transport=tcp')) &&
+      configured.some((url) => /^stun:stun\.cloudflare\.com(?::3478)?$/.test(url))) {
+    configured.push(CLOUDFLARE_TCP_STUN);
+  }
+  const ordered = configured.includes(primary) ? [primary, ...configured.filter((url) => url !== primary)] : configured;
+  const counts = { udp: 0, tcp: 0 };
+  return ordered.filter((url) => ++counts[url.endsWith('?transport=tcp') ? 'tcp' : 'udp'] <= 4);
 }
 
 function hasMappedAddress(message, transaction) {
@@ -115,7 +133,11 @@ class StunServerSelector {
   }
 
   async selectUncached(urls) {
-    const probes = urls.map((url) => probeStunServer(url, this.timeoutMs));
+    // TCP mapping must be discovered by the native SO socket itself. A desktop
+    // TCP probe would use a different source port, and a UDP probe is misleading.
+    const udpUrls = urls.filter((url) => !url.endsWith('?transport=tcp'));
+    if (!udpUrls.length) return { url: urls[0], reachable: false };
+    const probes = udpUrls.map((url) => probeStunServer(url, this.timeoutMs));
     try {
       const url = await Promise.any(probes.map(({ promise }) => promise.then((result) => {
         if (!result) throw new Error('stun-unreachable');
@@ -124,11 +146,11 @@ class StunServerSelector {
       return { url, reachable: true };
     } catch {
       // STUN may be blocked while LAN host candidates still work. Let ICE proceed.
-      return { url: urls[0], reachable: false };
+      return { url: udpUrls[0], reachable: false };
     } finally {
       for (const probe of probes) probe.cancel();
     }
   }
 }
 
-module.exports = { StunServerSelector, normalizeStunUrls, getStunServerPool };
+module.exports = { StunServerSelector, normalizeStunUrls, getStunServerPool, getNativeStunServerPool };

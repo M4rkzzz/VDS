@@ -1,6 +1,7 @@
 #include "native_live_preview.h"
 
 #include "wgc_capture.h"
+#include "shared_capture_frames.h"
 #include "win32_placeholder_frame.h"
 #include "platform_utils.h"
 
@@ -982,6 +983,9 @@ class NativeLivePreview::Impl {
       }
     }
 
+    if (!capture_start_complete_ && vds::media_agent::find_shared_capture_frame(source_config)) {
+      finalize_capture_start(true, "");
+    }
     if (!capture_start_complete_) {
       source_ = try_create_source_with_window_fallback();
       if (!source_) {
@@ -999,9 +1003,30 @@ class NativeLivePreview::Impl {
     auto next_source_retry_at = source_
       ? std::chrono::steady_clock::time_point {}
       : std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
-    WgcFrameCpuBuffer frame;
+    vds::media_agent::SharedCaptureFrames preview_pool;
+    auto frame = preview_pool.acquire();
+    std::shared_ptr<const WgcFrameCpuBuffer> last_shared_frame;
     std::string frame_error;
     while (!stop_requested_.load(std::memory_order_acquire)) {
+      if (auto shared = vds::media_agent::find_shared_capture_frame(source_config)) {
+        if (source_) { source_->close(); source_.reset(); }
+        if (shared != last_shared_frame) {
+          present_frame(shared);
+          last_shared_frame = shared;
+        }
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          snapshot_.implementation = "shared-wgc-live-preview";
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(1000000 / std::max(1, source_config.frame_rate)));
+        continue;
+      }
+      if (last_shared_frame) {
+        last_shared_frame.reset();
+        next_source_retry_at = {};
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_.implementation = "wgc-live-preview";
+      }
       if (placeholder_mode_active) {
         const WindowCaptureAvailability availability =
           query_window_capture_availability(source_config.window_handle);
@@ -1068,7 +1093,7 @@ class NativeLivePreview::Impl {
         placeholder_mode_active = false;
       }
 
-      if (!source_->wait_for_frame_bgra(250, &frame, &frame_error)) {
+      if (!source_->wait_for_frame_bgra(250, frame.get(), &frame_error)) {
         if (stop_requested_.load(std::memory_order_acquire)) {
           break;
         }
@@ -1089,6 +1114,7 @@ class NativeLivePreview::Impl {
         continue;
       }
       present_frame(frame);
+      frame = preview_pool.acquire();
     }
 
     if (source_) {
@@ -1506,17 +1532,17 @@ class NativeLivePreview::Impl {
     HDC target_dc = back_buffer_dc && back_buffer_bitmap ? back_buffer_dc : hdc;
     FillRect(target_dc, &client_rect, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
 
-    std::vector<std::uint8_t> local_bgra;
+    std::shared_ptr<const WgcFrameCpuBuffer> local_frame;
     int local_width = 0;
     int local_height = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      local_bgra = bgra_buffer_;
+      local_frame = displayed_frame_;
       local_width = frame_width_;
       local_height = frame_height_;
     }
 
-    if (!local_bgra.empty() && local_width > 0 && local_height > 0 && client_width > 0 && client_height > 0) {
+    if (local_frame && !local_frame->bgra.empty() && local_width > 0 && local_height > 0 && client_width > 0 && client_height > 0) {
       BITMAPINFO bitmap_info{};
       bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
       bitmap_info.bmiHeader.biWidth = local_width;
@@ -1539,7 +1565,7 @@ class NativeLivePreview::Impl {
         0,
         local_width,
         local_height,
-        local_bgra.data(),
+        local_frame->bgra.data(),
         &bitmap_info,
         DIB_RGB_COLORS,
         SRCCOPY
@@ -1565,6 +1591,11 @@ class NativeLivePreview::Impl {
 #endif
 
   void present_frame(const WgcFrameCpuBuffer& frame) {
+    present_frame(std::make_shared<const WgcFrameCpuBuffer>(frame));
+  }
+
+  void present_frame(std::shared_ptr<const WgcFrameCpuBuffer> frame_owner) {
+    const auto& frame = *frame_owner;
     if (frame.width <= 0 || frame.height <= 0 || frame.bgra.empty()) {
       return;
     }
@@ -1574,7 +1605,7 @@ class NativeLivePreview::Impl {
       std::lock_guard<std::mutex> lock(mutex_);
       frame_width_ = frame.width;
       frame_height_ = frame.height;
-      bgra_buffer_ = frame.bgra;
+      displayed_frame_ = std::move(frame_owner);
       if (last_frame_present_at_steady_us_ > 0 && now_steady_us > last_frame_present_at_steady_us_) {
         const double interval_us = static_cast<double>(now_steady_us - last_frame_present_at_steady_us_);
         frame_interval_sample_count_ += 1;
@@ -1629,7 +1660,7 @@ class NativeLivePreview::Impl {
   std::shared_ptr<WgcFrameSource> source_;
   int frame_width_ = 0;
   int frame_height_ = 0;
-  std::vector<std::uint8_t> bgra_buffer_;
+  std::shared_ptr<const WgcFrameCpuBuffer> displayed_frame_;
   long long last_frame_present_at_steady_us_ = -1;
   std::uint64_t frame_interval_sample_count_ = 0;
   double frame_interval_mean_us_ = 0.0;

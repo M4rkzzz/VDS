@@ -12,10 +12,25 @@ const { configureDifferentialUpdates, prepareDifferentialBaseline } = require('.
 const { SessionLogWriter } = require('./session-log-writer');
 const { MediaAgentManager } = require('./media-agent-manager');
 const { HostVideoRefreshWakeup } = require('./host-video-refresh-wakeup');
-const { StunServerSelector, getStunServerPool } = require('./stun-server-selector');
+const { StunServerSelector } = require('./stun-server-selector');
+const { NativeStunDiscovery, prepareNativeStunConfiguration } = require('./native-stun-discovery');
 const { buildPcpMapRequest, parsePcpMapResponse } = require('./pcp-packet');
+const { NatMappingLeases } = require('./nat-mapping-leases');
+const { UpnpPortMapper } = require('./upnp-port-mapper');
+const { UpnpMappingJournal } = require('./upnp-mapping-journal');
 const crypto = require('node:crypto');
 const nativeStunSelector = new StunServerSelector();
+const nativeStunDiscovery = new NativeStunDiscovery();
+const upnpPortMapper = new UpnpPortMapper({
+  journal: new UpnpMappingJournal({
+    directory: () => path.join(app.getPath('userData'), 'upnp-mappings'),
+    onError: (error) => logMainProcessDebug('p2p', '[p2p-upnp] journal:', error.message || String(error))
+  }),
+  onError: (error) => logMainProcessDebug('p2p', '[p2p-upnp] recovery:', error.message || String(error))
+});
+const natMappingLeases = new NatMappingLeases({
+  onError: (error) => logMainProcessDebug('p2p', '[p2p-nat] lease:', error.message || String(error))
+});
 
 const DISCONNECT_GRACE_MS = Number(process.env.DISCONNECT_GRACE_MS || 30000);
 const PREFERRED_AUDIO_BACKEND = String(process.env.VDS_PREFERRED_AUDIO_BACKEND || '').trim().toLowerCase();
@@ -233,8 +248,8 @@ ipcBoundary.handle(ipcMain, 'media-engine-start-audio-session', async (_event, o
 ipcBoundary.handle(ipcMain, 'media-engine-stop-audio-session', async (_event, options) => invokeMediaEngine('stopAudioSession', options || {}));
 ipcBoundary.handle(ipcMain, 'media-engine-create-peer', async (_event, options) => {
   const { iceServers, ...peerOptions } = options || {};
-  const selection = await nativeStunSelector.select(iceServers);
-  const stunServers = [selection.url, ...getStunServerPool(iceServers).filter((url) => url !== selection.url)].slice(0, 4);
+  const selection = await prepareNativeStunConfiguration(iceServers, nativeStunSelector, nativeStunDiscovery);
+  const stunServers = selection.stunServers;
   logMainProcessDebug('p2p', '[p2p-stun] selected:', selection.url, 'reachable:', selection.reachable);
   return invokeMediaEngine('createPeer', { ...peerOptions, stunServer: selection.url, stunServers });
 });
@@ -752,6 +767,7 @@ function requestAppQuit() {
   }
   quitInProgress = true;
   hostVideoRefreshWakeup.dispose();
+  const natCleanup = natMappingLeases.dispose();
 
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.hide();
@@ -769,7 +785,9 @@ function requestAppQuit() {
   Promise.resolve()
     .then(async () => {
       if (mediaAgentManager) {
-        await mediaAgentManager.stop();
+        await Promise.all([mediaAgentManager.stop(), natCleanup]);
+      } else {
+        await natCleanup;
       }
     })
     .catch((error) => {
@@ -939,12 +957,15 @@ function parseIceCandidateForMapping(candidate) {
   const port = Number(parts[5]);
   const typIndex = parts.findIndex((part) => String(part).toLowerCase() === 'typ');
   const type = typIndex >= 0 ? String(parts[typIndex + 1] || '').toLowerCase() : '';
-  if (protocol !== 'udp' || type !== 'host' || !isValidIpv4(address) || !Number.isInteger(port) || port <= 0 || port > 65535) {
+  const tcpTypeIndex = parts.findIndex((part) => part.toLowerCase() === 'tcptype');
+  const passiveTcp = protocol === 'tcp' && tcpTypeIndex >= 0 && String(parts[tcpTypeIndex + 1]).toLowerCase() === 'passive';
+  if ((protocol !== 'udp' && !passiveTcp) || type !== 'host' || !isValidIpv4(address) || !Number.isInteger(port) || port <= 0 || port > 65535) {
     return null;
   }
 
   return {
     foundation,
+    transport: protocol,
     component,
     priority,
     address,
@@ -1105,20 +1126,26 @@ async function requestNatPmpExternalAddress(gateway, localAddress = '') {
   if (response.length < 12 || response[0] !== 0 || response[1] !== 128 || response.readUInt16BE(2) !== 0) {
     throw new Error('nat-pmp-public-address-failed');
   }
-  return bufferToIpv4(response, 8);
+  const externalAddress = bufferToIpv4(response, 8);
+  if (externalAddress === '0.0.0.0') throw new Error('nat-pmp-public-address-unavailable');
+  return externalAddress;
 }
 
-async function requestNatPmpUdpMapping(gateway, internalPort, lifetimeSeconds, localAddress = '') {
+async function requestNatPmpMapping(gateway, internalPort, lifetimeSeconds, localAddress = '', previous = {}, transport = 'udp') {
+  if (!['udp', 'tcp'].includes(transport)) throw new Error('nat-mapping-invalid-transport');
+  const opcode = transport === 'tcp' ? 2 : 1;
   const request = Buffer.alloc(12);
   request[0] = 0;
-  request[1] = 1;
+  request[1] = opcode;
   request.writeUInt16BE(internalPort, 4);
-  request.writeUInt16BE(internalPort, 6);
+  request.writeUInt16BE(lifetimeSeconds === 0 ? 0 : (previous.externalPort || internalPort), 6);
   request.writeUInt32BE(lifetimeSeconds, 8);
   const response = await udpRequest(gateway, 5351, request, 1200, localAddress);
-  if (response.length < 16 || response[0] !== 0 || response[1] !== 129 || response.readUInt16BE(2) !== 0 || response.readUInt16BE(8) !== internalPort) {
-    throw new Error('nat-pmp-map-udp-failed');
+  if (response.length < 16 || response[0] !== 0 || response[1] !== (128 | opcode) || response.readUInt16BE(2) !== 0 || response.readUInt16BE(8) !== internalPort) {
+    throw new Error('nat-pmp-map-failed');
   }
+  if ((lifetimeSeconds === 0) !== (response.readUInt32BE(12) === 0) ||
+      (lifetimeSeconds !== 0 && !response.readUInt16BE(10))) throw new Error('nat-pmp-invalid-lease');
   return {
     protocol: 'nat-pmp',
     internalPort: response.readUInt16BE(8),
@@ -1127,12 +1154,41 @@ async function requestNatPmpUdpMapping(gateway, internalPort, lifetimeSeconds, l
   };
 }
 
-async function requestPcpUdpMapping(gateway, internalPort, lifetimeSeconds, localAddress = '') {
-  const nonce = crypto.randomBytes(12);
+async function requestPcpMapping(gateway, internalPort, lifetimeSeconds, localAddress = '', previous = {}, transport = 'udp') {
+  const nonce = previous.nonce || crypto.randomBytes(12);
   const response = await udpRequest(gateway, 5351, (clientAddress) => buildPcpMapRequest({
-    clientAddress, internalPort, externalPort: internalPort, lifetimeSeconds, nonce
+    clientAddress, internalPort, externalPort: previous.externalPort || internalPort,
+    externalAddress: previous.externalAddress, lifetimeSeconds, nonce, transport
   }), 1500, localAddress);
-  return parsePcpMapResponse(response, { nonce, internalPort });
+  return parsePcpMapResponse(response, { nonce, internalPort, lifetimeSeconds, transport });
+}
+
+async function createP2PNatLease(gateway, candidate, lifetimeSeconds, isActive = () => true) {
+  const requestPmp = (lifetime, previous) => requestNatPmpMapping(gateway, candidate.port, lifetime, candidate.address, previous, candidate.transport);
+  try {
+    const externalAddress = await requestNatPmpExternalAddress(gateway, candidate.address);
+    const mapping = { ...await requestPmp(lifetimeSeconds), externalAddress };
+    return {
+      mapping,
+      renew: async (previous) => ({ ...await requestPmp(lifetimeSeconds, previous),
+        externalAddress: await requestNatPmpExternalAddress(gateway, candidate.address) }),
+      release: (previous) => requestPmp(0, previous)
+    };
+  } catch (_error) {
+    const nonce = crypto.randomBytes(12);
+    const requestPcp = (lifetime, previous = {}) => requestPcpMapping(
+      gateway, candidate.port, lifetime, candidate.address, { ...previous, nonce }, candidate.transport);
+    try {
+      return {
+        mapping: await requestPcp(lifetimeSeconds),
+        renew: (previous) => requestPcp(lifetimeSeconds, previous),
+        release: (previous) => requestPcp(0, previous)
+      };
+    } catch (_pcpError) {
+      if (!isActive()) throw new Error('stale-native-transport');
+      return upnpPortMapper.createLease(gateway, candidate, lifetimeSeconds, isActive);
+    }
+  }
 }
 
 function buildMappedIceCandidate(candidate, mapping, externalAddress) {
@@ -1142,19 +1198,21 @@ function buildMappedIceCandidate(candidate, mapping, externalAddress) {
   }
   const foundation = `${candidate.foundation}mp`;
   return {
-    candidate: `candidate:${foundation} ${candidate.component} udp ${Math.max(1, candidate.priority - 1000)} ${publicIp} ${mapping.externalPort} typ srflx raddr ${candidate.address} rport ${candidate.port}`,
+    candidate: `candidate:${foundation} ${candidate.component} ${candidate.transport || 'udp'} ${Math.max(1, candidate.priority - 1000)} ${publicIp} ${mapping.externalPort} typ srflx raddr ${candidate.address} rport ${candidate.port}${candidate.transport === 'tcp' ? ' tcptype passive' : ''}`,
     sdpMid: candidate.sdpMid || 'video',
     sdpMLineIndex: Number.isFinite(candidate.sdpMLineIndex) ? candidate.sdpMLineIndex : 0
   };
 }
 
 async function openP2PNatMappings(options = {}) {
+  const owner = natMappingLeases.getPeer(options);
+  if (!owner) return { ok: false, reason: 'stale-native-transport', candidates: [] };
   const lifetimeSeconds = Math.max(60, Math.min(600, Number(options.lifetimeSeconds) || 180));
   const rawCandidates = Array.isArray(options.candidates) ? options.candidates : [];
   const candidates = rawCandidates.map(parseIceCandidateForMapping).filter(Boolean);
   const uniqueByPort = new Map();
   for (const candidate of candidates) {
-    const key = `${candidate.address}:${candidate.port}`;
+    const key = `${candidate.transport || 'udp'}:${candidate.address}:${candidate.port}`;
     if (!uniqueByPort.has(key) && uniqueByPort.size < 4) {
       uniqueByPort.set(key, candidate);
     }
@@ -1163,7 +1221,7 @@ async function openP2PNatMappings(options = {}) {
   if (uniqueByPort.size === 0) {
     return {
       ok: false,
-      reason: 'no-host-udp-candidates',
+      reason: 'no-mappable-host-candidates',
       candidates: []
     };
   }
@@ -1171,30 +1229,25 @@ async function openP2PNatMappings(options = {}) {
   const mappedCandidates = [];
   const errors = [];
   const gatewayQueries = new Map();
-  const publicAddressQueries = new Map();
   const gateways = new Set();
+  const protocols = new Set();
   await Promise.all([...uniqueByPort.values()].map(async (candidate) => {
     try {
       if (!gatewayQueries.has(candidate.address)) gatewayQueries.set(candidate.address, resolveDefaultGatewayIpv4(candidate.address));
       const gateway = await gatewayQueries.get(candidate.address);
       if (!gateway) throw new Error('candidate-gateway-not-found');
+      const key = `${gateway}:${candidate.transport || 'udp'}:${candidate.address}:${candidate.port}`;
+      const mapping = await natMappingLeases.acquire(owner, key,
+        (isActive) => createP2PNatLease(gateway, candidate, lifetimeSeconds, isActive),
+        (renewed) => {
+          const updated = buildMappedIceCandidate(candidate, renewed, renewed.externalAddress);
+          if (updated) sendToRenderer('media-engine-event', { event: 'signal', params: {
+            peerId: owner.peerId, transportGeneration: owner.generation, type: 'candidate', candidate: updated
+          } });
+        });
+      if (!mapping) return;
       gateways.add(gateway);
-      const key = `${candidate.address}:${gateway}`;
-      if (!publicAddressQueries.has(key)) publicAddressQueries.set(key, requestNatPmpExternalAddress(gateway, candidate.address).catch(() => ''));
-      let mapping;
-      try {
-        const [publicAddress, natPmpMapping] = await Promise.all([
-          publicAddressQueries.get(key), requestNatPmpUdpMapping(gateway, candidate.port, lifetimeSeconds, candidate.address)
-        ]);
-        if (!publicAddress) {
-          throw new Error('nat-pmp-public-address-unavailable');
-        }
-        mapping = natPmpMapping;
-        mapping.externalAddress = publicAddress;
-      } catch (natPmpError) {
-        mapping = await requestPcpUdpMapping(gateway, candidate.port, lifetimeSeconds, candidate.address);
-        errors.push(`nat-pmp:${candidate.port}:${natPmpError && natPmpError.message ? natPmpError.message : String(natPmpError)}`);
-      }
+      protocols.add(mapping.protocol);
 
       const mappedCandidate = buildMappedIceCandidate(candidate, mapping, mapping.externalAddress);
       if (mappedCandidate) {
@@ -1207,7 +1260,7 @@ async function openP2PNatMappings(options = {}) {
 
   return {
     ok: mappedCandidates.length > 0,
-    protocol: mappedCandidates.length > 0 ? 'nat-pmp/pcp' : '',
+    protocol: [...protocols].filter(Boolean).join('/'),
     gateway: [...gateways][0] || '',
     candidates: mappedCandidates,
     errors,
@@ -1832,10 +1885,12 @@ function getMediaAgentManager() {
     });
     mediaAgentManager.on('status', (status) => {
       hostVideoRefreshWakeup.handleAgentStatus(status);
+      natMappingLeases.handleAgentStatus(status);
       sendToRenderer('media-engine-status', status);
     });
     mediaAgentManager.on('event', (event) => {
       hostVideoRefreshWakeup.handleEvent(event);
+      natMappingLeases.handleEvent(event);
       sendToRenderer('media-engine-event', event);
     });
   }
@@ -1845,7 +1900,9 @@ function getMediaAgentManager() {
 
 async function invokeMediaEngine(method, params) {
   const wakeupTicket = method === 'createPeer' ? hostVideoRefreshWakeup.beginCreate(params || {}) : null;
+  const natTicket = method === 'createPeer' ? natMappingLeases.beginCreate(params || {}) : null;
   if (method === 'closePeer') hostVideoRefreshWakeup.closePeer(params || {});
+  if (method === 'closePeer') natMappingLeases.closePeer(params || {});
   if (method === 'stopHostSession') hostVideoRefreshWakeup.cancelPending();
   const debugCategory = getMediaEngineDebugCategory(method);
   if (shouldLogMediaInvoke(method, debugCategory)) {
@@ -1854,12 +1911,14 @@ async function invokeMediaEngine(method, params) {
   try {
     const result = await getMediaAgentManager().invoke(method, params);
     if (method === 'createPeer') hostVideoRefreshWakeup.completeCreate(wakeupTicket, result);
+    if (method === 'createPeer') natMappingLeases.completeCreate(natTicket, result);
     if (shouldLogMediaInvoke(method, debugCategory)) {
       logMainProcessDebug(debugCategory, `[media-agent invoke] ${method} result:`, JSON.stringify(summarizeMediaEnginePayload(result)));
     }
     return result;
   } catch (error) {
     if (method === 'createPeer') hostVideoRefreshWakeup.failCreate(wakeupTicket);
+    if (method === 'createPeer') natMappingLeases.forget(natTicket);
     const message = error && error.message ? error.message : String(error);
     if (method === 'getViewerVolume' && message.includes('No active render audio session was found')) {
       throw error;
@@ -2416,6 +2475,7 @@ function installProcessDiagnostics() {
 app.isQuitting = false;
 
 app.whenReady().then(() => {
+  void upnpPortMapper.recoverOrphans().catch((error) => logMainProcessDebug('p2p', '[p2p-upnp] recovery:', error.message || String(error)));
   getMediaAgentManager();
   createWindow();
 

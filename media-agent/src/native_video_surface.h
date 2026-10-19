@@ -22,6 +22,7 @@ struct NativeVideoSurfaceConfig {
   std::function<int(const char*, bool)> decoder_fault;
   bool force_gdi = false;
   std::function<bool()> fail_gpu_present;
+  std::function<bool()> defer_gpu_present;
   std::function<void(void*, void*)> inspect_gpu_output;
 #endif
 };

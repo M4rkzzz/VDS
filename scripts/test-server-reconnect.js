@@ -357,7 +357,34 @@ async function testHostResumePreservesReadyAndRelayConnections() {
   }, { maxDownstreamsPerUpstream: 1 });
 }
 
+async function testSiblingLeavePreservesDirectMedia() {
+  await withServer(async (instance, port) => {
+    const host = await createHost(port);
+    const first = await join(port, host, 'first-leaf', leaf);
+    await ready(instance, first);
+    const second = await join(port, host, 'second-leaf', leaf);
+    await ready(instance, second);
+    assert.strictEqual(second.session.upstreamPeerId, host.id);
+    await host.take(m => m.type === 'viewer-joined' && m.viewerId === second.id);
+    first.send({ type: 'leave-room', roomId: first.session.roomId, clientId: first.id,
+      sessionToken: first.session.sessionToken });
+    const position = await second.take(m => m.type === 'chain-reconnect');
+    assert.strictEqual(position.preserveMedia, true);
+    assert.strictEqual(position.newChainPosition, 0);
+    assert.strictEqual(position.upstreamPeerId, host.id);
+    assert.strictEqual(viewer(instance, second).mediaReady, true);
+    assert.strictEqual(viewer(instance, second).needsChainReconnect, false);
+    await delay(30);
+    assert.strictEqual(host.messages.filter(m => m.type === 'viewer-joined' && m.viewerId === second.id).length, 0);
+    // A later real reconnect still uses the updated position and works.
+    second.send({ type: 'viewer-reconnect-ready', roomId: second.session.roomId, clientId: second.id,
+      sessionToken: second.session.sessionToken, chainPosition: 0, upstreamPeerId: host.id });
+    await host.take(m => m.type === 'viewer-joined' && m.viewerId === second.id);
+  }, { maxDownstreamsPerUpstream: 2 });
+}
+
 const tests = {
+  'sibling-leave-preserves-media': testSiblingLeavePreservesDirectMedia,
   'limit1-resume': () => testConfiguredLimit(1, 'resume'),
   'limit1-join': () => testConfiguredLimit(1, 'join'),
   'limit3-resume': () => testConfiguredLimit(3, 'resume'),

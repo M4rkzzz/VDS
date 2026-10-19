@@ -19,6 +19,9 @@ class NativeD3D11Presenter {
   Result present(void* parent, AVFrame* frame, int width, int height,
     int left, int top, int right, int bottom, int rate_num, int rate_den, std::string& error);
   void reset();
+  // Window-thread only: the message loop may wait alongside its input queue.
+  void* wait_handle() const;
+  void notify_ready();
 #ifdef VDS_NATIVE_SURFACE_TESTING
   std::function<void(void*, void*)> inspect_output;
 #endif
