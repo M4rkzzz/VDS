@@ -152,3 +152,19 @@ node scripts/test-local-playback-e2e.js --wgc
 - 使用生产 `NsisUpdater`、正式 1.7.11 基线和默认 HTTPS 源，实际下载并重组 1.7.12：7 次 206 Range，安装包差异 1,422,351 字节，两个 blockmap 共 476,803 字节，总传输 1,899,154 字节，比全包少约 99.19%。测试禁用全包回退，最终完整包通过生产 Ed25519 清单签名及哈希校验。没有运行安装程序或修改用户已安装客户端；这里的签名是更新清单签名，不是 Windows Authenticode。
 
 原始证据位于本地 `tmp/release-1.7.12-*`、`tmp/public-differential-1.7.12-result.json`。保持纯 P2P，无新增运行配额；本次发布验证不替代远端听感或跨运营商弱网验收。
+
+## 2026-10-20：直播端 CPU 减负
+
+用户反馈直播时 CPU 高、电脑变卡。本轮从正式 1.7.12 本地运行时做对照，改动保持原有编码参数、分辨率、帧率和纯 P2P，不增加运行配额。
+
+- 本地预览原来每次绘制分配 DC/Bitmap 并使用 GDI HALFTONE 缩放。现在复用 Windows Direct2D 硬件位图和窗口目标，已有共享 BGRA 帧每次变化上传一次，重复重绘复用位图。GPU 不可用或丢失时走 GDI，恢复后重新创建 GPU 资源；软件回退也复用绘制缓冲。没有增加第三方运行库。预览缩放改用 GPU 线性插值，发送给观看者的编码图像不变。
+- 独立预览按已有配置帧率在 GPU 回读前采样，窗口尺寸变化和采集重建仍即时处理；共享采集保持已有行为。编码访问单元在所有已就绪 DataChannel 订阅者之间复用同一只读封装，避免每个观看者重复复制整帧；各连接仍保留独立背压、关键帧引导和传输缓冲。
+- 新增可复现的 Windows 预览 CPU 对照脚本 `node scripts/profile-native-host-preview.cjs <label>`，记录进程 CPU 时间、帧数、GDI 对象数、GPU 路径启用事件及引擎指纹；不保存桌面像素、不加入房间。共享长测也增加 native/encoder 进程 CPU 时间采样。
+
+同机 1080p30 显示采集、默认 960×540 预览窗口，两轮各 10 秒稳定采样：旧版可见预览 native CPU 平均 **31.70% 单核**，最终版本 **8.59% 单核**，下降 **72.89%**；对应实际采集帧率约 28.5→28.3 fps。`100% 单核` 指占满一个逻辑处理器，本机有 32 个逻辑处理器；该结果是预览场景的引擎进程 CPU，不是整机或全直播链路下降 73%。GDI 对象数在各稳定段保持不变，最终可见测试两轮均确认启用硬件预览。
+
+Release 构建、8 项相关 CTest、媒体边界检查和脚本语法检查通过。新 GPU 测试实际核对屏幕像素、黑边、四向移动、尺寸变化、静态复用、资源重建、嵌入子窗口，以及输入拒绝后 GDI 绘制和 GPU 恢复。1080p30 四观看者共享烟测通过六轮编码器死亡恢复、六轮预览开关、六轮单人重入和三轮全员退出重入；稳定观察段最低实际呈现 27.02 fps，单编码器共享关系及 P2P 连接保持，测试编码器和原生引擎全部退出，warnings/consoleErrors 为空。恢复和浏览器呈现存在丢帧，不称零丢帧；本轮未重测音频链路或跨显卡设备故障。
+
+四观看者稳定段采样中，native 与编码器 CPU 中位数分别约 25.7% / 128.0% 单核（该场景预览隐藏，没有整链路旧版对照）。采集 BGRA 回读、管道传输与编码器处理仍有开销。实际 FFmpeg verbose 探测确认同尺寸 AMF 输入/缩放输出均为 BGRA，没有插入软件 YUV 转换，因此没有盲目追加颜色转换选项。
+
+最终本地引擎 SHA256：`cacab0a0ebc6703c67d4f1ae8f307f70340db5a1acdbd8e4f9b64557c4046a00`。证据：`tmp/host-preview-cpu-before.json`、`tmp/host-preview-cpu-final.json`、`tmp/host-cpu-summary.json`、`tmp/host-cpu-native-tests.log`、`tmp/host-cpu-shared-smoke.log`、`tmp/shared-producer-soak-host-cpu-20261020.json`、`tmp/host-cpu-encoder-format.log`。以上为开发阶段记录；后续 1.7.13 发布验收另行记录。

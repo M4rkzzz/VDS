@@ -42,6 +42,7 @@ add_executable(vds-media-agent
   src/media_audio.cpp
   src/native_artifact_preview.cpp
   src/native_live_preview.cpp
+  src/native_preview_presenter.cpp
   src/native_surface_layout.cpp
   src/native_video_surface.cpp
   src/native_d3d11_presenter.cpp
@@ -140,6 +141,7 @@ if(WIN32)
     Winmm
     Ws2_32
     D3D11
+    D2d1
     Dwmapi
     Dxgi
     ole32
@@ -495,6 +497,12 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
     ENVIRONMENT "PATH=${VDS_MEDIA_AGENT_FFMPEG_ROOT}/bin;$ENV{PATH}"
   )
   if(WIN32)
+    add_executable(vds-native-preview-presenter-tests
+      tests/native_preview_presenter_tests.cpp src/native_preview_presenter.cpp)
+    target_include_directories(vds-native-preview-presenter-tests PRIVATE src)
+    target_link_libraries(vds-native-preview-presenter-tests PRIVATE D2d1 User32 Gdi32 Dwmapi)
+    add_test(NAME vds-native-preview-presenter-tests COMMAND vds-native-preview-presenter-tests)
+    set_tests_properties(vds-native-preview-presenter-tests PROPERTIES TIMEOUT 20)
     add_executable(vds-native-playback-surface-tests
       tests/native_playback_surface_tests.cpp
       src/native_video_surface.cpp

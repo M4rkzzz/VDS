@@ -31,6 +31,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "native_preview_presenter.h"
 #endif
 
 namespace {
@@ -1005,6 +1006,9 @@ class NativeLivePreview::Impl {
       : std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
     vds::media_agent::SharedCaptureFrames preview_pool;
     auto frame = preview_pool.acquire();
+    std::unique_ptr<WgcFrameReadbackSampler> readback_sampler;
+    int sampled_width = 0;
+    int sampled_height = 0;
     std::shared_ptr<const WgcFrameCpuBuffer> last_shared_frame;
     std::string frame_error;
     while (!stop_requested_.load(std::memory_order_acquire)) {
@@ -1076,6 +1080,7 @@ class NativeLivePreview::Impl {
           continue;
         }
         source_ = try_create_source_with_window_fallback();
+        readback_sampler.reset();
         if (!source_) {
           const std::string source_retry_error = normalize_source_error(last_source_create_error);
           present_source_unavailable_placeholder(source_retry_error);
@@ -1093,11 +1098,12 @@ class NativeLivePreview::Impl {
         placeholder_mode_active = false;
       }
 
-      if (!source_->wait_for_frame_bgra(250, frame.get(), &frame_error)) {
+      if (!source_->wait_for_frame_bgra(250, frame.get(), &frame_error, readback_sampler.get())) {
         if (stop_requested_.load(std::memory_order_acquire)) {
           break;
         }
-        if (frame_error == "wgc-frame-timeout" || frame_error == "wgc-frame-pool-recreated") {
+        if (frame_error == "wgc-frame-timeout" || frame_error == "wgc-frame-pool-recreated" ||
+            frame_error == "wgc-frame-skipped") {
           continue;
         }
         {
@@ -1112,6 +1118,14 @@ class NativeLivePreview::Impl {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         continue;
+      }
+      if (!readback_sampler || frame->width != sampled_width || frame->height != sampled_height) {
+        sampled_width = frame->width;
+        sampled_height = frame->height;
+        readback_sampler = std::make_unique<WgcFrameReadbackSampler>(
+          1000000 / std::max(1, source_config.frame_rate), sampled_width, sampled_height);
+        readback_sampler->accept(frame->width, frame->height, frame->stride,
+          frame->timestamp_100ns, WgcFrameReadbackSampler::Clock::now());
       }
       present_frame(frame);
       frame = preview_pool.acquire();
@@ -1360,6 +1374,8 @@ class NativeLivePreview::Impl {
 
   void destroy_window() {
     unregister_owner_move_hook();
+    gpu_preview_.reset();
+    cleanup_back_buffer();
     HWND hwnd = window_handle_.exchange(nullptr);
     if (hwnd && IsWindow(hwnd)) {
       DestroyWindow(hwnd);
@@ -1519,18 +1535,6 @@ class NativeLivePreview::Impl {
 
     const int client_width = client_rect.right - client_rect.left;
     const int client_height = client_rect.bottom - client_rect.top;
-    HDC back_buffer_dc = CreateCompatibleDC(hdc);
-    HBITMAP back_buffer_bitmap = nullptr;
-    HGDIOBJ previous_bitmap = nullptr;
-    if (back_buffer_dc && client_width > 0 && client_height > 0) {
-      back_buffer_bitmap = CreateCompatibleBitmap(hdc, client_width, client_height);
-      if (back_buffer_bitmap) {
-        previous_bitmap = SelectObject(back_buffer_dc, back_buffer_bitmap);
-      }
-    }
-
-    HDC target_dc = back_buffer_dc && back_buffer_bitmap ? back_buffer_dc : hdc;
-    FillRect(target_dc, &client_rect, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
 
     std::shared_ptr<const WgcFrameCpuBuffer> local_frame;
     int local_width = 0;
@@ -1542,7 +1546,31 @@ class NativeLivePreview::Impl {
       local_height = frame_height_;
     }
 
-    if (local_frame && !local_frame->bgra.empty() && local_width > 0 && local_height > 0 && client_width > 0 && client_height > 0) {
+    if (local_frame && client_width > 0 && client_height > 0 &&
+        std::chrono::steady_clock::now() >= gpu_retry_at_) {
+      const RECT destination = fit_rect_with_aspect(local_width, local_height, client_width, client_height);
+      if (gpu_preview_.present(hwnd, local_frame, client_width, client_height, destination)) {
+        if (!gpu_preview_active_) emit_live_preview_breadcrumb("d2d-presenter-ready");
+        gpu_preview_active_ = true;
+        cleanup_back_buffer();
+        EndPaint(hwnd, &paint_struct);
+        return;
+      }
+      // Retry a lost/unavailable GPU without repeatedly constructing a device
+      // per frame. Software preview keeps running throughout recovery.
+      gpu_preview_active_ = false;
+      gpu_retry_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    }
+    ensure_back_buffer(hdc, client_width, client_height);
+    HDC target_dc = back_buffer_dc_ ? back_buffer_dc_ : hdc;
+
+    // Expose/layout paints can reuse already scaled pixels. Keeping the frame
+    // alive also prevents the capture pool from recycling it under this cache.
+    const bool redraw = !back_buffer_dc_ || !back_buffer_valid_ || back_buffer_frame_ != local_frame;
+    if (redraw) {
+      FillRect(target_dc, &client_rect, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+    }
+    if (redraw && local_frame && !local_frame->bgra.empty() && local_width > 0 && local_height > 0 && client_width > 0 && client_height > 0) {
       BITMAPINFO bitmap_info{};
       bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
       bitmap_info.bmiHeader.biWidth = local_width;
@@ -1572,21 +1600,42 @@ class NativeLivePreview::Impl {
       );
     }
 
-    if (back_buffer_dc && back_buffer_bitmap) {
-      BitBlt(hdc, 0, 0, client_width, client_height, back_buffer_dc, 0, 0, SRCCOPY);
-    }
-
-    if (previous_bitmap) {
-      SelectObject(back_buffer_dc, previous_bitmap);
-    }
-    if (back_buffer_bitmap) {
-      DeleteObject(back_buffer_bitmap);
-    }
-    if (back_buffer_dc) {
-      DeleteDC(back_buffer_dc);
+    if (back_buffer_dc_) {
+      back_buffer_frame_ = local_frame;
+      back_buffer_valid_ = true;
+      BitBlt(hdc, 0, 0, client_width, client_height, back_buffer_dc_, 0, 0, SRCCOPY);
     }
 
     EndPaint(hwnd, &paint_struct);
+  }
+
+  void cleanup_back_buffer() {
+    if (back_buffer_dc_ && previous_back_buffer_bitmap_) SelectObject(back_buffer_dc_, previous_back_buffer_bitmap_);
+    if (back_buffer_bitmap_) DeleteObject(back_buffer_bitmap_);
+    if (back_buffer_dc_) DeleteDC(back_buffer_dc_);
+    back_buffer_dc_ = nullptr;
+    back_buffer_bitmap_ = nullptr;
+    previous_back_buffer_bitmap_ = nullptr;
+    back_buffer_width_ = back_buffer_height_ = 0;
+    back_buffer_valid_ = false;
+    back_buffer_frame_.reset();
+  }
+
+  void ensure_back_buffer(HDC dc, int width, int height) {
+    if (back_buffer_dc_ && back_buffer_width_ == width && back_buffer_height_ == height) return;
+    cleanup_back_buffer();
+    if (width <= 0 || height <= 0) return;
+    back_buffer_dc_ = CreateCompatibleDC(dc);
+    if (!back_buffer_dc_) return;
+    back_buffer_bitmap_ = CreateCompatibleBitmap(dc, width, height);
+    if (back_buffer_bitmap_) previous_back_buffer_bitmap_ = SelectObject(back_buffer_dc_, back_buffer_bitmap_);
+    if (!back_buffer_bitmap_ || !previous_back_buffer_bitmap_ || previous_back_buffer_bitmap_ == HGDI_ERROR) {
+      if (previous_back_buffer_bitmap_ == HGDI_ERROR) previous_back_buffer_bitmap_ = nullptr;
+      cleanup_back_buffer();
+      return;
+    }
+    back_buffer_width_ = width;
+    back_buffer_height_ = height;
   }
 #endif
 
@@ -1667,6 +1716,16 @@ class NativeLivePreview::Impl {
   double frame_interval_m2_us_ = 0.0;
 
 #ifdef _WIN32
+  NativePreviewPresenter gpu_preview_;
+  bool gpu_preview_active_ = false;
+  std::chrono::steady_clock::time_point gpu_retry_at_{};
+  HDC back_buffer_dc_ = nullptr;
+  HBITMAP back_buffer_bitmap_ = nullptr;
+  HGDIOBJ previous_back_buffer_bitmap_ = nullptr;
+  int back_buffer_width_ = 0;
+  int back_buffer_height_ = 0;
+  bool back_buffer_valid_ = false;
+  std::shared_ptr<const WgcFrameCpuBuffer> back_buffer_frame_;
   std::atomic<HWND> window_handle_ { nullptr };
   std::atomic<bool> repaint_pending_ { false };
   OverlayAnchorState overlay_anchor_{};

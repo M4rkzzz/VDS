@@ -10,6 +10,7 @@ function processProbe() {
   const lastError = kernel.func('uint32_t __stdcall GetLastError()');
   const handles = kernel.func('bool __stdcall GetProcessHandleCount(void *handle, _Out_ uint32_t *count)');
   const exitCode = kernel.func('bool __stdcall GetExitCodeProcess(void *handle, _Out_ uint32_t *code)');
+  const times = kernel.func('bool __stdcall GetProcessTimes(void *handle, _Out_ uint64_t *created, _Out_ uint64_t *exited, _Out_ uint64_t *kernel, _Out_ uint64_t *user)');
   const counters = koffi.struct({ cb:'uint32_t', faults:'uint32_t', peakWorking:'size_t', working:'size_t',
     peakPaged:'size_t', paged:'size_t', peakNonPaged:'size_t', nonPaged:'size_t', pagefile:'size_t', peakPagefile:'size_t', privateBytes:'size_t' });
   const memory = psapi.func('GetProcessMemoryInfo', 'bool', ['void *', koffi.out(koffi.pointer(counters)), 'uint32_t']);
@@ -25,7 +26,9 @@ function processProbe() {
       if(code[0]!==259)return {pid,exited:true,exitCode:code[0]};
       const values={cb:koffi.sizeof(counters)}; assert.ok(memory(handle,values,koffi.sizeof(counters)));
       const count=[0]; assert.ok(handles(handle,count));
-      return {pid,privateBytes:Number(values.privateBytes),workingSetBytes:Number(values.working),handles:count[0],exited:false};
+      const cpu=[[0],[0],[0],[0]]; assert.ok(times(handle,...cpu));
+      return {pid,privateBytes:Number(values.privateBytes),workingSetBytes:Number(values.working),handles:count[0],
+        cpuMs:(Number(cpu[2][0])+Number(cpu[3][0]))/10000,exited:false};
     } finally {close(handle);}
   };
 }
@@ -101,7 +104,7 @@ async function runSharedProducerSoak(context) {
         assert.ok(now-lastPresentationAdvance[i]<4000,'viewer '+i+' presentation stalled for four seconds');
       });
       last=current;
-      if(now>=nextRecord){
+      if(now>=nextRecord || now-start>=ms){
         const s=await shared(viewers.length),b=bindings(s)[0].mediaBinding;
         const surface=s.surfaces.find(v=>v.surface===previewName);
         if(previewAttached)assert.equal(surface?.implementation,'shared-wgc-live-preview','preview stopped sharing capture');

@@ -835,6 +835,9 @@ bool start_peer_video_sender(
       }
       // Admission and reference-chain recovery remain local to each subscriber.
       // Never hold the producer mutex while entering a transport.
+      const auto& payload = complete_bootstrap ? bootstrap : access_unit;
+      PeerEncodedMediaDataChannelFrame encoded_frame;
+      bool encoded_frame_prepared = false;
       for (const auto& subscriber : subscribers) {
         const auto readiness = get_peer_transport_media_readiness(subscriber->transport);
         {
@@ -849,21 +852,24 @@ bool start_peer_video_sender(
             continue;
           }
         }
-        const auto& payload = complete_bootstrap ? bootstrap : access_unit;
         std::string send_error;
         bool sent;
         if (readiness.use_encoded_data_channel) {
-          PeerEncodedMediaDataChannelFrame frame;
-          frame.stream_type = "video";
-          frame.codec = codec_path;
-          frame.payload_format = "annexb";
-          frame.timestamp_us = timing.timestamp_us;
-          frame.sequence = timing.sequence;
-          frame.source_epoch = runtime->source_clock.source_epoch;
-          frame.keyframe = timing.keyframe;
-          frame.config = complete_bootstrap || timing.config;
-          frame.payload = payload;
-          sent = send_peer_transport_encoded_media_frame(subscriber->transport, frame, &send_error);
+          // One immutable payload per AU, shared by the synchronous sends.
+          // Transport admission/backpressure remain independent per viewer.
+          if (!encoded_frame_prepared) {
+            encoded_frame.stream_type = "video";
+            encoded_frame.codec = codec_path;
+            encoded_frame.payload_format = "annexb";
+            encoded_frame.timestamp_us = timing.timestamp_us;
+            encoded_frame.sequence = timing.sequence;
+            encoded_frame.source_epoch = runtime->source_clock.source_epoch;
+            encoded_frame.keyframe = timing.keyframe;
+            encoded_frame.config = complete_bootstrap || timing.config;
+            encoded_frame.payload = payload;
+            encoded_frame_prepared = true;
+          }
+          sent = send_peer_transport_encoded_media_frame(subscriber->transport, encoded_frame, &send_error);
         } else {
           sent = send_peer_transport_video_frame(subscriber->transport, payload, codec_path, timing.timestamp_us, &send_error);
         }

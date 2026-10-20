@@ -29,8 +29,8 @@ struct WgcFrameCpuBuffer {
   std::vector<std::uint8_t> bgra;
 };
 
-// Moves the sender's existing sampling decision ahead of GPU readback. Preview
-// callers omit it, and changed geometry always reaches the source refresh path.
+// Select the configured sender/preview cadence before GPU readback. Changed
+// geometry always reaches the caller's source refresh path.
 class WgcFrameReadbackSampler {
  public:
   using Clock = std::chrono::steady_clock;
