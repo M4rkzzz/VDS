@@ -140,4 +140,15 @@ node scripts/test-local-playback-e2e.js --wgc
 - 真实 OBS SRT → native DataChannel → WebCodecs/WebAudio：直连网页刷新、转发下游网页刷新、源重启两次、转发上游退出后重新分配均恢复新帧。20 秒稳定段视频 14.88/15fps、音频 46.52/46.875 块/秒，零音频丢弃，886 个 WebAudio 调度块间没有空隙。源重启有清理旧音频和等待关键帧的丢弃，不称全流程零丢帧。
 - 最终布局合并构建再跑完整媒体烟测，通过新增连续性断言，525 个音频调度块间零空隙。两次媒体烟测均无 warnings/consoleErrors，引擎正常停止。声音输出保持静音，验证真实解码和 WebAudio 调度，未做远端听感或跨运营商弱网验收。
 
-证据：`tmp/native-motion-negative.txt`、`tmp/native-motion-visible.txt`、`tmp/native-motion-regression.txt`、`tmp/window-audio-refresh-summary.json`、`tmp/local-playback-e2e-result.json`、`tmp/web-audio-refresh-final.txt`。本地运行时和 Web 构建已更新，尚未生成新版本安装包、推送或部署本轮更改。
+证据：`tmp/native-motion-negative.txt`、`tmp/native-motion-visible.txt`、`tmp/native-motion-regression.txt`、`tmp/window-audio-refresh-summary.json`、`tmp/local-playback-e2e-result.json`、`tmp/web-audio-refresh-final.txt`。上述为开发阶段记录；后续发布验收见下节。
+
+## 1.7.12 发布与部署验收
+
+- [GitHub 正式发布 v1.7.12](https://github.com/M4rkzzz/VDS/releases/tag/v1.7.12) 对应代码提交 `58da11c`，四份发布资产的大小和 GitHub SHA256 均与本地构建一致。安装包 235,451,971 字节，SHA256 `d2e400f7f0615cc9ddff3fd14b0b45d2d24f66ba3c999e0aac1bd36760276449`；正式包内 media-agent SHA256 `7c64b2b616845fd1f5cf787276d6260d71e7bd902e76839eff44664f28f7b935`，与本轮开发验证的最终引擎相同。
+- 发布前、打包后检查全部通过：Web 165/165、桌面 343/343、服务静态 7/7、原生 CTest 54/54；协议、架构、类型、server-core/revival/reconnect、原生 RPC、包内指纹、发布资产一致性和依赖审计通过。生产依赖审计 0 漏洞。八轮真实预览创建后帧数均继续增长。
+- 最终打包程序三轮开播、预览、调试按钮、停止重开通过（12/11/11 帧）；两轮原生观看与离开重入增长到 308/314 帧。renderer 来自 app.asar、agent 来自包内 resources；两轮均为 TCP 直连、D3D11 GPU 呈现，播放 CPU readback 为 0，正常退出无测试进程残留。隐藏窗口夹具由定时器驱动布局 tick，不据此替代可见窗口四向移动的独立测试。
+- NAS 候选镜像先完成 17 项重连场景和房间权限范围检查；部署前再次确认没有在线房间和观看者，再从 1.7.11 切换为 1.7.12。34 份部署源文件指纹一致，6 个其他容器未变，27 份旧版本更新文件保持原样，回滚备份保留，测试容器已清理。准备阶段首次因缺失测试脚本指纹字段而被拒绝，补齐元数据后重新验证通过，失败发生在正式服务修改前。
+- 公网严格 TLS 检查通过：版本、签名清单、blockmap、安装包头尾 Range、两份 Web 资源、gzip/immutable 缓存；建房、加入、会话过期重新建房、旧房号拒绝、私有房隐藏和测试房间清理通过。所有公网诊断使用临时私有房间，不发送媒体。
+- 使用生产 `NsisUpdater`、正式 1.7.11 基线和默认 HTTPS 源，实际下载并重组 1.7.12：7 次 206 Range，安装包差异 1,422,351 字节，两个 blockmap 共 476,803 字节，总传输 1,899,154 字节，比全包少约 99.19%。测试禁用全包回退，最终完整包通过生产 Ed25519 清单签名及哈希校验。没有运行安装程序或修改用户已安装客户端；这里的签名是更新清单签名，不是 Windows Authenticode。
+
+原始证据位于本地 `tmp/release-1.7.12-*`、`tmp/public-differential-1.7.12-result.json`。保持纯 P2P，无新增运行配额；本次发布验证不替代远端听感或跨运营商弱网验收。
