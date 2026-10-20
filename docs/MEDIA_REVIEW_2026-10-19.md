@@ -168,3 +168,16 @@ Release 构建、8 项相关 CTest、媒体边界检查和脚本语法检查通�
 四观看者稳定段采样中，native 与编码器 CPU 中位数分别约 25.7% / 128.0% 单核（该场景预览隐藏，没有整链路旧版对照）。采集 BGRA 回读、管道传输与编码器处理仍有开销。实际 FFmpeg verbose 探测确认同尺寸 AMF 输入/缩放输出均为 BGRA，没有插入软件 YUV 转换，因此没有盲目追加颜色转换选项。
 
 最终本地引擎 SHA256：`cacab0a0ebc6703c67d4f1ae8f307f70340db5a1acdbd8e4f9b64557c4046a00`。证据：`tmp/host-preview-cpu-before.json`、`tmp/host-preview-cpu-final.json`、`tmp/host-cpu-summary.json`、`tmp/host-cpu-native-tests.log`、`tmp/host-cpu-shared-smoke.log`、`tmp/shared-producer-soak-host-cpu-20261020.json`、`tmp/host-cpu-encoder-format.log`。以上为开发阶段记录；后续 1.7.13 发布验收另行记录。
+
+
+## 1.7.13 发布与部署验收
+
+- [GitHub 正式发布 v1.7.13](https://github.com/M4rkzzz/VDS/releases/tag/v1.7.13)，代码提交 `ebcd20a`。四份资产大小与 GitHub SHA256 均与本地构建一致；安装包 235,452,785 字节，SHA256 `24bd6cb34f0851550f65e6ca53383e4dd240a0dab15507e00a4afa28005fdc03`。包内引擎与上述最终 CPU 优化引擎指纹相同。
+- 发布前与打包后检查通过：Web 165/165、桌面 343/343、服务静态 7/7、原生 CTest 55/55，以及架构、类型、协议、重连、原生 RPC/NAT、包内指纹和资产一致性检查；生产依赖审计 0 漏洞，八轮真实预览持续出帧。
+- 最终包三轮开播、嵌入预览、调试按钮与停止重开通过（23/22/24 帧）；两轮原生观看持续增长到 347/302 帧，TCP 直连、D3D11 GPU 呈现，播放 CPU readback 为 0，正常退出且无测试进程残留。包内引擎另做两轮可见 GPU 预览，均确认 Direct2D 路径、持续出帧和稳定采样段 GDI 对象数不增长。这次可见采样同时运行发布检查，不能替代前述独立 CPU 对照。
+- NAS 候选镜像先完成 17 项重连测试；切换前确认房间/观看者均为 0。正式服务从 1.7.12 更新至 1.7.13，34 份源文件指纹匹配，6 个其他容器未变，29 份旧版本更新文件原样保留，4 份新资产验证通过，回滚备份保留，测试容器已清理。
+- 默认 HTTPS 源严格 TLS、更新清单签名、blockmap、安装包头尾 206 Range、Web 资源内容与 gzip/immutable 缓存通过；公网临时私有房间创建、加入、过期后新建、旧号拒绝、会话保留和清理通过，未发送媒体。
+- 使用真实生产 `NsisUpdater`、正式 1.7.12 基线实际下载并重组 1.7.13：8 次 206 Range，安装包差异 1,434,000 字节，两个 blockmap 共 476,733 字节，总传输 **1,910,733 字节**，比全包少约 **99.19%**。全量下载被测试主动禁止，完整重组包通过生产签名清单与哈希验证。未运行安装程序，也未修改用户已安装客户端；清单签名不是 Windows Authenticode。
+- 验收过程中，差分夹具首次沿用 1.7.11 基线，该路径也通过（1,926,485 字节）；随后纠正基线并完成上述 1.7.12 验证，中间一次 TLS 建连中断，重新运行成功。GitHub 上传收到 EOF，但远端四份资产均已完成且哈希正确，核对后将原草稿正式发布，未重复上传或更换资产。
+
+本地证据：`tmp/release-1.7.13-*`、`tmp/public-differential-1.7.13-result.json`、`tmp/public-differential-1.7.11-to-1.7.13-result.json`、`tmp/host-preview-cpu-packaged-1-7-13.json`。保持轻量、纯 P2P，无新增运行配额；不据此宣称全链路 CPU 降低同等比例或完成跨运营商弱网验收。
