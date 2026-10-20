@@ -93,3 +93,51 @@ UU 的收益不能从字符串、函数名或固定参数推算。共享生产�
 - 默认 HTTPS 源使用真实 NsisUpdater 从正式 1.7.10 基线下载 1.7.11：10 次 206 Range，安装包差异 2,276,839 字节，blockmap 476,787 字节，共 2,753,626 字节，比全包少约 98.83%；禁止全包回退，重组完整包签名/哈希验证成功。另核对清单签名、头尾 Range、Web 两份资产及 gzip/immutable、新版后续差分基线。未运行安装程序，不修改用户已安装客户端。
 
 原始发布证据位于本地 `tmp/release-1.7.11-*`、`tmp/public-differential-1.7.11-result.json`。仍保持纯 P2P，无新增运行配额；这些结果不替代跨运营商实机成功率或长时间弱网验收。
+
+## 1.7.11 多观看端长时间烟测
+
+2026-10-19 使用正式包 `dist/win-unpacked/resources/runtime/media-agent/vds-media-agent.exe`，SHA256 与上述发布版本一致。宿主控制模块与 app.asar 内文件逐字节一致，本地 Web 资源与 1.7.11 部署清单一致。宿主使用真实 WGC / AMF H264，四个独立 WebCodecs 页面直连，选择的 ICE 候选对均非 relay；本机信令服务器不转发媒体。
+
+- 配置 1920×1080、30 fps；稳定观察窗口累计 30 分钟，加入故障恢复和切换后，四端阶段实际为 **31 分 13 秒**。186 份周期样本记录解码、实际呈现、预览、生产者 PID、私有内存与句柄。
+- **6/6 次编码器强制终止后自动恢复**。恢复等待期间不调用测试侧 `getStats`，由生产 `HostVideoRefreshWakeup` 唤醒重建；四端均新增至少 90 帧才算恢复，transportGeneration 与 sourceEpoch 不变。观测耗时 4.076–4.174 秒，包含额外约 3 秒帧增长确认，不能当作黑屏时长。
+- **6/6 次预览关闭重开、6/6 次单观看端离开重入**保持共享生产者身份。**3/3 次全员离开重入**验证旧编码器退出、预览回退独立 WGC 并新增至少 5 帧、重新加入后恢复共享。四端持续共用一个采集编码生产者。
+- 稳定的约 10 秒采样窗口中，实际呈现为 **26.65–30.24 fps**；大于 30 的短窗值含诊断采样边界误差。没有静帧、意外断流或低于源帧率 80% 的稳定采样窗口；有正常的过期呈现帧丢弃，不宣称零丢帧。
+- 原生引擎私有内存 **137.7–174.9 MiB**，首尾为 164.0 / 145.8 MiB；句柄 **1180–1242**，首尾为 1242 / 1196，未观察到持续累积。编码器私有内存为 155.3–170.7 MiB。通过记录的 PID 额外核验末次生产者和原生引擎均已退出。
+- 整体脚本退出码 0；最终报告 `ok=true`，warnings、consoleErrors 均为空。四端长测之后的原有两端死亡恢复、单端保留播放和预览回退检查也通过。
+
+本轮未复现需要修改生产代码的问题。新增可重复的长测夹具，补强实际呈现推进和最终进程退出断言，以及失败时保留证据。没有改变运行配额、媒体策略或纯 P2P 路线。帧率阈值和超时仅为测试断言，不进入产品运行逻辑。
+
+本轮边界：同一台机器上的四个 Web 观看页面与包内原生宿主；不是四台跨运营商电脑，也没有重跑原生观看窗口长测、进程音频、弱网或跨 GPU 场景。预览验证采集帧推进和复用状态，未据此宣称可见窗口交互完成长测。测试使用 16×16 自有动态窗口提供确定的桌面变化，不保存采集图像。
+
+复现命令（PowerShell）：
+
+```powershell
+$env:VDS_MEDIA_AGENT_PATH = "$PWD/dist/win-unpacked/resources/runtime/media-agent/vds-media-agent.exe"
+$env:VDS_PLAYBACK_E2E_SHARED_PRODUCER = '1'
+$env:VDS_PLAYBACK_E2E_SOAK_MS = '1800000'
+$env:VDS_PLAYBACK_E2E_WIDTH = '1920'
+$env:VDS_PLAYBACK_E2E_HEIGHT = '1080'
+$env:VDS_PLAYBACK_E2E_FPS = '30'
+node scripts/test-local-playback-e2e.js --wgc
+```
+
+本地原始证据：`tmp/soak-1.7.11-artifact-verification.json`、`tmp/soak-1.7.11-30min-result.json`、`tmp/soak-1.7.11-30min-summary.json`、`tmp/soak-1.7.11-30min-final-cleanup.json`、`tmp/soak-1.7.11-30min.log`。首次短测证据保存在 `tmp/soak-1.7.11-calibration-result.json`。
+
+补强断言后另以相同 1080p / 30 fps 配置运行完整六轮短回归，退出码 0、21 项恢复与切换事件通过，实际呈现增长及最终编码器、原生引擎退出检查通过；无 warnings / consoleErrors。证据为 `tmp/soak-1.7.11-final-regression-result.json`。两次脚本语法检查和 `git diff --check` 通过。长测原始数据不因补强断言而重写，呈现速率结论由长测保留的周期样本独立核算。
+
+## 2026-10-20：观看窗口移动、Web 音频与刷新恢复
+
+用户确认移动的是观看端 VDS 窗口；另外反馈网页有声时卡顿、刷新后停在等待上游。本轮没有增加依赖、限帧或运行配额，保持纯 P2P。
+
+- **窗口移动**：原生布局 RPC 跨线程直接移动正处于 BeginPaint/Present 的窗口。改为交给窗口线程，合并尚未处理的布局；移动不再复制旧位置的客户区像素，父窗口排除 D3D 子窗口绘制区域，静帧在位置变化后重新呈现。新增忙绘制线程回归，HEAD 旧实现确定性失败于 `RPC layout must not block on a busy native painting thread`，修复后通过。独立 `--window-motion` 模式检查可见测试窗口四向移动后的屏幕像素及 D3D 子窗口原点，GDI/D3D11 均通过。旧实现可见移动曾出现一次黑像素失败，之后未稳定复现，不能据此宣称所有显卡上的确定性复现。
+- **Web 音频**：自适应缓冲变化直接平移已建立的播放时间线，增长时插入静音，下降时裁掉采样。500 个连续 Opus 块、110ms 用户延迟、18ms 周期抖动回归中，旧实现额外产生 40ms 静音，新实现为 0。现在保持已排定的连续时间线，新的目标用于启动和断粮恢复。原有超时、解码恢复、AAC 批量输入测试通过。
+- **刷新恢复**：服务器向房主发送重连标志，却在向观看转发端发送 `connect-to-next` 时丢失它；原生转发端复用刷新前的旧连接，未发送新 offer。已贯通重连标志并替换旧 transport，普通重复通知仍复用当前协商。新增真实 WebSocket 转发拓扑刷新和实际 renderer 控制器回归。
+
+验证：
+
+- `npm run check` 全通过：Web 165/165、桌面 343/343、服务静态 7/7，以及协议、生命周期、架构、类型、server-core/revival/reconnect。
+- Release 原生引擎和播放集成重新编译，通过 B 帧、配置分离、尺寸变化、GPU/GDI 切换、解码器死亡恢复、1080p60 音视频批量输入、可见四向移动测试。
+- 真实 OBS SRT → native DataChannel → WebCodecs/WebAudio：直连网页刷新、转发下游网页刷新、源重启两次、转发上游退出后重新分配均恢复新帧。20 秒稳定段视频 14.88/15fps、音频 46.52/46.875 块/秒，零音频丢弃，886 个 WebAudio 调度块间没有空隙。源重启有清理旧音频和等待关键帧的丢弃，不称全流程零丢帧。
+- 最终布局合并构建再跑完整媒体烟测，通过新增连续性断言，525 个音频调度块间零空隙。两次媒体烟测均无 warnings/consoleErrors，引擎正常停止。声音输出保持静音，验证真实解码和 WebAudio 调度，未做远端听感或跨运营商弱网验收。
+
+证据：`tmp/native-motion-negative.txt`、`tmp/native-motion-visible.txt`、`tmp/native-motion-regression.txt`、`tmp/window-audio-refresh-summary.json`、`tmp/local-playback-e2e-result.json`、`tmp/web-audio-refresh-final.txt`。本地运行时和 Web 构建已更新，尚未生成新版本安装包、推送或部署本轮更改。

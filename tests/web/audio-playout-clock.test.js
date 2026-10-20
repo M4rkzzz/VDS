@@ -317,7 +317,8 @@ test('source scheduling follows PTS, while jitter changes are bounded and source
   }
   assert.equal(h.player.playbackDelay.value, 60);
   const source = h.sources.at(-1);
-  assert.ok(Math.abs(source.starts[0].at - (h.contexts[0].currentTime + 0.06)) < 1e-8);
+  assert.ok(Math.abs(source.starts[0].at - (h.contexts[0].currentTime + 0.02)) < 1e-8,
+    'an already buffered timeline must stay continuous when its target grows');
   h.player.close();
 });
 
@@ -340,7 +341,28 @@ test('normal onended removes a source; close stops every remaining source exactl
   assert.equal(h.player.scheduledSources.size, 0);
 });
 
-test('stable arrivals reduce extra jitter delay slowly, trimming overlap instead of double-playing samples', async () => {
+test('jitter adaptation does not insert silence into already buffered contiguous audio', async () => {
+  const h = harness();
+  await h.player.resume();
+  h.player.setDelayMs(110);
+  for (let index = 0; index < 500; index += 1) {
+    const arrival = 1000 + index * 20 + (index % 7 === 6 ? 18 : 0);
+    await advancePlayout(h, arrival - h.nowMs);
+    await h.push(1000000 + index * 20000);
+  }
+  let gaps = 0;
+  for (let index = 1; index < h.sources.length; index += 1) {
+    const previous = h.sources[index - 1];
+    const end = previous.starts[0].at + previous.buffer.duration - previous.starts[0].offset;
+    gaps += Math.max(0, h.sources[index].starts[0].at - end);
+  }
+  assert.deepEqual(h.drops, []);
+  assert.equal(h.outputs, 500);
+  assert.ok(gaps < 0.001, `buffered audio gained ${(gaps * 1000).toFixed(1)} ms of artificial silence`);
+  h.player.close();
+});
+
+test('stable arrivals reduce the recovery target without trimming healthy audio samples', async () => {
   const h = harness();
   await h.player.resume();
   await h.push();
@@ -361,7 +383,8 @@ test('stable arrivals reduce extra jitter delay slowly, trimming overlap instead
     assert.ok(current.starts[0].at >= previous.starts[0].at + previous.buffer.duration - previous.starts[0].offset - 1e-8);
   }
   assert.equal(h.player.getMetrics().targetBufferMs, 55);
-  assert.ok(h.sources.some((source) => source.starts[0].offset > 0.004));
+  assert.ok(h.sources.every((source) => source.starts[0].offset < 0.000001),
+    'jitter target decay must not cut samples from a healthy timeline');
   assert.ok(h.player.getMetrics().scheduledLeadMs <= 80);
   h.player.close();
 });

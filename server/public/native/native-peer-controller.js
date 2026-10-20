@@ -2731,7 +2731,7 @@
       });
     }
 
-    async function createRelayViewerOffer(nextViewerId, nextViewerMediaCapabilities) {
+    async function createRelayViewerOffer(nextViewerId, nextViewerMediaCapabilities, offerOptions = {}) {
       if (!nextViewerId) {
         throw new Error('native-relay-next-viewer-missing');
       }
@@ -2754,6 +2754,8 @@
         throw new Error('native-relay-upstream-peer-missing');
       }
       const handle = await createOfferForPeer(nextViewerId, {
+        force: Boolean(offerOptions.force),
+        reconnect: Boolean(offerOptions.reconnect),
         kind: 'relay-viewer',
         encodedMediaDataChannel: true,
         mediaManifest: getCurrentMediaManifestSnapshot(),

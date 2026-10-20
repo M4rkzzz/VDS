@@ -220,6 +220,23 @@ async function testFreshPageJoinRebuildsMedia() {
   });
 }
 
+async function testFreshPageBehindRelayRebuildsMedia() {
+  await withServer(async (instance, port) => {
+    const host = await createHost(port);
+    const relay = await join(port, host, 'native-relay');
+    await ready(instance, relay);
+    const target = await join(port, host, 'web-leaf');
+    await relay.take(message => message.type === 'connect-to-next' && message.nextViewerId === target.id);
+    await ready(instance, target);
+    const replacement = await rebind(port, target, 'join', true);
+    const request = await relay.take(message => message.type === 'connect-to-next' && message.nextViewerId === target.id);
+    assert.strictEqual(request.reconnect, true, 'fresh page behind a native relay needs a new transport');
+    await exchange(relay, replacement, 'refreshed-relay-page');
+    await ready(instance, replacement);
+    assert.strictEqual(viewer(instance, replacement).upstreamPeerId, relay.id);
+  }, { maxDownstreamsPerUpstream: 1 });
+}
+
 async function testChangedUpstreamWaitsForAcknowledgement(occupyHost = false) {
   await withServer(async (instance, port) => {
     const host = await createHost(port);
@@ -394,6 +411,7 @@ const tests = {
   'relay-timeout': testRelayTimeoutRecovery,
   'malformed-rate': testMalformedMessagesAreLimited,
   'fresh-page': testFreshPageJoinRebuildsMedia,
+  'fresh-page-relay': testFreshPageBehindRelayRebuildsMedia,
   'changed-upstream': () => testChangedUpstreamWaitsForAcknowledgement(),
   'changed-to-relay': () => testChangedUpstreamWaitsForAcknowledgement(true),
   'same-upstream': testSameUpstreamStartsOneReconnect,

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -449,12 +450,18 @@ void test_gpu_presentation() {
   std::atomic<bool> defer_present{false};
   std::atomic<unsigned int> inspected{0}, changed{0};
   std::atomic<bool> pixels_valid{true};
+  std::atomic<bool> hold_paint{false}, paint_entered{false};
   std::uint32_t previous_pixel = 0;
   SurfaceFixture fixture("gpu-present", kFps, {}, [&](NativeVideoSurfaceConfig& config) {
     config.force_gdi = false;
     config.fail_gpu_present = [&] { return fail_present.exchange(false); };
     config.defer_gpu_present = [&] { return defer_present.load(); };
     config.inspect_gpu_output = [&](void* raw_device, void* raw_resource) {
+      if (hold_paint.load()) {
+        paint_entered.store(true);
+        const auto deadline = SteadyClock::now() + std::chrono::seconds(2);
+        while (hold_paint.load() && SteadyClock::now() < deadline) Sleep(1);
+      }
       // Test-only readback validates the actual video-processor output, not
       // just HRESULTs. This callback is absent from the production agent.
       auto* device = static_cast<ID3D11Device*>(raw_device);
@@ -509,6 +516,28 @@ void test_gpu_presentation() {
       resized.cpu_readback_frames == 0, "GPU resize must preserve the direct path and pixels: " + resized.last_present_failure);
   require(FindWindowExW(fixture.window, nullptr, L"VDSD3D11VideoWindow", nullptr) != nullptr,
     "flip presentation must own a separate child HWND");
+  // Real RPC-style update while Present is in progress. It must queue the
+  // geometry, not block RPC or mutate the window underneath BeginPaint.
+  hold_paint.store(true);
+  SetWindowPos(fixture.window, nullptr, -31990, -32000, 242, 192, SWP_NOZORDER | SWP_NOACTIVATE);
+  auto painting = std::async(std::launch::async, [&] { pump_hidden_paint(fixture); });
+  const auto enter_deadline = SteadyClock::now() + std::chrono::milliseconds(500);
+  while (!paint_entered.load() && SteadyClock::now() < enter_deadline) Sleep(1);
+  NativeEmbeddedSurfaceLayout queued;
+  queued.embedded = true; queued.visible = true;
+  std::ostringstream owner_handle;
+  owner_handle << "0x" << std::hex << reinterpret_cast<std::uintptr_t>(fixture.owner.handle());
+  queued.parent_window_handle = owner_handle.str();
+  queued.x = -31980; queued.y = -31980; queued.width = 240; queued.height = 192;
+  auto updating = std::async(std::launch::async, [&] {
+    std::string error;
+    return fixture.surface->update_layout(queued, &error);
+  });
+  const bool queued_without_waiting = updating.wait_for(std::chrono::milliseconds(80)) == std::future_status::ready;
+  hold_paint.store(false);
+  painting.get();
+  require(updating.get(), "queue layout during native paint");
+  require(paint_entered.load() && queued_without_waiting, "RPC layout must not block on a busy native painting thread");
   // A sender can restart at a different coded size without replacing the
   // viewer window. Exercise decoder textures and processor reconfiguration.
   const auto changed_source = encode_h264(72, kFps, 0, 320, 180);
@@ -556,6 +585,69 @@ void test_gpu_presentation() {
     << ", GDI-fallback-frames=" << fallback.cpu_readback_frames
     << ", recovered-GPU-frames=" << recovered.gpu_presented_frames - fallback.gpu_presented_frames << '\n';
   assert_closed(fixture, units.front());
+}
+
+// Opt-in compositor smoke: inspect only this fixture's visible window. Hidden
+// swapchain readbacks cannot catch a moved child being clipped by its parent.
+void test_window_motion(bool gpu) {
+  SurfaceFixture fixture(gpu ? "motion-gpu" : "motion-gdi", kFps, {},
+    [&](NativeVideoSurfaceConfig& config) { config.force_gdi = !gpu; });
+  if (gpu) require(fixture.surface->snapshot().decoder_backend == "d3d11va",
+    "visible GPU motion smoke requires a D3D11 decoder");
+  constexpr int width = 320, height = 192;
+  SetWindowPos(fixture.window, HWND_TOPMOST, 300, 300, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  const auto units = encode_h264(24, kFps, 0);
+  submit_paced(fixture, units, units.size(), "motion-source");
+  const POINT positions[] = {{300,300}, {260,300}, {220,300}, {340,300},
+    {380,300}, {300,260}, {300,220}, {300,340}, {300,380}, {300,300}};
+  for (const auto& position : positions) {
+    NativeEmbeddedSurfaceLayout layout;
+    layout.embedded = true; layout.visible = true;
+    std::ostringstream handle;
+    handle << "0x" << std::hex << reinterpret_cast<std::uintptr_t>(fixture.owner.handle());
+    layout.parent_window_handle = handle.str();
+    layout.x = position.x; layout.y = position.y;
+    layout.width = width; layout.height = height;
+    std::string error;
+    require(fixture.surface->update_layout(layout, &error), "move visible test surface: " + error);
+    const auto layout_deadline = SteadyClock::now() + std::chrono::seconds(1);
+    RECT positioned{};
+    do {
+      GetWindowRect(fixture.window, &positioned);
+      if (positioned.left == position.x && positioned.top == position.y) break;
+      Sleep(1);
+    } while (SteadyClock::now() < layout_deadline);
+    require(positioned.left == position.x && positioned.top == position.y, "queued native move was applied");
+    pump_hidden_paint(fixture);
+    Sleep(100);
+    if (gpu) {
+      const HWND child = FindWindowExW(fixture.window, nullptr, L"VDSD3D11VideoWindow", nullptr);
+      RECT child_rect{};
+      require(child && GetWindowRect(child, &child_rect), "GPU child exists after move");
+      POINT origin{child_rect.left, child_rect.top};
+      ScreenToClient(fixture.window, &origin);
+      require(origin.x == 0 && origin.y == 0 &&
+        child_rect.right - child_rect.left == width && child_rect.bottom - child_rect.top == height,
+        "GPU child must remain at client origin after moving to " + std::to_string(position.x) + "," +
+        std::to_string(position.y) + "; actual offset=" + std::to_string(origin.x) + "," + std::to_string(origin.y));
+    }
+    HDC screen = GetDC(nullptr);
+    bool valid = screen != nullptr;
+    std::ostringstream pixels;
+    for (int y : {5, height / 2, height - 6}) {
+      for (int x : {5, width / 2, width - 6}) {
+        const COLORREF pixel = GetPixel(screen, position.x + x, position.y + y);
+        pixels << std::hex << pixel << ' ';
+        valid = valid && pixel != CLR_INVALID && pixel != RGB(0, 0, 0);
+      }
+    }
+    if (screen) ReleaseDC(nullptr, screen);
+    RECT actual{}; GetWindowRect(fixture.window, &actual);
+    require(valid, "composited video has black/missing pixels after move to " +
+      std::to_string(position.x) + "," + std::to_string(position.y) + "; actual=" +
+      std::to_string(actual.left) + "," + std::to_string(actual.top) + "; pixels=" + pixels.str());
+  }
+  std::cout << "visible window motion passed: " << (gpu ? "D3D11" : "GDI") << '\n';
 }
 
 void test_decoder_recovery(const std::string& stage, int injected_error, bool gpu = false) {
@@ -928,10 +1020,19 @@ void test_real_1080p60_synchronized_pes_bursts(bool gpu = false) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   std::cout << std::unitbuf;
   av_log_set_level(AV_LOG_ERROR);
   try {
+    if (argc == 2 && std::string(argv[1]) == "--gpu-only") {
+      test_gpu_presentation();
+      return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--window-motion") {
+      test_window_motion(false);
+      test_window_motion(true);
+      return 0;
+    }
     {
       SurfaceFixture fixture("standalone-hidden", 0, {}, [](NativeVideoSurfaceConfig& config) {
         config.layout.embedded = false;

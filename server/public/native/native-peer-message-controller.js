@@ -226,7 +226,10 @@
     async function handleConnectToNextMessage(data) {
       try {
         rememberMediaManifest(data && data.mediaManifest);
-        await callRequired('createOfferToNextViewer', data && data.nextViewerId, data && data.nextViewerMediaCapabilities);
+        await callRequired('createOfferToNextViewer', data && data.nextViewerId, data && data.nextViewerMediaCapabilities, {
+          force: Boolean(data && data.reconnect),
+          reconnect: Boolean(data && data.reconnect)
+        });
       } catch (error) {
         const nextViewerId = data && data.nextViewerId;
         logRecoverableNativeWarning('relay:connect-to-next-failed', error, {

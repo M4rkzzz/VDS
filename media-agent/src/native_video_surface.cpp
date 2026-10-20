@@ -688,6 +688,13 @@ class NativeVideoSurface::Impl {
 
   bool update_layout(const NativeEmbeddedSurfaceLayout& layout, std::string* error) {
 #ifdef _WIN32
+    if (layout.embedded) {
+      const HWND owner = parse_window_handle(layout.parent_window_handle);
+      if (!owner || !IsWindow(owner)) {
+        if (error) *error = "native-video-window-parent-handle-invalid";
+        return false;
+      }
+    }
     HWND hwnd = nullptr;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -702,7 +709,16 @@ class NativeVideoSurface::Impl {
       return true;
     }
 
-    return apply_window_layout(hwnd, layout, error);
+    // RPC runs on a different thread. Moving the HWND while its UI thread is
+    // inside BeginPaint/Present can preserve pixels from the old screen origin.
+    // Apply the latest layout on the owning thread, between paints.
+    if (!layout_update_pending_.exchange(true) && !PostMessageW(hwnd, kApplyLayoutMessage, 0, 0)) {
+      layout_update_pending_.store(false);
+      if (error) *error = "native-video-window-layout-post-failed";
+      return false;
+    }
+    if (error) error->clear();
+    return true;
 #else
     (void)layout;
     if (error) {
@@ -800,6 +816,7 @@ class NativeVideoSurface::Impl {
 #ifdef _WIN32
   static constexpr UINT kFrameAvailableMessage = WM_APP + 1;
   static constexpr UINT kRefreshOwnerMoveHookMessage = WM_APP + 2;
+  static constexpr UINT kApplyLayoutMessage = WM_APP + 3;
 #endif
 
 #ifdef _WIN32
@@ -860,8 +877,30 @@ class NativeVideoSurface::Impl {
       case kRefreshOwnerMoveHookMessage:
         self->refresh_owner_move_hook();
         return 0;
+      case kApplyLayoutMessage: {
+        self->layout_update_pending_.store(false);
+        NativeEmbeddedSurfaceLayout layout;
+        {
+          std::lock_guard<std::mutex> lock(self->mutex_);
+          layout = self->config_.layout;
+        }
+        std::string error;
+        if (!self->apply_window_layout(hwnd, layout, &error)) {
+          std::lock_guard<std::mutex> lock(self->mutex_);
+          self->snapshot_.last_error = error;
+        }
+        return 0;
+      }
       case WM_SIZE:
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return DefWindowProcW(hwnd, message, w_param, l_param);
       case WM_WINDOWPOSCHANGED:
+        // A move invalidates the compositor's preserved pixels even for a
+        // paused/static frame; ordinary WM_PAINT still avoids duplicate work.
+        if (const auto* position = reinterpret_cast<const WINDOWPOS*>(l_param);
+            position && (position->flags & (SWP_NOMOVE | SWP_NOSIZE)) != (SWP_NOMOVE | SWP_NOSIZE)) {
+          self->gpu_width_ = self->gpu_height_ = 0;
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         return DefWindowProcW(hwnd, message, w_param, l_param);
       case WM_PAINT:
@@ -1146,7 +1185,8 @@ class NativeVideoSurface::Impl {
 
     const int target_x = owner_rect.left + anchor.offset_x;
     const int target_y = owner_rect.top + anchor.offset_y;
-    const UINT flags = SWP_NOACTIVATE | SWP_NOZORDER | (anchor.visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
+    const UINT flags = SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS |
+      (anchor.visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
     SetWindowPos(
       hwnd,
       nullptr,
@@ -1171,8 +1211,8 @@ class NativeVideoSurface::Impl {
     const bool embedded = config_.layout.embedded;
     const bool overlay_popup = should_use_overlay_popup(config_.layout);
     const DWORD window_style = embedded
-      ? (overlay_popup ? WS_POPUP : (WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS))
-      : WS_OVERLAPPEDWINDOW;
+      ? (overlay_popup ? (WS_POPUP | WS_CLIPCHILDREN) : (WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS))
+      : (WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN);
     const DWORD window_ex_style = embedded
       ? (overlay_popup ? (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) : WS_EX_NOPARENTNOTIFY)
       : 0;
@@ -1345,7 +1385,7 @@ class NativeVideoSurface::Impl {
       target_y,
       std::max(2, layout.width),
       std::max(2, layout.height),
-      SWP_SHOWWINDOW | SWP_NOACTIVATE
+      SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOCOPYBITS
     );
     if (!positioned) {
       {
@@ -2256,6 +2296,7 @@ class NativeVideoSurface::Impl {
 #ifdef _WIN32
   std::atomic<HWND> window_handle_ { nullptr };
   std::atomic<bool> frame_drain_pending_ { false };
+  std::atomic<bool> layout_update_pending_ { false };
   std::atomic<std::uint64_t> gpu_retry_at_us_ { 0 };
   unsigned gpu_failure_streak_ = 0; // window thread only
   bool gpu_paint_pending_ = false; // window thread only

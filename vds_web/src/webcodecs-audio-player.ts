@@ -570,11 +570,13 @@ export class WebCodecsAudioPlayer {
       }
       const targetDelay = this.playbackDelay.value;
       const minimumStartTime = context.currentTime + (this.delayMs + targetDelay) / 1000;
-      if (this.timelineAnchor) {
-        this.timelineAnchor.contextTime += (targetDelay - this.appliedBufferDelayMs) / 1000;
-      } else {
+      if (!this.timelineAnchor) {
         this.timelineAnchor = { ptsUs, contextTime: minimumStartTime };
       }
+      // Already scheduled blocks cannot move. Sliding this anchor when the
+      // jitter estimate changes inserts silence (growth) or cuts samples
+      // (decay), even while the device has ample audio buffered. Use the new
+      // target on startup/underrun; keep a healthy sample timeline continuous.
       this.appliedBufferDelayMs = targetDelay;
       let expectedStart = this.timelineAnchor.contextTime + (ptsUs - this.timelineAnchor.ptsUs) / 1000000;
       // A burst or a suspended AudioContext must not accumulate seconds of old sound.

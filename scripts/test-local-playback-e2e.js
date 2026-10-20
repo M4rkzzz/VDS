@@ -36,8 +36,12 @@ const mediaOptions = {
   audioGraphVolumePercent: integerOption('VOLUME', 100, 0, 100),
   traceRendering: process.env.VDS_PLAYBACK_E2E_TRACE === '1'
 };
+const soakMs = integerOption('SOAK_MS', 0, 0, 7200000);
+if (soakMs && !sharedProducerTest) throw new Error('SOAK_MS requires shared producer mode');
+const directViewers = soakMs ? 4 : (sharedProducerTest ? 2 : 1);
+Object.assign(mediaOptions, { soakMs, directViewers });
 if (mediaOptions.width % 2 || mediaOptions.height % 2) throw new Error('YUV420 fixture dimensions must be even');
-const runDeadlineMs = mediaOptions.sustainedMs * (isWgc ? 2 : 1) + 90000;
+const runDeadlineMs = mediaOptions.sustainedMs * (isWgc ? 2 : 1) + 90000 + soakMs + (soakMs ? 180000 : 0);
 function saveReport(report) {
   fs.mkdirSync(path.dirname(reportPath), { recursive: true });
   fs.writeFileSync(reportPath, JSON.stringify({ runId, mediaOptions, updatedAt: new Date().toISOString(), ...report }, null, 2));
@@ -174,6 +178,8 @@ async function runElectron() {
   const refreshWakeup = new HostVideoRefreshWakeup({ isRunning: () => agent.getStatus().running,
     invokeStats: () => agent.invoke('getStats'), onError: error => logs.push('[refresh] ' + error.message) });
   const producerEvidence = [];
+  let soakEvidence;
+  let stopStimulus;
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
   app.commandLine.appendSwitch('disable-renderer-backgrounding');
   app.commandLine.appendSwitch('disable-background-timer-throttling');
@@ -456,6 +462,18 @@ async function runElectron() {
     // The fixture emits 48 kHz AAC with 1024 samples per access unit. Merely
     // checking that audio advances would miss losing half a normal PES burst.
     if (!isWgc) assert.ok(audioIncrement >= Math.floor(48000 / 1024 * durationMs / 1000 * 0.9), 'sustained playback audio rate fell below 90% of the AAC source rate');
+    if (!isWgc && mediaOptions.traceRendering) {
+      const starts = latest.renderTrace.codec.filter(event => event.kind === 'audio-start');
+      const gaps = starts.slice(1).map((event, index) => {
+        const previous = starts[index];
+        return Math.max(0, (event.when - (previous.when + previous.duration - (previous.offset || 0))) * 1000);
+      }).filter(gap => gap > 0.1);
+      phases.at(-1).audioContinuity = { inspectedBlocks: starts.length, gapCount: gaps.length,
+        totalGapMs: gaps.reduce((sum, gap) => sum + gap, 0), maxGapMs: Math.max(0, ...gaps) };
+      assert.ok(starts.length >= Math.min(100, Math.floor(durationMs / 1000 * 48000 / 1024 * 0.8)),
+        'audio continuity requires actual scheduled WebAudio blocks');
+      assert.ok(Math.max(0, ...gaps) < 10, 'stable local audio inserted a perceptible scheduling gap');
+    }
     return latest.diagnostics;
   }
   async function freeUdpPort() {
@@ -470,6 +488,7 @@ async function runElectron() {
   try {
     step('electron-ready');
     await app.whenReady();
+    if (soakMs) stopStimulus = require('../tests/fixtures/capture-stimulus').startCaptureStimulus();
     if (nativeMapped) {
       step('mapping-router-start');
       mappingRouter = await require('../tests/fixtures/tcp-mapping-router').tcpMappingRouter('pcp', { controlAddress: '0.0.0.0' });
@@ -483,7 +502,7 @@ async function runElectron() {
       });
     }
     step('server-listening');
-    instance = startServer({ port: 0, disconnectGraceMs: 2000, maxDownstreamsPerUpstream: sharedProducerTest ? 2 : 1,
+    instance = startServer({ port: 0, disconnectGraceMs: 2000, maxDownstreamsPerUpstream: directViewers,
       ...(nativeTcp ? { iceServers: [] } : {}), publicDir: path.join(root, 'server/public') });
     await once(instance.server, 'listening');
     const port = instance.server.address().port;
@@ -528,7 +547,7 @@ async function runElectron() {
     await once(hostSocket, 'open');
     const created = once(hostSocket, 'message');
     hostSocket.send(JSON.stringify({ type: 'create-room', clientId: hostId, mediaManifest: manifest,
-      mediaCapabilities: { maxDirectDownstreams: sharedProducerTest ? 2 : 1 } }));
+      mediaCapabilities: { maxDirectDownstreams: directViewers } }));
     room = JSON.parse(String((await created)[0]));
     assert.equal(room.type, 'room-created');
     hostSocket.on('message', (raw) => {
@@ -655,13 +674,25 @@ async function runElectron() {
       const downstream = await waitForFrames('browser-relay-playback');
       if (sharedProducerTest) {
         assert.equal(downstream.upstreamPeerId, hostId);
-        const before = await agent.invoke('getStats');
-        const bindings = before.peers.filter(p => p.mediaBinding.producerId).map(p => p.mediaBinding);
+        let before = await agent.invoke('getStats');
+        let bindings = before.peers.filter(p => p.mediaBinding.producerId).map(p => p.mediaBinding);
         assert.equal(bindings.length, 2);
         assert.equal(bindings[0].producerId, bindings[1].producerId, 'same source/config started separate encoders');
         assert.equal(bindings[0].producerSubscribers, 2);
         assert.ok(bindings.every(b => b.active), 'open DataChannel must report active without RTP');
         producerEvidence.push({ stage: 'two-subscribers', stats: before });
+        if (soakMs) {
+          soakEvidence = await require('../tests/fixtures/shared-producer-soak').runSharedProducerSoak({
+            durationMs: soakMs, viewers: [relayWindow, window], windows, BrowserWindow, app,
+            onEvidence: evidence => { soakEvidence = evidence; },
+            agent, instance, room, port, hostId, snapshot, selectedTransports, installTransportProbe,
+            transportGenerations, checkFatal: () => { if (fatalError) throw fatalError; },
+            onFailure: fail, step, frameRate: mediaOptions.frameRate,
+            reportPath: path.join(root, 'tmp', `shared-producer-soak-${runId}.json`)
+          });
+          before = await agent.invoke('getStats');
+          bindings = before.peers.filter(p => p.mediaBinding.producerId).map(p => p.mediaBinding);
+        }
         const generations = new Map(transportGenerations);
         const beforeFirst = await snapshot(relayWindow);
         const beforeSecond = await snapshot(window);
@@ -711,6 +742,12 @@ async function runElectron() {
       }
       assert.equal(downstream.upstreamPeerId, relaySnapshot.diagnostics.clientId, 'second viewer bypassed browser relay');
       assert.equal(downstream.reencodePathUsed, false);
+      await window.webContents.reload();
+      await once(window.webContents, 'did-finish-load');
+      await installCodecTrace(window);
+      const refreshedDownstream = await waitForFrames('relay-page-refresh-playback');
+      assert.equal(refreshedDownstream.upstreamPeerId, relaySnapshot.diagnostics.clientId,
+        'refresh should resume through the same live upstream');
       // Restart the source on the same native and browser relay connections. The
       // source input restarts while host PTS retains its common clock offset;
       // a fresh epoch must separate old output.
@@ -758,6 +795,13 @@ async function runElectron() {
     const nativeStats = agent.getStatus().running
       ? await agent.invoke('getStats', {}, { timeoutMs: 2000 }).catch((error) => ({ error: error.message }))
       : { status: agent.getStatus() };
+    if (soakEvidence) {
+      soakEvidence.nativeProcessId = agent.child?.pid;
+      for (const peer of nativeStats.peers || []) {
+        const pid = peer.mediaBinding?.producerProcessId;
+        if (pid > 0) soakEvidence.encoders.push(pid);
+      }
+    }
     for (const ownedWindow of windows) if (!ownedWindow.isDestroyed()) ownedWindow.destroy();
     if (hostSocket) hostSocket.terminate();
     for (const peerId of peers) if (agent.getStatus().running) await agent.invoke('closePeer', {
@@ -772,6 +816,11 @@ async function runElectron() {
       await exited;
     }
     await agent.stop();
+    if (stopStimulus) stopStimulus();
+    if (soakEvidence) {
+      try { soakEvidence.cleanup = require('../tests/fixtures/shared-producer-soak').verifySoakStopped(soakEvidence); }
+      catch (error) { fatalError ||= error; exitCode = 1; }
+    }
     await Promise.all([...mappingJobs]);
     await mappingLeases.dispose();
     const mappingSummary = mappingRouter ? { protocol: 'pcp', bytes: mappingRouter.bytes,
@@ -790,9 +839,9 @@ async function runElectron() {
     clearTimeout(cleanupDeadline);
     const report = { ok: exitCode === 0 && !fatalError, status: 'completed', stage,
       error: fatalError?.message || null, progress,
-      path: isWgc ? 'Real WGC -> hardware-selected H264 -> native DataChannel -> room server -> WebCodecs'
-        : 'FFmpeg synthetic H264/AAC -> loopback SRT -> native DataChannel -> room server -> WebCodecs',
-      electron: process.versions.electron, nativeBinarySha256, producerEvidence, obsState, phases, nativeStats, warnings, consoleErrors, hostMessages,
+      path: isWgc ? 'Real WGC -> hardware-selected H264 -> native DataChannel -> WebCodecs (room server: signaling only)'
+        : 'FFmpeg synthetic H264/AAC -> loopback SRT -> native DataChannel -> WebCodecs (room server: signaling only)',
+      electron: process.versions.electron, nativeBinarySha256, producerEvidence, soakEvidence, obsState, phases, nativeStats, warnings, consoleErrors, hostMessages,
       transportAudit, mappingSummary, audioOutputMuted: true, ffmpegExit, nativeStopped: !agent.getStatus().running, logs: logs.slice(-40) };
     saveReport(report);
     console.log(JSON.stringify({ ok: report.ok, error: report.error, phases: phases.map(({ label, diagnostics }) => ({

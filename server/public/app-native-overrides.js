@@ -409,7 +409,7 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
       syncRendererAppState: (reason, patch) => syncRendererAppState(reason, patch),
       updateViewerCount: (viewerId) => updateViewerCount(viewerId),
       createOffer: (viewerId, options) => nativePeerController.createHostViewerOffer(viewerId, options),
-      createOfferToNextViewer: (nextViewerId, caps) => nativePeerController.createRelayViewerOffer(nextViewerId, caps),
+      createOfferToNextViewer: (nextViewerId, caps, offerOptions) => nativePeerController.createRelayViewerOffer(nextViewerId, caps, offerOptions),
       closePeerConnection: (peerId, options) => nativePeerController.closePeerConnection(peerId, options),
       getHostId: () => hostId,
       getUpstreamPeerId: () => upstreamPeerId,
@@ -887,8 +887,8 @@ const installNativeAuthorityOverrides = function (installOptions = {}) {
     return nativePeerController.createHostViewerOffer(viewerId, options);
   }
 
-  async function createOfferToNextViewer(nextViewerId, nextViewerMediaCapabilities) {
-    return nativePeerController.createRelayViewerOffer(nextViewerId, nextViewerMediaCapabilities);
+  async function createOfferToNextViewer(nextViewerId, nextViewerMediaCapabilities, offerOptions) {
+    return nativePeerController.createRelayViewerOffer(nextViewerId, nextViewerMediaCapabilities, offerOptions);
   }
 
   function scheduleRelayOfferRetry(nextViewerId, error) {

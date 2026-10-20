@@ -1089,7 +1089,7 @@ function requestViewerReconnect(room, viewer, maxDownstreamsPerUpstream = DEFAUL
   notifyViewerCurrentUpstream(room, viewer, true);
 }
 
-function notifyViewerToConnectNext(room, previousViewer, nextViewer) {
+function notifyViewerToConnectNext(room, previousViewer, nextViewer, reconnect = false) {
   if (!room || !previousViewer || !nextViewer || !isSocketOpen(previousViewer.ws)) {
     return;
   }
@@ -1108,7 +1108,8 @@ function notifyViewerToConnectNext(room, previousViewer, nextViewer) {
     nextViewerChainPosition: nextViewer.chainPosition,
     upstreamPeerId: previousViewer.clientId,
     nextViewerMediaCapabilities: nextViewer.mediaCapabilities,
-    mediaManifest: room.mediaManifest
+    mediaManifest: room.mediaManifest,
+    reconnect
   });
 }
 
@@ -1126,7 +1127,7 @@ function notifyViewerCurrentUpstream(room, viewer, reconnect) {
   }
   const upstreamViewer = findViewerById(room, upstreamPeerId);
   if (upstreamViewer && upstreamViewer.mediaReady && upstreamViewer.relayEstablished && isSocketOpen(upstreamViewer.ws)) {
-    notifyViewerToConnectNext(room, upstreamViewer, viewer);
+    notifyViewerToConnectNext(room, upstreamViewer, viewer, reconnect);
   }
 }
 
