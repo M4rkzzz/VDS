@@ -24,6 +24,8 @@ class NativeD3D11Presenter {
   void notify_ready();
 #ifdef VDS_NATIVE_SURFACE_TESTING
   std::function<void(void*, void*)> inspect_output;
+  std::function<long(unsigned int, unsigned int)> swapchain_creation_fault;
+  std::function<void()> on_input_view_created;
 #endif
  private:
   class Impl;

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,8 @@ struct NativeVideoSurfaceConfig {
   std::function<bool()> fail_gpu_present;
   std::function<bool()> defer_gpu_present;
   std::function<void(void*, void*)> inspect_gpu_output;
+  std::function<std::optional<std::uint64_t>(const std::string&)> audio_clock;
+  std::function<void(std::uint64_t, std::int64_t)> inspect_presentation_deadline;
 #endif
 };
 

@@ -232,6 +232,10 @@
         });
       } catch (error) {
         const nextViewerId = data && data.nextViewerId;
+        if (isStaleNativePeerError(error)) {
+          logNativeStep('connect-to-next:stale-offer-ignored', { nextViewerId }, 'connection');
+          return;
+        }
         logRecoverableNativeWarning('relay:connect-to-next-failed', error, {
           key: `relay-connect-failed:${nextViewerId}`,
           category: 'connection',

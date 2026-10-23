@@ -9,6 +9,9 @@ export class UpstreamRecovery {
   private recover: ((reason: string) => void) | null = null;
   private requested = false;
   private ready = false;
+  private states = new Map<string, string>();
+  private timerReason = '';
+  private terminalReason = '';
 
   start(recover: (reason: string) => void): void {
     this.stop();
@@ -18,32 +21,48 @@ export class UpstreamRecovery {
     this.arm(CONNECT_TIMEOUT_MS, 'upstream-connect-timeout');
   }
 
-  stateChanged(state: string): void {
+  stateChanged(state: string, layer: 'connection' | 'ice' | 'datachannel' = 'connection'): void {
     if (!this.recover || this.requested) return;
+    this.states.set(layer, state);
     if (state === 'failed' || state === 'closed') {
-      this.arm(0, `upstream-${state}`);
-    } else if (state === 'disconnected') {
+      this.terminalReason ||= `upstream-${state}`;
+    }
+    // A healthy ICE notification cannot revive closed SCTP/DTLS, and decoded
+    // frames already queued for display cannot prove a disconnected path works.
+    if (this.terminalReason) {
+      this.arm(0, this.terminalReason);
+    } else if (this.pathInterrupted()) {
       this.arm(DISCONNECT_GRACE_MS, 'upstream-disconnected');
     } else if (state === 'connected' || state === 'completed') {
-      this.clearTimer();
-      if (!this.ready) this.arm(CONNECT_TIMEOUT_MS, 'upstream-media-handshake-timeout');
+      if (this.ready) this.clearTimer();
+      else this.arm(CONNECT_TIMEOUT_MS, 'upstream-media-handshake-timeout');
     }
   }
 
   mediaReady(): void {
     if (!this.recover || this.requested) return;
     this.ready = true;
-    this.clearTimer();
+    if (!this.terminalReason && !this.pathInterrupted()) this.clearTimer();
   }
 
   stop(): void {
     this.generation += 1;
     this.clearTimer();
     this.recover = null;
+    this.states.clear();
+    this.terminalReason = '';
+  }
+
+  private pathInterrupted(): boolean {
+    return [...this.states.values()].some(state => state === 'disconnected' ||
+      (this.ready && (state === 'checking' || state === 'connecting')));
   }
 
   private arm(delayMs: number, reason: string): void {
+    // Repeated notifications do not extend the deadline of the same outage.
+    if (this.timer !== null && this.timerReason === reason) return;
     this.clearTimer();
+    this.timerReason = reason;
     const generation = this.generation;
     this.timer = setTimeout(() => {
       this.timer = null;
@@ -56,5 +75,6 @@ export class UpstreamRecovery {
   private clearTimer(): void {
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;
+    this.timerReason = '';
   }
 }

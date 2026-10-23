@@ -24,7 +24,7 @@ function createHarness() {
   const h = {
     states: [], videoStates: [], audioStates: [], videoDrops: [], audioDrops: [],
     videoDecoders: [], audioDecoders: [], contexts: [], videoChunks: [], audioChunks: [],
-    videoOutputs: 0, audioOutputs: 0, released: 0, audioStarts: [], gains: [], sourceChanges: [], sources: []
+    videoOutputs: 0, audioOutputs: 0, keyframeRequests: 0, released: 0, audioStarts: [], gains: [], sourceChanges: [], sources: []
   };
   h.clock = {
     get now() { return now; },
@@ -134,6 +134,7 @@ function createHarness() {
       onDroppedBlock: (reason) => h.audioDrops.push(reason)
     },
     onState: (state) => h.states.push(state),
+    onKeyframeNeeded: () => { h.keyframeRequests++; },
     onSourceChanged: (epoch) => h.sourceChanges.push(epoch)
   });
   h.header = (sequence = 1, keyframe = true, kind = 'video') => ({
@@ -151,6 +152,74 @@ function createHarness() {
   }, h.payload)[0]);
   return h;
 }
+
+test('sequence loss retries recovery while audio keeps its context and source replacement cancels old work', async () => {
+  const h = createHarness(); await h.session.resumeAudio(); h.session.start();
+  h.acceptEpoch('old-source', 1); h.acceptEpoch('old-source', 1, true, 'audio'); await flushMicrotasks();
+  const audio = h.audioDecoders[0], context = h.contexts[0];
+  h.acceptEpoch('old-source', 3, false); await flushMicrotasks(); h.clock.advance(80); await flushMicrotasks();
+  assert.equal(h.keyframeRequests, 1);
+  h.clock.advance(2000); assert.equal(h.keyframeRequests, 2);
+  h.acceptEpoch('old-source', 2, true, 'audio'); await flushMicrotasks();
+  assert.equal(h.audioDecoders[0], audio); assert.equal(audio.state, 'configured');
+  assert.equal(h.audioOutputs, 2); assert.equal(context.state, 'running');
+  h.acceptEpoch('new-source', 0); await flushMicrotasks(); h.clock.advance(5000);
+  assert.equal(h.keyframeRequests, 2); assert.equal(h.videoOutputs, 2);
+  h.session.close(); assert.equal(h.clock.size, 0);
+});
+
+test('same-source sequence recovery retains cached parameters for an IDR without repeated SPS/PPS', async () => {
+  const h = createHarness(); h.session.start();
+  const configured = new Uint8Array([0, 0, 0, 1, 0x67, 0x4d, 0x40, 0x28,
+    0, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1, 0x65, 0x88]).buffer;
+  const idrOnly = new Uint8Array([0, 0, 0, 1, 0x65, 0x88]).buffer;
+  h.session.acceptMessage(h.messages(1, true, 'video', configured)[0]); await flushMicrotasks();
+  assert.equal(h.videoDecoders[0].config.codec, 'avc1.4D4028');
+  h.session.acceptMessage(h.messages(3, false, 'video', new Uint8Array([0, 0, 0, 1, 0x41, 0x88]).buffer)[0]);
+  await flushMicrotasks(); h.clock.advance(80); await flushMicrotasks();
+  h.session.acceptMessage(h.messages(4, true, 'video', idrOnly)[0]); await flushMicrotasks();
+  assert.equal(h.videoDecoders.at(-1).config.codec, 'avc1.4D4028');
+  assert.deepEqual(new Uint8Array(h.videoChunks.at(-1).data), new Uint8Array(configured));
+  assert.equal(h.videoOutputs, 2);
+  h.session.resetMedia(); h.session.start();
+  h.session.acceptMessage(h.messages(1, true, 'video', idrOnly)[0]); await flushMicrotasks();
+  assert.deepEqual(new Uint8Array(h.videoChunks.at(-1).data), new Uint8Array(idrOnly), 'new source must not inherit old parameters');
+  h.session.close();
+});
+
+test('sequence recovery retains the learned jitter target until the source is reset', async () => {
+  const h = createHarness(); h.session.start(); h.accept(); await flushMicrotasks();
+  const delay = h.session.video.bufferDelay;
+  delay.observe(0, 0);
+  for (let i = 1; i <= 8; i++) delay.observe(i * 60, i * 33333);
+  assert.equal(delay.value, 60);
+  h.accept(3, false); await flushMicrotasks(); h.clock.advance(80); await flushMicrotasks();
+  assert.equal(delay.value, 60, 'reference repair must not forget the current network jitter');
+  h.session.resetMedia(); assert.equal(delay.value, 20);
+  h.session.close();
+});
+
+test('continued undecodable deltas do not restart or accelerate the existing recovery deadline', async () => {
+  const h = createHarness(); h.session.start(); h.accept(); await flushMicrotasks();
+  h.accept(3, false); await flushMicrotasks(); h.clock.advance(80); await flushMicrotasks();
+  assert.equal(h.keyframeRequests, 1);
+  for (let sequence = 4; sequence < 24; sequence++) {
+    h.accept(sequence, false); await flushMicrotasks(); h.clock.advance(80); await flushMicrotasks();
+  }
+  assert.equal(h.keyframeRequests, 1, 'repeated missing-reference input must not create a request storm');
+  h.clock.advance(400); assert.equal(h.keyframeRequests, 2, 'lost request still retries on its original deadline');
+  h.accept(24); await flushMicrotasks(); h.clock.advance(6000);
+  assert.equal(h.keyframeRequests, 2, 'actual decoded output ends recovery');
+  h.session.close(); assert.equal(h.clock.size, 0);
+});
+
+test('session close cancels recovery after a decoder error without another media packet', async () => {
+  const h = createHarness(); h.session.start(); h.accept(); await flushMicrotasks();
+  h.videoDecoders[0].callbacks.error(new Error('decoder lost'));
+  h.clock.advance(2000); assert.equal(h.keyframeRequests, 2);
+  h.session.close(); h.clock.advance(10000);
+  assert.equal(h.keyframeRequests, 2); assert.equal(h.clock.size, 0);
+});
 
 test('idle chunk cleanup is canceled on leave and expired pieces cannot complete a new playback frame', () => {
   const h = createHarness();
@@ -382,11 +451,11 @@ test('production upstream recovery preserves running audio context while actual 
   class Peer { close() { closedPeers++; } }
   const filename = path.resolve(sourceDirectory, 'main.ts');
   const parsed = ts.createSourceFile(filename, fs.readFileSync(filename, 'utf8'), ts.ScriptTarget.ES2022, true);
-  const names = ['requestUpstreamRecovery', 'waitForUpstreamOffer', 'ensureUpstreamPeer', 'handleChainReconnect', 'resetLocalViewerSession'];
+  const names = ['requestUpstreamRecovery', 'waitForUpstreamOffer', 'ensureUpstreamPeer', 'handleChainReconnect', 'resetLocalViewerSession', 'retireUpstreamMedia'];
   const declarations = parsed.statements.filter((node) => ts.isFunctionDeclaration(node) && names.includes(node.name?.text));
   assert.equal(declarations.length, names.length);
   const prelude = `
-    let upstreamPc = currentPeer, upstreamMediaChannel = null, downstreamPc = null, downstreamDataChannel = null;
+    let upstreamPc = currentPeer, upstreamMediaChannel = null, downstreamPc = null, downstreamDataChannel = null, relayFrameSender = null;
     let upstreamEdgeAttemptId = null, downstreamEdgeAttemptId = null, upstreamRecoveryAttempts = 0, viewerReadySent = true;
     let downstreamDataChannelReady = false, downstreamRelayForwarding = false, downstreamCloseExpected = false;
     let lastVideoKeyframeForRelay = null, lastBootstrapFrameId = '', downstreamPeerId = '', relaySourceEpoch = '';
@@ -400,7 +469,7 @@ test('production upstream recovery preserves running audio context while actual 
   const globals = {
     currentPeer, playback: h.session, RTCPeerConnection: Peer, clientId: 'client',
     upstreamRecovery: { stop() {}, start() {} }, isCurrentUpstreamPeer: () => true,
-    diagnostics: { update() {} }, signaling: { send() {}, close() {} }, wirePeerEvents() {}, rotateRelaySourceEpoch() {},
+    diagnostics: { update() {} }, signaling: { send() {}, close() {} }, signalingRecovery: { active: false, stop() {} }, wirePeerEvents() {}, rotateRelaySourceEpoch() {},
     setError: (reason) => assert.fail(reason), setStatus() {}, errorToMessage: (error) => error.message,
     getManifestCompatibilityFailure: () => null, removePeerDiagnostics() {}, clearError() {},
     formatChainPosition: (position) => String(position), sessionStorage: { setItem() {} },

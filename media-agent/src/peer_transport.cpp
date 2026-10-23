@@ -1268,7 +1268,11 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       frame.keyframe ? SendAdmission::Kind::keyframe :
       configuration_only(frame) ? SendAdmission::Kind::configuration : SendAdmission::Kind::video;
     std::string rejection;
-    if (!send_admission.admit(kind, wire_bytes, local_data_channel->bufferedAmount(), &rejection)) {
+    auto buffered = local_data_channel->bufferedAmount();
+#ifdef VDS_TRANSPORT_TESTING
+    if (callbacks.buffered_amount) buffered = callbacks.buffered_amount(buffered);
+#endif
+    if (!send_admission.admit(kind, wire_bytes, buffered, &rejection)) {
       std::lock_guard<std::mutex> lock(mutex);
       ++snapshot.encoded_media_data_channel_backpressure_drops;
       if (frame.stream_type == "video") ++snapshot.dropped_video_units;
@@ -1291,6 +1295,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
         std::memcpy(payload.data() + 8 + header.size(), frame.payload.data() + start, end - start);
         // false means accepted into libdatachannel's send queue, not failure.
         // Never retry it or stop halfway through this admitted complete frame.
+#ifdef VDS_TRANSPORT_TESTING
+        if (callbacks.before_send) callbacks.before_send(frame.stream_type, chunk_index);
+#endif
         local_data_channel->send(std::move(payload));
       }
     } catch (...) {
@@ -1325,6 +1332,9 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
   }
 
   void request_keyframe(const std::string& reason) {
+    // Serialize check/send/commit with media writers. A failed admission/send
+    // must not consume the cooldown or make a concurrent retry look successful.
+    std::lock_guard<std::mutex> send_lock(outbound_mutex);
     std::shared_ptr<rtc::Track> local_inbound_video_track;
     std::shared_ptr<rtc::DataChannel> local_data_channel;
     std::string session_fields;
@@ -1343,7 +1353,6 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       if (!local_data_channel && !local_inbound_video_track) {
         throw std::runtime_error("peer-keyframe-source-unavailable");
       }
-      last_keyframe_request_sent_us = now;
       session_fields = build_encoded_media_session_fields(snapshot);
     }
     if (local_data_channel) {
@@ -1351,9 +1360,15 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
       const auto message = std::string("{\"protocol\":\"") + kEncodedMediaProtocol +
         "\",\"type\":\"keyframe-request\",\"protocolVersion\":1,\"reason\":\"" +
         vds::media_agent::json_escape(bounded_reason) + "\"" + session_fields + "}";
-      std::lock_guard<std::mutex> send_lock(outbound_mutex);
-      if (!send_admission.allow_control(message.size(), local_data_channel->bufferedAmount()))
+      auto buffered = local_data_channel->bufferedAmount();
+#ifdef VDS_TRANSPORT_TESTING
+      if (callbacks.buffered_amount) buffered = callbacks.buffered_amount(buffered);
+#endif
+      if (!send_admission.allow_control(message.size(), buffered))
         throw std::runtime_error("datachannel-control-backpressure");
+#ifdef VDS_TRANSPORT_TESTING
+      if (callbacks.before_send) callbacks.before_send("control", 0);
+#endif
       local_data_channel->send(message);
     } else {
       local_inbound_video_track->requestKeyframe();
@@ -1361,6 +1376,7 @@ class PeerTransportSession final : public std::enable_shared_from_this<PeerTrans
     {
       std::lock_guard<std::mutex> lock(mutex);
       if (closed) return;
+      last_keyframe_request_sent_us = vds::media_agent::current_time_micros_steady();
       ++snapshot.keyframe_requests_sent;
       if (reason == "decoder-recovery" || reason == "waiting-for-random-access") {
         snapshot.decoder_recovery_count += 1;

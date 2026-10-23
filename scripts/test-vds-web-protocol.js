@@ -687,7 +687,7 @@ function testKeyframeRequestUsesFlatManifestIdentity() {
   let now = 1000;
   let manifest;
   const request = loadMainHandlers(['requestUpstreamKeyframe'], `
-    let lastUpstreamKeyframeRequestMs = -Infinity;
+    const lastUpstreamKeyframeRequests = new WeakMap();
     const upstreamPc = {};
     const upstreamMediaChannel = channel;
   `, 'requestUpstreamKeyframe', {
@@ -722,11 +722,14 @@ function testRelayPreservesSourceEpoch() {
     let downstreamDataChannel = null;
     let downstreamPeerId = 'same-peer';
     let downstreamCloseExpected = false;
+    let relayFrameSender = null;
     const DATA_CHANNEL_MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
   `, `{ forwardEncodedFrame, sendRelayBootstrapKeyframe, epoch: () => relaySourceEpoch, cache: () => lastVideoKeyframeForRelay,
     bind: (channel) => { downstreamDataChannel = channel; attachOutboundDataChannel(channel, downstreamPeerId); },
     sourceChanged: (next) => { handlePlaybackSourceChanged(); lastVideoKeyframeForRelay = next; } }`, {
     cache,
+    ...loadTsModule('vds_web/src/encoded-relay-sender.ts'),
+    requestUpstreamKeyframe() {},
     crypto: { getRandomValues: (values) => { values.fill(++nonce); return values; } },
     window: { setTimeout: () => 1, clearTimeout() {} },
     DATA_CHANNEL_OPEN_TIMEOUT_MS: 3000,

@@ -557,6 +557,8 @@ class NativeVideoSurface::Impl {
 
   ~Impl() {
     stop("surface-destroyed");
+    if (playback_wake_event_) CloseHandle(playback_wake_event_);
+    if (playback_deadline_timer_) CloseHandle(playback_deadline_timer_);
   }
 
   bool start(std::string* error) {
@@ -682,7 +684,7 @@ class NativeVideoSurface::Impl {
     if (error) {
       error->clear();
     }
-    frame_available_.notify_one();
+    notify_playback_worker();
     return true;
   }
 
@@ -758,7 +760,7 @@ class NativeVideoSurface::Impl {
         stop_reason_ = reason;
       }
       worker_to_join = std::move(worker_);
-      frame_available_.notify_one();
+      notify_playback_worker();
     }
 
 #ifdef _WIN32
@@ -774,6 +776,47 @@ class NativeVideoSurface::Impl {
   }
 
  private:
+  void notify_playback_worker() {
+    if (playback_wake_event_) SetEvent(playback_wake_event_);
+    frame_available_.notify_all();
+  }
+
+  void wait_for_playback(std::unique_lock<std::mutex>& lock, std::optional<std::uint64_t> deadline) {
+    if (playback_wake_event_ && playback_deadline_timer_ && !precise_wait_failed_) {
+      // Reset under the queue mutex: a new input/close cannot be lost between
+      // checking input_generation_ and entering the interruptible kernel wait.
+      ResetEvent(playback_wake_event_);
+      bool armed = true;
+      if (deadline) {
+        const auto now = static_cast<std::uint64_t>(current_time_micros_steady());
+        if (*deadline <= now) return;
+        LARGE_INTEGER due{};
+        const auto limit = static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max() / 10);
+        due.QuadPart = -static_cast<LONGLONG>(std::min(*deadline - now, limit) * 10);
+        armed = SetWaitableTimerEx(playback_deadline_timer_, &due, 0, nullptr, nullptr, nullptr, 0) != FALSE;
+      }
+      if (armed) {
+        HANDLE handles[] = {playback_wake_event_, playback_deadline_timer_};
+        lock.unlock();
+        const auto result = WaitForMultipleObjects(deadline ? 2 : 1, handles, FALSE, INFINITE);
+        if (deadline) CancelWaitableTimer(playback_deadline_timer_);
+        lock.lock();
+        // Recheck queue/stop state on any wake; falling directly into a CV wait
+        // after unlocking could miss an input that arrived during a failed wait.
+        if (result == WAIT_FAILED) precise_wait_failed_ = true;
+        return;
+      }
+    }
+    // Older systems or unavailable timer resources retain the existing path.
+    if (deadline) {
+      const auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+      frame_available_.wait_until(lock, std::chrono::steady_clock::time_point(
+          std::chrono::microseconds(static_cast<std::int64_t>(std::min(*deadline, limit)))));
+    } else {
+      frame_available_.wait(lock);
+    }
+  }
+
   struct EncodedFrame {
     std::string codec;
     std::shared_ptr<std::vector<std::uint8_t>> bytes;
@@ -839,7 +882,7 @@ class NativeVideoSurface::Impl {
       stop_reason_ = "surface-window-closed";
     }
     stop_requested_ = true;
-    frame_available_.notify_all();
+    notify_playback_worker();
   }
 
   static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param) {
@@ -944,7 +987,7 @@ class NativeVideoSurface::Impl {
       if (!decoder_start_succeeded_ || stop_requested_) {
         stop_requested_ = true;
         lock.unlock();
-        frame_available_.notify_all();
+        notify_playback_worker();
         if (decode_worker_.joinable()) decode_worker_.join();
         destroy_window();
         return;
@@ -962,7 +1005,7 @@ class NativeVideoSurface::Impl {
       start_succeeded_ = true;
     }
     started_condition_.notify_all();
-    frame_available_.notify_all();
+    notify_playback_worker();
 
     bool should_stop = false;
     MSG msg{};
@@ -995,7 +1038,7 @@ class NativeVideoSurface::Impl {
       std::lock_guard<std::mutex> lock(mutex_);
       stop_requested_ = true;
     }
-    frame_available_.notify_all();
+    notify_playback_worker();
     if (decode_worker_.joinable()) decode_worker_.join();
     gpu_presenter_.reset();
     cleanup_back_buffer();
@@ -1618,6 +1661,9 @@ class NativeVideoSurface::Impl {
 #endif
 
   std::optional<std::uint64_t> active_audio_time(const std::string& source_id) const {
+#ifdef VDS_NATIVE_SURFACE_TESTING
+    if (config_.audio_clock) return config_.audio_clock(source_id);
+#endif
     const auto clock = get_viewer_audio_playback_clock_snapshot();
     if (!clock.valid || source_id.empty() || source_id != active_source_id_ || clock.source_id != source_id) return std::nullopt;
     return native_playback_detail::add_saturated(clock.timestamp_us,
@@ -1628,7 +1674,8 @@ class NativeVideoSurface::Impl {
     pending_frames_.clear();
     pending_nonvcl_prefix_.clear();
     if (codec_context_) avcodec_flush_buffers(codec_context_);
-    playback_scheduler_.reset();
+    // Repair codec references within this source without changing its playout
+    // phase or learned jitter. Source/codec transitions reset these separately.
     std::lock_guard<std::mutex> lock(mutex_);
     snapshot_.reference_chain_resets += 1;
     snapshot_.pending_decoded_frames = 0;
@@ -1730,13 +1777,7 @@ class NativeVideoSurface::Impl {
         if (frame_queue_.needs_keyframe() && (!wake || next_keyframe_request_us < *wake)) {
           wake = next_keyframe_request_us;
         }
-        if (wake) {
-          const auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
-          frame_available_.wait_until(lock, std::chrono::steady_clock::time_point(
-            std::chrono::microseconds(static_cast<std::int64_t>(std::min(*wake, limit)))));
-        } else {
-          frame_available_.wait(lock);
-        }
+        wait_for_playback(lock, wake);
       }
     }
     pending_frames_.clear();
@@ -1778,6 +1819,10 @@ class NativeVideoSurface::Impl {
       snapshot_.dropped_decoded_frames += dropped;
     }
     if (selected) {
+#ifdef VDS_NATIVE_SURFACE_TESTING
+      if (config_.inspect_presentation_deadline)
+        config_.inspect_presentation_deadline(selected->timing.timestamp_us, selected_due_us);
+#endif
       AVFrame* frame_to_present = selected->frame.get();
       bool allow_gpu = now_us >= gpu_retry_at_us_.load(std::memory_order_acquire);
 #ifdef VDS_NATIVE_SURFACE_TESTING
@@ -1949,7 +1994,7 @@ class NativeVideoSurface::Impl {
     const auto discarded_decoded = pending_frames_.size();
     pending_frames_.clear();
     pending_nonvcl_prefix_.clear();
-    playback_scheduler_.reset();
+    // A decoder failure does not invalidate the source's audio/fallback clock.
     {
       std::lock_guard<std::mutex> lock(mutex_);
       snapshot_.dropped_encoded_frames += frame_queue_.size();
@@ -2273,6 +2318,10 @@ class NativeVideoSurface::Impl {
   NativeVideoSurfaceConfig config_;
   mutable std::mutex mutex_;
   std::condition_variable frame_available_;
+  HANDLE playback_wake_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  HANDLE playback_deadline_timer_ = CreateWaitableTimerExW(nullptr, nullptr,
+      CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  bool precise_wait_failed_ = false; // decoder worker only
   std::condition_variable started_condition_;
   NativeEncodedFrameQueue<EncodedFrame> frame_queue_{
     native_playback_detail::encoded_capacity_for_frame_rate(0), 20000, kMaxEncodedBytes, 500000};

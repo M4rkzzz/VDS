@@ -205,7 +205,7 @@ class SendAdmission {
     if (kind == Kind::audio) budget += kAudioReserve;
     if (kind == Kind::configuration || kind == Kind::keyframe) budget += std::max(kFrameBytes, wire_bytes);
     if (buffered > budget || wire_bytes > budget - buffered) {
-      if (kind == Kind::video || kind == Kind::keyframe) waiting_for_keyframe_ = true;
+      if (kind != Kind::audio) waiting_for_keyframe_ = true;
       if (reason) *reason = "datachannel-send-backpressure";
       return false;
     }
@@ -224,7 +224,9 @@ class SendAdmission {
     }
   }
   void failed(Kind kind) {
-    if (kind == Kind::video || kind == Kind::keyframe) waiting_for_keyframe_ = true;
+    // Lost parameter sets can invalidate all subsequent predictive pictures,
+    // just like a lost video fragment. Audio has an independent decode chain.
+    if (kind != Kind::audio) waiting_for_keyframe_ = true;
   }
   bool allow_control(std::size_t bytes, std::size_t buffered) const {
     const auto budget = queue_budget() + kAudioReserve + kControlReserve;

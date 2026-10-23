@@ -8,6 +8,10 @@ const root = path.resolve(__dirname, '..');
 const captureSource = process.argv.includes('--wgc') ? 'wgc' : (process.env.VDS_PLAYBACK_E2E_SOURCE || 'obs');
 if (!['obs', 'wgc'].includes(captureSource)) throw new Error('VDS_PLAYBACK_E2E_SOURCE must be obs or wgc');
 const isWgc = captureSource === 'wgc';
+const connectionRecoveryTest = process.argv.includes('--connection-recovery') || process.env.VDS_PLAYBACK_E2E_CONNECTION_RECOVERY === '1';
+const transportStabilityTest = process.argv.includes('--transport-stability') || process.env.VDS_PLAYBACK_E2E_TRANSPORT_STABILITY === '1';
+const receiverStabilityTest = process.argv.includes('--receiver-stability') || process.env.VDS_PLAYBACK_E2E_RECEIVER_STABILITY === '1';
+const playoutSmoothnessTest = process.argv.includes('--playout-smoothness') || process.env.VDS_PLAYBACK_E2E_PLAYOUT_SMOOTHNESS === '1';
 const sharedProducerTest = process.env.VDS_PLAYBACK_E2E_SHARED_PRODUCER === '1';
 if (sharedProducerTest && !isWgc) throw new Error('Shared producer smoke requires --wgc');
 const nativeMapped = process.argv.includes('--native-tcp-mapped') || process.env.VDS_PLAYBACK_E2E_NATIVE_MAPPED === '1';
@@ -25,6 +29,10 @@ function integerOption(name, fallback, minimum, maximum) {
 }
 const mediaOptions = {
   captureSource,
+  connectionRecoveryTest,
+  transportStabilityTest,
+  receiverStabilityTest,
+  playoutSmoothnessTest,
   nativeTcp,
   nativeMapped,
   width: integerOption('WIDTH', 640, 64, 3840),
@@ -53,6 +61,10 @@ if (!process.versions.electron) {
   env.VDS_PLAYBACK_E2E_RUN_ID = runId;
   env.VDS_PLAYBACK_E2E_NATIVE_TCP = nativeTcp ? '1' : '0';
   env.VDS_PLAYBACK_E2E_NATIVE_MAPPED = nativeMapped ? '1' : '0';
+  env.VDS_PLAYBACK_E2E_CONNECTION_RECOVERY = connectionRecoveryTest ? '1' : '0';
+  env.VDS_PLAYBACK_E2E_TRANSPORT_STABILITY = transportStabilityTest ? '1' : '0';
+  env.VDS_PLAYBACK_E2E_RECEIVER_STABILITY = receiverStabilityTest ? '1' : '0';
+  env.VDS_PLAYBACK_E2E_PLAYOUT_SMOOTHNESS = playoutSmoothnessTest ? '1' : '0';
   saveReport({ ok: false, status: 'starting', stage: 'launch-electron' });
   const child = spawn(require('electron'), [__filename, ...(isWgc ? ['--wgc'] : [])], { env, windowsHide: true, stdio: 'inherit' });
   const deadline = setTimeout(() => {
@@ -124,9 +136,119 @@ async function runElectron() {
     await target.webContents.debugger.sendCommand('Page.enable');
     await target.webContents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: `
       window.__vdsTransportPeers = [];
+      window.__vdsTransportChannels = [];
+      if (${playoutSmoothnessTest}) {
+        const probe = window.__vdsPlayout = { enabled: false, start: 0, presents: [], validClockReads: 0, suppressedClockReads: 0 };
+        const draw = CanvasRenderingContext2D.prototype.drawImage;
+        CanvasRenderingContext2D.prototype.drawImage = function(...args) {
+          const result = draw.apply(this, args);
+          if (args[0] instanceof VideoFrame) {
+            probe.presents.push({ at: performance.now(), ptsUs: args[0].timestamp });
+            if (probe.presents.length > 4096) probe.presents.shift();
+          }
+          return result;
+        };
+        const timestamp = AudioContext.prototype.getOutputTimestamp;
+        AudioContext.prototype.getOutputTimestamp = function() {
+          const value = timestamp.call(this);
+          if (value.contextTime > 0 && value.performanceTime > 0) probe.validClockReads++;
+          if (probe.enabled && (performance.now() - probe.start) % 1000 < 150) {
+            probe.suppressedClockReads++; return { contextTime: 0, performanceTime: 0 };
+          }
+          return value;
+        };
+      }
+      const observeReceiver = channel => {
+        if (!${receiverStabilityTest} && !${transportStabilityTest}) return;
+        const send = channel.send;
+        channel.send = function(data) {
+          const idle = window.__vdsRelayIdleFault;
+          if (idle?.suppressVideo && typeof data === 'string' && JSON.parse(data).type === 'keyframe-request') {
+            idle.requests++;
+            if (idle.requests === 1) return;
+            idle.suppressVideo = false;
+          }
+          const fault = window.__vdsReceiverFault;
+          if (fault && typeof data === 'string') {
+            const control = JSON.parse(data);
+            if (control.type === 'keyframe-request') {
+              fault.requests++;
+              fault.requestTimes.push(performance.now());
+              if (fault.requests === 1) {
+                // Start the quiet interval from the actual lost control. A
+                // preceding fault may still occupy the shared request cooldown.
+                if (fault.mode !== 'sequence-gap') fault.holdUntil = Math.max(fault.holdUntil, performance.now() + 2600);
+                return; // Deliberately lose the first recovery request.
+              }
+            }
+          }
+          return send.call(this, data);
+        };
+        channel.addEventListener('message', event => {
+          const idle = window.__vdsRelayIdleFault;
+          if (idle?.suppressVideo && event.data instanceof ArrayBuffer) {
+            const size = new DataView(event.data).getUint32(4, false);
+            const header = JSON.parse(new TextDecoder().decode(new Uint8Array(event.data, 8, size)));
+            if (header.streamType === 'video') { idle.suppressedVideoChunks++; event.stopImmediatePropagation(); return; }
+          }
+          const fault = window.__vdsReceiverFault;
+          if (!fault || !(event.data instanceof ArrayBuffer)) return;
+          if (fault.mode !== 'sequence-gap' && performance.now() >= fault.holdUntil) return;
+          const size = new DataView(event.data).getUint32(4, false);
+          const header = JSON.parse(new TextDecoder().decode(new Uint8Array(event.data, 8, size)));
+          if (header.streamType !== 'video') return;
+          if (fault.mode === 'sequence-gap') {
+            fault.missingSequence ??= header.sequence;
+            // Drop one complete AU, then keep delivering dependent frames. Hold
+            // periodic IDRs until the retry so they cannot conceal a lost request.
+            if (header.sequence !== fault.missingSequence && (!header.keyframe || fault.requests >= 2)) {
+              if (!header.keyframe) fault.forwardedDeltaChunks++;
+              return;
+            }
+          }
+          fault.droppedVideoChunks++; event.stopImmediatePropagation();
+        }, true);
+      };
+      if (${receiverStabilityTest}) {
+        window.__vdsVideoDecoders = [];
+        const NativeDecoder = window.VideoDecoder;
+        window.VideoDecoder = class extends NativeDecoder {
+          constructor(config) {
+            super(config);
+            window.__vdsVideoDecoders.push({ decoder: this, fail: () => config.error(new DOMException('synthetic decoder loss', 'EncodingError')) });
+          }
+          decode(chunk) {
+            const fault = window.__vdsReceiverFault;
+            if (fault?.mode === 'decoder-stall' && fault.decoder === this) {
+              fault.stalledSubmissions++;
+              fault.holdUntil ||= performance.now() + 3000;
+              return; // Accepted codec work with no output; production watchdog must detect it.
+            }
+            return super.decode(chunk);
+          }
+        };
+      }
       const NativePeer = window.RTCPeerConnection;
       window.RTCPeerConnection = class extends NativePeer {
-        constructor(...args) { super(...args); window.__vdsTransportPeers.push(this); }
+        constructor(...args) {
+          super(...args); window.__vdsTransportPeers.push(this);
+          this.addEventListener('datachannel', event => {
+            window.__vdsTransportChannels.push({ pc: this, channel: event.channel });
+            observeReceiver(event.channel);
+          });
+        }
+        createDataChannel(...args) {
+          const channel = super.createDataChannel(...args);
+          window.__vdsTransportChannels.push({ pc: this, channel, outbound: true });
+          channel.addEventListener('message', event => {
+            const idle = window.__vdsRelayIdleFault;
+            if (idle && typeof event.data === 'string' && JSON.parse(event.data).type === 'keyframe-request') {
+              idle.blockedDownstreamRequests++;
+              event.stopImmediatePropagation();
+            }
+          }, true);
+          return channel;
+        }
       };
     ` });
   }
@@ -178,6 +300,11 @@ async function runElectron() {
   const refreshWakeup = new HostVideoRefreshWakeup({ isRunning: () => agent.getStatus().running,
     invokeStats: () => agent.invoke('getStats'), onError: error => logs.push('[refresh] ' + error.message) });
   const producerEvidence = [];
+  const connectionRecoveryEvidence = [];
+  const transportStabilityEvidence = [];
+  const receiverStabilityEvidence = [];
+  const playoutSmoothnessEvidence = [];
+  const nativeChannelCloseEvents = [];
   let soakEvidence;
   let stopStimulus;
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
@@ -188,7 +315,7 @@ async function runElectron() {
   let stage = 'electron-ready';
   const progress = [];
   const checkpoint = () => saveReport({ ok: false, status: fatalError ? 'failed' : 'running', stage, nativeBinarySha256,
-    error: fatalError?.message || null, progress, phases, warnings, consoleErrors, logs: logs.slice(-40) });
+    error: fatalError?.message || null, progress, phases, connectionRecoveryEvidence, warnings, consoleErrors, logs: logs.slice(-40) });
   const step = (label) => {
     stage = label; progress.push({ stage, at: new Date().toISOString() });
     console.log('[local-playback-e2e] ' + label); checkpoint();
@@ -268,6 +395,9 @@ async function runElectron() {
     sendHost({ ...filtered, type: params.type === 'candidate' ? 'ice-candidate' : params.type, mediaManifest: manifest });
   };
   agent.on('event', ({ event, params }) => {
+    if (event === 'peer-state' && params.state === 'datachannel-closed') {
+      nativeChannelCloseEvents.push({ peerId: params.peerId, transportGeneration: params.transportGeneration });
+    }
     refreshWakeup.handleEvent({ event, params });
     if (event === 'host-video-producer-failed') producerEvidence.push({ event, params, at: Date.now() });
     if (nativeMapped) mappingLeases.handleEvent({ event, params });
@@ -502,7 +632,7 @@ async function runElectron() {
       });
     }
     step('server-listening');
-    instance = startServer({ port: 0, disconnectGraceMs: 2000, maxDownstreamsPerUpstream: directViewers,
+    instance = startServer({ port: 0, disconnectGraceMs: connectionRecoveryTest ? 6000 : 2000, maxDownstreamsPerUpstream: directViewers,
       ...(nativeTcp ? { iceServers: [] } : {}), publicDir: path.join(root, 'server/public') });
     await once(instance.server, 'listening');
     const port = instance.server.address().port;
@@ -625,6 +755,128 @@ async function runElectron() {
     await join();
     const initial = await waitForFrames('initial-playback');
     const sustained = await observeSustainedPlayback(initial);
+    if (playoutSmoothnessTest) {
+      assert.equal(isWgc, false, 'clock handoff smoke requires an actual audio source');
+      const generationBefore = [...transportGenerations.values()];
+      for (const enabled of [false, true]) {
+        await window.webContents.executeJavaScript(`Object.assign(window.__vdsPlayout, {
+          enabled: ${enabled}, start: performance.now(), presents: [], validClockReads: 0, suppressedClockReads: 0 })`);
+        await new Promise(resolve => setTimeout(resolve, 6000));
+        const probe = await window.webContents.executeJavaScript(`(() => {
+          const probe = window.__vdsPlayout; probe.enabled = false;
+          return { ...probe, durationMs: performance.now() - probe.start };
+        })()`);
+        assert.ok(probe.validClockReads > 0, 'real audio device clock was never available');
+        if (enabled) assert.ok(probe.suppressedClockReads > 0, 'clock interruption was not exercised');
+        const gaps = probe.presents.slice(1).map((frame, index) => frame.at - probe.presents[index].at).sort((a, b) => a - b);
+        assert.ok(gaps.length >= mediaOptions.frameRate * 6 * 0.6, 'sustained presentation rate unexpectedly low');
+        playoutSmoothnessEvidence.push({ interrupted: enabled, durationMs: probe.durationMs,
+          presented: probe.presents.length, p95GapMs: gaps[Math.ceil(gaps.length * 0.95) - 1], maxGapMs: gaps.at(-1),
+          gapsOver50Ms: gaps.filter(gap => gap > 50).length,
+          validClockReads: probe.validClockReads, suppressedClockReads: probe.suppressedClockReads,
+          injection: '150 ms audio timestamp blackout every second; audio and video packets unchanged' });
+      }
+      assert.deepEqual([...transportGenerations.values()], generationBefore);
+    }
+    if (receiverStabilityTest) {
+      const generationBefore = [...transportGenerations.values()];
+      for (const mode of ['sequence-gap', 'decoder-error', 'decoder-stall']) {
+        const before = (await snapshot()).diagnostics;
+        const started = Date.now();
+        await poll('receiver-fault-installed-' + mode, () => window.webContents.executeJavaScript(`(() => {
+          const current = window.__vdsVideoDecoders.filter(entry => entry.decoder.state === 'configured').at(-1);
+          if (!current) return false; // A preceding recovery may still be replacing its codec.
+          window.__vdsReceiverFault = { mode: ${JSON.stringify(mode)}, decoder: current.decoder, requests: 0,
+            droppedVideoChunks: 0, stalledSubmissions: 0, requestTimes: [], forwardedDeltaChunks: 0,
+            holdUntil: ${JSON.stringify(mode)} === 'decoder-error' ? performance.now() + 2600 : 0 };
+          if (${JSON.stringify(mode)} === 'decoder-error') current.fail();
+          return true;
+        })()`));
+        await poll('receiver-keyframe-retry-' + mode, () => window.webContents.executeJavaScript('window.__vdsReceiverFault.requests >= 2'));
+        const during = (await snapshot()).diagnostics;
+        if (!isWgc) assert.ok(during.webDecodedAudioBlocks > before.webDecodedAudioBlocks + 12,
+          'video decoder failure must not interrupt audio decoding');
+        const recovered = await waitForFrames('receiver-recovered-' + mode, before);
+        const fault = await window.webContents.executeJavaScript(`(() => {
+          const fault = window.__vdsReceiverFault;
+          const result = { requests: fault.requests, droppedVideoChunks: fault.droppedVideoChunks,
+            stalledSubmissions: fault.stalledSubmissions, retiredDecoderClosed: fault.decoder.state === 'closed',
+            requestTimes: fault.requestTimes, forwardedDeltaChunks: fault.forwardedDeltaChunks };
+          window.__vdsReceiverFault = null; return result;
+        })()`);
+        assert.ok(fault.droppedVideoChunks > 0); assert.equal(fault.retiredDecoderClosed, true);
+        if (mode === 'decoder-stall') assert.ok(fault.stalledSubmissions > 0);
+        if (mode === 'sequence-gap') {
+          assert.ok(fault.forwardedDeltaChunks > 0, 'dependent video must continue arriving during recovery');
+          assert.ok(fault.requestTimes[1] - fault.requestTimes[0] >= 1900,
+            'incoming dependent frames must not accelerate the 2s recovery retry');
+        }
+        assert.deepEqual([...transportGenerations.values()], generationBefore, 'decoder recovery must preserve P2P');
+        receiverStabilityEvidence.push({ mode, ...fault, elapsedMs: Date.now() - started,
+          videoFramesAdded: recovered.webDecodedVideoFrames - before.webDecodedVideoFrames,
+          audioBlocksDuringFailure: during.webDecodedAudioBlocks - before.webDecodedAudioBlocks,
+          sameNativeGeneration: true, injection: mode === 'sequence-gap'
+            ? 'one missing video AU, dependent frames continue, first request dropped, periodic IDRs held until retry'
+            : 'decoder callback/work suppression plus dropped first keyframe request and temporary video reception' });
+      }
+      await observeSustainedPlayback((await snapshot()).diagnostics, 'receiver-recovered-sustained');
+    }
+    if (connectionRecoveryTest) {
+      const beforeSignalLoss = (await snapshot()).diagnostics;
+      const originalGeneration = transportGenerations.get(beforeSignalLoss.clientId);
+      const originalSocket = [...instance.wss.clients].find(socket => socket.clientId === beforeSignalLoss.clientId);
+      assert.ok(originalSocket, 'missing viewer signaling socket');
+      let rejectedSockets = 0;
+      const rejectReplacement = socket => {
+        if (rejectedSockets++ < 2) socket.terminate();
+        else instance.wss.off('connection', rejectReplacement);
+      };
+      instance.wss.on('connection', rejectReplacement);
+      step('signaling-only-loss');
+      originalSocket.terminate();
+      await poll('signaling-session-resumed', () => {
+        const participant = instance.rooms.get(room.roomId)?.viewers.find(v => v.clientId === beforeSignalLoss.clientId);
+        return participant?.ws && participant.ws !== originalSocket && participant.ws.readyState === WebSocket.OPEN;
+      });
+      const afterSignalLoss = await waitForFrames('signaling-loss-media-preserved', beforeSignalLoss);
+      assert.equal(transportGenerations.get(beforeSignalLoss.clientId), originalGeneration, 'signal loss rebuilt healthy P2P');
+      assert.ok(rejectedSockets >= 3, 'two failed replacement sockets were not exercised');
+      connectionRecoveryEvidence.push({ kind: 'signaling-only', rejectedSockets: 2, sameNativeGeneration: true,
+        videoFramesAdded: afterSignalLoss.webDecodedVideoFrames - beforeSignalLoss.webDecodedVideoFrames });
+      for (let outage = 1; outage <= 2; outage++) {
+        const before = (await snapshot()).diagnostics;
+        const oldGeneration = transportGenerations.get(before.clientId);
+        const started = Date.now();
+        step('close-real-media-channel-' + outage);
+        if (outage === 1) {
+          const socket = [...instance.wss.clients].find(socket => socket.clientId === before.clientId);
+          assert.ok(socket); socket.terminate();
+        }
+        await window.webContents.executeJavaScript(`(() => {
+          const entry = window.__vdsTransportChannels.find(({ pc, channel }) =>
+            pc.connectionState === 'connected' && channel.readyState === 'open');
+          if (!entry) throw new Error('missing-live-media-channel');
+          // Close actual SCTP, then replay a healthy ICE notification in the
+          // same task. This reproduces independently ordered transport events.
+          entry.channel.addEventListener('close', () => entry.pc.dispatchEvent(new Event('iceconnectionstatechange')), { once: true });
+          entry.channel.close();
+        })()`);
+        await poll('native-transport-replaced-' + outage, () => {
+          const generation = transportGenerations.get(before.clientId);
+          return generation && generation !== oldGeneration;
+        });
+        const resumed = await waitForFrames('channel-close-recovery-' + outage, before);
+        assert.equal(resumed.clientId, before.clientId, 'recovery changed viewer identity');
+        assert.equal(resumed.roomId, before.roomId, 'recovery left the room');
+        const selected = await selectedTransports(window);
+        assert.ok(selected.length && selected.every(pair => pair.local.candidateType !== 'relay' && pair.remote.candidateType !== 'relay'));
+        connectionRecoveryEvidence.push({ outage, kind: outage === 1 ? 'signaling-and-media' : 'media-only', elapsedMs: Date.now() - started, selected,
+          oldGeneration, newGeneration: transportGenerations.get(before.clientId),
+          videoFramesAdded: resumed.webDecodedVideoFrames - before.webDecodedVideoFrames,
+          audioBlocksAdded: resumed.webDecodedAudioBlocks - before.webDecodedAudioBlocks });
+      }
+      assert.ok(nativeChannelCloseEvents.length >= 2, 'native host did not report the actual closed media channels');
+    }
     if (sharedProducerTest) {
       await agent.invoke('attachSurface', { surface: 'producer-preview', target: 'host-capture-preview', visible: false });
       await poll('preview-reuses-producer', async () => {
@@ -635,11 +887,12 @@ async function runElectron() {
     }
     // Exercise room and browser relay recovery with both real source paths.
     {
+      const beforeLeave = (await snapshot()).diagnostics;
       await window.webContents.executeJavaScript("document.getElementById('leaveButton').click()");
       await poll('room-leave', () => instance.rooms.get(room.roomId).viewers.length === 0);
       await poll('playback-stopped', async () => (await snapshot()).diagnostics.playbackState === 'stopped', 3000);
       await join();
-      await waitForFrames('leave-rejoin-playback', sustained);
+      await waitForFrames('leave-rejoin-playback', beforeLeave);
       await window.webContents.reload();
       await once(window.webContents, 'did-finish-load');
       await installCodecTrace(window);
@@ -742,6 +995,79 @@ async function runElectron() {
       }
       assert.equal(downstream.upstreamPeerId, relaySnapshot.diagnostics.clientId, 'second viewer bypassed browser relay');
       assert.equal(downstream.reencodePathUsed, false);
+      if (transportStabilityTest) {
+        const generationBefore = [...transportGenerations.values()];
+        for (const mode of ['queue-full', 'send-error', 'queue-full', 'silent-upstream']) {
+          const before = (await snapshot()).diagnostics;
+          const relayBeforeFault = (await snapshot(relayWindow)).diagnostics;
+          // Inject only the queue observation / native send exception. Media is
+          // still encoded, sent over real SCTP and decoded by the actual player.
+          await relayWindow.webContents.executeJavaScript(`(() => {
+            const entry = window.__vdsTransportChannels.find(e => e.outbound && e.channel.readyState === 'open');
+            if (!entry) throw new Error('live relay sender not found');
+            const channel = entry.channel, send = channel.send;
+            const fault = window.__vdsQueueFault = { mode: ${JSON.stringify(mode)}, injected: false, channel, pc: entry.pc };
+            if (fault.mode === 'queue-full') {
+              Object.defineProperty(channel, 'bufferedAmount', { configurable: true, get: () => 8 * 1024 * 1024 + 1 });
+              fault.injected = true;
+            } else {
+              channel.send = function(data) {
+                if (!fault.injected && data instanceof ArrayBuffer) {
+                  const view = new DataView(data), size = view.getUint32(4, false);
+                  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(data, 8, size)));
+                  if (header.streamType === 'video' && (header.type === 'frame' || header.chunkIndex === 1)) {
+                    fault.injected = true;
+                    if (fault.mode === 'silent-upstream') window.__vdsRelayIdleFault = {
+                      suppressVideo: true, requests: 0, suppressedVideoChunks: 0, blockedDownstreamRequests: 0
+                    };
+                    throw new DOMException('synthetic native send queue full', 'OperationError');
+                  }
+                }
+                return send.call(this, data);
+              };
+            }
+            fault.restore = () => { delete channel.bufferedAmount; channel.send = send;
+              channel.dispatchEvent(new Event('bufferedamountlow')); };
+          })()`);
+          await poll('relay-queue-fault-injected', () => relayWindow.webContents.executeJavaScript('window.__vdsQueueFault.injected'));
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          const relayDuring = await snapshot(relayWindow);
+          if (mode === 'silent-upstream') {
+            assert.ok(relayDuring.diagnostics.webDecodedAudioBlocks > relayBeforeFault.webDecodedAudioBlocks,
+              'video silence must leave upstream audio decoding alive');
+          } else {
+            assert.ok(relayDuring.diagnostics.webDecodedVideoFrames > relayBeforeFault.webDecodedVideoFrames,
+              'downstream pressure must not stop upstream local decoding');
+          }
+          assert.ok(relayDuring.diagnostics.dataChannelFramesDropped > (relayBeforeFault.dataChannelFramesDropped || 0),
+            'injected congestion must actually exercise relay frame rejection');
+          await relayWindow.webContents.executeJavaScript('window.__vdsQueueFault.restore()');
+          const atDrain = (await snapshot()).diagnostics;
+          const started = Date.now();
+          const recovered = await waitForFrames('relay-' + mode + '-recovered', atDrain);
+          assert.deepEqual([...transportGenerations.values()], generationBefore, 'congestion must not rebuild native transport');
+          assert.equal(await relayWindow.webContents.executeJavaScript(`window.__vdsQueueFault.channel.readyState === 'open' && window.__vdsQueueFault.pc.connectionState === 'connected'`), true);
+          let idleRecovery;
+          if (mode === 'silent-upstream') {
+            idleRecovery = await relayWindow.webContents.executeJavaScript(`(() => {
+              const evidence = window.__vdsRelayIdleFault;
+              window.__vdsRelayIdleFault = null;
+              return evidence;
+            })()`);
+            assert.ok(idleRecovery.requests >= 2, 'lost recovery control must retry without video arrivals');
+            assert.ok(idleRecovery.suppressedVideoChunks > 0, 'silence fault must actually block upstream video');
+            assert.equal(idleRecovery.suppressVideo, false);
+          }
+          transportStabilityEvidence.push({ mode, injection: 'synthetic queue observation or send exception on real media channel',
+            elapsedAfterDrainMs: Date.now() - started, videoFramesAdded: recovered.webDecodedVideoFrames - atDrain.webDecodedVideoFrames,
+            audioBlocksAdded: recovered.webDecodedAudioBlocks - atDrain.webDecodedAudioBlocks,
+            sameNativeGeneration: true, sameRelayChannel: true, upstreamContinued: mode !== 'silent-upstream',
+            ...(idleRecovery ? { idleRecovery, upstreamAudioContinued: true } : {}),
+            upstreamFramesDuringFault: relayDuring.diagnostics.webDecodedVideoFrames - relayBeforeFault.webDecodedVideoFrames,
+            videoFramesBeforeFault: before.webDecodedVideoFrames });
+        }
+        await observeSustainedPlayback((await snapshot()).diagnostics, 'post-congestion-sustained');
+      }
       await window.webContents.reload();
       await once(window.webContents, 'did-finish-load');
       await installCodecTrace(window);
@@ -841,7 +1167,7 @@ async function runElectron() {
       error: fatalError?.message || null, progress,
       path: isWgc ? 'Real WGC -> hardware-selected H264 -> native DataChannel -> WebCodecs (room server: signaling only)'
         : 'FFmpeg synthetic H264/AAC -> loopback SRT -> native DataChannel -> WebCodecs (room server: signaling only)',
-      electron: process.versions.electron, nativeBinarySha256, producerEvidence, soakEvidence, obsState, phases, nativeStats, warnings, consoleErrors, hostMessages,
+      electron: process.versions.electron, nativeBinarySha256, producerEvidence, connectionRecoveryEvidence, transportStabilityEvidence, receiverStabilityEvidence, playoutSmoothnessEvidence, nativeChannelCloseEvents, soakEvidence, obsState, phases, nativeStats, warnings, consoleErrors, hostMessages,
       transportAudit, mappingSummary, audioOutputMuted: true, ffmpegExit, nativeStopped: !agent.getStatus().running, logs: logs.slice(-40) };
     saveReport(report);
     console.log(JSON.stringify({ ok: report.ok, error: report.error, phases: phases.map(({ label, diagnostics }) => ({

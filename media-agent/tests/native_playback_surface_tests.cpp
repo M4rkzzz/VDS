@@ -1018,12 +1018,158 @@ void test_real_1080p60_synchronized_pes_bursts(bool gpu = false) {
   assert_closed(fixture, units.front());
 }
 
+void test_audio_clock_handoff_surface(bool gpu, bool interrupt_clock) {
+  constexpr int frames = 240;
+  auto units = encode_h264(frames, 60, 0, 1920, 1080);
+  for (auto& unit : units) unit.pts += 60;
+  auto began = SteadyClock::now();
+  std::atomic<unsigned int> missing_samples{0};
+  const std::string source = "clock-handoff-source";
+  SurfaceFixture fixture("clock-handoff", 60, {}, [&](NativeVideoSurfaceConfig& config) {
+    config.force_gdi = !gpu;
+    config.audio_clock = [&](const std::string& id) -> std::optional<std::uint64_t> {
+      if (id != source) return std::nullopt;
+      const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - began).count();
+      if (interrupt_clock && elapsed >= 1000000 && elapsed % 1000000 < 150000) {
+        ++missing_samples;
+        return std::nullopt;
+      }
+      return static_cast<std::uint64_t>(1000000 + elapsed - 120000);
+    };
+  });
+  // Decoder/device startup precedes the source clock and must not manufacture
+  // an initial catch-up burst in this presentation-cadence fixture.
+  began = SteadyClock::now();
+  HighResolutionWaiter waiter;
+  std::size_t sent = 0;
+  std::uint64_t previous_painted = 0;
+  auto last_paint = began;
+  std::vector<double> gaps;
+  while (SteadyClock::now() < began + std::chrono::milliseconds(4300)) {
+    const auto now = SteadyClock::now();
+    while (sent < units.size() && now >= began + std::chrono::microseconds(sent * 1000000 / 60)) {
+      submit(fixture, units[sent], sent + 1, source);
+      ++sent;
+    }
+    pump_hidden_paint(fixture);
+    const auto stats = fixture.surface->snapshot();
+    if (stats.painted_frames > previous_painted) {
+      const auto painted_at = SteadyClock::now();
+      if (previous_painted) gaps.push_back(std::chrono::duration<double, std::milli>(painted_at - last_paint).count());
+      last_paint = painted_at;
+      previous_painted = stats.painted_frames;
+    }
+    if (sent == units.size() && stats.painted_frames == frames) break;
+    waiter.wait_for(std::chrono::microseconds(500));
+  }
+  const auto stats = fixture.surface->snapshot();
+  std::sort(gaps.begin(), gaps.end());
+  require(!gaps.empty(), "clock handoff must produce real paints");
+  std::cout << "clock-handoff-1080p60: gpu=" << gpu << ", interrupt=" << interrupt_clock
+    << ", painted=" << stats.painted_frames << "/" << frames << ", dropped=" << stats.dropped_decoded_frames
+    << ", p95-gap-ms=" << gaps[gaps.size() * 95 / 100] << ", max-gap-ms=" << gaps.back()
+    << ", gaps-over-50ms=" << std::count_if(gaps.begin(), gaps.end(), [](double gap) { return gap > 50; })
+    << ", missing-clock-samples=" << missing_samples.load() << ", cpu-readbacks=" << stats.cpu_readback_frames << '\n';
+  require(stats.painted_frames >= frames - 5 && stats.dropped_encoded_frames == 0 &&
+    stats.reference_chain_resets == 0 && stats.last_error.empty(), "clock handoff preserves real playback: " + describe(stats));
+  require(gaps.back() < 100, "clock handoff must not cause a 100ms presentation stall");
+  require(!interrupt_clock || missing_samples.load() > 30, "clock fault must actually reach the decoder worker");
+  if (gpu) require(stats.gpu_presented_frames == stats.painted_frames && stats.cpu_readback_frames == 0,
+    "clock handoff must retain direct GPU presentation");
+  assert_closed(fixture, units.front());
+}
+
+void test_network_recovery_timeline(bool gpu, bool decoder_fault) {
+  constexpr int frames = 180;
+  auto units = encode_h264(frames, 60, 0, 1920, 1080);
+  for (auto& unit : units) {
+    unit.pts += 60;
+    if (unit.keyframe && unit.pts > 60) unit = split_parameter_sets(unit).second;
+  }
+  auto began = SteadyClock::now();
+  std::atomic<bool> armed{false};
+  std::atomic<unsigned int> injected{0}, recovered_deadlines{0};
+  std::atomic<std::int64_t> max_phase_error_us{0};
+  const std::string source = "network-recovery-source";
+  SurfaceFixture fixture("network-recovery", 60,
+    [&](const char* stage, bool) {
+      if (decoder_fault && std::strcmp(stage, "send") == 0 && armed.exchange(false)) {
+        ++injected; return AVERROR_INVALIDDATA;
+      }
+      return 0;
+    }, [&](NativeVideoSurfaceConfig& config) {
+      config.force_gdi = !gpu;
+      config.audio_clock = [&](const std::string& id) -> std::optional<std::uint64_t> {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - began).count();
+        // Lose the device clock around the network/codec failure, while the
+        // source keeps its original PTS and frame rate.
+        if (id != source || elapsed >= 1200000) return std::nullopt;
+        return static_cast<std::uint64_t>(1000000 + elapsed - 120000);
+      };
+      config.inspect_presentation_deadline = [&](std::uint64_t pts, std::int64_t due) {
+        if (pts < 2200000) return;
+        const auto base = std::chrono::duration_cast<std::chrono::microseconds>(began.time_since_epoch()).count();
+        const auto expected = base + static_cast<std::int64_t>(pts) - 1000000 + 120000;
+        const auto error = due >= expected ? due - expected : expected - due;
+        max_phase_error_us.store(std::max(max_phase_error_us.load(), error));
+        ++recovered_deadlines;
+      };
+    });
+  began = SteadyClock::now();
+  HighResolutionWaiter waiter;
+  std::size_t sent = 0;
+  unsigned int learned_buffer_ms = 0;
+  while (SteadyClock::now() < began + std::chrono::milliseconds(3500)) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - began).count();
+    // A 40ms path step learns the existing jitter budget before the failure.
+    while (sent < units.size() && elapsed >= static_cast<std::int64_t>(sent * 1000000 / 60 + (sent >= 30 ? 40000 : 0))) {
+      if (sent == 70) {
+        learned_buffer_ms = fixture.surface->snapshot().buffer_delay_ms;
+        if (decoder_fault) armed = true;
+      }
+      if (sent != 70 || decoder_fault) submit(fixture, units[sent], sent + 1, source);
+      ++sent;
+    }
+    pump_hidden_paint(fixture);
+    if (sent == units.size() && fixture.surface->snapshot().pending_encoded_frames == 0 &&
+        fixture.surface->snapshot().pending_decoded_frames == 0) break;
+    waiter.wait_for(std::chrono::microseconds(500));
+  }
+  const auto stats = fixture.surface->snapshot();
+  std::cout << "network-recovery-1080p60: gpu=" << gpu << ", decoder-fault=" << decoder_fault
+    << ", painted=" << stats.painted_frames << ", learned-buffer-ms=" << learned_buffer_ms
+    << ", recovered-buffer-ms=" << stats.buffer_delay_ms << ", phase-error-us=" << max_phase_error_us.load()
+    << ", recovered-deadlines=" << recovered_deadlines.load() << ", resets=" << stats.reference_chain_resets
+    << ", cpu-readbacks=" << stats.cpu_readback_frames << '\n';
+  require(learned_buffer_ms >= 50, "fixture must learn network jitter before the failure");
+  require(stats.reference_chain_resets > 0 && recovered_deadlines.load() > 80 && stats.painted_frames > 145,
+    "fault must exercise real recovery and sustained presentation: " + describe(stats));
+  require(stats.buffer_delay_ms >= 50, "same-source recovery must retain learned jitter buffering");
+  require(max_phase_error_us.load() < 3000, "same-source recovery must retain audio-to-fallback presentation phase");
+  require(stats.last_error.empty() && !stats.needs_keyframe, "native playback must recover completely");
+  require(injected.load() == (decoder_fault ? 1u : 0u), "exactly the requested decoder fault must be injected");
+  if (gpu) require(stats.gpu_presented_frames == stats.painted_frames && stats.cpu_readback_frames == 0,
+    "network recovery must retain direct GPU presentation");
+  assert_closed(fixture, units.front());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::cout << std::unitbuf;
   av_log_set_level(AV_LOG_ERROR);
   try {
+    if (argc == 2 && (std::string(argv[1]) == "--network-gap" || std::string(argv[1]) == "--network-decode")) {
+      for (const bool gpu : {false, true}) test_network_recovery_timeline(gpu, std::string(argv[1]) == "--network-decode");
+      return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--clock-handoff") {
+      for (const bool gpu : {false, true}) {
+        test_audio_clock_handoff_surface(gpu, false);
+        test_audio_clock_handoff_surface(gpu, true);
+      }
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--gpu-only") {
       test_gpu_presentation();
       return 0;

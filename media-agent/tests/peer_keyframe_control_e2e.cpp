@@ -175,10 +175,12 @@ struct ProductionPair {
   ProductionPair(const std::string& name,
                  std::function<std::string(const std::string&)> handler = {},
                  std::function<void(const PeerTransportSnapshot&, const std::string&)> on_state_change = {},
-                 std::function<void(const PeerEncodedMediaDataChannelFrame&)> on_media = {}) {
+                 std::function<void(const PeerEncodedMediaDataChannelFrame&)> on_media = {},
+                 std::function<void(PeerTransportCallbacks&, bool)> customize = {}) {
     auto publisher_callbacks = signaling_callbacks(bridge, 0);
     publisher_callbacks.on_keyframe_requested = std::move(handler);
     publisher_callbacks.on_state_change = std::move(on_state_change);
+    if (customize) customize(publisher_callbacks, true);
     std::string error;
     // An explicit localhost pool prevents the production default STUN pool.
     const std::vector<std::string> local_stun = {"stun:127.0.0.1:9"};
@@ -190,6 +192,7 @@ struct ProductionPair {
             "unconnected transport reported writable media");
     auto viewer_callbacks = signaling_callbacks(bridge, 1);
     viewer_callbacks.on_encoded_media_data_channel_frame = std::move(on_media);
+    if (customize) customize(viewer_callbacks, false);
     viewer = create_peer_transport_session(name + "-viewer", false,
       viewer_callbacks, true, local_stun.front(), local_stun, &error);
     require(viewer != nullptr, "viewer creation failed: " + error);
@@ -491,6 +494,77 @@ void test_production_encoded_wire_copy() {
   require(!closed.connected && !closed.video_ready && !closed.audio_ready && !closed.use_encoded_data_channel,
           "closed transport retained media readiness");
   std::cout << "wire copy: production sender -> real SCTP -> receiver preserves all byte values/metadata for frame and chunks; diagnostics/readiness passed\n";
+}
+
+void test_congestion_control_retry() {
+  for (const bool throw_send : {false, true}) {
+    std::atomic<bool> fault{true};
+    std::atomic<unsigned> requests{0};
+    ProductionPair pair("congestion-control", [&](const std::string&) { ++requests; return "test-refresh"; }, {}, {},
+      [&](PeerTransportCallbacks& callbacks, bool publisher) {
+        if (publisher) return;
+        callbacks.buffered_amount = [&](std::size_t actual) { return !throw_send && fault.load() ? std::size_t(32 * 1024 * 1024) : actual; };
+        callbacks.before_send = [&](const std::string& kind, std::size_t) {
+          if (throw_send && kind == "control" && fault.load()) throw std::runtime_error("injected-send-failure");
+        };
+      });
+    std::string error;
+    require(!request_peer_transport_keyframe(pair.viewer, "decoder-recovery", &error), "injected blocked request must fail");
+    require(get_peer_transport_snapshot(pair.viewer).keyframe_requests_sent == 0, "failed request cannot count as sent");
+    fault = false;
+    require(request_peer_transport_keyframe(pair.viewer, "decoder-recovery", &error), "immediate recovery retry rejected");
+    require(get_peer_transport_snapshot(pair.viewer).keyframe_requests_sent == 1,
+      "failed send incorrectly consumed cooldown and silently swallowed the immediate retry");
+    pair.wait([&] { return requests.load() == 1; }, "real SCTP recovery retry never reached producer");
+    for (int i = 0; i < 8; ++i) pair.request("decoder-recovery");
+    require(get_peer_transport_snapshot(pair.viewer).keyframe_requests_sent == 1,
+      "successful retry must retain existing storm coalescing");
+  }
+  std::cout << "network recovery: blocked/throwing control sends retry immediately over real SCTP, successful requests still coalesce passed\n";
+}
+
+void test_congestion_configuration_recovery() {
+  for (const bool throw_send : {false, true}) {
+    std::atomic<bool> fault{true};
+    std::mutex received_mutex;
+    std::vector<PeerEncodedMediaDataChannelFrame> received;
+    ProductionPair pair("congestion-config", {}, {}, [&](const auto& frame) {
+      std::lock_guard<std::mutex> lock(received_mutex); received.push_back(frame);
+    }, [&](PeerTransportCallbacks& callbacks, bool publisher) {
+      if (!publisher) return;
+      callbacks.buffered_amount = [&](std::size_t actual) { return !throw_send && fault.load() ? std::size_t(32 * 1024 * 1024) : actual; };
+      callbacks.before_send = [&](const std::string& kind, std::size_t chunk_index) {
+        if (throw_send && kind == "video" && chunk_index == 1 && fault.load())
+          throw std::runtime_error("injected-mid-frame-send-failure");
+      };
+    });
+    PeerEncodedMediaDataChannelFrame frame;
+    frame.stream_type = "video"; frame.codec = "h264"; frame.payload_format = "annexb";
+    frame.source_epoch = "congestion-source"; frame.config = true;
+    frame.payload = {0,0,1,0x67,1,0,0,1,0x68,1};
+    frame.payload.resize(vds::media_agent::encoded_transport::kChunkBytes + 13, 0);
+    std::string error;
+    require(!send_peer_transport_encoded_media_frame(pair.publisher, frame, &error), "configuration fault was not injected");
+    fault = false;
+    frame.config = false; frame.sequence = 1; frame.timestamp_us = 16667;
+    frame.payload = {0,0,1,0x41,1};
+    require(!send_peer_transport_encoded_media_frame(pair.publisher, frame, &error) && error == "datachannel-waiting-for-fresh-keyframe",
+      "dependent video escaped after lost decoder configuration");
+    auto audio = frame; audio.stream_type = "audio"; audio.codec = "opus"; audio.payload_format = "opus-raw";
+    require(send_peer_transport_encoded_media_frame(pair.publisher, audio, &error), "video recovery blocked audio");
+    frame.sequence = 2; frame.timestamp_us = 33334; frame.config = frame.keyframe = true;
+    frame.payload = {0,0,1,0x67,1,0,0,1,0x68,1,0,0,1,0x65,1};
+    require(send_peer_transport_encoded_media_frame(pair.publisher, frame, &error), "fresh recovery keyframe rejected");
+    frame.sequence = 3; frame.timestamp_us = 50001; frame.config = frame.keyframe = false;
+    frame.payload = {0,0,1,0x41,1};
+    require(send_peer_transport_encoded_media_frame(pair.publisher, frame, &error), "healthy video did not resume");
+    pair.wait([&] { std::lock_guard<std::mutex> lock(received_mutex); return received.size() == 3; }, "recovered media did not reach real SCTP receiver");
+    std::lock_guard<std::mutex> lock(received_mutex);
+    require(received[0].stream_type == "audio" && received[1].keyframe && received[2].sequence == 3,
+      "recovered audio/keyframe/video sequence differs from complete admitted frames");
+    require(get_peer_transport_snapshot(pair.publisher).connection_state == "connected", "congestion recovery rebuilt or closed healthy P2P transport");
+  }
+  std::cout << "network recovery: lost configuration protects reference chain, audio continues, fresh keyframe resumes on same P2P transport passed\n";
 }
 
 void test_host_control() {
@@ -848,9 +922,16 @@ void test_relay_forwarding() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
     rtc::InitLogger(rtc::LogLevel::Error);
+    if (argc == 2) {
+      if (std::string(argv[1]) == "--congestion-control") test_congestion_control_retry();
+      else if (std::string(argv[1]) == "--congestion-config") test_congestion_configuration_recovery();
+      else throw std::runtime_error("unknown test mode");
+      std::cout << "network recovery: " << checks << " checks passed\n";
+      return 0;
+    }
     std::string error;
     require(!request_peer_transport_keyframe(nullptr, "decoder-recovery", &error),
             "missing session accepted a keyframe request");

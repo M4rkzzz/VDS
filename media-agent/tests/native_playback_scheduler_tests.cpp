@@ -490,6 +490,51 @@ void test_audio_master_and_integer_safety() {
   expect_reset(deadline, max, "saturated gap deadline still triggers recovery");
 }
 
+void test_audio_clock_handoff() {
+  for (const unsigned int missing_frames : {3u, 12u, 60u}) {
+    NativePlaybackScheduler clock;
+    clock.observe(0, 1000000);
+    unsigned int presented = 0;
+    std::uint64_t last_present = 0, maximum_gap = 0;
+    for (unsigned int i = 0; i < 240; ++i) {
+      const auto pts = static_cast<std::uint64_t>(i) * 1000000 / 60;
+      const auto now = pts + 1120000; // Audio device latency differs from first arrival.
+      clock.observe(pts, pts + 1000000 + (i % 7 == 0 ? 30000 : 0));
+      const bool available = i < 90 || i >= 90 + missing_frames;
+      clock.observe_output(pts, now, available);
+      const auto decision = clock.decision(pts, now,
+          available ? std::optional<std::uint64_t>{pts} : std::nullopt);
+      if (decision.action == NativePlaybackScheduler::Action::Present) {
+        if (presented) maximum_gap = std::max(maximum_gap, now - last_present);
+        last_present = now;
+        ++presented;
+      }
+    }
+    std::cout << "audio-clock-handoff: missing=" << missing_frames << ", presented=" << presented
+              << "/240, max-gap-us=" << maximum_gap << '\n';
+    expect(presented == 240 && maximum_gap <= 16667,
+        "audio clock loss and return preserve every 60fps deadline despite arrival jitter");
+  }
+  NativePlaybackScheduler clock;
+  clock.observe(0, 1000000);
+  clock.decision(0, 1120000, 0);
+  expect(clock.decision(16667, 1120000).due_us == 1136667,
+      "fallback retains the last audio phase without adding another jitter buffer");
+  clock.observe(16667, 1056667);
+  expect(clock.buffer_delay_us() == 60000 && clock.target_time_us(16667) == 1136667,
+      "arrival jitter estimation remains independent of the audio presentation phase");
+  clock.reset();
+  expect(clock.decision(0, 42).due_us == 42, "reset removes the previous source audio epoch");
+  clock.observe(0, 1000000);
+  clock.decision(0, 1120000, 0);
+  clock.observe(0, 5000000);
+  expect(clock.target_time_us(0) == 5020000, "arrival discontinuity discards stale audio mapping");
+  clock.decision(0, 5120000, 0);
+  for (std::uint64_t i = 1; i <= 4; ++i) clock.observe_output(i * 16667, 5400000 + i * 16667);
+  expect(clock.target_time_us(66668) == 5486668,
+      "persistent video path stall can still recover after the audio clock disappears");
+}
+
 void test_output_driven_fallback_recovery() {
   for (const std::uint64_t step : {100000, 100001, 120000, 150000, 200000}) {
     NativePlaybackScheduler clock;
@@ -731,6 +776,7 @@ int main() {
   test_non_vcl_cache_and_discard_metrics();
   test_fallback_clock_and_adaptive_buffer();
   test_audio_master_and_integer_safety();
+  test_audio_clock_handoff();
   test_output_driven_fallback_recovery();
   test_ready_queue_backpressure_cadence(2, 60000);
   test_ready_queue_backpressure_cadence(1, 20000);

@@ -79,6 +79,7 @@
     const signalRegistry = createSignalRegistry();
     const peerReconnectState = new Map();
     const pendingRemoteCandidates = new Map();
+    const recoveryRequests = new Map();
 
     function getPeerMeta(peerId) {
       return typeof options.getPeerMeta === 'function'
@@ -573,8 +574,10 @@
       const delayMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
         ? Number(timeoutMs)
         : 750;
+      const handle = getPeerHandle(peerId);
       meta.disconnectTimerId = setTimeout(async () => {
         meta.disconnectTimerId = null;
+        if (getPeerMeta(peerId) !== meta || getPeerHandle(peerId) !== handle || (handle && handle.closed)) return;
         if (typeof onTimeout !== 'function') {
           return;
         }
@@ -709,6 +712,10 @@
         };
       }
 
+      if (handle.role === 'relay-downstream' && room.roomId && room.role === 'viewer') {
+        return { prepared: true, peerId, action: 'relay-force-offer', edge, handle, meta, logPayload };
+      }
+
       if (handle.role === 'viewer-upstream' && room.roomId && room.role === 'viewer') {
         return {
           prepared: true,
@@ -748,30 +755,51 @@
     }
 
     async function requestPeerRecovery(peerId, reason, requestOptions = {}) {
+      if (recoveryRequests.has(peerId)) return false;
+      const roomSnapshot = requestOptions.roomSnapshot || getRecoveryRoomSnapshot();
       const recovery = preparePeerRecoveryRequest(peerId, reason, {
         attemptId: requestOptions.attemptId,
         source: requestOptions.source || '',
-        roomSnapshot: requestOptions.roomSnapshot || getRecoveryRoomSnapshot()
+        roomSnapshot
       });
       if (!recovery || !recovery.prepared) {
         return false;
       }
-      logNativeStep('peer:recovery-requested', recovery.logPayload, 'connection');
-      if (recovery.action === 'host-force-offer') {
-        if (typeof options.createOffer === 'function') {
-          await options.createOffer(peerId, { force: true, reconnect: true });
+      const request = { handle: recovery.handle };
+      recoveryRequests.set(peerId, request);
+      try {
+        logNativeStep('peer:recovery-requested', recovery.logPayload, 'connection');
+        if (recovery.action === 'host-force-offer') {
+          if (typeof options.createOffer === 'function') {
+            await options.createOffer(peerId, { force: true, reconnect: true });
+            return true;
+          }
+          return false;
+        }
+        if (recovery.action === 'relay-force-offer') {
+          // Repair only the outgoing relay edge; the viewer's live upstream
+          // and its media source stay in place.
+          await createRelayViewerOffer(peerId, undefined, { force: true, reconnect: true });
+          return true;
+        }
+        if (recovery.action === 'viewer-reconnect-ready') {
+          if (typeof options.closePeerConnection === 'function') {
+            await options.closePeerConnection(peerId, { clearRetryState: false }).catch(() => {});
+          }
+          // Closing yields to incoming offers and room changes. An old recovery
+          // must not ask the server to replace a new, potentially healthy edge.
+          if (recoveryRequests.get(peerId) !== request) return false;
+          const currentHandle = getPeerHandle(peerId);
+          if (currentHandle && currentHandle !== recovery.handle) return false;
+          const room = getRecoveryRoomSnapshot();
+          if (['roomId', 'role', 'clientId', 'sessionToken'].some(key => room[key] !== roomSnapshot[key])) return false;
+          sendViewerReconnectReady(recovery.reconnectReady);
           return true;
         }
         return false;
+      } finally {
+        if (recoveryRequests.get(peerId) === request) recoveryRequests.delete(peerId);
       }
-      if (recovery.action === 'viewer-reconnect-ready') {
-        if (typeof options.closePeerConnection === 'function') {
-          await options.closePeerConnection(peerId, { clearRetryState: false }).catch(() => {});
-        }
-        sendViewerReconnectReady(recovery.reconnectReady);
-        return true;
-      }
-      return false;
     }
 
     function prepareRemoteIceCandidate(peerId, candidate, attemptId) {
@@ -971,6 +999,9 @@
       if (!currentHandle) {
         return { prepared: false, peerId, reason: 'missing-handle' };
       }
+      if (getPeerHandle(peerId) !== currentHandle || recoveryRequests.has(peerId)) {
+        return { prepared: false, peerId, reason: 'stale-or-recovering' };
+      }
       if (currentHandle.closed) {
         return { prepared: false, peerId, handle: currentHandle, reason: 'closed-handle' };
       }
@@ -1013,7 +1044,7 @@
       const handle = getPeerHandle(peerId);
       const meta = getPeerMeta(peerId);
       const markSkipped = (reason) => {
-        if (meta) {
+        if (meta && handle && (!Number.isInteger(attemptId) || handle.attemptId === attemptId)) {
           meta.restartInProgress = false;
         }
         return { ready: false, peerId, handle, meta, reason };
@@ -1058,8 +1089,13 @@
       }
     }
 
-    function scheduleDisconnectedRecovery(peerId, handle) {
-      const preparedRecovery = prepareDisconnectedRecovery(peerId, handle);
+    function scheduleDisconnectedRecovery(peerId, handle, terminal = false) {
+      if (terminal && getPeerHandle(peerId) === handle && !recoveryRequests.has(peerId)) {
+        clearPeerDisconnectTimer(peerId);
+        const meta = getPeerMeta(peerId);
+        if (meta) meta.restartInProgress = false;
+      }
+      const preparedRecovery = prepareDisconnectedRecovery(peerId, handle, terminal ? { initialDelayMs: 1, reconnectDelaysMs: [1] } : {});
       if (!preparedRecovery || !preparedRecovery.prepared) {
         return false;
       }
@@ -1435,7 +1471,15 @@
         return { handled: false, peerId, reason: 'stale-transport-generation' };
       }
       const meta = getPeerMeta(peerId);
-      const state = String(params.state || '');
+      const eventState = String(params.state || '');
+      const state = eventState === 'datachannel-closed' ? 'failed' : eventState;
+      if (eventState === 'datachannel-closed') {
+        if (handle.closed) return { handled: false, peerId, reason: 'closed-handle' };
+        handle.__mediaChannelClosed = true;
+      }
+      if (state === 'connected' && handle.__mediaChannelClosed) {
+        return { handled: false, peerId, reason: 'media-channel-already-closed' };
+      }
 
       if (state === 'connected') {
         handle.connectionState = 'connected';
@@ -1499,6 +1543,16 @@
       if (state === 'failed') {
         handle.connectionState = 'failed';
         handle.iceConnectionState = 'failed';
+        if (meta && meta.hasConnected) {
+          return {
+            handled: true, peerId, state, handle, meta,
+            effects: [
+              ...(handle.role === 'viewer-upstream' ? [{ type: 'clearViewerMediaWaitTimer' }] : []),
+              { type: 'setP2pState', peerId, state: 'restart-attempting' },
+              { type: 'scheduleDisconnectedRecovery', peerId, handle, terminal: true }
+            ]
+          };
+        }
         return {
           handled: true,
           peerId,
@@ -1554,7 +1608,7 @@
             options.armViewerMediaWaitTimer(effect.peerId);
           }
         } else if (effect.type === 'scheduleDisconnectedRecovery' && effect.peerId && effect.handle) {
-          scheduleDisconnectedRecovery(effect.peerId, effect.handle);
+          scheduleDisconnectedRecovery(effect.peerId, effect.handle, effect.terminal);
         } else if (effect.type === 'clearViewerMediaWaitTimer') {
           if (typeof options.clearViewerMediaWaitTimer === 'function') {
             options.clearViewerMediaWaitTimer();
@@ -1583,6 +1637,8 @@
     }
 
     function setPeerHandle(peerId, handle) {
+      // Invalidate in-flight recovery even if this replacement later closes.
+      if (recoveryRequests.get(peerId)?.handle !== handle) recoveryRequests.delete(peerId);
       return peerHandleRegistry.set(peerId, handle);
     }
 
@@ -2376,7 +2432,9 @@
       signalRegistry.deleteBacklog(peerId);
       signalRegistry.waiterKeys().forEach((key) => {
         if (key === `${peerId}:*` || key.startsWith(`${peerId}:`)) {
+          const waiters = signalRegistry.getWaiters(key) || [];
           signalRegistry.deleteWaiters(key);
+          for (const waiter of waiters) waiter.cancel();
         }
       });
     }
@@ -2444,6 +2502,10 @@
           clearTimeout(timerId);
           resolve(payload);
         };
+        resolver.cancel = () => {
+          clearTimeout(timerId);
+          reject(new Error(`native-peer-stale:${peerId}`));
+        };
 
         if (!signalRegistry.hasWaiters(key)) {
           signalRegistry.setWaiters(key, []);
@@ -2510,6 +2572,7 @@
       dropQueuedSignals(peerId, (entry) => entry && entry.type === 'offer');
       await ensurePeerReady(peerId, handle);
       await attachPeerMediaSources(peerId, handle);
+      if (handle.closed || getPeerHandle(peerId) !== handle) throw new Error(`native-peer-stale:${peerId}`);
       const allowEncodedDataChannel = Boolean(
         signalOptions.allowEncodedDataChannel !== undefined
           ? signalOptions.allowEncodedDataChannel
@@ -2539,6 +2602,7 @@
         );
       }
 
+      if (handle.closed || getPeerHandle(peerId) !== handle) throw new Error(`native-peer-stale:${peerId}`);
       updateSignalState(peerId, signal);
       return signal;
     }
@@ -2557,6 +2621,7 @@
         );
       }
       const prepared = await prepareOfferMessage(peerId, handle, messageOptions);
+      if (handle.closed || getPeerHandle(peerId) !== handle) throw new Error(`native-peer-stale:${peerId}`);
       sendSignalMessage(prepared.message);
       return prepared.sdp;
     }
@@ -2772,6 +2837,7 @@
       }
       await ensurePeerReady(peerId, handle);
       const signal = await waitForSignal(peerId, 'answer', timeoutMs);
+      if (handle.closed || getPeerHandle(peerId) !== handle) throw new Error(`native-peer-stale:${peerId}`);
       updateSignalState(peerId, signal);
       return signal;
     }
@@ -2784,6 +2850,7 @@
 
     async function createAndSendAnswer(peerId, handle, messageOptions = {}) {
       const prepared = await prepareAnswerMessage(peerId, handle, messageOptions);
+      if (handle.closed || getPeerHandle(peerId) !== handle) throw new Error(`native-peer-stale:${peerId}`);
       sendSignalMessage(prepared.message);
       return prepared.sdp;
     }

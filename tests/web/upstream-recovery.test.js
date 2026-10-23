@@ -30,13 +30,152 @@ function fakeClock() {
 }
 
 function loadRecovery(clock) {
-  const code = ts.transpileModule(fs.readFileSync(path.join(root, 'vds_web/src/upstream-recovery.ts'), 'utf8'), {
+  const code = ts.transpileModule(fs.readFileSync(process.env.VDS_UPSTREAM_RECOVERY_TEST_SOURCE || path.join(root, 'vds_web/src/upstream-recovery.ts'), 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
   }).outputText;
   const context = { exports: {}, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout };
   vm.runInNewContext(code, context);
   return new context.exports.UpstreamRecovery();
 }
+
+function loadSignalingRecovery(clock, resume) {
+  const code = ts.transpileModule(fs.readFileSync(path.join(root, 'vds_web/src/signaling-recovery.ts'), 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
+  }).outputText;
+  const context = { exports: {}, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout };
+  vm.runInNewContext(code, context);
+  return new context.exports.SignalingRecovery(resume);
+}
+
+test('signaling recovery serializes failures, waits for acknowledgement and cancels all retired work', async () => {
+  const clock = fakeClock(); let calls = 0, finish;
+  const recovery = loadSignalingRecovery(clock, async current => {
+    calls++;
+    if (calls === 1) throw new Error('offline');
+    if (calls === 3) await new Promise(resolve => { finish = () => resolve(current()); });
+  });
+  const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
+  recovery.start(); recovery.start(); await flush();
+  assert.equal(calls, 1);
+  clock.advance(249); await flush(); assert.equal(calls, 1);
+  clock.advance(1); await flush(); assert.equal(calls, 2);
+  clock.advance(10000); await flush(); assert.equal(calls, 2, 'socket open still needs an acknowledged session');
+  clock.advance(500); await flush(); assert.equal(calls, 3);
+  recovery.stop(); assert.equal(finish(), undefined); await flush();
+  clock.advance(60000); assert.equal(calls, 3);
+  assert.equal(clock.pendingCount(), 0);
+});
+
+function createSignalingResumeHarness(connect = async () => {}) {
+  const clock = fakeClock(), calls = { sent: [], reset: 0, closes: 0, statuses: [], errors: [], restores: 0 };
+  const peer = { connectionState: 'connected', close() { calls.closes++; this.connectionState = 'closed'; } };
+  let flow;
+  const recovery = loadSignalingRecovery(clock, current => flow.resumeSignalingSession(current));
+  const upstream = loadRecovery(clock);
+  flow = loadHandlers(['handleSignalingStatus', 'resumeSignalingSession', 'handleSignalingResumed',
+    'hasUsableUpstreamMedia', 'retireUpstreamMedia', 'requestUpstreamRecovery', 'isCurrentUpstreamPeer', 'waitForUpstreamOffer'], `
+    let session = { roomId: 'ABC234', clientId: 'web-client', sessionToken: 'token', hostId: 'host', upstreamPeerId: 'host', chainPosition: 0 };
+    let upstreamPc = peer, upstreamMediaChannel = { readyState: 'open' }, viewerReadySent = true;
+    let joinPending = false, restoringStoredSession = false, resumeNeedsMediaReconnect = false;
+    let upstreamEdgeAttemptId = 1, lastVideoKeyframeForRelay = null, lastBootstrapFrameId = '', upstreamRecoveryAttempts = 0;
+    const pendingIceCandidates = new Map();
+    function resetLocalViewerSession() { signalingRecovery.stop(); retireUpstreamMedia(); session = null; }
+    function leaveCurrentRoom() { resetLocalViewerSession(); }
+  `, `{
+    handleSignalingStatus, resumeSignalingSession, handleSignalingResumed,
+    mediaFailed: () => requestUpstreamRecovery(upstreamPc, 'host', 'datachannel-closed'),
+    leave: resetLocalViewerSession, snapshot: () => ({ session, upstreamPc, viewerReadySent })
+  }`, {
+    peer, clientId: 'web-client', signalingRecovery: recovery, upstreamRecovery: upstream,
+    signaling: { connect, send: message => calls.sent.push(message) },
+    playback: { resetMedia() { calls.reset++; } },
+    setStatus: status => calls.statuses.push(status), setError: error => calls.errors.push(error), clearError() {},
+    restoreWatchingStatusAfterRelay: () => calls.restores++, diagnostics: { update() {} },
+    sessionStorage: { setItem() {} }, chainPositionText: {}, formatChainPosition: String,
+    getManifestCompatibilityFailure: () => null, errorToMessage: error => error.message
+  });
+  const flush = async () => { for (let i = 0; i < 15; i++) await Promise.resolve(); };
+  const ack = () => flow.handleSignalingResumed({ type: 'session-resumed', roomId: 'ABC234', role: 'viewer',
+    hostId: 'host', upstreamPeerId: 'host', chainPosition: 0 });
+  return { ...flow, calls, clock, peer, recovery, flush, ack };
+}
+
+test('signaling-only outage resumes the same room without closing live media', async () => {
+  const h = createSignalingResumeHarness();
+  h.handleSignalingStatus('closed'); await h.flush();
+  assert.equal(h.calls.sent[0].type, 'resume-session');
+  assert.equal(h.calls.sent[0].needsMediaReconnect, false);
+  assert.equal(h.calls.reset, 0); assert.equal(h.calls.closes, 0);
+  h.ack();
+  assert.equal(h.snapshot().upstreamPc, h.peer);
+  assert.equal(h.snapshot().session.sessionToken, 'token');
+  assert.equal(h.calls.restores, 1);
+  assert.equal(h.clock.pendingCount(), 0);
+});
+
+test('production signaling close callback retains an authenticated live session', () => {
+  const filename = process.env.VDS_SIGNALING_MAIN_TEST_SOURCE || path.join(root, 'vds_web/src/main.ts');
+  const source = ts.createSourceFile(filename, fs.readFileSync(filename, 'utf8'), ts.ScriptTarget.ES2022, true);
+  const registration = source.statements.find(node => ts.isExpressionStatement(node) &&
+    ts.isCallExpression(node.expression) && node.expression.expression.getText(source) === 'signaling.onStatus');
+  assert.ok(registration);
+  const handler = registration.expression.arguments[0];
+  const declaration = ts.isIdentifier(handler) ? source.statements.find(node =>
+    ts.isFunctionDeclaration(node) && node.name?.text === handler.text).getText(source) : '';
+  const script = ts.transpileModule(`${declaration}\nconst callback = ${handler.getText(source)}; callback('closed');`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
+  }).outputText;
+  const calls = { resets: 0, recoveries: 0 };
+  vm.runInNewContext(script, { session: { roomId: 'ABC234', sessionToken: 'token' }, joinPending: false,
+    restoringStoredSession: false, setStatus() {}, setError() {},
+    resetLocalViewerSession: () => calls.resets++,
+    signalingRecovery: { disconnected: () => calls.recoveries++ } });
+  assert.equal(calls.resets, 0, 'control-plane loss must not destroy working media');
+  assert.equal(calls.recoveries, 1);
+});
+
+test('a replacement signaling socket dying before ack retries promptly without parallel resume work', async () => {
+  const h = createSignalingResumeHarness();
+  h.handleSignalingStatus('closed'); await h.flush();
+  h.handleSignalingStatus('closed'); await h.flush();
+  assert.equal(h.calls.sent.length, 1);
+  h.clock.advance(250); await h.flush();
+  assert.equal(h.calls.sent.length, 2);
+  h.ack(); h.clock.advance(30000); await h.flush();
+  assert.equal(h.calls.sent.length, 2);
+  assert.equal(h.calls.closes, 0);
+  assert.equal(h.clock.pendingCount(), 0);
+});
+
+test('media failing while signaling reconnects is deferred until the resumed socket is bound', async () => {
+  let connected;
+  const h = createSignalingResumeHarness(() => new Promise(resolve => { connected = resolve; }));
+  h.handleSignalingStatus('closed'); h.mediaFailed();
+  assert.equal(h.calls.sent.length, 0);
+  assert.equal(h.snapshot().session.roomId, 'ABC234');
+  connected(); await h.flush();
+  assert.equal(h.calls.sent[0].needsMediaReconnect, true);
+  h.ack();
+  assert.equal(h.calls.sent.length, 1, 'resume already asks the server to restart media');
+  assert.equal(h.clock.pendingCount(), 1, 'replacement offer has a media readiness deadline');
+});
+
+test('media loss between resume request and acknowledgement requests one fresh offer', async () => {
+  const h = createSignalingResumeHarness();
+  h.handleSignalingStatus('closed'); await h.flush(); h.mediaFailed(); h.ack();
+  assert.deepEqual(h.calls.sent.map(m => m.type), ['resume-session', 'viewer-reconnect-ready']);
+  assert.equal(h.snapshot().session.roomId, 'ABC234');
+});
+
+test('leaving during signaling reconnection cannot send a late resume or arm another retry', async () => {
+  let connected;
+  const h = createSignalingResumeHarness(() => new Promise(resolve => { connected = resolve; }));
+  h.handleSignalingStatus('closed'); h.leave(); connected(); await h.flush();
+  h.clock.advance(60000); await h.flush();
+  assert.equal(h.calls.sent.length, 0);
+  assert.equal(h.clock.pendingCount(), 0);
+  assert.equal(h.snapshot().session, null);
+});
 
 function loadHandler(name, prelude, globals) {
   return loadHandlers([name], prelude, name, globals);
@@ -181,6 +320,75 @@ test('a short disconnect preserves playback; a sustained disconnect requests rec
   assert.equal(reasons.length, 1);
 });
 
+test('repeated disconnect notifications and buffered playback cannot postpone recovery', () => {
+  const clock = fakeClock(), recovery = loadRecovery(clock), reasons = [];
+  recovery.start(reason => reasons.push(reason));
+  recovery.mediaReady();
+  recovery.stateChanged('disconnected', 'ice');
+  for (let i = 0; i < 3; i++) {
+    clock.advance(999);
+    recovery.stateChanged('disconnected', 'ice');
+    recovery.mediaReady();
+  }
+  clock.advance(3);
+  assert.deepEqual(reasons, ['upstream-disconnected']);
+});
+
+test('healthy ICE cannot mask a disconnected aggregate transport or a closed data channel', () => {
+  const clock = fakeClock(), recovery = loadRecovery(clock), reasons = [];
+  recovery.start(reason => reasons.push(reason));
+  recovery.mediaReady();
+  recovery.stateChanged('disconnected', 'connection');
+  clock.advance(2000);
+  recovery.stateChanged('completed', 'ice');
+  clock.advance(1000);
+  assert.deepEqual(reasons, ['upstream-disconnected']);
+  recovery.start(reason => reasons.push(reason));
+  recovery.stateChanged('closed', 'datachannel');
+  recovery.stateChanged('connected', 'connection');
+  recovery.stateChanged('connected', 'ice');
+  recovery.mediaReady();
+  clock.advance(0);
+  assert.deepEqual(reasons, ['upstream-disconnected', 'upstream-closed']);
+});
+
+test('duplicate connected notifications cannot keep a peer without media alive indefinitely', () => {
+  const clock = fakeClock(), recovery = loadRecovery(clock), reasons = [];
+  recovery.start(reason => reasons.push(reason));
+  recovery.stateChanged('connected', 'ice');
+  clock.advance(20000);
+  recovery.stateChanged('connected', 'connection');
+  clock.advance(10000);
+  assert.deepEqual(reasons, ['upstream-media-handshake-timeout']);
+});
+
+test('both layers recover during grace without rebuilding a healthy peer', () => {
+  const clock = fakeClock(), recovery = loadRecovery(clock), reasons = [];
+  recovery.start(reason => reasons.push(reason));
+  recovery.mediaReady();
+  recovery.stateChanged('disconnected', 'connection');
+  recovery.stateChanged('disconnected', 'ice');
+  clock.advance(2000);
+  recovery.stateChanged('connected', 'ice');
+  assert.equal(clock.pendingCount(), 1);
+  recovery.stateChanged('connected', 'connection');
+  clock.advance(30000);
+  assert.deepEqual(reasons, []);
+  assert.equal(clock.pendingCount(), 0);
+});
+
+test('an established path still checking is not healed by an unrelated healthy layer', () => {
+  const clock = fakeClock(), recovery = loadRecovery(clock), reasons = [];
+  recovery.start(reason => reasons.push(reason)); recovery.mediaReady();
+  recovery.stateChanged('disconnected', 'ice');
+  clock.advance(1000);
+  recovery.stateChanged('checking', 'ice');
+  recovery.stateChanged('connected', 'connection');
+  recovery.mediaReady();
+  clock.advance(2000);
+  assert.deepEqual(reasons, ['upstream-disconnected']);
+});
+
 test('failed/closed peers recover immediately and stop/replacement cancels obsolete recovery', () => {
   const clock = fakeClock();
   const recovery = loadRecovery(clock);
@@ -247,7 +455,7 @@ function createRecoveryHarness() {
   const clock = fakeClock();
   const recovery = loadRecovery(clock);
   const calls = { sent: [], errors: [], statuses: [], closes: 0, resets: 0 };
-  const flow = loadHandlers(['waitForUpstreamOffer', 'requestUpstreamRecovery', 'isCurrentUpstreamPeer'], `
+  const flow = loadHandlers(['waitForUpstreamOffer', 'requestUpstreamRecovery', 'isCurrentUpstreamPeer', 'retireUpstreamMedia'], `
     let session = { roomId: 'ABC234', hostId: 'host-peer', upstreamPeerId: 'host-peer', chainPosition: 0 };
     let upstreamPc = null, upstreamMediaChannel = null, upstreamRecoveryAttempts = 0;
     let upstreamEdgeAttemptId = 1, viewerReadySent = false, lastVideoKeyframeForRelay = null, lastBootstrapFrameId = '';
@@ -259,7 +467,7 @@ function createRecoveryHarness() {
     replaceSession: () => { session = { ...session, upstreamPeerId: 'replacement' }; },
     snapshot: () => ({ session, upstreamPc, upstreamRecoveryAttempts })
   }`, {
-    calls, clientId: 'web-client', upstreamRecovery: recovery,
+    calls, clientId: 'web-client', upstreamRecovery: recovery, signalingRecovery: { active: false },
     signaling: { send: (message) => calls.sent.push(message) },
     playback: { resetMedia: () => { calls.resets += 1; } },
     diagnostics: { update() {} }, setStatus: (status) => calls.statuses.push(status),
@@ -365,6 +573,35 @@ test('production console diagnostics redact session tokens including nested sign
   assert.doesNotMatch(output, /private-token/);
   assert.equal(JSON.parse(output).sessionToken, '[redacted]');
   assert.equal(source.sessionToken, 'private-token', 'redaction must not damage a live session credential');
+});
+
+test('retired inbound channel cannot feed media or fail its replacement on the same peer', () => {
+  const calls = { frames: [], states: [], errors: [], sent: [] };
+  const flow = loadHandlers(['attachInboundDataChannel'], `
+    const upstreamPc = {}; let upstreamMediaChannel = null;
+  `, `{ attachInboundDataChannel, current: () => upstreamMediaChannel }`, {
+    ENCODED_MEDIA_CHANNEL_LABEL: 'vds-encoded-media', ENCODED_MEDIA_PROTOCOL: 'vds-media-encoded-v1',
+    ENCODED_MEDIA_PROTOCOL_VERSION: 1, isCurrentUpstreamPeer: () => true,
+    diagnostics: { update() {} }, parseControlMessage: JSON.parse, getControlManifestFailure: () => null,
+    getCurrentManifest: () => ({}), helloAckMessage: () => ({ type: 'hello-ack' }), maybeSendViewerReady() {},
+    handleInboundEncodedFrame: frame => calls.frames.push(frame),
+    markRelayUnsupported: error => calls.errors.push(error),
+    upstreamRecovery: { stateChanged: state => calls.states.push(state) }
+  });
+  const channel = () => ({ label: 'vds-encoded-media', send: value => calls.sent.push(value) });
+  const old = channel(), current = channel();
+  flow.attachInboundDataChannel(old, 'host');
+  flow.attachInboundDataChannel(current, 'host');
+  old.onmessage({ data: new ArrayBuffer(1) });
+  old.onmessage({ data: JSON.stringify({ type: 'hello', protocolVersion: 1 }) });
+  old.onerror(); old.onclose();
+  assert.deepEqual(calls, { frames: [], states: [], errors: [], sent: [] });
+  assert.equal(flow.current(), current);
+  const frame = new ArrayBuffer(2); current.onmessage({ data: frame });
+  assert.equal(calls.frames[0], frame);
+  current.onerror(); current.onclose();
+  assert.deepEqual(calls.states, ['failed', 'closed']);
+  assert.equal(flow.current(), null);
 });
 
 test('production hello with no presented video keeps first-frame recovery active', () => {

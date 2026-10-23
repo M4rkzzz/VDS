@@ -530,6 +530,8 @@ class NativePlaybackScheduler {
     last_observation_us_ = 0;
     stable_since_us_.reset();
     last_output_source_us_.reset();
+    audio_anchor_source_us_.reset();
+    audio_anchor_local_us_ = 0;
     continuously_late_outputs_ = 0;
     buffer_delay_us_ = minimum_buffer_us_;
   }
@@ -577,6 +579,10 @@ class NativePlaybackScheduler {
   }
 
   std::uint64_t target_time_us(std::uint64_t source_pts_us) const {
+    if (audio_anchor_source_us_) {
+      return native_playback_detail::add_signed(audio_anchor_local_us_,
+          native_playback_detail::difference(source_pts_us, *audio_anchor_source_us_));
+    }
     if (!anchored_) {
       return 0;
     }
@@ -612,6 +618,7 @@ class NativePlaybackScheduler {
     }
     base_source_us_ = source_pts_us;
     base_local_us_ = local_now_us;
+    audio_anchor_source_us_.reset();
     last_observation_us_ = local_now_us;
     stable_since_us_.reset();
     continuously_late_outputs_ = 0;
@@ -619,13 +626,20 @@ class NativePlaybackScheduler {
   }
 
   Decision decision(std::uint64_t source_pts_us, std::uint64_t now_us,
-                    std::optional<std::uint64_t> audio_source_us = std::nullopt) const {
+                    std::optional<std::uint64_t> audio_source_us = std::nullopt) {
+    // The decoder worker owns this scheduler. Keep the last audio/local mapping
+    // separate from arrival jitter observations so temporary waveOut clock loss
+    // continues the same presentation timeline, without a second buffer delay.
+    if (audio_source_us) {
+      audio_anchor_source_us_ = *audio_source_us;
+      audio_anchor_local_us_ = now_us;
+    }
     Decision result;
     result.audio_clock = audio_source_us.has_value();
     result.due_us = audio_source_us
         ? native_playback_detail::add_signed(now_us,
             native_playback_detail::difference(source_pts_us, *audio_source_us))
-        : (anchored_ ? target_time_us(source_pts_us) : now_us);
+        : (anchored_ || audio_anchor_source_us_ ? target_time_us(source_pts_us) : now_us);
     result.lateness_us = audio_source_us
         ? native_playback_detail::difference(*audio_source_us, source_pts_us)
         : native_playback_detail::difference(now_us, result.due_us);
@@ -652,6 +666,8 @@ class NativePlaybackScheduler {
   std::uint64_t last_observation_us_ = 0;
   std::optional<std::uint64_t> stable_since_us_;
   std::optional<std::uint64_t> last_output_source_us_;
+  std::optional<std::uint64_t> audio_anchor_source_us_;
+  std::uint64_t audio_anchor_local_us_ = 0;
   unsigned int continuously_late_outputs_ = 0;
   bool anchored_ = false;
 };

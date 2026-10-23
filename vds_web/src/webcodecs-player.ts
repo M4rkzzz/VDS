@@ -66,6 +66,8 @@ export class WebCodecsVideoPlayer {
   private configuredVideoCodec: 'h264' | 'h265' | '' = '';
   private configuredPayloadFormat: WebCodecsPayloadFormat = 'annexb';
   private waitingForKeyframe = true;
+  private keyframeRecoveryTimer: number | null = null;
+  private keyframeRecoveryDeadlineMs = 0;
   private expectedDisplayWidth = 0;
   private expectedDisplayHeight = 0;
   private expectedFrameRate = 0;
@@ -80,6 +82,7 @@ export class WebCodecsVideoPlayer {
   private animationFrame: number | null = null;
   private clock: (() => MediaPlaybackClock | null) | null = null;
   private presentationAnchor: MediaPlaybackClock | null = null;
+  private audioFallbackDelayMs: number | null = null;
   private readonly bufferDelay = new AdaptivePlaybackDelay();
   private configurationPrefix: ArrayBuffer | null = null;
   private configurationUnits = new Map<number, Uint8Array>();
@@ -154,9 +157,9 @@ export class WebCodecsVideoPlayer {
     this.latestSourcePtsUs = Math.max(this.latestSourcePtsUs ?? header.timestampUs, header.timestampUs);
     if (this.pendingFrames >= this.inputQueueCapacity()) {
       // Cancel the queued reference chain and recover at the next keyframe.
-      this.close();
+      this.resetReferenceChain();
       this.diagnostics.onDroppedFrame('webcodecs-video-queue-full');
-      this.diagnostics.onKeyframeNeeded?.();
+      this.requestKeyframeRecovery();
       if (!header.keyframe) {
         return Promise.resolve();
       }
@@ -172,8 +175,9 @@ export class WebCodecsVideoPlayer {
         await this.processFrame(header, payload, generation);
       } catch (error) {
         if (generation === this.generation) {
-          this.waitingForKeyframe = true;
+          this.releaseDecoder();
           this.diagnostics.onDroppedFrame(error instanceof Error ? error.message : 'webcodecs-decode-failed');
+          this.requestKeyframeRecovery();
         }
       } finally {
         if (generation === this.generation) {
@@ -283,8 +287,8 @@ export class WebCodecsVideoPlayer {
     // Empty ready queues must permit B-frame priming, but a codec that returns only
     // a fraction of its work cannot accumulate an unbounded internal reference chain.
     if (this.pendingCodecWork.length >= Math.max(16, this.presentationCapacity + this.codecReorderAllowance())) {
-      this.close(); this.diagnostics.onDroppedFrame('webcodecs-video-output-backlog');
-      this.diagnostics.onKeyframeNeeded?.(); return;
+      this.resetReferenceChain(); this.diagnostics.onDroppedFrame('webcodecs-video-output-backlog');
+      this.requestKeyframeRecovery(); return;
     }
     try {
       const decodePayload = this.configuredPayloadFormat === 'avcc' ? convertAnnexBToLengthPrefixed(units) : annexB;
@@ -308,11 +312,20 @@ export class WebCodecsVideoPlayer {
     } catch (error) {
       this.releaseDecoder();
       this.diagnostics.onDroppedFrame(error instanceof Error ? error.message : 'webcodecs-decode-failed');
-      this.diagnostics.onKeyframeNeeded?.();
+      this.requestKeyframeRecovery();
     }
   }
 
-  close(): void {
+  close(): void { this.resetVideoPipeline(true); }
+
+  // A transport gap invalidates references, not the source's codec parameters
+  // or the jitter already measured on this connection.
+  resetReferenceChain(): void { this.resetVideoPipeline(false); }
+
+  private resetVideoPipeline(resetSource: boolean): void {
+    const retryInMs = !resetSource && this.keyframeRecoveryTimer !== null
+      ? Math.max(0, this.keyframeRecoveryDeadlineMs - playbackNowMs()) : null;
+    this.clearKeyframeRecovery();
     this.generation += 1;
     this.frameQueue = Promise.resolve();
     this.pendingFrames = 0;
@@ -329,9 +342,38 @@ export class WebCodecsVideoPlayer {
     this.reorderDistanceUs = 0;
     this.lastOutputPtsUs = null; this.framePeriodMs = 1000 / (this.expectedFrameRate || 60);
     this.latePresentations = 0; this.fallbackReanchors = 0; this.schedulerLateness = [];
-    this.presentationAnchor = null; this.configurationPrefix = null; this.configurationUnits.clear(); this.configurationCodec = ''; this.bufferDelay.reset();
+    this.presentationAnchor = null; this.audioFallbackDelayMs = null;
+    if (resetSource) {
+      this.configurationPrefix = null; this.configurationUnits.clear(); this.configurationCodec = ''; this.bufferDelay.reset();
+    }
     this.releaseDecoder();
     this.renderedFrameCount = 0;
+    if (retryInMs !== null) this.armKeyframeRecovery(retryInMs);
+  }
+
+  // Only a known broken reference chain owns this timer. Receiving an IDR or
+  // rendering an old queued picture is not proof that the decoder recovered.
+  requestKeyframeRecovery(): void {
+    if (this.keyframeRecoveryTimer !== null || !this.diagnostics.onKeyframeNeeded) return;
+    this.armKeyframeRecovery(2000);
+    try { this.diagnostics.onKeyframeNeeded(); }
+    catch { /* A transient control-channel send failure must keep the retry alive. */ }
+  }
+
+  private armKeyframeRecovery(delayMs: number): void {
+    const generation = this.generation;
+    this.keyframeRecoveryDeadlineMs = playbackNowMs() + delayMs;
+    this.keyframeRecoveryTimer = window.setTimeout(() => {
+      if (generation !== this.generation) return;
+      this.keyframeRecoveryTimer = null;
+      this.requestKeyframeRecovery();
+    }, delayMs);
+  }
+
+  private clearKeyframeRecovery(): void {
+    if (this.keyframeRecoveryTimer !== null) window.clearTimeout(this.keyframeRecoveryTimer);
+    this.keyframeRecoveryTimer = null;
+    this.keyframeRecoveryDeadlineMs = 0;
   }
 
   private releaseDecoder(): void {
@@ -393,6 +435,7 @@ export class WebCodecsVideoPlayer {
     const decoder = new window.VideoDecoder!({
       output: (frame) => {
         if (generation === this.generation && this.decoder === decoder) {
+          this.clearKeyframeRecovery();
           this.queueOutput(frame);
         } else {
           frame.close();
@@ -402,7 +445,7 @@ export class WebCodecsVideoPlayer {
         if (generation === this.generation && this.decoder === decoder) {
           this.releaseDecoder();
           this.diagnostics.onDroppedFrame(error.message || 'webcodecs-decoder-error');
-          this.diagnostics.onKeyframeNeeded?.();
+          this.requestKeyframeRecovery();
         }
       }
     });
@@ -502,8 +545,8 @@ export class WebCodecsVideoPlayer {
       const timer = window.setTimeout(() => {
         finish(false);
         if (generation === this.generation) {
-          this.close(); this.diagnostics.onDroppedFrame('webcodecs-video-decode-backlog');
-          this.diagnostics.onKeyframeNeeded?.();
+          this.resetReferenceChain(); this.diagnostics.onDroppedFrame('webcodecs-video-decode-backlog');
+          this.requestKeyframeRecovery();
         }
       }, 160);
       this.capacityWaiters.add(finish);
@@ -572,8 +615,8 @@ export class WebCodecsVideoPlayer {
       this.outputWatchdog = null;
       if (generation !== this.generation || decoder !== this.decoder || !this.pendingCodecOutputs) return;
       if (this.isRetainedReorderWaiting()) { this.armOutputWatchdog(); return; }
-      this.close(); this.diagnostics.onDroppedFrame('webcodecs-video-output-stalled');
-      this.diagnostics.onKeyframeNeeded?.();
+      this.resetReferenceChain(); this.diagnostics.onDroppedFrame('webcodecs-video-output-stalled');
+      this.requestKeyframeRecovery();
     }, Math.max(0, 500 - (now - this.pendingCodecWork[0].watchedAtMs)));
   }
 
@@ -592,12 +635,20 @@ export class WebCodecsVideoPlayer {
     this.diagnostics.onDroppedFrame('web-video-presentation-superseded');
   }
 
-  private dueAt(ptsUs: number, now: number): number {
-    const clock = this.clock?.();
-    if (clock && Math.abs(ptsUs - clock.ptsUs) < 1000000) return clock.performanceMs + (ptsUs - clock.ptsUs) / 1000;
+  private dueAt(ptsUs: number, now: number, clock = this.clock?.()): number {
+    if (clock && Number.isFinite(clock.performanceMs) && Math.abs(ptsUs - clock.ptsUs) < 1000000) {
+      // Continue the most recent device timeline when its timestamp briefly
+      // disappears (or audio is muted). The startup anchor may be 100+ ms away.
+      this.presentationAnchor ??= { ptsUs: 0, performanceMs: 0 };
+      this.presentationAnchor.ptsUs = clock.ptsUs;
+      this.presentationAnchor.performanceMs = clock.performanceMs - this.bufferDelay.value;
+      this.audioFallbackDelayMs = this.bufferDelay.value;
+      return clock.performanceMs + (ptsUs - clock.ptsUs) / 1000;
+    }
     const anchor = this.presentationAnchor!;
-    let due = anchor.performanceMs + (ptsUs - anchor.ptsUs) / 1000 + this.bufferDelay.value;
+    let due = anchor.performanceMs + (ptsUs - anchor.ptsUs) / 1000 + (this.audioFallbackDelayMs ?? this.bufferDelay.value);
     if (due > now + 1000 || due < now - 1000) {
+      this.audioFallbackDelayMs = null;
       this.presentationAnchor = { ptsUs, performanceMs: now }; due = now + this.bufferDelay.value;
     }
     return due;
@@ -655,7 +706,10 @@ export class WebCodecsVideoPlayer {
   }
 
   private sourceClockLeadMs(): number {
-    const clock = this.clock?.();
+    const clock = this.clock?.() || (this.presentationAnchor && this.audioFallbackDelayMs !== null ? {
+      ptsUs: this.presentationAnchor.ptsUs,
+      performanceMs: this.presentationAnchor.performanceMs + this.audioFallbackDelayMs
+    } : null);
     if (!clock || this.latestSourcePtsUs === null || !Number.isFinite(clock.ptsUs) || !Number.isFinite(clock.performanceMs)) return 0;
     const leadMs = (this.latestSourcePtsUs - clock.ptsUs) / 1000 - (playbackNowMs() - clock.performanceMs);
     // Use the same clock domain as dueAt; discontinuities already fall back to
@@ -670,13 +724,15 @@ export class WebCodecsVideoPlayer {
       this.animationFrame = null;
       if (generation !== this.generation || !this.outputFrames.length) return;
       const now = playbackNowMs();
-      while (this.outputFrames.length > 1 && this.dueAt(this.outputFrames[1].ptsUs, now) <= now) this.discardOutput();
-      let deadline = this.dueAt(this.outputFrames[0].ptsUs, now);
-      if (!this.clock?.() && now - deadline > Math.max(80, this.framePeriodMs * 3)) {
+      const clock = this.clock?.() ?? null;
+      while (this.outputFrames.length > 1 && this.dueAt(this.outputFrames[1].ptsUs, now, clock) <= now) this.discardOutput();
+      let deadline = this.dueAt(this.outputFrames[0].ptsUs, now, clock);
+      if (!clock && now - deadline > Math.max(80, this.framePeriodMs * 3)) {
         if (++this.latePresentations >= 4) {
+          this.audioFallbackDelayMs = null;
           this.presentationAnchor = { ptsUs: this.outputFrames[0].ptsUs, performanceMs: now };
           this.latePresentations = 0; this.fallbackReanchors += 1;
-          deadline = this.dueAt(this.outputFrames[0].ptsUs, now);
+          deadline = this.dueAt(this.outputFrames[0].ptsUs, now, clock);
         }
       } else this.latePresentations = 0;
       if (deadline <= now + 2) {

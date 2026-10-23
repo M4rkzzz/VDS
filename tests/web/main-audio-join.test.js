@@ -44,7 +44,7 @@ function harness({ savedSession = false, activeGesture = true } = {}) {
     constructor(canvas, callbacks) { playback = this; this.callbacks = callbacks; }
     // A suspended browser context may leave this pending until a later gesture.
     resumeAudio() { calls.audio += 1; return new Promise(() => {}); }
-    setAudioFormat() {} setVideoDisplaySize() {} close() {}
+    setAudioFormat() {} setVideoDisplaySize() {} close() {} resetMedia() {}
   }
   class Diagnostics {
     constructor() {
@@ -85,6 +85,18 @@ function harness({ savedSession = false, activeGesture = true } = {}) {
     console: { info: (value) => calls.console.push(value), warn() {}, error() {} }
   });
   const filename = path.resolve(__dirname, '../../vds_web/src/main.ts');
+  context.setTimeout = context.window.setTimeout;
+  context.clearTimeout = context.window.clearTimeout;
+  const recoveryCode = ts.transpileModule(fs.readFileSync(path.resolve(__dirname,
+    '../../vds_web/src/signaling-recovery.ts'), 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
+  }).outputText;
+  modules['./signaling-recovery'] = vm.runInContext(`(function(exports) { ${recoveryCode}; return exports; })({})`, context);
+  const senderCode = ts.transpileModule(fs.readFileSync(path.resolve(__dirname,
+    '../../vds_web/src/encoded-relay-sender.ts'), 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
+  }).outputText;
+  modules['./encoded-relay-sender'] = vm.runInContext(`(function(exports) { ${senderCode}; return exports; })({})`, context);
   const code = ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
   }).outputText;
@@ -96,6 +108,27 @@ function harness({ savedSession = false, activeGesture = true } = {}) {
 async function flush() {
   for (let index = 0; index < 20; index += 1) await Promise.resolve();
 }
+
+test('full Web entry re-joins an expired session but does not retry an invalid credential', async () => {
+  for (const code of ['session-not-found', 'session-token-invalid']) {
+    const h = harness(); await flush();
+    h.elements.get('roomIdInput').value = 'ABC234';
+    h.elements.get('joinButton').handlers.get('click')(); await flush(); joined(h); await flush();
+    h.signaling.status('closed'); await flush();
+    assert.equal(h.calls.sent.at(-1).type, 'resume-session');
+    assert.equal(h.calls.sent.at(-1).needsMediaReconnect, true);
+    h.signaling.message({ type: 'error', code }); await flush();
+    if (code === 'session-not-found') {
+      assert.equal(h.calls.sent.at(-1).type, 'join-room');
+      assert.equal(h.calls.sent.at(-1).roomId, 'ABC234');
+      assert.equal(h.calls.sent.at(-1).sessionToken, undefined);
+    } else {
+      assert.equal(h.calls.sent.at(-1).type, 'resume-session');
+      assert.equal(h.storage.has('vds-web-session'), false);
+      assert.equal(h.clock.size, 0);
+    }
+  }
+});
 
 function joined(h) {
   h.signaling.message({ type: 'room-joined', roomId: 'ABC234', sessionToken: 'fixture-new-token',

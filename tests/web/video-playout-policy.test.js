@@ -8,7 +8,7 @@ const ts = require('typescript');
 async function flush() { for (let index = 0; index < 80; index += 1) await Promise.resolve(); }
 
 function harness() {
-  const h = { now: 1000, chunks: [], decoders: [], drops: [], frames: [], painted: [], keyframeRequests: 0 };
+  const h = { now: 1000, chunks: [], decoders: [], drops: [], frames: [], painted: [], paintTimes: [], keyframeRequests: 0 };
   let id = 0;
   const timers = new Map();
   const animations = new Map();
@@ -54,7 +54,8 @@ function harness() {
   function load(name) {
     if (modules.has(name)) return modules.get(name).exports;
     const module = { exports: {} }; modules.set(name, module);
-    const filename = path.resolve(__dirname, `../../vds_web/src/${name}.ts`);
+    const filename = name === 'webcodecs-player' && process.env.VDS_VIDEO_PLAYER_TEST_SOURCE
+      ? path.resolve(process.env.VDS_VIDEO_PLAYER_TEST_SOURCE) : path.resolve(__dirname, `../../vds_web/src/${name}.ts`);
     const code = ts.transpileModule(fs.readFileSync(filename, 'utf8'), { compilerOptions: {
       target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
     vm.runInContext(`(function(module,exports,require){${code}\n})`, context)(module, module.exports, (relative) => load(relative.replace(/^\.\//, '')));
@@ -62,9 +63,11 @@ function harness() {
   }
   h.policy = load('playback-policy');
   h.player = new (load('webcodecs-player').WebCodecsVideoPlayer)({ width: 1, height: 1,
-    getContext: () => ({ drawImage(frame) { if (h.failRender) throw new Error('canvas unavailable'); h.painted.push(frame.timestamp); } }) }, {
+    getContext: () => ({ drawImage(frame) { if (h.failRender) throw new Error('canvas unavailable'); h.painted.push(frame.timestamp); h.paintTimes.push(h.now); } }) }, {
     onState() {}, onPayloadFormat() {}, onDecodedFrame() {},
-    onDroppedFrame: (reason) => h.drops.push(reason), onKeyframeNeeded: () => h.keyframeRequests++
+    onDroppedFrame: (reason) => h.drops.push(reason), onKeyframeNeeded: () => {
+      h.keyframeRequests++; if (h.failRequest) throw new Error('control-channel-temporarily-unavailable');
+    }
   });
   h.payload = new Uint8Array([0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0, 0, 0, 1, 0x65, 0x88]).buffer;
   h.header = (sequence = 0, ptsUs = sequence * 33333, keyframe = sequence === 0, config = keyframe) => ({
@@ -159,7 +162,9 @@ test('out-of-order partial output cannot renew the oldest codec submission beyon
   h.tick(99); assert.equal(h.decoders[0].state, 'configured');
   h.tick(1); assert.equal(h.decoders[0].state, 'closed');
   assert.ok(h.drops.includes('webcodecs-video-output-stalled'));
-  h.holdOutputs = false; await h.push(5, 500000, true); h.tick(20);
+  h.holdOutputs = false; await h.push(5, 500000, true);
+  // Recovery retains the measured jitter buffer rather than resetting it to 20 ms.
+  h.tick(h.player.getMetrics().targetBufferMs);
   assert.equal(h.painted.at(-1), 500000); h.player.close();
 });
 
@@ -388,7 +393,7 @@ for (const end of ['close', 'decoder error']) test(`a retained B-frame presentat
   else oldDecoder.callbacks.error(new Error('codec-error'));
   await Promise.all(promises);
   assert.equal(h.player.getMetrics().codecPresentationWait, false);
-  assert.equal(h.pendingTimers(), 0);
+  assert.equal(h.pendingTimers(), end === 'close' ? 0 : 1, 'decoder failure retains only its keyframe recovery timer');
   h.player.setPlaybackClock(() => null); h.tick(1000); await flush();
   const replacementPts = end === 'close' ? 20000000 : 10233333;
   h.onDecode = null; await h.push(7, replacementPts, true);
@@ -538,10 +543,50 @@ test('a rejected decode clears pending output accounting and recovers without a 
   const h = harness(); h.failDecode = true;
   await h.push();
   assert.equal(h.decoders[0].state, 'closed');
-  assert.equal(h.player.getMetrics().pendingCodecOutputs, 0); assert.equal(h.pendingTimers(), 0);
+  assert.equal(h.player.getMetrics().pendingCodecOutputs, 0); assert.equal(h.pendingTimers(), 1);
   h.failDecode = false; await h.push(1, 33333, true); h.tick(20); h.tick(500);
   assert.equal(h.decoders[1].state, 'configured');
   assert.ok(!h.drops.includes('webcodecs-video-output-stalled')); h.player.close();
+});
+
+test('failed video retries an ineffective keyframe request without needing another incoming packet', async () => {
+  const h = harness(); h.failDecode = true; await h.push();
+  assert.equal(h.keyframeRequests, 1);
+  h.tick(1999); assert.equal(h.keyframeRequests, 1);
+  h.tick(1); assert.equal(h.keyframeRequests, 2);
+  h.tick(2000); assert.equal(h.keyframeRequests, 3);
+  h.failDecode = false; await h.push(1, 33333, true);
+  assert.equal(h.pendingTimers(), 0, 'actual current decoder output ends recovery');
+  h.tick(6000); assert.equal(h.keyframeRequests, 3);
+  h.player.close();
+});
+
+test('control send failure keeps recovery alive and explicit close cancels it', async () => {
+  const h = harness(); h.failDecode = true; h.failRequest = true; await h.push();
+  assert.equal(h.keyframeRequests, 1);
+  h.tick(2000); assert.equal(h.keyframeRequests, 2);
+  h.failRequest = false; h.tick(2000); assert.equal(h.keyframeRequests, 3);
+  h.player.close(); assert.equal(h.pendingTimers(), 0);
+  h.tick(10000); assert.equal(h.keyframeRequests, 3);
+});
+
+test('old queued pictures and retired decoder callbacks cannot cancel keyframe recovery', async () => {
+  const h = harness(); await h.push(); const old = h.decoders[0];
+  old.callbacks.error(new Error('device lost'));
+  h.tick(20); // Render any output queued before the error.
+  const stale = h.frame(99999); old.callbacks.output(stale);
+  assert.equal(stale.closed, 1);
+  h.tick(2000); assert.equal(h.keyframeRequests, 2);
+  await h.push(1, 33333, true); h.tick(6000);
+  assert.equal(h.keyframeRequests, 2);
+  h.player.close();
+});
+
+test('replacing a failed source cancels its keyframe retry and healthy decoding adds no retry timer', async () => {
+  const h = harness(); h.failDecode = true; await h.push();
+  h.player.close(); h.failDecode = false; await h.push(0, 0, true);
+  h.tick(6000); assert.equal(h.keyframeRequests, 1); assert.equal(h.pendingTimers(), 0);
+  h.player.close();
 });
 
 test('a canvas failure releases its frame and the remaining RAF presentation continues', async () => {
@@ -636,6 +681,34 @@ for (const fps of [30, 60]) {
     }
   }
 }
+
+test('one presentation tick uses one device timestamp for both frame dropping and rendering', async () => {
+  const h = harness(); h.holdOutputs = true;
+  await h.push(0); await h.push(1); h.output(0); h.output(33333);
+  let reads = 0;
+  h.player.setPlaybackClock(() => { reads++; return { ptsUs: 0, performanceMs: h.now }; });
+  h.tick(20); assert.equal(reads, 1); h.player.close();
+});
+
+for (const gapFrames of [3, 12, 60]) test(`60 fps audio clock disappears for ${gapFrames} frames without freezing or skipping the presentation timeline`, async (t) => {
+  const h = harness(); h.player.setExpectedDisplaySize(640, 360, 60);
+  let available = true;
+  h.player.setPlaybackClock(() => available ? { ptsUs: (h.now - 1000 - 110) * 1000, performanceMs: h.now } : null);
+  const tasks = [];
+  for (let index = 0; index < 240; index++) {
+    available = !(index >= 70 && index < 70 + gapFrames);
+    tasks.push(h.push(index, Math.round(index * 1000000 / 60)));
+    await flush(); h.tick(1000 / 60); await flush();
+  }
+  for (let index = 0; index < 12; index++) { h.tick(1000 / 60); await flush(); }
+  await Promise.all(tasks);
+  const gaps = h.paintTimes.slice(1).map((at, index) => at - h.paintTimes[index]);
+  const maxGapMs = Math.max(...gaps);
+  t.diagnostic(JSON.stringify({ gapFrames, presented: h.painted.length, maxGapMs, lateDrops: h.player.getMetrics().presentationLateDrops }));
+  assert.ok(maxGapMs < 35, `clock handoff inserted ${maxGapMs.toFixed(1)} ms freeze`);
+  assert.ok(h.painted.length >= 237, `clock handoff skipped ${240 - h.painted.length} pictures`);
+  assert.equal(h.keyframeRequests, 0); h.player.close();
+});
 
 test('device audio 60 ms behind source retains 60 fps by waiting on bounded presentation capacity', async () => {
   const h = harness(); const tasks = [];

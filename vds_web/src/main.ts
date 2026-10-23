@@ -6,7 +6,6 @@ import {
   ENCODED_MEDIA_CHANNEL_LABEL,
   ENCODED_MEDIA_PROTOCOL,
   ENCODED_MEDIA_PROTOCOL_VERSION,
-  encodeFrameMessages,
   helloAckMessage,
   helloMessage,
   parseControlMessage,
@@ -16,6 +15,8 @@ import { DiagnosticsStore } from './diagnostics';
 import { fetchPublicRooms, fetchServerConfig, VdsWebSignaling, type SignalMessage } from './signaling';
 import { EncodedMediaPlaybackSession } from './playback-session';
 import { UpstreamRecovery } from './upstream-recovery';
+import { SignalingRecovery } from './signaling-recovery';
+import { EncodedRelaySender, RELAY_BUFFERED_LOW_BYTES } from './encoded-relay-sender';
 
 type SessionState = {
   roomId: string;
@@ -32,6 +33,8 @@ let capabilityDetectionComplete = false;
 const diagnostics = new DiagnosticsStore(capability, clientId);
 const signaling = new VdsWebSignaling();
 const upstreamRecovery = new UpstreamRecovery();
+const signalingRecovery = new SignalingRecovery(resumeSignalingSession);
+let resumeNeedsMediaReconnect = false;
 let upstreamRecoveryAttempts = 0;
 let audioOutputState = '';
 
@@ -63,8 +66,7 @@ type PendingIceCandidate = {
   pc: RTCPeerConnection | null;
 };
 const pendingIceCandidates = new Map<string, PendingIceCandidate[]>();
-const DATA_CHANNEL_MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
-const DATA_CHANNEL_BUFFERED_LOW_BYTES = 2 * 1024 * 1024;
+let relayFrameSender: EncodedRelaySender | null = null;
 let lastVideoKeyframeForRelay: {
   codec: string;
   sourceEpoch?: string;
@@ -178,16 +180,74 @@ diagnostics.subscribe(renderDiagnostics);
 signaling.onMessage((message) => {
   void handleSignal(message).catch((error) => setError(errorToMessage(error)));
 });
-signaling.onStatus((status) => {
+signaling.onStatus(handleSignalingStatus);
+
+function handleSignalingStatus(status: string): void {
   if (status === 'closed') {
-    if (session) {
-      resetLocalViewerSession();
+    if (session?.sessionToken && !joinPending && !restoringStoredSession) {
+      setStatus('信令重连中');
+      signalingRecovery.disconnected();
+      return;
     }
     setStatus('连接已断开');
   } else if (status === 'error') {
-    setError('WebSocket 连接失败。');
+    if (!session?.sessionToken) setError('WebSocket 连接失败。');
   }
-});
+}
+
+function hasUsableUpstreamMedia(): boolean {
+  return upstreamPc?.connectionState === 'connected' && upstreamMediaChannel?.readyState === 'open' && viewerReadySent;
+}
+
+function retireUpstreamMedia(): void {
+  const peerId = session?.upstreamPeerId || session?.hostId || '';
+  const pc = upstreamPc;
+  upstreamRecovery.stop();
+  upstreamPc = null;
+  upstreamMediaChannel = null;
+  pc?.close();
+  upstreamEdgeAttemptId = null;
+  pendingIceCandidates.delete(peerId);
+  viewerReadySent = false;
+  playback.resetMedia();
+  lastVideoKeyframeForRelay = null;
+  lastBootstrapFrameId = '';
+}
+
+async function resumeSignalingSession(isCurrent: () => boolean): Promise<void> {
+  const expectedSession = session;
+  await signaling.connect();
+  if (!isCurrent() || session !== expectedSession || !expectedSession?.sessionToken) return;
+  resumeNeedsMediaReconnect = !hasUsableUpstreamMedia();
+  if (resumeNeedsMediaReconnect) retireUpstreamMedia();
+  signaling.send({ type: 'resume-session', role: 'viewer', roomId: expectedSession.roomId,
+    clientId, sessionToken: expectedSession.sessionToken, needsMediaReconnect: resumeNeedsMediaReconnect });
+}
+
+function handleSignalingResumed(message: SignalMessage): void {
+  if (!session || message.roomId !== session.roomId || message.role !== 'viewer') return;
+  const failure = getManifestCompatibilityFailure(message.mediaManifest);
+  if (failure) { resetLocalViewerSession(); setError(failure); return; }
+  const previousUpstream = session.upstreamPeerId || session.hostId;
+  const nextUpstream = String(message.upstreamPeerId || message.hostId || '');
+  const requestedMedia = resumeNeedsMediaReconnect;
+  signalingRecovery.stop();
+  Object.assign(session, { upstreamPeerId: nextUpstream, hostId: message.hostId,
+    chainPosition: Number(message.chainPosition || 0), sessionToken: message.sessionToken || session.sessionToken });
+  sessionStorage.setItem('vds-web-session', JSON.stringify(session));
+  chainPositionText.textContent = formatChainPosition(session.chainPosition);
+  diagnostics.update({ upstreamPeerId: nextUpstream, chainPosition: session.chainPosition });
+  clearError();
+  if (requestedMedia) {
+    // The server already requested a new offer as part of resume-session.
+    waitForUpstreamOffer();
+    setStatus('等待上游');
+  } else if (nextUpstream !== previousUpstream || !hasUsableUpstreamMedia()) {
+    requestUpstreamRecovery(upstreamPc, nextUpstream, 'signaling-resumed-media-unavailable');
+  } else {
+    restoreWatchingStatusAfterRelay();
+  }
+}
 
 joinButton.addEventListener('click', () => void joinRoom(roomIdInput.value.trim()));
 refreshRoomsButton.addEventListener('click', () => void refreshRooms(true));
@@ -338,6 +398,10 @@ async function handleSignal(message: SignalMessage): Promise<void> {
   switch (message.type) {
     case 'room-joined':
     case 'session-resumed':
+      if (message.type === 'session-resumed' && signalingRecovery.active) {
+        handleSignalingResumed(message);
+        break;
+      }
       handleJoined(message);
       break;
     case 'offer':
@@ -366,6 +430,14 @@ async function handleSignal(message: SignalMessage): Promise<void> {
       setError('主持端已断开。');
       break;
     case 'error':
+      if (signalingRecovery.active) {
+        const roomId = session?.roomId;
+        resetLocalViewerSession();
+        if (message.code === 'session-not-found' && roomId) {
+          void joinRoom(roomId);
+          break;
+        }
+      }
       if (message.code === 'session-token-invalid') {
         clearStoredSession();
         session = null;
@@ -719,6 +791,8 @@ function wirePeerEvents(pc: RTCPeerConnection, peerId: string): void {
     if (!session || !event.candidate || (pc !== upstreamPc && pc !== downstreamPc)) {
       return;
     }
+    // An interrupted negotiation will be restarted after session restoration.
+    if (signalingRecovery.active) return;
     diagnostics.incrementCandidate(peerId, 'local');
     signaling.send({
       type: 'ice-candidate',
@@ -731,7 +805,7 @@ function wirePeerEvents(pc: RTCPeerConnection, peerId: string): void {
   pc.oniceconnectionstatechange = () => {
     if (pc !== upstreamPc && pc !== downstreamPc) return;
     diagnostics.updateIce(peerId, pc.iceConnectionState);
-    if (pc === upstreamPc) upstreamRecovery.stateChanged(pc.iceConnectionState);
+    if (pc === upstreamPc) upstreamRecovery.stateChanged(pc.iceConnectionState, 'ice');
   };
   pc.onconnectionstatechange = () => {
     if (pc !== upstreamPc && pc !== downstreamPc) return;
@@ -742,16 +816,8 @@ function wirePeerEvents(pc: RTCPeerConnection, peerId: string): void {
 
 function requestUpstreamRecovery(pc: RTCPeerConnection | null, peerId: string, reason: string): void {
   if (!session || pc !== upstreamPc || !isCurrentUpstreamPeer(peerId)) return;
-  upstreamRecovery.stop();
-  upstreamPc = null;
-  upstreamMediaChannel = null;
-  pc?.close();
-  upstreamEdgeAttemptId = null;
-  pendingIceCandidates.delete(peerId);
-  viewerReadySent = false;
-  playback.resetMedia();
-  lastVideoKeyframeForRelay = null;
-  lastBootstrapFrameId = '';
+  retireUpstreamMedia();
+  if (signalingRecovery.active) return;
   if (++upstreamRecoveryAttempts > 3) {
     leaveCurrentRoom();
     setError('上游连接恢复失败，请重新加入房间。');
@@ -770,16 +836,21 @@ function requestUpstreamRecovery(pc: RTCPeerConnection | null, peerId: string, r
       failedUpstreamPeerId: peerId === session.hostId ? undefined : peerId
     });
   } catch (error) {
-    leaveCurrentRoom();
-    setError(errorToMessage(error));
+    if (session?.sessionToken) {
+      upstreamRecovery.stop();
+      signalingRecovery.start();
+      setStatus('信令重连中');
+    } else {
+      leaveCurrentRoom();
+      setError(errorToMessage(error));
+    }
   }
 }
 
 function maybeSendViewerReady(): void {
-  if (!session || viewerReadySent) {
+  if (!session || viewerReadySent || signalingRecovery.active) {
     return;
   }
-  viewerReadySent = true;
   signaling.send({
     type: 'viewer-ready',
     roomId: session.roomId,
@@ -787,6 +858,7 @@ function maybeSendViewerReady(): void {
     sessionToken: session.sessionToken,
     chainPosition: session.chainPosition
   });
+  viewerReadySent = true;
 }
 
 function markRelayUnsupported(reason: string): void {
@@ -802,6 +874,11 @@ function markRelayUnsupported(reason: string): void {
 
 function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): void {
   rotateRelaySourceEpoch();
+  relayFrameSender = new EncodedRelaySender(channel, requestUpstreamKeyframe);
+  channel.bufferedAmountLowThreshold = RELAY_BUFFERED_LOW_BYTES;
+  channel.onbufferedamountlow = () => {
+    if (isCurrentDownstreamChannel(channel, peerId)) relayFrameSender?.onBufferedLow();
+  };
   downstreamCloseExpected = false;
   diagnostics.update({ relayProtocolState: 'datachannel-opening' });
   const openTimer = window.setTimeout(() => {
@@ -853,9 +930,11 @@ function attachOutboundDataChannel(channel: RTCDataChannel, peerId: string): voi
         downstreamDataChannelReady = true;
         markDownstreamRelayReady();
         sendRelayBootstrapKeyframe();
+        requestUpstreamKeyframe();
       } else if (control?.type === 'error') {
         markRelayUnsupported(control.reason || 'datachannel-remote-error');
       } else if (control?.type === 'keyframe-request') {
+        if (getControlManifestFailure(control)) return;
         lastBootstrapFrameId = '';
         sendRelayBootstrapKeyframe();
         requestUpstreamKeyframe();
@@ -895,7 +974,7 @@ function attachInboundDataChannel(channel: RTCDataChannel, peerId: string): void
   const pc = upstreamPc;
   diagnostics.update({ relayProtocolState: 'datachannel-inbound-attached' });
   channel.onmessage = (event) => {
-    if (pc !== upstreamPc || !isCurrentUpstreamPeer(peerId)) {
+    if (pc !== upstreamPc || channel !== upstreamMediaChannel || !isCurrentUpstreamPeer(peerId)) {
       return;
     }
     if (typeof event.data === 'string') {
@@ -932,36 +1011,51 @@ function attachInboundDataChannel(channel: RTCDataChannel, peerId: string): void
     handleInboundEncodedFrame(event.data, peerId);
   };
   channel.onerror = () => {
-    if (pc !== upstreamPc || !isCurrentUpstreamPeer(peerId)) {
+    if (pc !== upstreamPc || channel !== upstreamMediaChannel || !isCurrentUpstreamPeer(peerId)) {
       return;
     }
     markRelayUnsupported('datachannel-error');
-    upstreamRecovery.stateChanged('failed');
+    upstreamRecovery.stateChanged('failed', 'datachannel');
   };
   channel.onclose = () => {
-    if (pc !== upstreamPc || !isCurrentUpstreamPeer(peerId)) {
+    if (pc !== upstreamPc || channel !== upstreamMediaChannel || !isCurrentUpstreamPeer(peerId)) {
       return;
     }
     diagnostics.update({ relayProtocolState: 'datachannel-closed' });
     if (upstreamMediaChannel === channel) upstreamMediaChannel = null;
-    upstreamRecovery.stateChanged('closed');
+    upstreamRecovery.stateChanged('closed', 'datachannel');
   };
 }
 
-let lastUpstreamKeyframeRequestMs = -Infinity;
+// Coalesce requests only for the same transport and source. Weak keys avoid
+// keeping retired channels alive just to remember their cooldown.
+const lastUpstreamKeyframeRequests = new WeakMap<RTCDataChannel, {
+  mediaSessionId: string; manifestVersion: number; sentAt: number;
+}>();
 function requestUpstreamKeyframe(): void {
   const channel = upstreamMediaChannel;
   const now = performance.now();
-  if (!upstreamPc || !channel || channel.readyState !== 'open' || now - lastUpstreamKeyframeRequestMs < 500) return;
+  if (!upstreamPc || !channel || channel.readyState !== 'open') return;
   const manifest = getCurrentManifest();
   if (!manifest || typeof manifest.mediaSessionId !== 'string' || !manifest.mediaSessionId ||
     typeof manifest.manifestVersion !== 'number' || !Number.isSafeInteger(manifest.manifestVersion) || manifest.manifestVersion < 1) return;
-  lastUpstreamKeyframeRequestMs = now;
-  channel.send(JSON.stringify({ protocol: ENCODED_MEDIA_PROTOCOL, protocolVersion: ENCODED_MEDIA_PROTOCOL_VERSION,
-    type: 'keyframe-request', mediaSessionId: manifest.mediaSessionId, manifestVersion: manifest.manifestVersion }));
+  const previous = lastUpstreamKeyframeRequests.get(channel);
+  if (previous?.mediaSessionId === manifest.mediaSessionId && previous.manifestVersion === manifest.manifestVersion &&
+    now - previous.sentAt < 500) return;
+  try {
+    channel.send(JSON.stringify({ protocol: ENCODED_MEDIA_PROTOCOL, protocolVersion: ENCODED_MEDIA_PROTOCOL_VERSION,
+      type: 'keyframe-request', mediaSessionId: manifest.mediaSessionId, manifestVersion: manifest.manifestVersion }));
+    lastUpstreamKeyframeRequests.set(channel, {
+      mediaSessionId: manifest.mediaSessionId, manifestVersion: manifest.manifestVersion, sentAt: now
+    });
+  } catch {
+    // Congestion/close can race the state check. Recovery owners retry; a
+    // failed send neither consumes cooldown nor aborts incoming media/control.
+  }
 }
 
 function rotateRelaySourceEpoch(): void {
+  relayFrameSender?.reset();
   const nonce = crypto.getRandomValues(new Uint32Array(4));
   relaySourceEpoch = `web-${Array.from(nonce, (value) => value.toString(16).padStart(8, '0')).join('')}`;
   lastBootstrapFrameId = '';
@@ -986,12 +1080,8 @@ function sendRelayBootstrapKeyframe(): void {
   if (bootstrapFrameId === lastBootstrapFrameId) {
     return;
   }
-  if (downstreamDataChannel.bufferedAmount > DATA_CHANNEL_MAX_BUFFERED_BYTES) {
-    diagnostics.update({ relayFailureReason: 'relay-bootstrap-buffered-amount-high' });
-    return;
-  }
   try {
-    const messages = encodeFrameMessages({
+    if (relayFrameSender?.channel !== downstreamDataChannel || !relayFrameSender.send({
       protocol: ENCODED_MEDIA_PROTOCOL,
       type: 'frame',
       streamType: 'video',
@@ -1002,13 +1092,7 @@ function sendRelayBootstrapKeyframe(): void {
       sequence: lastVideoKeyframeForRelay.sequence,
       keyframe: true,
       config: true
-    }, lastVideoKeyframeForRelay.payload);
-    for (const message of messages) {
-      if (!canSendDataChannelMessage('relay-bootstrap-buffered-amount-high')) {
-        return;
-      }
-      downstreamDataChannel.send(message);
-    }
+    }, lastVideoKeyframeForRelay.payload, true)) return;
     lastBootstrapFrameId = bootstrapFrameId;
     markDownstreamRelayForwarding('datachannel-bootstrap-sent');
     diagnostics.incrementCounter('dataChannelBootstrapFramesSent');
@@ -1034,9 +1118,11 @@ function handleViewerLeft(message: SignalMessage): void {
   downstreamDataChannelReady = false;
   downstreamRelayForwarding = false;
   clearRelayHelloAckTimer();
+  relayFrameSender?.reset();
   downstreamDataChannel?.close();
   downstreamPc?.close();
   downstreamDataChannel = null;
+  relayFrameSender = null;
   relaySourceEpoch = '';
   downstreamPc = null;
   downstreamEdgeAttemptId = null;
@@ -1051,6 +1137,7 @@ function handleViewerLeft(message: SignalMessage): void {
 }
 
 function handleDownstreamChannelClosed(): void {
+  relayFrameSender?.reset();
   const wasReady = downstreamDataChannelReady;
   if (wasReady) {
     downstreamCloseExpected = true;
@@ -1199,6 +1286,7 @@ function leaveCurrentRoom(): void {
 }
 
 function resetLocalViewerSession(): void {
+  signalingRecovery.stop();
   upstreamRecovery.stop();
   joinAttemptSeq += 1;
   clearJoinAckTimer();
@@ -1209,12 +1297,14 @@ function resetLocalViewerSession(): void {
   downstreamCloseExpected = true;
   clearRelayHelloAckTimer();
   playback.close();
+  relayFrameSender?.reset();
   pendingIceCandidates.clear();
   downstreamDataChannel?.close();
   downstreamPc?.close();
   upstreamPc?.close();
   signaling.close();
   downstreamDataChannel = null;
+  relayFrameSender = null;
   relaySourceEpoch = '';
   downstreamPc = null;
   upstreamPc = null;
@@ -1267,7 +1357,6 @@ function handleInboundEncodedFrame(data: unknown, peerId: string): void {
           payload: decoded.payload.slice(0),
           payloadFormat: decoded.header.payloadFormat || 'unknown'
         };
-        sendRelayBootstrapKeyframe();
       }
       const received = diagnostics.getSnapshot().encodedFramesReceived;
       if (received === 1 || received % 120 === 0) {
@@ -1307,12 +1396,8 @@ function forwardEncodedFrame(header: {
   if (!downstreamDataChannel || downstreamDataChannel.readyState !== 'open' || !isDataChannelRelayReady()) {
     return;
   }
-  if (downstreamDataChannel.bufferedAmount > DATA_CHANNEL_MAX_BUFFERED_BYTES) {
-    diagnostics.incrementCounter('dataChannelFramesDropped');
-    return;
-  }
   try {
-    const messages = encodeFrameMessages({
+    if (relayFrameSender?.channel !== downstreamDataChannel || !relayFrameSender.send({
       protocol: ENCODED_MEDIA_PROTOCOL,
       type: 'frame',
       streamType: header.streamType,
@@ -1323,13 +1408,9 @@ function forwardEncodedFrame(header: {
       sequence: header.sequence,
       keyframe: header.keyframe,
       config: header.config
-    }, payload);
-    for (const message of messages) {
-      if (!canSendDataChannelMessage('relay-buffered-amount-high')) {
-        diagnostics.incrementCounter('dataChannelFramesDropped');
-        return;
-      }
-      downstreamDataChannel.send(message);
+    }, payload)) {
+      diagnostics.incrementCounter('dataChannelFramesDropped');
+      return;
     }
     if (header.streamType === 'video') {
       diagnostics.incrementCounter('encodedFramesForwarded');
@@ -1393,18 +1474,6 @@ function handlePlaybackState(state: 'stopped' | 'waiting-media' | 'decoding' | '
   if (!session || downstreamDataChannelReady || downstreamRelayForwarding) return;
   if (state === 'playing') setStatus('观看中');
   else if (state === 'decoding') setStatus('解码中');
-}
-
-function canSendDataChannelMessage(dropReason: string): boolean {
-  if (!downstreamDataChannel || downstreamDataChannel.readyState !== 'open') {
-    return false;
-  }
-  downstreamDataChannel.bufferedAmountLowThreshold = DATA_CHANNEL_BUFFERED_LOW_BYTES;
-  if (downstreamDataChannel.bufferedAmount <= DATA_CHANNEL_MAX_BUFFERED_BYTES) {
-    return true;
-  }
-  diagnostics.update({ relayFailureReason: dropReason });
-  return false;
 }
 
 function clearRelayHelloAckTimer(): void {

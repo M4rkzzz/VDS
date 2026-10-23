@@ -302,8 +302,15 @@ export class WebCodecsAudioPlayer {
       const performanceMs = output.performanceTime;
       if (typeof contextTime !== 'number' || typeof performanceMs !== 'number' ||
         !Number.isFinite(contextTime) || !Number.isFinite(performanceMs) || contextTime <= 0 || performanceMs <= 0) return null;
-      this.clockAnchors = this.clockAnchors.filter((anchor) => anchor.endContextTime >= contextTime - 0.08);
-      const anchor = [...this.clockAnchors].reverse().find((candidate) => candidate.contextTime <= contextTime);
+      // Reservations are chronological. Prune the expired prefix in place;
+      // video may sample this clock every display refresh.
+      let expired = 0;
+      while (expired < this.clockAnchors.length && this.clockAnchors[expired].endContextTime < contextTime - 0.08) expired++;
+      if (expired) this.clockAnchors.splice(0, expired);
+      let anchor: AudioClockAnchor | undefined;
+      for (let index = this.clockAnchors.length - 1; index >= 0; index--) {
+        if (this.clockAnchors[index].contextTime <= contextTime) { anchor = this.clockAnchors[index]; break; }
+      }
       if (!anchor || contextTime > anchor.endContextTime + 0.08) return null;
       return { ptsUs: anchor.ptsUs + (contextTime - anchor.contextTime) * 1000000, performanceMs };
     } catch {

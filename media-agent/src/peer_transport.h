@@ -120,6 +120,11 @@ struct PeerEncodedMediaDataChannelFrame {
 using PeerKeyframeRequestHandler = std::function<std::string(const std::string&)>;
 
 struct PeerTransportCallbacks {
+#ifdef VDS_TRANSPORT_TESTING
+  // Fault injection is compiled only into the real-transport integration test.
+  std::function<std::size_t(std::size_t)> buffered_amount;
+  std::function<void(const std::string&, std::size_t)> before_send;
+#endif
   // Downstream media bindings still accept hello/keyframe control, but cannot
   // feed media back into a host or relay receiver.
   bool allow_remote_media = true;

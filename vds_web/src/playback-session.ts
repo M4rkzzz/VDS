@@ -153,9 +153,9 @@ export class EncodedMediaPlaybackSession {
     if (this.videoPumpTimer !== null) window.clearTimeout(this.videoPumpTimer);
     this.videoPumpTimer = null;
     const ordered = this.videoOrder.drain(playbackNowMs());
-    if (ordered.reset) this.video.close();
+    if (ordered.reset) this.video.resetReferenceChain();
     for (let index = 0; index < ordered.dropped; index += 1) this.callbacks.video.onDroppedFrame('web-video-sequence-discontinuity');
-    if (ordered.requestKeyframe) this.requestKeyframe();
+    if (ordered.requestKeyframe) this.video.requestKeyframeRecovery();
     for (const frame of ordered.frames) {
       void this.video.pushFrame(frame.header, frame.payload).catch((error) => {
         if (this.isCurrent(generation)) this.callbacks.video.onDroppedFrame(error instanceof Error ? error.message : 'web-playback-failed');

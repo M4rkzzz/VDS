@@ -10,6 +10,7 @@
 #include <mutex>
 #include <sstream>
 #include <cstdint>
+#include <vector>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -53,6 +54,7 @@ class NativeD3D11Presenter::Impl {
     if (latency_event) CloseHandle(latency_event);
     latency_event = nullptr;
     latency_ready = false;
+    clear_input_views();
     output.Reset();
     processor.Reset();
     enumerator.Reset();
@@ -97,7 +99,7 @@ class NativeD3D11Presenter::Impl {
     if (SUCCEEDED(factory.As(&factory5))) {
       factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing));
     }
-    flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+    const UINT preferred_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
       (tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     DXGI_SWAP_CHAIN_DESC1 desc{};
     desc.Width = w;
@@ -107,18 +109,43 @@ class NativeD3D11Presenter::Impl {
     desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     desc.BufferCount = 2;
     desc.Scaling = DXGI_SCALING_STRETCH;
-    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    desc.Flags = flags;
-    hr = factory->CreateSwapChainForHwnd(device.Get(), window, &desc, nullptr, nullptr, &swapchain);
-    if (FAILED(hr)) {
-      desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-      hr = factory->CreateSwapChainForHwnd(device.Get(), window, &desc, nullptr, nullptr, &swapchain);
+    const auto create_chain = [&](DXGI_SWAP_EFFECT effect, UINT options) {
+      desc.SwapEffect = effect;
+      desc.Flags = options;
+      swapchain.Reset();
+#ifdef VDS_NATIVE_SURFACE_TESTING
+      if (swapchain_creation_fault) {
+        const HRESULT injected = swapchain_creation_fault(effect, options);
+        if (FAILED(injected)) return injected;
+      }
+#endif
+      return factory->CreateSwapChainForHwnd(device.Get(), window, &desc, nullptr, nullptr,
+        swapchain.GetAddressOf());
+    };
+    // A rejected optional flag must not force decoded pixels through the CPU.
+    // Try simpler GPU paths only during creation; the media clock still paces
+    // presentation and Present remains nonblocking on every path.
+    UINT previous_options = ~0u;
+    hr = E_FAIL;
+    for (const UINT options : {preferred_flags,
+        static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT), 0u}) {
+      if (options == previous_options) continue;
+      previous_options = options;
+      for (const auto effect : {DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL}) {
+        hr = create_chain(effect, options);
+        if (SUCCEEDED(hr)) break;
+        if (FAILED(device->GetDeviceRemovedReason())) return hr;
+      }
+      if (SUCCEEDED(hr)) break;
     }
+    if (FAILED(hr)) hr = create_chain(DXGI_SWAP_EFFECT_DISCARD, 0);
     if (FAILED(hr)) return hr;
+    flags = desc.Flags;
     factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
     ComPtr<IDXGISwapChain2> chain2;
-    if (SUCCEEDED(swapchain.As(&chain2))) {
+    if ((flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) &&
+        SUCCEEDED(swapchain.As(&chain2))) {
       chain2->SetMaximumFrameLatency(1);
       latency_event = chain2->GetFrameLatencyWaitableObject();
     }
@@ -135,12 +162,14 @@ class NativeD3D11Presenter::Impl {
       if (FAILED(hr)) return hr;
       width = w;
       height = h;
+      clear_input_views();
       enumerator.Reset();
     }
     if (!enumerator || input_width != frame->width || input_height != frame->height ||
         rate_num != frame_rate_num || rate_den != frame_rate_den) {
       output.Reset();
       processor.Reset();
+      clear_input_views();
       enumerator.Reset();
       D3D11_VIDEO_PROCESSOR_CONTENT_DESC desc{};
       desc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -175,6 +204,47 @@ class NativeD3D11Presenter::Impl {
     return S_OK;
   }
 
+  void clear_input_views() {
+    input_views.clear();
+    input_texture.Reset();
+  }
+
+  HRESULT input_view(AVFrame* frame, ID3D11VideoProcessorInputView** result) {
+    auto* texture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);
+    const auto slice = reinterpret_cast<std::uintptr_t>(frame->data[1]);
+    if (texture != input_texture.Get()) {
+      D3D11_TEXTURE2D_DESC desc{};
+      texture->GetDesc(&desc);
+      if (slice >= desc.ArraySize) return E_INVALIDARG;
+      // FFmpeg's D3D11 decoder pool is a texture array. Retain only the current
+      // array, so stream/texture replacement cannot accumulate old GPU pools.
+      clear_input_views();
+      input_views.resize(desc.ArraySize);
+      input_texture = texture;
+    }
+    if (slice >= input_views.size()) return E_INVALIDARG;
+    auto& view = input_views[slice];
+    if (!view) {
+      D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC desc{};
+      desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+      desc.Texture2D.ArraySlice = static_cast<UINT>(slice);
+      const HRESULT hr = video_device->CreateVideoProcessorInputView(texture,
+        enumerator.Get(), &desc, view.GetAddressOf());
+      if (FAILED(hr)) return hr;
+#ifdef VDS_NATIVE_SURFACE_TESTING
+      if (on_input_view_created) on_input_view_created();
+#endif
+    }
+    *result = view.Get();
+    return S_OK;
+  }
+
+#ifdef VDS_NATIVE_SURFACE_TESTING
+  std::function<long(unsigned int, unsigned int)> swapchain_creation_fault;
+  std::function<void()> on_input_view_created;
+#endif
+  ComPtr<ID3D11Texture2D> input_texture;
+  std::vector<ComPtr<ID3D11VideoProcessorInputView>> input_views;
   HWND window = nullptr;
   HANDLE latency_event = nullptr;
   bool latency_ready = false;
@@ -215,6 +285,10 @@ NativeD3D11Presenter::Result NativeD3D11Presenter::present(void* parent, AVFrame
   if (!supports(frame)) { error = "d3d11-present-format-unsupported"; return Result::Failed; }
   auto* frames = reinterpret_cast<AVHWFramesContext*>(frame->hw_frames_ctx->data);
   auto* hardware = static_cast<AVD3D11VADeviceContext*>(frames->device_ctx->hwctx);
+#ifdef VDS_NATIVE_SURFACE_TESTING
+  impl_->swapchain_creation_fault = swapchain_creation_fault;
+  impl_->on_input_view_created = on_input_view_created;
+#endif
   HRESULT hr = S_OK;
   if (impl_->device.Get() != hardware->device) {
     hr = impl_->initialize(static_cast<HWND>(parent), hardware->device, width, height);
@@ -234,12 +308,8 @@ NativeD3D11Presenter::Result NativeD3D11Presenter::present(void* parent, AVFrame
     DeviceLock lock(hardware);
     hr = impl_->configure(frame, width, height, rate_num > 0 ? rate_num : 1, rate_den > 0 ? rate_den : 1);
     if (SUCCEEDED(hr)) {
-      D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC view{};
-      view.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-      view.Texture2D.ArraySlice = static_cast<UINT>(reinterpret_cast<std::uintptr_t>(frame->data[1]));
-      ComPtr<ID3D11VideoProcessorInputView> input;
-      hr = impl_->video_device->CreateVideoProcessorInputView(reinterpret_cast<ID3D11Texture2D*>(frame->data[0]),
-        impl_->enumerator.Get(), &view, &input);
+      ID3D11VideoProcessorInputView* input = nullptr;
+      hr = impl_->input_view(frame, &input);
       if (SUCCEEDED(hr)) {
         RECT source{0, 0, frame->width, frame->height}, destination{left, top, right, bottom};
         RECT output_rect{0, 0, width, height};
@@ -263,7 +333,7 @@ NativeD3D11Presenter::Result NativeD3D11Presenter::present(void* parent, AVFrame
         context->VideoProcessorSetOutputColorSpace(processor, &output_color);
         D3D11_VIDEO_PROCESSOR_STREAM stream{};
         stream.Enable = TRUE;
-        stream.pInputSurface = input.Get();
+        stream.pInputSurface = input;
         hr = context->VideoProcessorBlt(processor, impl_->output.Get(), 0, 1, &stream);
 #ifdef VDS_NATIVE_SURFACE_TESTING
         if (SUCCEEDED(hr) && inspect_output) {

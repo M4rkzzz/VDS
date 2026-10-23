@@ -261,7 +261,7 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
       tests/peer_keyframe_control_e2e.cpp
       src/peer_transport.cpp src/json_protocol.cpp src/peer_stun_config.cpp src/time_utils.cpp)
     target_include_directories(vds-peer-keyframe-control-e2e PRIVATE src)
-    target_compile_definitions(vds-peer-keyframe-control-e2e PRIVATE VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL=1)
+    target_compile_definitions(vds-peer-keyframe-control-e2e PRIVATE VDS_MEDIA_AGENT_ENABLE_LIBDATACHANNEL=1 VDS_TRANSPORT_TESTING=1)
     target_link_libraries(vds-peer-keyframe-control-e2e PRIVATE
       LibDataChannel::LibDataChannel Threads::Threads Ws2_32)
     if(VDS_MEDIA_AGENT_ENHANCED_ICE)
@@ -269,6 +269,11 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
       vds_copy_enhanced_ice_runtime(vds-peer-keyframe-control-e2e)
     endif()
     add_test(NAME vds-peer-keyframe-control-e2e COMMAND vds-peer-keyframe-control-e2e)
+    foreach(network_recovery IN ITEMS control config)
+      add_test(NAME vds-peer-congestion-${network_recovery} COMMAND vds-peer-keyframe-control-e2e --congestion-${network_recovery})
+      set_tests_properties(vds-peer-congestion-${network_recovery} PROPERTIES TIMEOUT 30
+        ENVIRONMENT "PATH=${CMAKE_CURRENT_SOURCE_DIR}/../runtime/media-agent;$ENV{PATH}")
+    endforeach()
     set_tests_properties(vds-peer-keyframe-control-e2e PROPERTIES TIMEOUT 30
       ENVIRONMENT "PATH=${CMAKE_CURRENT_SOURCE_DIR}/../runtime/media-agent;$ENV{PATH}")
   endif()
@@ -503,6 +508,15 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
     target_link_libraries(vds-native-preview-presenter-tests PRIVATE D2d1 User32 Gdi32 Dwmapi)
     add_test(NAME vds-native-preview-presenter-tests COMMAND vds-native-preview-presenter-tests)
     set_tests_properties(vds-native-preview-presenter-tests PROPERTIES TIMEOUT 20)
+    add_executable(vds-native-d3d11-resource-tests
+      tests/native_d3d11_resource_tests.cpp src/native_d3d11_presenter.cpp)
+    target_include_directories(vds-native-d3d11-resource-tests PRIVATE src "${VDS_MEDIA_AGENT_FFMPEG_ROOT}/include")
+    target_compile_definitions(vds-native-d3d11-resource-tests PRIVATE VDS_NATIVE_SURFACE_TESTING)
+    target_link_libraries(vds-native-d3d11-resource-tests PRIVATE
+      "${VDS_MEDIA_AGENT_AVUTIL_LIBRARY}" User32 D3D11 Dxgi)
+    add_test(NAME vds-native-d3d11-resource-tests COMMAND vds-native-d3d11-resource-tests)
+    set_tests_properties(vds-native-d3d11-resource-tests PROPERTIES
+      ENVIRONMENT "PATH=${VDS_MEDIA_AGENT_FFMPEG_ROOT}/bin;$ENV{PATH}" TIMEOUT 40)
     add_executable(vds-native-playback-surface-tests
       tests/native_playback_surface_tests.cpp
       src/native_video_surface.cpp
@@ -519,6 +533,13 @@ if(VDS_MEDIA_AGENT_BUILD_TESTS)
       "${VDS_MEDIA_AGENT_AVCODEC_LIBRARY}" "${VDS_MEDIA_AGENT_AVUTIL_LIBRARY}"
       "${VDS_MEDIA_AGENT_SWSCALE_LIBRARY}" "${VDS_MEDIA_AGENT_SWRESAMPLE_LIBRARY}" User32 Gdi32 Winmm D3D11 Dxgi)
     add_test(NAME vds-native-playback-surface-tests COMMAND vds-native-playback-surface-tests)
+    add_test(NAME vds-native-playback-clock-handoff-tests COMMAND vds-native-playback-surface-tests --clock-handoff)
+    add_test(NAME vds-native-playback-network-gap-tests COMMAND vds-native-playback-surface-tests --network-gap)
+    add_test(NAME vds-native-playback-network-decode-tests COMMAND vds-native-playback-surface-tests --network-decode)
+    set_tests_properties(vds-native-playback-network-gap-tests vds-native-playback-network-decode-tests PROPERTIES
+      ENVIRONMENT "PATH=${VDS_MEDIA_AGENT_FFMPEG_ROOT}/bin;$ENV{PATH}" TIMEOUT 60)
+    set_tests_properties(vds-native-playback-clock-handoff-tests PROPERTIES
+      ENVIRONMENT "PATH=${VDS_MEDIA_AGENT_FFMPEG_ROOT}/bin;$ENV{PATH}" TIMEOUT 40)
     set_tests_properties(vds-native-playback-surface-tests PROPERTIES
       ENVIRONMENT "PATH=${VDS_MEDIA_AGENT_FFMPEG_ROOT}/bin;$ENV{PATH}" TIMEOUT 60)
     add_executable(vds-viewer-audio-clock-tests
