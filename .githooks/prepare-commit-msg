@@ -1,0 +1,3 @@
+#!/bin/sh
+# Render is retired; keep ordinary VDS commits from deploying the old service.
+exec node "$(git rev-parse --show-toplevel)/scripts/skip-render-deploy.js" "$1"
