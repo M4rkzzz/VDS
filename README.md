@@ -14,11 +14,11 @@ VDS 是一套为“把画面稳定地给很多人看”而做的屏幕共享工�
 
 ## 快速入口
 
-- 下载最新版：[VDS 1.7.2 Release](https://github.com/M4rkzzz/VDS/releases/tag/v1.7.2)
+- 下载最新版：[GitHub Releases](https://github.com/M4rkzzz/VDS/releases/latest)
 - 适合人群：需要比普通聊天软件更可控的屏幕共享、OBS 分发、局域网观看或多人 relay 的用户。
 - 如果这个项目刚好解决了你的屏幕分享痛点，可以给仓库点一个 Star，后续更新和排障记录都会继续公开在这里。
 
-1.7.2 已包含本轮连接、播放和增强 ICE 改动，GitHub Release 与默认公网自动更新源均已同步。安装包约 229 MiB，未签名。验证范围与剩余实机验收项见 [项目现状报告](docs/PROJECT_STATUS.md)。
+当前已发布版本为 1.7.14，包含连接恢复、直播拥塞恢复和原生播放时序改进；发布验收见 [更新记录](CHANGELOG.md) 和 [近期改动与发布记录](MEDIA_REFACTOR_PLAN.md#2-近期改动与发布记录)。目录用途和本地清理边界见 [仓库整理说明](docs/REPOSITORY_LAYOUT.md)。项目早期恢复背景见 [项目现状报告](docs/PROJECT_STATUS.md)。
 
 ## 为什么值得试试
 
@@ -45,7 +45,7 @@ VDS 是一套为“把画面稳定地给很多人看”而做的屏幕共享工�
 - 提供 3010 后台查看实时房间、拓扑、节点状态和媒体 manifest。
 - 提供诊断面板，方便定位 P2P、采集、编码、解码、relay 和浏览器能力问题。
 
-## 1.7.2 版本概览
+## 1.7.2 恢复版本回顾
 
 `1.7.2` 集中恢复纯 P2P 连接与播放，更新至 Electron 42，并恢复自部署服务与自动更新源。
 
